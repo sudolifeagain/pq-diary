@@ -9,3 +9,10 @@ license.workspace = true
 thiserror = "2"
 zeroize = { version = "1", features = ["derive"] }
 secrecy = "0.10"
+argon2 = "0.5"
+aes-gcm = "0.10"
+ml-kem = { git = "https://github.com/sudolifeagain/ml-kem", branch = "pq-diary" }
+ml-dsa = { git = "https://github.com/sudolifeagain/ml-dsa", branch = "pq-diary" }
+hmac = "0.12"
+sha2 = "0.10"
+rand = "0.8"

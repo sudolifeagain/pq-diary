@@ -20,3 +20,6 @@ Thumbs.db
 .idea/
 .vscode/
 *.iml
+
+# Automation logs
+logs/

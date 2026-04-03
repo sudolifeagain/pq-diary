@@ -8,11 +8,17 @@
 //! - [`dsa`]: ML-DSA-65 digital signatures
 //! - [`hmac_util`]: HMAC-SHA256 message authentication
 
+/// AES-256-GCM authenticated encryption and decryption.
 pub mod aead;
+/// ML-DSA-65 digital signature algorithm (FIPS 204).
 pub mod dsa;
+/// HMAC-SHA256 message authentication code.
 pub mod hmac_util;
+/// Argon2id key derivation.
 pub mod kdf;
+/// ML-KEM-768 key encapsulation mechanism (FIPS 203).
 pub mod kem;
+/// Secure memory types: [`SecureBuffer`], [`ZeroizingKey`], [`MasterKey`], [`CryptoEngine`].
 pub mod secure_mem;
 
 pub use secure_mem::{CryptoEngine, MasterKey, SecureBuffer, ZeroizingKey};

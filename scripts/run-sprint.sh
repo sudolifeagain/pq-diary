@@ -8,41 +8,39 @@ set -euo pipefail
 # =============================================================================
 
 # === 設定 ===
-SPRINT_NAME="s2-crypto-core"
+SPRINT_NAME="s3-vault-storage"
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TASKS_DIR="${PROJECT_ROOT}/docs/tasks/${SPRINT_NAME}"
 PROMPTS_DIR="$(dirname "$0")/prompts"
 LOG_DIR="${PROJECT_ROOT}/logs/sprint-${SPRINT_NAME}"
 
 # タスク一覧 (依存順)
-TASKS=(TASK-0008 TASK-0009 TASK-0010 TASK-0011 TASK-0012 TASK-0013 TASK-0014 TASK-0015 TASK-0016 TASK-0017)
+TASKS=(TASK-0018 TASK-0019 TASK-0020 TASK-0021 TASK-0022 TASK-0023 TASK-0024 TASK-0025 TASK-0026)
 
 # タスクタイプ
 declare -A TASK_TYPES=(
-    [TASK-0008]="DIRECT"
-    [TASK-0009]="DIRECT"
-    [TASK-0010]="TDD"
-    [TASK-0011]="TDD"
-    [TASK-0012]="TDD"
-    [TASK-0013]="TDD"
-    [TASK-0014]="TDD"
-    [TASK-0015]="TDD"
-    [TASK-0016]="TDD"
-    [TASK-0017]="TDD"
+    [TASK-0018]="DIRECT"
+    [TASK-0019]="TDD"
+    [TASK-0020]="TDD"
+    [TASK-0021]="TDD"
+    [TASK-0022]="TDD"
+    [TASK-0023]="TDD"
+    [TASK-0024]="TDD"
+    [TASK-0025]="TDD"
+    [TASK-0026]="TDD"
 )
 
 # タスク名 (コミットメッセージ用)
 declare -A TASK_NAMES=(
-    [TASK-0008]="PQC fork repositories (ml-kem, ml-dsa)"
-    [TASK-0009]="crypto submodule split and dependency setup"
-    [TASK-0010]="Argon2id key derivation (kdf.rs)"
-    [TASK-0011]="AES-256-GCM encrypt/decrypt (aead.rs)"
-    [TASK-0012]="ML-KEM-768 encapsulation (kem.rs)"
-    [TASK-0013]="ML-DSA-65 sign/verify (dsa.rs)"
-    [TASK-0014]="HMAC-SHA256 (hmac_util.rs)"
-    [TASK-0015]="CryptoEngine unlock/lock"
-    [TASK-0016]="CryptoEngine crypto method integration"
-    [TASK-0017]="integration tests and doc comments"
+    [TASK-0018]="vault submodule split and serde/toml dependency setup"
+    [TASK-0019]="vault.toml and config.toml serde structs"
+    [TASK-0020]="vault.pqd v4 header constants and structs"
+    [TASK-0021]="vault.pqd header write (writer.rs)"
+    [TASK-0022]="vault.pqd header read (reader.rs)"
+    [TASK-0023]="entry and template record read/write"
+    [TASK-0024]="random padding and verification token"
+    [TASK-0025]="VaultManager multi-vault and init"
+    [TASK-0026]="integration tests and doc comments"
 )
 
 # モデル設定
@@ -86,8 +84,8 @@ check_prerequisites() {
 
     local branch
     branch="$(git branch --show-current)"
-    if [[ "${branch}" != "sprint/s2" ]]; then
-        log_warn "Expected 'sprint/s2', on '${branch}'"
+    if [[ "${branch}" != "sprint/s3" ]]; then
+        log_warn "Expected 'sprint/s3', on '${branch}'"
     fi
 
     log_ok "Prerequisites OK (claude, cargo, git)"
@@ -96,11 +94,6 @@ check_prerequisites() {
 # === テスト実行 ===
 run_tests() {
     local label="$1"
-
-    if [[ "${CURRENT_TASK}" == "TASK-0008" ]]; then
-        log_info "${label}: skipping cargo checks (TASK-0008 — PQC fork, no local code changes)"
-        return 0
-    fi
 
     if [[ "${CURRENT_TASK}" == "TASK-0001" ]]; then
         log_info "${label}: cargo build (TASK-0001 — workspace初回)"

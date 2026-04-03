@@ -1,15 +1,15 @@
 # Sprint Status
 
-## Current: Sprint 1 — 基盤構築 (not started)
+## Current: Sprint 4 — エントリ操作 + CLI (not started)
 
 ## Progress
 
 | Sprint | テーマ | Status | Week |
 |--------|--------|--------|------|
-| S1 | 基盤構築 | not started | 1 |
-| S2 | 暗号コア | blocked by S1 | 2 |
-| S3 | Vaultフォーマット | blocked by S2 | 3 |
-| S4 | エントリ操作 + CLI | blocked by S3 | 4 |
+| S1 | 基盤構築 | completed (s1-done) | 1 |
+| S2 | 暗号コア | completed (s2-done) | 2 |
+| S3 | Vaultフォーマット | completed (s3-done) | 3 |
+| S4 | エントリ操作 + CLI | not started | 4 |
 | S5 | デイリーノート + テンプレート + リンク | blocked by S4 | 5 |
 | S6 | 検索 + 統計 + インポート | blocked by S4 | 6 |
 | S7 | アクセス制御 + Claude連携 | blocked by S4 | 7 |

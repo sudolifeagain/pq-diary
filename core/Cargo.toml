@@ -1,0 +1,11 @@
+[package]
+name = "pq-diary-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror = "2"
+zeroize = { version = "1", features = ["derive"] }
+secrecy = "0.10"

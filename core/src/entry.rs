@@ -188,6 +188,42 @@ impl IdPrefix {
 // CRUD functions
 // =============================================================================
 
+/// List all entries in the vault and return their metadata.
+///
+/// Reads every [`EntryRecord`] from the vault, decrypts each one with
+/// `engine.decrypt()`, deserialises the JSON payload into [`EntryPlaintext`],
+/// and returns a flat [`Vec<EntryMeta>`] suitable for display or filtering.
+///
+/// Sorting and filtering are intentionally left to the caller (e.g. the CLI).
+///
+/// # Errors
+///
+/// Returns [`DiaryError::Io`] on vault I/O failure.
+/// Returns [`DiaryError::Crypto`] if decryption fails for any record.
+/// Returns [`DiaryError::Entry`] if JSON deserialisation fails for any record.
+/// Returns [`DiaryError::NotUnlocked`] if the engine is locked.
+pub fn list_entries(
+    vault_path: &Path,
+    engine: &CryptoEngine,
+) -> Result<Vec<EntryMeta>, DiaryError> {
+    let (_header, records) = read_vault(vault_path)?;
+    let mut metas = Vec::with_capacity(records.len());
+    for record in records {
+        let decrypted = engine.decrypt(&record.iv, &record.ciphertext)?;
+        let plaintext: EntryPlaintext = serde_json::from_slice(decrypted.as_ref())
+            .map_err(|e| DiaryError::Entry(format!("deserialization failed: {e}")))?;
+        let uuid_hex: String = record.uuid.iter().map(|b| format!("{:02x}", b)).collect();
+        metas.push(EntryMeta {
+            uuid_hex,
+            title: plaintext.title,
+            tags: plaintext.tags,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+        });
+    }
+    Ok(metas)
+}
+
 /// Create a new entry in the vault and return its UUID.
 ///
 /// Processing pipeline:
@@ -741,6 +777,122 @@ mod tests {
         assert_ne!(u1, u2, "uuid1 and uuid2 must differ");
         assert_ne!(u2, u3, "uuid2 and uuid3 must differ");
         assert_ne!(u1, u3, "uuid1 and uuid3 must differ");
+    }
+
+    // =========================================================================
+    // TASK-0030: list_entries
+    // =========================================================================
+
+    /// TC-0030-01: list_entries on an empty vault returns an empty Vec.
+    #[test]
+    fn test_list_entries_empty_vault() {
+        let dir = tempdir().expect("tempdir");
+        let vault_path = dir.path().join("vault.pqd");
+        let engine = make_test_engine();
+        init_test_vault(&vault_path);
+
+        let metas = list_entries(&vault_path, &engine).expect("list_entries");
+        assert!(metas.is_empty(), "expected empty Vec for empty vault");
+    }
+
+    /// TC-0030-02: list_entries returns exactly one EntryMeta with correct fields.
+    #[test]
+    fn test_list_entries_single_entry() {
+        let dir = tempdir().expect("tempdir");
+        let vault_path = dir.path().join("vault.pqd");
+        let engine = make_test_engine();
+        init_test_vault(&vault_path);
+
+        let plaintext = EntryPlaintext {
+            title: "Hello World".to_string(),
+            tags: vec!["work".to_string(), "diary".to_string()],
+            body: "Some body text.".to_string(),
+        };
+        let uuid = create_entry(&vault_path, &engine, &plaintext).expect("create_entry");
+
+        let metas = list_entries(&vault_path, &engine).expect("list_entries");
+        assert_eq!(metas.len(), 1, "expected exactly 1 meta");
+
+        let meta = &metas[0];
+        assert_eq!(meta.title, plaintext.title);
+        assert_eq!(meta.tags, plaintext.tags);
+        assert_eq!(meta.uuid_hex, uuid.as_bytes().iter().map(|b| format!("{:02x}", b)).collect::<String>());
+        assert!(meta.created_at > 0, "created_at must be positive");
+        assert!(meta.updated_at >= meta.created_at, "updated_at must be >= created_at");
+    }
+
+    /// TC-0030-03: list_entries returns all 3 entries with correct titles and tags.
+    #[test]
+    fn test_list_entries_multiple_entries() {
+        let dir = tempdir().expect("tempdir");
+        let vault_path = dir.path().join("vault.pqd");
+        let engine = make_test_engine();
+        init_test_vault(&vault_path);
+
+        let originals = vec![
+            EntryPlaintext {
+                title: "First".to_string(),
+                tags: vec!["alpha".to_string()],
+                body: "Body 1".to_string(),
+            },
+            EntryPlaintext {
+                title: "Second".to_string(),
+                tags: vec!["beta".to_string(), "work".to_string()],
+                body: "Body 2".to_string(),
+            },
+            EntryPlaintext {
+                title: "Third".to_string(),
+                tags: vec![],
+                body: "Body 3".to_string(),
+            },
+        ];
+
+        for pt in &originals {
+            create_entry(&vault_path, &engine, pt).expect("create_entry");
+        }
+
+        let metas = list_entries(&vault_path, &engine).expect("list_entries");
+        assert_eq!(metas.len(), 3, "expected 3 metas");
+
+        for (i, meta) in metas.iter().enumerate() {
+            assert_eq!(meta.title, originals[i].title, "title mismatch at index {}", i);
+            assert_eq!(meta.tags, originals[i].tags, "tags mismatch at index {}", i);
+        }
+    }
+
+    /// TC-0030-04: Full field validation — uuid_hex length, timestamps, id_prefix.
+    #[test]
+    fn test_list_entries_full_field_validation() {
+        let dir = tempdir().expect("tempdir");
+        let vault_path = dir.path().join("vault.pqd");
+        let engine = make_test_engine();
+        init_test_vault(&vault_path);
+
+        let plaintext = EntryPlaintext {
+            title: "Validation Test".to_string(),
+            tags: vec!["qa".to_string()],
+            body: "body".to_string(),
+        };
+        create_entry(&vault_path, &engine, &plaintext).expect("create_entry");
+
+        let metas = list_entries(&vault_path, &engine).expect("list_entries");
+        assert_eq!(metas.len(), 1);
+
+        let meta = &metas[0];
+
+        // uuid_hex must be exactly 32 lowercase hex characters.
+        assert_eq!(meta.uuid_hex.len(), 32, "uuid_hex must be 32 chars");
+        assert!(
+            meta.uuid_hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+            "uuid_hex must be lowercase hex"
+        );
+
+        // Timestamps must be positive.
+        assert!(meta.created_at > 0, "created_at must be > 0");
+        assert!(meta.updated_at >= meta.created_at, "updated_at >= created_at");
+
+        // id_prefix(4) must match the first 4 characters of uuid_hex.
+        assert_eq!(meta.id_prefix(4), &meta.uuid_hex[..4]);
     }
 
     /// TC-0029-04: created_at == updated_at and both fall within the current time window.

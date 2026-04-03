@@ -156,6 +156,11 @@ pub fn read_entries(reader: &mut impl Read) -> Result<Vec<EntryRecord>, DiaryErr
 fn parse_entry_payload(payload: &[u8]) -> Result<EntryRecord, DiaryError> {
     let mut cursor = io::Cursor::new(payload);
 
+    // Record type (1 byte) — first byte of every payload.
+    let mut type_buf = [0u8; 1];
+    cursor.read_exact(&mut type_buf)?;
+    let record_type = type_buf[0];
+
     // UUID (16 bytes)
     let mut uuid = [0u8; 16];
     cursor.read_exact(&mut uuid)?;
@@ -225,6 +230,7 @@ fn parse_entry_payload(payload: &[u8]) -> Result<EntryRecord, DiaryError> {
     }
 
     Ok(EntryRecord {
+        record_type,
         uuid,
         created_at,
         updated_at,
@@ -265,8 +271,8 @@ pub fn read_vault(path: &Path) -> Result<(VaultHeader, Vec<EntryRecord>), DiaryE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vault::format::{VaultHeader, SCHEMA_VERSION};
-    use crate::vault::writer::{write_header, write_vault};
+    use crate::vault::format::{VaultHeader, RECORD_TYPE_ENTRY, RECORD_TYPE_TEMPLATE, SCHEMA_VERSION};
+    use crate::vault::writer::{write_entries, write_header, write_vault};
 
     /// Build a [`VaultHeader`] with recognisable non-zero field values.
     fn make_test_header() -> VaultHeader {
@@ -285,8 +291,9 @@ mod tests {
     }
 
     /// Build a minimal [`EntryRecord`] with known content.
-    fn make_test_entry() -> crate::vault::format::EntryRecord {
-        crate::vault::format::EntryRecord {
+    fn make_test_entry() -> EntryRecord {
+        EntryRecord {
+            record_type: RECORD_TYPE_ENTRY,
             uuid: [0xABu8; 16],
             created_at: 1_000_000,
             updated_at: 2_000_000,
@@ -294,6 +301,25 @@ mod tests {
             ciphertext: vec![0x10, 0x20, 0x30],
             signature: vec![0x40, 0x50],
             content_hmac: [0x7Fu8; 32],
+            legacy_flag: 0x00,
+            legacy_key_block: vec![],
+            attachment_count: 0,
+            attachment_offset: 0,
+            padding: vec![],
+        }
+    }
+
+    /// Build a template [`EntryRecord`] with known content.
+    fn make_test_template() -> EntryRecord {
+        EntryRecord {
+            record_type: RECORD_TYPE_TEMPLATE,
+            uuid: [0xCDu8; 16],
+            created_at: 3_000_000,
+            updated_at: 4_000_000,
+            iv: [0x02u8; 12],
+            ciphertext: vec![0xA0, 0xB0],
+            signature: vec![0xC0],
+            content_hmac: [0x3Cu8; 32],
             legacy_flag: 0x00,
             legacy_key_block: vec![],
             attachment_count: 0,
@@ -424,6 +450,7 @@ mod tests {
         // Entry checks
         assert_eq!(entries.len(), 1, "expected 1 entry");
         let e = &entries[0];
+        assert_eq!(e.record_type, RECORD_TYPE_ENTRY);
         assert_eq!(e.uuid, [0xABu8; 16]);
         assert_eq!(e.created_at, 1_000_000);
         assert_eq!(e.updated_at, 2_000_000);
@@ -432,5 +459,230 @@ mod tests {
         assert_eq!(e.signature, vec![0x40, 0x50]);
         assert_eq!(e.content_hmac, [0x7Fu8; 32]);
         assert_eq!(e.legacy_flag, 0x00);
+    }
+
+    // -----------------------------------------------------------------------
+    // TASK-0023 test cases
+    // -----------------------------------------------------------------------
+
+    /// TC-002-01: write one entry then read back — all fields must match.
+    ///
+    /// Given one EntryRecord with distinct non-zero field values, when written
+    /// via write_entries and read back via read_entries, every field must equal
+    /// the original value.
+    #[test]
+    fn test_tc_002_01_entry_roundtrip_all_fields() {
+        let entry = make_test_entry();
+
+        let mut buf: Vec<u8> = Vec::new();
+        write_entries(&mut buf, &[entry]).expect("write_entries");
+
+        let mut cursor = io::Cursor::new(&buf);
+        let entries = read_entries(&mut cursor).expect("read_entries");
+
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        assert_eq!(e.record_type, RECORD_TYPE_ENTRY);
+        assert_eq!(e.uuid, [0xABu8; 16]);
+        assert_eq!(e.created_at, 1_000_000);
+        assert_eq!(e.updated_at, 2_000_000);
+        assert_eq!(e.iv, [0x01u8; 12]);
+        assert_eq!(e.ciphertext, vec![0x10, 0x20, 0x30]);
+        assert_eq!(e.signature, vec![0x40, 0x50]);
+        assert_eq!(e.content_hmac, [0x7Fu8; 32]);
+        assert_eq!(e.legacy_flag, 0x00);
+        assert!(e.legacy_key_block.is_empty());
+        assert_eq!(e.attachment_count, 0);
+        assert_eq!(e.attachment_offset, 0);
+        assert!(e.padding.is_empty());
+    }
+
+    /// TC-002-02: multiple entries preserve insertion order.
+    ///
+    /// Given three EntryRecords with distinct UUIDs, when written and read
+    /// back, the returned slice must contain all three in original order.
+    #[test]
+    fn test_tc_002_02_multiple_entries_order() {
+        let mut e1 = make_test_entry();
+        e1.uuid = [0x01u8; 16];
+        let mut e2 = make_test_entry();
+        e2.uuid = [0x02u8; 16];
+        let mut e3 = make_test_entry();
+        e3.uuid = [0x03u8; 16];
+
+        let mut buf: Vec<u8> = Vec::new();
+        write_entries(&mut buf, &[e1, e2, e3]).expect("write_entries");
+
+        let mut cursor = io::Cursor::new(&buf);
+        let entries = read_entries(&mut cursor).expect("read_entries");
+
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].uuid, [0x01u8; 16]);
+        assert_eq!(entries[1].uuid, [0x02u8; 16]);
+        assert_eq!(entries[2].uuid, [0x03u8; 16]);
+    }
+
+    /// TC-002-03: zero-length record signals end of entry section.
+    ///
+    /// Given a byte stream that contains one valid entry followed by a zero
+    /// sentinel, when read_entries parses it, it must return exactly one entry
+    /// and stop without consuming bytes beyond the sentinel.
+    #[test]
+    fn test_tc_002_03_zero_sentinel_stops_reading() {
+        let entry = make_test_entry();
+
+        let mut buf: Vec<u8> = Vec::new();
+        write_entries(&mut buf, &[entry]).expect("write_entries");
+
+        // Append extra bytes after the sentinel to verify they are not consumed.
+        buf.extend_from_slice(&[0xFFu8; 16]);
+
+        let mut cursor = io::Cursor::new(&buf);
+        let entries = read_entries(&mut cursor).expect("read_entries");
+
+        assert_eq!(entries.len(), 1, "exactly one entry before the sentinel");
+    }
+
+    /// TC-002-04: attachment reservation fields are zero-initialised.
+    ///
+    /// Given an EntryRecord created with attachment_count=0 and
+    /// attachment_offset=0, when written and read back, those fields
+    /// must both equal zero.
+    #[test]
+    fn test_tc_002_04_attachment_fields_zero_initialised() {
+        let entry = make_test_entry(); // attachment_count=0, attachment_offset=0
+
+        let mut buf: Vec<u8> = Vec::new();
+        write_entries(&mut buf, &[entry]).expect("write_entries");
+
+        let mut cursor = io::Cursor::new(&buf);
+        let entries = read_entries(&mut cursor).expect("read_entries");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].attachment_count, 0, "attachment_count must be 0");
+        assert_eq!(entries[0].attachment_offset, 0, "attachment_offset must be 0");
+    }
+
+    /// TC-003-01: template record write→read roundtrip.
+    ///
+    /// Given an EntryRecord with record_type=RECORD_TYPE_TEMPLATE, when
+    /// written and read back, the record_type and all other fields must match.
+    #[test]
+    fn test_tc_003_01_template_roundtrip() {
+        let template = make_test_template();
+
+        let mut buf: Vec<u8> = Vec::new();
+        write_entries(&mut buf, &[template]).expect("write_entries");
+
+        let mut cursor = io::Cursor::new(&buf);
+        let entries = read_entries(&mut cursor).expect("read_entries");
+
+        assert_eq!(entries.len(), 1);
+        let t = &entries[0];
+        assert_eq!(t.record_type, RECORD_TYPE_TEMPLATE);
+        assert_eq!(t.uuid, [0xCDu8; 16]);
+        assert_eq!(t.created_at, 3_000_000);
+        assert_eq!(t.updated_at, 4_000_000);
+        assert_eq!(t.ciphertext, vec![0xA0, 0xB0]);
+    }
+
+    /// TC-003-02: mixed entry and template records are read in order with correct types.
+    ///
+    /// Given one ENTRY and one TEMPLATE record written in sequence, when read
+    /// back, the first must have record_type=ENTRY and the second TEMPLATE.
+    #[test]
+    fn test_tc_003_02_mixed_entry_and_template() {
+        let entry = make_test_entry();
+        let template = make_test_template();
+
+        let mut buf: Vec<u8> = Vec::new();
+        write_entries(&mut buf, &[entry, template]).expect("write_entries");
+
+        let mut cursor = io::Cursor::new(&buf);
+        let records = read_entries(&mut cursor).expect("read_entries");
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].record_type, RECORD_TYPE_ENTRY);
+        assert_eq!(records[1].record_type, RECORD_TYPE_TEMPLATE);
+    }
+
+    /// TC-002-05: non-zero padding (0–255 B) survives round trip.
+    ///
+    /// Given an EntryRecord with 128 bytes of padding, when written and read
+    /// back, the padding field must match exactly.
+    #[test]
+    fn test_tc_002_05_padding_roundtrip() {
+        let mut entry = make_test_entry();
+        entry.padding = (0u8..128).collect();
+
+        let mut buf: Vec<u8> = Vec::new();
+        write_entries(&mut buf, &[entry]).expect("write_entries");
+
+        let mut cursor = io::Cursor::new(&buf);
+        let entries = read_entries(&mut cursor).expect("read_entries");
+
+        assert_eq!(entries.len(), 1);
+        let expected_padding: Vec<u8> = (0u8..128).collect();
+        assert_eq!(entries[0].padding, expected_padding, "padding must survive roundtrip");
+    }
+
+    /// TC-002-06: maximum padding (255 B) survives round trip.
+    ///
+    /// Given an EntryRecord with 255 bytes of padding (the maximum for a u8
+    /// length byte), when written and read back, the padding must match.
+    #[test]
+    fn test_tc_002_06_max_padding_roundtrip() {
+        let mut entry = make_test_entry();
+        entry.padding = vec![0xFEu8; 255];
+
+        let mut buf: Vec<u8> = Vec::new();
+        write_entries(&mut buf, &[entry]).expect("write_entries");
+
+        let mut cursor = io::Cursor::new(&buf);
+        let entries = read_entries(&mut cursor).expect("read_entries");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].padding, vec![0xFEu8; 255], "max padding must survive roundtrip");
+    }
+
+    /// TC-002-B01: empty vault (zero entries) is read without error.
+    ///
+    /// Given a vault written with an empty entry slice, when read_entries
+    /// parses the resulting byte stream, it must return an empty Vec without
+    /// returning an error.
+    #[test]
+    fn test_tc_002_b01_empty_vault_reads_ok() {
+        let mut buf: Vec<u8> = Vec::new();
+        write_entries(&mut buf, &[]).expect("write_entries");
+
+        let mut cursor = io::Cursor::new(&buf);
+        let entries = read_entries(&mut cursor).expect("read_entries");
+
+        assert!(entries.is_empty(), "expected no entries for empty vault");
+    }
+
+    /// TC-002-B02: 100-entry write/read roundtrip.
+    ///
+    /// Given 100 EntryRecords each with a unique UUID derived from the index,
+    /// when written and read back, the count must be 100 and every UUID must
+    /// match the original.
+    #[test]
+    fn test_tc_002_b02_bulk_100_entries() {
+        let entries: Vec<EntryRecord> = (0u8..100).map(|i| {
+            let mut e = make_test_entry();
+            e.uuid = [i; 16];
+            e
+        }).collect();
+
+        let mut buf: Vec<u8> = Vec::new();
+        write_entries(&mut buf, &entries).expect("write_entries");
+
+        let mut cursor = io::Cursor::new(&buf);
+        let read_back = read_entries(&mut cursor).expect("read_entries");
+
+        assert_eq!(read_back.len(), 100, "must read back 100 entries");
+        for (i, e) in read_back.iter().enumerate() {
+            assert_eq!(e.uuid, [i as u8; 16], "uuid mismatch at index {}", i);
+        }
     }
 }

@@ -80,6 +80,7 @@ pub fn write_header<W: Write>(writer: &mut W, header: &VaultHeader) -> Result<()
 ///
 /// ```text
 /// [record_len: LE u32]   -- byte count of the following payload
+/// [record_type: 1 B]
 /// [uuid: 16 B]
 /// [created_at: LE u64]
 /// [updated_at: LE u64]
@@ -105,6 +106,8 @@ pub fn write_entries<W: Write>(writer: &mut W, entries: &[EntryRecord]) -> Resul
         // Serialise the record payload into a temporary buffer so we know the length.
         let mut payload: Vec<u8> = Vec::new();
 
+        // Record type is the first byte of every payload.
+        payload.push(entry.record_type);
         payload.extend_from_slice(&entry.uuid);
         payload.extend_from_slice(&entry.created_at.to_le_bytes());
         payload.extend_from_slice(&entry.updated_at.to_le_bytes());
@@ -182,11 +185,12 @@ pub fn write_vault(path: &Path, mut header: VaultHeader, entries: &[EntryRecord]
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vault::format::{EntryRecord, VaultHeader, MAGIC};
+    use crate::vault::format::{EntryRecord, VaultHeader, MAGIC, RECORD_TYPE_ENTRY};
 
     /// Build a minimal [`EntryRecord`] with known content for testing.
     fn make_test_entry() -> EntryRecord {
         EntryRecord {
+            record_type: RECORD_TYPE_ENTRY,
             uuid: [0xABu8; 16],
             created_at: 1_000_000,
             updated_at: 2_000_000,

@@ -1,16 +1,71 @@
-//! Secure temporary file management for the pq-diary editor integration.
+//! Secure temporary file management and external editor integration for pq-diary.
 //!
-//! Provides a secure temporary directory selection strategy and a
-//! cryptographically overwritten file deletion primitive used when the
-//! external editor finishes working with a plaintext entry.
+//! Provides a secure temporary directory selection strategy, header comment
+//! formatting for `$EDITOR`-edited temporary files, and editor process management.
 //!
-//! Items here are consumed by command handlers implemented in subsequent tasks
-//! (TASK-0036 onwards).
+//! Items here are consumed by command handlers implemented in TASK-0037 and later.
 // Allow dead_code until the command handlers wire these up.
 #![allow(dead_code)]
 
-use pq_diary_core::DiaryError;
+use pq_diary_core::{DiaryError, EntryPlaintext};
 use std::path::{Path, PathBuf};
+
+// =============================================================================
+// Public Types
+// =============================================================================
+
+/// Configuration for launching an external editor.
+///
+/// Build with [`EditorConfig::from_env`] to read `$EDITOR` and detect
+/// vim/neovim for security-option injection.
+pub struct EditorConfig {
+    /// Editor command (`$EDITOR` or platform fallback: `"vi"` / `"notepad"`).
+    pub command: String,
+
+    /// Extra arguments for vim/neovim: `["-c", "set noswapfile nobackup noundofile"]`.
+    /// Empty for all other editors.
+    pub vim_options: Vec<String>,
+
+    /// Secure temporary directory obtained from [`secure_tmpdir`].
+    pub secure_tmpdir: PathBuf,
+}
+
+impl EditorConfig {
+    /// Construct an `EditorConfig` from the current environment.
+    ///
+    /// - Reads `$EDITOR`; falls back to `"vi"` on Unix and `"notepad"` on Windows.
+    /// - Prepends `-c "set noswapfile nobackup noundofile"` for `vim`/`nvim`.
+    /// - Calls [`secure_tmpdir`] to resolve the temporary directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DiaryError::Editor`] if [`secure_tmpdir`] fails.
+    pub fn from_env() -> Result<Self, DiaryError> {
+        let command = std::env::var("EDITOR").unwrap_or_else(|_| default_editor());
+        let vim_options = vim_options_for(&command);
+        let secure_tmpdir = secure_tmpdir()?;
+        Ok(Self {
+            command,
+            vim_options,
+            secure_tmpdir,
+        })
+    }
+}
+
+/// Parsed result of a header-comment temporary file.
+///
+/// Fields are `None` when the file does not contain a valid header (i.e. the
+/// `# ---` separator line is absent).
+pub struct HeaderComment {
+    /// Entry title extracted from the `# Title:` line; `None` if absent or header invalid.
+    pub title: Option<String>,
+
+    /// Tag list extracted from the `# Tags:` line; `None` if absent or header invalid.
+    pub tags: Option<Vec<String>>,
+
+    /// Entry body: content after `# ---`, or the whole file when no header is present.
+    pub body: String,
+}
 
 // =============================================================================
 // Public API
@@ -86,6 +141,190 @@ pub fn secure_delete(path: &Path) -> Result<(), DiaryError> {
     std::fs::remove_file(path)?;
 
     Ok(())
+}
+
+/// Write an [`EntryPlaintext`] to a header-comment formatted temporary file.
+///
+/// The file is created inside `tmpdir` with a UUID-based filename (`{uuid}.md`).
+///
+/// **Output format**:
+/// ```text
+/// # Title: {title}
+/// # Tags: {tag1}, {tag2}
+/// # ---
+///
+/// {body}
+/// ```
+///
+/// An empty tag list produces `# Tags:` with no content after the colon.
+///
+/// # Errors
+///
+/// Returns [`DiaryError::Io`] on file creation or write failure.
+pub fn write_header_file(tmpdir: &Path, plaintext: &EntryPlaintext) -> Result<PathBuf, DiaryError> {
+    use std::io::Write as _;
+
+    let filename = format!("{}.md", uuid::Uuid::new_v4().as_simple());
+    let path = tmpdir.join(&filename);
+
+    let tags_str = plaintext.tags.join(", ");
+    let content = format!(
+        "# Title: {}\n# Tags: {}\n# ---\n\n{}",
+        plaintext.title, tags_str, plaintext.body
+    );
+
+    let mut file = std::fs::File::create(&path)?;
+    file.write_all(content.as_bytes())?;
+
+    Ok(path)
+}
+
+/// Parse a header-comment formatted file into [`HeaderComment`].
+///
+/// **Parse rules**:
+/// - Lines before `# ---` are scanned for `# Title: ` and `# Tags: `.
+/// - The `# Tags:` value is split on commas; empty strings are discarded.
+/// - Body is the content after `# ---` (one leading blank line is skipped).
+///
+/// **Fallback when no `# ---` separator is found**:
+/// - `title` and `tags` are set to `None`.
+/// - `body` contains the entire raw file content.
+///
+/// # Errors
+///
+/// Returns [`DiaryError::Io`] if the file cannot be read.
+pub fn read_header_file(path: &Path) -> Result<HeaderComment, DiaryError> {
+    let content = std::fs::read_to_string(path)?;
+
+    let lines: Vec<&str> = content.lines().collect();
+
+    let sep_idx = lines.iter().position(|l| *l == "# ---");
+
+    let Some(sep_idx) = sep_idx else {
+        // No separator: invalid format — return whole content as body.
+        return Ok(HeaderComment {
+            title: None,
+            tags: None,
+            body: content,
+        });
+    };
+
+    let mut title: Option<String> = None;
+    let mut tags: Option<Vec<String>> = None;
+
+    for line in &lines[..sep_idx] {
+        if let Some(t) = line.strip_prefix("# Title: ") {
+            title = Some(t.to_string());
+        } else if let Some(t) = line.strip_prefix("# Tags: ") {
+            let tag_str = t.trim();
+            if tag_str.is_empty() {
+                tags = Some(vec![]);
+            } else {
+                tags = Some(
+                    tag_str
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect(),
+                );
+            }
+        }
+    }
+
+    // Body = lines after the separator.
+    // Skip exactly one leading blank line (the blank line between header and body).
+    let after_sep = &lines[sep_idx + 1..];
+    let body = if after_sep.first().is_some_and(|l| l.is_empty()) {
+        after_sep[1..].join("\n")
+    } else {
+        after_sep.join("\n")
+    };
+
+    Ok(HeaderComment { title, tags, body })
+}
+
+/// Launch `$EDITOR` for the given temporary file and wait for it to exit.
+///
+/// - vim/neovim options (`-c "set noswapfile nobackup noundofile"`) are
+///   prepended when present in `config.vim_options`.
+/// - `TMPDIR` (Unix), `TEMP`, and `TMP` are set to `config.secure_tmpdir`
+///   so that the editor cannot leak data outside the secure area.
+///
+/// # Errors
+///
+/// - Returns [`DiaryError::Editor`] if the process cannot be spawned.
+/// - Returns [`DiaryError::Editor`] if the editor exits with a non-zero status.
+pub fn launch_editor(tmpfile: &Path, config: &EditorConfig) -> Result<(), DiaryError> {
+    let mut cmd = std::process::Command::new(&config.command);
+
+    for opt in &config.vim_options {
+        cmd.arg(opt);
+    }
+
+    cmd.arg(tmpfile);
+
+    let tmpdir_str = config.secure_tmpdir.to_str().ok_or_else(|| {
+        DiaryError::Editor(
+            "Secure tmpdir path contains non-UTF-8 characters".to_string(),
+        )
+    })?;
+
+    #[cfg(unix)]
+    cmd.env("TMPDIR", tmpdir_str);
+    cmd.env("TEMP", tmpdir_str);
+    cmd.env("TMP", tmpdir_str);
+
+    let status = cmd
+        .status()
+        .map_err(|e| DiaryError::Editor(format!("Failed to launch editor '{}': {}", config.command, e)))?;
+
+    if !status.success() {
+        return Err(DiaryError::Editor(format!(
+            "Editor '{}' exited with non-zero status: {}",
+            config.command,
+            status.code().unwrap_or(-1)
+        )));
+    }
+
+    Ok(())
+}
+
+// =============================================================================
+// Private helpers
+// =============================================================================
+
+/// Returns the platform default editor when `$EDITOR` is not set.
+///
+/// Returns `"notepad"` on Windows and `"vi"` on all other platforms.
+fn default_editor() -> String {
+    if cfg!(windows) {
+        "notepad".to_string()
+    } else {
+        "vi".to_string()
+    }
+}
+
+/// Returns the vim/neovim security options for the given editor command.
+///
+/// Returns `["-c", "set noswapfile nobackup noundofile"]` when the basename
+/// of `command` is `"vim"` or `"nvim"` (`.exe` suffix is stripped on Windows).
+/// Returns an empty vector for all other editors.
+fn vim_options_for(command: &str) -> Vec<String> {
+    let basename = Path::new(command)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(command);
+
+    let basename = basename.strip_suffix(".exe").unwrap_or(basename);
+
+    if basename == "vim" || basename == "nvim" {
+        vec![
+            "-c".to_string(),
+            "set noswapfile nobackup noundofile".to_string(),
+        ]
+    } else {
+        vec![]
+    }
 }
 
 // =============================================================================
@@ -208,7 +447,7 @@ mod tests {
     use super::*;
 
     // -------------------------------------------------------------------------
-    // secure_delete tests
+    // secure_delete tests (TASK-0035)
     // -------------------------------------------------------------------------
 
     /// TC-0035-01: secure_delete removes the file after overwriting with random
@@ -262,7 +501,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // secure_tmpdir tests
+    // secure_tmpdir tests (TASK-0035)
     // -------------------------------------------------------------------------
 
     /// TC-0035-04: secure_tmpdir returns an existing directory.
@@ -339,5 +578,241 @@ mod tests {
             "Owner must be able to write to the secure temp directory"
         );
         let _ = std::fs::remove_file(&test_file);
+    }
+
+    // -------------------------------------------------------------------------
+    // write_header_file / read_header_file round-trip tests (TASK-0036)
+    // -------------------------------------------------------------------------
+
+    fn make_plaintext(title: &str, tags: Vec<&str>, body: &str) -> EntryPlaintext {
+        EntryPlaintext {
+            title: title.to_string(),
+            tags: tags.into_iter().map(|s| s.to_string()).collect(),
+            body: body.to_string(),
+        }
+    }
+
+    /// TC-0036-01: full round-trip with title, multiple tags, and body.
+    #[test]
+    fn tc_0036_01_roundtrip_full() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plaintext = make_plaintext("My Title", vec!["tag1", "tag2", "tag3"], "Hello\nWorld");
+
+        let path = write_header_file(dir.path(), &plaintext).expect("write_header_file");
+        let header = read_header_file(&path).expect("read_header_file");
+
+        assert_eq!(header.title, Some("My Title".to_string()));
+        assert_eq!(
+            header.tags,
+            Some(vec!["tag1".to_string(), "tag2".to_string(), "tag3".to_string()])
+        );
+        assert_eq!(header.body, "Hello\nWorld");
+    }
+
+    /// TC-0036-02: round-trip with empty tag list.
+    #[test]
+    fn tc_0036_02_roundtrip_empty_tags() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plaintext = make_plaintext("Title", vec![], "body text");
+
+        let path = write_header_file(dir.path(), &plaintext).expect("write_header_file");
+        let header = read_header_file(&path).expect("read_header_file");
+
+        assert_eq!(header.title, Some("Title".to_string()));
+        assert_eq!(header.tags, Some(vec![]));
+        assert_eq!(header.body, "body text");
+    }
+
+    /// TC-0036-03: round-trip with Japanese tags and multi-line body.
+    #[test]
+    fn tc_0036_03_roundtrip_japanese_tags() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plaintext = make_plaintext(
+            "日記タイトル",
+            vec!["日記", "仕事/設計"],
+            "今日の出来事\n箇条書き1\n箇条書き2",
+        );
+
+        let path = write_header_file(dir.path(), &plaintext).expect("write_header_file");
+        let header = read_header_file(&path).expect("read_header_file");
+
+        assert_eq!(header.title, Some("日記タイトル".to_string()));
+        assert_eq!(
+            header.tags,
+            Some(vec!["日記".to_string(), "仕事/設計".to_string()])
+        );
+        assert_eq!(header.body, "今日の出来事\n箇条書き1\n箇条書き2");
+    }
+
+    // -------------------------------------------------------------------------
+    // Partial header tests (TASK-0036)
+    // -------------------------------------------------------------------------
+
+    /// TC-0036-04: title-only header (no Tags line) — title parsed, tags=None.
+    #[test]
+    fn tc_0036_04_partial_title_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("partial_title.md");
+        std::fs::write(&path, "# Title: Only Title\n# ---\n\nbody here").expect("write");
+
+        let header = read_header_file(&path).expect("read_header_file");
+
+        assert_eq!(header.title, Some("Only Title".to_string()));
+        assert_eq!(header.tags, None);
+        assert_eq!(header.body, "body here");
+    }
+
+    /// TC-0036-05: tags-only header (no Title line) — tags parsed, title=None.
+    #[test]
+    fn tc_0036_05_partial_tags_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("partial_tags.md");
+        std::fs::write(&path, "# Tags: foo, bar\n# ---\n\nbody content").expect("write");
+
+        let header = read_header_file(&path).expect("read_header_file");
+
+        assert_eq!(header.title, None);
+        assert_eq!(
+            header.tags,
+            Some(vec!["foo".to_string(), "bar".to_string()])
+        );
+        assert_eq!(header.body, "body content");
+    }
+
+    // -------------------------------------------------------------------------
+    // Invalid header fallback tests (TASK-0036)
+    // -------------------------------------------------------------------------
+
+    /// TC-0036-06: file with no header at all — title=None, tags=None, body=whole file.
+    #[test]
+    fn tc_0036_06_no_header_fallback() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("no_header.md");
+        let raw = "Just plain text\nNo header here\n";
+        std::fs::write(&path, raw).expect("write");
+
+        let header = read_header_file(&path).expect("read_header_file");
+
+        assert_eq!(header.title, None);
+        assert_eq!(header.tags, None);
+        assert_eq!(header.body, raw);
+    }
+
+    /// TC-0036-07: file with title/tags lines but no `# ---` separator — fallback to whole file.
+    #[test]
+    fn tc_0036_07_no_separator_fallback() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("no_sep.md");
+        let raw = "# Title: Foo\n# Tags: bar\nsome body without separator\n";
+        std::fs::write(&path, raw).expect("write");
+
+        let header = read_header_file(&path).expect("read_header_file");
+
+        assert_eq!(header.title, None);
+        assert_eq!(header.tags, None);
+        assert_eq!(header.body, raw);
+    }
+
+    // -------------------------------------------------------------------------
+    // vim option detection tests (TASK-0036)
+    // -------------------------------------------------------------------------
+
+    /// TC-0036-08: "vim" command → security options are added.
+    #[test]
+    fn tc_0036_08_vim_options_for_vim() {
+        let opts = vim_options_for("vim");
+        assert_eq!(
+            opts,
+            vec!["-c".to_string(), "set noswapfile nobackup noundofile".to_string()]
+        );
+    }
+
+    /// TC-0036-09: "nvim" command → security options are added.
+    #[test]
+    fn tc_0036_09_vim_options_for_nvim() {
+        let opts = vim_options_for("nvim");
+        assert_eq!(
+            opts,
+            vec!["-c".to_string(), "set noswapfile nobackup noundofile".to_string()]
+        );
+    }
+
+    /// TC-0036-10: full path to vim → security options are added (basename check).
+    #[cfg(unix)]
+    #[test]
+    fn tc_0036_10_vim_options_full_path() {
+        let opts = vim_options_for("/usr/bin/vim");
+        assert_eq!(
+            opts,
+            vec!["-c".to_string(), "set noswapfile nobackup noundofile".to_string()]
+        );
+    }
+
+    /// TC-0036-11: "nano" → no vim options.
+    #[test]
+    fn tc_0036_11_non_vim_no_options() {
+        let opts = vim_options_for("nano");
+        assert!(opts.is_empty(), "nano must not produce vim options");
+    }
+
+    /// TC-0036-12: "emacs" → no vim options.
+    #[test]
+    fn tc_0036_12_emacs_no_options() {
+        let opts = vim_options_for("emacs");
+        assert!(opts.is_empty(), "emacs must not produce vim options");
+    }
+
+    /// TC-0036-13: `$EDITOR` unset → default_editor() returns platform fallback.
+    #[test]
+    fn tc_0036_13_default_editor_fallback() {
+        let editor = default_editor();
+        if cfg!(windows) {
+            assert_eq!(editor, "notepad");
+        } else {
+            assert_eq!(editor, "vi");
+        }
+    }
+
+    /// TC-0036-14: vim.exe on Windows path → security options are added.
+    #[test]
+    fn tc_0036_14_vim_exe_windows() {
+        let opts = vim_options_for("vim.exe");
+        assert_eq!(
+            opts,
+            vec!["-c".to_string(), "set noswapfile nobackup noundofile".to_string()]
+        );
+    }
+
+    /// TC-0036-15: write_header_file creates a .md file in the given directory.
+    #[test]
+    fn tc_0036_15_write_creates_md_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plaintext = make_plaintext("Test", vec!["t1"], "body");
+
+        let path = write_header_file(dir.path(), &plaintext).expect("write_header_file");
+
+        assert!(path.exists(), "File must exist after write_header_file");
+        assert_eq!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("md"),
+            "File must have .md extension"
+        );
+        assert_eq!(
+            path.parent().expect("parent"),
+            dir.path(),
+            "File must be inside the given tmpdir"
+        );
+    }
+
+    /// TC-0036-16: each call to write_header_file creates a distinct file.
+    #[test]
+    fn tc_0036_16_write_unique_filenames() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plaintext = make_plaintext("A", vec![], "b");
+
+        let p1 = write_header_file(dir.path(), &plaintext).expect("write 1");
+        let p2 = write_header_file(dir.path(), &plaintext).expect("write 2");
+
+        assert_ne!(p1, p2, "Each write must produce a unique filename");
     }
 }

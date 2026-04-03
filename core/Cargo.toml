@@ -12,7 +12,7 @@ secrecy = "0.10"
 argon2 = "0.5"
 aes-gcm = "0.10"
 ml-kem = { git = "https://github.com/sudolifeagain/ml-kem", branch = "pq-diary", features = ["getrandom", "zeroize"] }
-ml-dsa = { git = "https://github.com/sudolifeagain/ml-dsa", branch = "pq-diary" }
+ml-dsa = { git = "https://github.com/sudolifeagain/ml-dsa", branch = "pq-diary", features = ["zeroize"] }
 hmac = "0.12"
 sha2 = "0.10"
 rand = "0.8"

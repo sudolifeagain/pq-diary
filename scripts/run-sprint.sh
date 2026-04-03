@@ -140,7 +140,7 @@ run_claude() {
     log_info "[${task_id}] ${role} (model=${model}, attempt ${attempt}/${MAX_RETRIES})"
 
     if echo "${prompt}" | claude -p \
-        --permission-mode bypassPermissions \
+        --dangerously-skip-permissions \
         --model "${model}" \
         --no-session-persistence \
         --append-system-prompt "You are working on pq-diary (Rust PQC CLI journal). Sprint: ${SPRINT_NAME}. Read CLAUDE.md first for all project rules." \

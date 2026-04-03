@@ -452,4 +452,110 @@ mod tests {
             result
         );
     }
+
+    // -------------------------------------------------------------------------
+    // TASK-0017 tests: integration + performance
+    // -------------------------------------------------------------------------
+
+    /// TC-017-01: Full cryptographic pipeline end-to-end test.
+    ///
+    /// Exercises the complete pipeline in order:
+    /// Argon2id key derivation → unlock → AES-256-GCM encryption →
+    /// ML-DSA-65 signing → HMAC-SHA256 → ML-KEM-768 encapsulation/decapsulation →
+    /// AES-256-GCM decryption → ML-DSA-65 verification → HMAC-SHA256 verification → lock.
+    #[test]
+    fn tc_017_01_e2e_crypto_pipeline() {
+        let params = fast_params();
+        let password = b"e2e-password-test";
+        let salt = b"e2e-salt-16bytes";
+
+        // Step 1: Argon2id key derivation via unlock
+        let (iv, ct) = make_verification_token(password, salt, &params);
+        let mut engine = CryptoEngine::new();
+        engine.unlock(password, salt, &params, iv, &ct).unwrap();
+        assert!(engine.is_unlocked(), "engine must be unlocked after unlock()");
+
+        // Step 2: Generate full key material (DSA + KEM)
+        let dsa_kp = dsa::keygen().unwrap();
+        let kem_kp = kem::keygen().unwrap();
+        let vk_bytes = dsa_kp.verifying_key.clone();
+        let ek_bytes = kem_kp.encapsulation_key.clone();
+
+        // Derive sym_key and inject full MasterKey
+        let sym_key = *kdf::derive_key(password, salt, &params).unwrap().as_ref();
+        let master_key = MasterKey {
+            sym_key,
+            dsa_sk: dsa_kp.signing_key.as_ref().to_vec().into_boxed_slice(),
+            kem_sk: kem_kp.decapsulation_key.as_ref().to_vec().into_boxed_slice(),
+        };
+        engine.master_key = Some(SecretBox::new(Box::new(master_key)));
+
+        // Step 3: AES-256-GCM encryption
+        let plaintext = b"E2E test: secret journal entry content.";
+        let (ciphertext, nonce) = engine.encrypt(plaintext).unwrap();
+
+        // Step 4: ML-DSA-65 signing
+        let signature = engine.dsa_sign(plaintext).unwrap();
+
+        // Step 5: HMAC-SHA256
+        let mac = engine.hmac(plaintext).unwrap();
+        assert_eq!(mac.len(), 32);
+
+        // Step 6: ML-KEM-768 encapsulation → decapsulation (shared secrets must match)
+        let (kem_ct, ss_sender) = engine.kem_encapsulate(&ek_bytes).unwrap();
+        let ss_receiver = engine.kem_decapsulate(&kem_ct).unwrap();
+        assert_eq!(
+            ss_sender.as_ref(),
+            ss_receiver.as_ref(),
+            "KEM shared secrets must match"
+        );
+
+        // Step 7: AES-256-GCM decryption
+        let recovered = engine.decrypt(&nonce, &ciphertext).unwrap();
+        assert_eq!(
+            recovered.as_ref(),
+            plaintext,
+            "decrypted plaintext must match original"
+        );
+
+        // Step 8: ML-DSA-65 signature verification
+        let sig_valid = engine.dsa_verify(&vk_bytes, plaintext, &signature).unwrap();
+        assert!(sig_valid, "DSA signature must verify as valid");
+
+        // Step 9: HMAC-SHA256 verification
+        let mac_valid = engine.hmac_verify(plaintext, &mac).unwrap();
+        assert!(mac_valid, "HMAC must verify as valid");
+
+        // Step 10: lock
+        engine.lock();
+        assert!(!engine.is_unlocked(), "engine must be locked after lock()");
+    }
+
+    /// TC-017-02: unlock() with default Argon2id params completes within 5 seconds.
+    ///
+    /// Measures wall-clock time for `unlock()` (which includes Argon2id key derivation).
+    /// The 5-second upper bound accounts for CI environment variability while still
+    /// providing a meaningful regression guard.
+    #[test]
+    fn tc_017_02_unlock_performance_within_5_seconds() {
+        use std::time::Instant;
+
+        let params = kdf::Argon2Params::default(); // 64 MiB, 3 iterations, 4 threads
+        let password = b"perf-test-password";
+        let salt = b"perf-salt-16byte";
+
+        // Build verification token outside the timed region.
+        let (iv, ct) = make_verification_token(password, salt, &params);
+
+        let mut engine = CryptoEngine::new();
+        let start = Instant::now();
+        engine.unlock(password, salt, &params, iv, &ct).unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed.as_secs() < 5,
+            "unlock() took {:?}, expected < 5 seconds (CI-adjusted bound)",
+            elapsed
+        );
+    }
 }

@@ -296,6 +296,57 @@ pub fn create_entry(
     Ok(uuid)
 }
 
+/// Look up an entry by ID prefix and return the decrypted record and plaintext.
+///
+/// Processing:
+/// 1. Read all [`EntryRecord`]s from the vault.
+/// 2. Filter records whose UUID hex starts with `prefix`.
+/// 3. Exactly one match: decrypt the ciphertext and return `(record, plaintext)`.
+/// 4. Zero matches: return a "not found" error.
+/// 5. Multiple matches: return an error listing candidate UUID hexes.
+///
+/// # Errors
+///
+/// Returns [`DiaryError::Io`] on vault I/O failure.
+/// Returns [`DiaryError::Crypto`] if decryption fails.
+/// Returns [`DiaryError::Entry`] if JSON deserialisation fails, no match is
+///   found, or multiple matches are found.
+/// Returns [`DiaryError::NotUnlocked`] if the engine is locked.
+pub fn get_entry(
+    vault_path: &Path,
+    engine: &CryptoEngine,
+    prefix: &IdPrefix,
+) -> Result<(EntryRecord, EntryPlaintext), DiaryError> {
+    let (_header, records) = read_vault(vault_path)?;
+
+    let mut matches: Vec<EntryRecord> = records
+        .into_iter()
+        .filter(|r| prefix.matches(&r.uuid))
+        .collect();
+
+    match matches.len() {
+        0 => Err(DiaryError::Entry("エントリが見つかりません".to_string())),
+        1 => {
+            let record = matches.remove(0);
+            let decrypted = engine.decrypt(&record.iv, &record.ciphertext)?;
+            let plaintext: EntryPlaintext = serde_json::from_slice(decrypted.as_ref())
+                .map_err(|e| DiaryError::Entry(format!("deserialization failed: {e}")))?;
+            Ok((record, plaintext))
+        }
+        _ => {
+            let candidates = matches
+                .iter()
+                .map(|r| r.uuid.iter().map(|b| format!("{:02x}", b)).collect::<String>())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(DiaryError::Entry(format!(
+                "複数のエントリがマッチしました: {}",
+                candidates
+            )))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -937,5 +988,145 @@ mod tests {
             record.created_at,
             after
         );
+    }
+
+    // =========================================================================
+    // TASK-0031: get_entry
+    // =========================================================================
+
+    /// TC-0031-01: get_entry with a 4-character prefix returns the correct entry.
+    #[test]
+    fn test_get_entry_unique_match() {
+        let dir = tempdir().expect("tempdir");
+        let vault_path = dir.path().join("vault.pqd");
+        let engine = make_test_engine();
+        init_test_vault(&vault_path);
+
+        let plaintext = EntryPlaintext {
+            title: "Unique Entry".to_string(),
+            tags: vec!["test".to_string()],
+            body: "Hello, world!".to_string(),
+        };
+        let uuid = create_entry(&vault_path, &engine, &plaintext).expect("create_entry");
+
+        let uuid_hex: String = uuid.as_bytes().iter().map(|b| format!("{:02x}", b)).collect();
+        let prefix = IdPrefix::new(&uuid_hex[..4]).expect("valid prefix");
+
+        let (record, got) = get_entry(&vault_path, &engine, &prefix).expect("get_entry");
+        assert_eq!(&record.uuid, uuid.as_bytes());
+        assert_eq!(got.title, plaintext.title);
+        assert_eq!(got.tags, plaintext.tags);
+        assert_eq!(got.body, plaintext.body);
+    }
+
+    /// TC-0031-02: get_entry with a non-matching prefix returns DiaryError::Entry
+    /// containing "エントリが見つかりません".
+    #[test]
+    fn test_get_entry_no_match() {
+        let dir = tempdir().expect("tempdir");
+        let vault_path = dir.path().join("vault.pqd");
+        let engine = make_test_engine();
+        init_test_vault(&vault_path);
+
+        let pt = EntryPlaintext {
+            title: "Some Entry".to_string(),
+            tags: vec![],
+            body: "body".to_string(),
+        };
+        create_entry(&vault_path, &engine, &pt).expect("create_entry");
+
+        // Force UUID to start with 0x01,0x01 so "ffff" definitely won't match.
+        {
+            let (header, mut records) = read_vault(&vault_path).expect("read_vault");
+            records[0].uuid[0] = 0x01;
+            records[0].uuid[1] = 0x01;
+            write_vault(&vault_path, header, &records).expect("write_vault");
+        }
+
+        let prefix = IdPrefix::new("ffff").expect("valid prefix");
+        let err = get_entry(&vault_path, &engine, &prefix).expect_err("should be Err");
+        assert!(matches!(err, DiaryError::Entry(_)));
+        if let DiaryError::Entry(msg) = err {
+            assert!(
+                msg.contains("エントリが見つかりません"),
+                "expected not-found message, got: {}",
+                msg
+            );
+        }
+    }
+
+    /// TC-0031-03: get_entry with a prefix matching two entries returns DiaryError::Entry
+    /// listing both candidate UUID hexes.
+    #[test]
+    fn test_get_entry_multiple_matches() {
+        let dir = tempdir().expect("tempdir");
+        let vault_path = dir.path().join("vault.pqd");
+        let engine = make_test_engine();
+        init_test_vault(&vault_path);
+
+        let pt = EntryPlaintext {
+            title: "Entry".to_string(),
+            tags: vec![],
+            body: "body".to_string(),
+        };
+        create_entry(&vault_path, &engine, &pt).expect("create 1");
+        create_entry(&vault_path, &engine, &pt).expect("create 2");
+
+        // Force both UUIDs to share hex prefix "0000" but differ afterwards.
+        {
+            let (header, mut records) = read_vault(&vault_path).expect("read_vault");
+            records[0].uuid[0] = 0x00;
+            records[0].uuid[1] = 0x00;
+            records[0].uuid[2] = 0x01;
+            records[1].uuid[0] = 0x00;
+            records[1].uuid[1] = 0x00;
+            records[1].uuid[2] = 0x02;
+            write_vault(&vault_path, header, &records).expect("write_vault");
+        }
+
+        let prefix = IdPrefix::new("0000").expect("valid prefix");
+        let err = get_entry(&vault_path, &engine, &prefix).expect_err("should be Err");
+        assert!(matches!(err, DiaryError::Entry(_)));
+        if let DiaryError::Entry(msg) = err {
+            assert!(
+                msg.contains("複数のエントリがマッチしました"),
+                "expected multiple-match message, got: {}",
+                msg
+            );
+            assert!(
+                msg.contains("000001"),
+                "first candidate UUID should appear, got: {}",
+                msg
+            );
+            assert!(
+                msg.contains("000002"),
+                "second candidate UUID should appear, got: {}",
+                msg
+            );
+        }
+    }
+
+    /// TC-0031-04: get_entry with a full 32-character UUID hex returns the correct entry.
+    #[test]
+    fn test_get_entry_full_uuid_prefix() {
+        let dir = tempdir().expect("tempdir");
+        let vault_path = dir.path().join("vault.pqd");
+        let engine = make_test_engine();
+        init_test_vault(&vault_path);
+
+        let plaintext = EntryPlaintext {
+            title: "Full UUID test".to_string(),
+            tags: vec![],
+            body: "exact match".to_string(),
+        };
+        let uuid = create_entry(&vault_path, &engine, &plaintext).expect("create_entry");
+
+        let full_hex: String = uuid.as_bytes().iter().map(|b| format!("{:02x}", b)).collect();
+        assert_eq!(full_hex.len(), 32, "UUID hex must be 32 chars");
+
+        let prefix = IdPrefix::new(&full_hex).expect("valid 32-char prefix");
+        let (_record, got) = get_entry(&vault_path, &engine, &prefix).expect("get_entry");
+        assert_eq!(got.title, plaintext.title);
+        assert_eq!(got.body, plaintext.body);
     }
 }

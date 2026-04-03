@@ -10,7 +10,7 @@
 - [x] CI (cargo test, clippy, audit)
 
 ### S2: 暗号コア
-- [ ] PQCフォーク作成 (ml-kem: zeroize補完, ml-dsa: Drop漏れ修正+CVE-2026-22705)
+- [x] PQCフォーク作成 (ml-kem: zeroize補完, ml-dsa: Drop漏れ修正+CVE-2026-22705)
 - [ ] Argon2id鍵導出 (memory_cost 64MB, time_cost 3, parallelism 4)
 - [ ] AES-256-GCM暗号化/復号
 - [ ] ML-KEM-768鍵カプセル化/脱カプセル化

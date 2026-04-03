@@ -6,6 +6,10 @@
 //!
 //! All multi-byte integer fields use little-endian byte order.
 
+use crate::{crypto::aead, error::DiaryError};
+use rand::{rngs::OsRng, RngCore};
+use zeroize::Zeroizing;
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -171,12 +175,148 @@ pub struct EntryRecord {
 }
 
 // =============================================================================
+// Padding and verification-token helpers
+// =============================================================================
+
+/// Generate random padding for the end of a vault.pqd file.
+///
+/// Returns between 512 and 4096 bytes of cryptographically random data.
+/// The random length makes it harder for an observer to infer the number of
+/// entries in the vault from the file size.
+pub fn generate_file_padding() -> Vec<u8> {
+    let mut size_buf = [0u8; 4];
+    OsRng.fill_bytes(&mut size_buf);
+    let raw = u32::from_le_bytes(size_buf) as usize;
+    // Range: 512..=4096  (4096 - 512 + 1 = 3585 possible sizes)
+    let size = 512 + (raw % 3585);
+    let mut padding = vec![0u8; size];
+    OsRng.fill_bytes(&mut padding);
+    padding
+}
+
+/// Generate random padding for the end of a single entry record.
+///
+/// Returns between 0 and 255 bytes of cryptographically random data.
+/// The random length obscures individual entry sizes.
+pub fn generate_entry_padding() -> Vec<u8> {
+    let mut size_buf = [0u8; 1];
+    OsRng.fill_bytes(&mut size_buf);
+    let size = size_buf[0] as usize;
+    let mut padding = vec![0u8; size];
+    OsRng.fill_bytes(&mut padding);
+    padding
+}
+
+/// Generate a verification token to be stored in the vault.pqd header.
+///
+/// Generates 32 bytes of cryptographically random data and encrypts them
+/// with AES-256-GCM using `sym_key`.
+///
+/// Returns `(iv, ciphertext)` where `iv` is 12 bytes and `ciphertext` is
+/// 48 bytes (32-byte plaintext + 16-byte GCM authentication tag).
+pub fn generate_verification_token(
+    sym_key: &[u8; 32],
+) -> Result<([u8; 12], Vec<u8>), DiaryError> {
+    let mut plaintext = Zeroizing::new([0u8; 32]);
+    OsRng.fill_bytes(&mut *plaintext);
+    let (ciphertext, iv) = aead::encrypt(sym_key, &*plaintext)?;
+    Ok((iv, ciphertext))
+}
+
+/// Verify a verification token against a symmetric key.
+///
+/// Decrypts `ciphertext` with AES-256-GCM using `sym_key` and `iv`.
+/// Returns `Ok(true)` if decryption and authentication succeed,
+/// `Ok(false)` if the key is wrong (GCM tag mismatch), and `Err` for
+/// any other failure.
+pub fn verify_token(
+    sym_key: &[u8; 32],
+    iv: [u8; 12],
+    ciphertext: &[u8],
+) -> Result<bool, DiaryError> {
+    match aead::decrypt(sym_key, iv, ciphertext) {
+        Ok(_) => Ok(true),
+        Err(DiaryError::Crypto(_)) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TC-008-01: generate_file_padding() returns data in the 512–4096 byte range.
+    ///
+    /// Given no input, when generate_file_padding() is called, the returned
+    /// Vec must have a length of at least 512 bytes and at most 4096 bytes.
+    #[test]
+    fn tc_008_01_file_padding_in_range() {
+        for _ in 0..20 {
+            let p = generate_file_padding();
+            assert!(
+                p.len() >= 512 && p.len() <= 4096,
+                "file padding length {} is outside 512–4096",
+                p.len()
+            );
+        }
+    }
+
+    /// TC-008-02: generate_entry_padding() returns data in the 0–255 byte range.
+    ///
+    /// Given no input, when generate_entry_padding() is called, the returned
+    /// Vec must have a length between 0 and 255 bytes inclusive.
+    #[test]
+    fn tc_008_02_entry_padding_in_range() {
+        for _ in 0..20 {
+            let p = generate_entry_padding();
+            assert!(
+                p.len() <= 255,
+                "entry padding length {} exceeds 255",
+                p.len()
+            );
+        }
+    }
+
+    /// TC-008-03: two calls to generate_file_padding() produce different output.
+    ///
+    /// Given two independent calls, the resulting byte vectors must not be
+    /// identical (same size AND same content).  With 512+ bytes of OsRng data
+    /// the probability of a collision is negligible.
+    #[test]
+    fn tc_008_03_file_padding_differs_between_calls() {
+        let p1 = generate_file_padding();
+        let p2 = generate_file_padding();
+        assert_ne!(p1, p2, "two calls to generate_file_padding must produce different data");
+    }
+
+    /// TC-007-01: generate_verification_token then verify_token with the same key → true.
+    ///
+    /// Given a 32-byte symmetric key, when a verification token is generated
+    /// and immediately verified with the same key, the result must be Ok(true).
+    #[test]
+    fn tc_007_01_token_generate_and_verify_roundtrip() {
+        let key = [0x42u8; 32];
+        let (iv, ct) = generate_verification_token(&key).unwrap();
+        let result = verify_token(&key, iv, &ct).unwrap();
+        assert!(result, "verify_token with correct key must return true");
+    }
+
+    /// TC-007-02: verify_token with a wrong key → Ok(false).
+    ///
+    /// Given a token generated with one key, when verify_token is called
+    /// with a different key, the result must be Ok(false) (not an error).
+    #[test]
+    fn tc_007_02_token_verify_with_wrong_key_returns_false() {
+        let key = [0x42u8; 32];
+        let wrong_key = [0xFFu8; 32];
+        let (iv, ct) = generate_verification_token(&key).unwrap();
+        let result = verify_token(&wrong_key, iv, &ct).unwrap();
+        assert!(!result, "verify_token with wrong key must return false");
+    }
 
     /// TC-020-01: MAGIC equals b"PQDIARY\0" and is exactly 8 bytes.
     ///

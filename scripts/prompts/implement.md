@@ -6,9 +6,10 @@ You are implementing {{TASK_ID}} for the pq-diary project (Rust post-quantum cry
 
 Read these files in order:
 1. `CLAUDE.md` — project conventions and coding rules
-2. `docs/tasks/s1-foundation/{{TASK_ID}}.md` — full task requirements and completion criteria
-3. `docs/design/s1-foundation/types.rs` — reference type definitions
-4. `docs/design/s1-foundation/architecture.md` — architectural context
+2. `docs/tasks/entry-ops-cli/{{TASK_ID}}.md` — full task requirements and completion criteria
+3. `docs/design/entry-ops-cli/types.rs` — reference type definitions
+4. `docs/design/entry-ops-cli/architecture.md` — architectural context
+5. `docs/design/entry-ops-cli/dataflow.md` — data flow diagrams
 
 ## Step 2: Implement
 
@@ -31,7 +32,7 @@ This task is **{{TASK_TYPE}}** type.
 - Tests in `#[cfg(test)] mod tests` blocks.
 - All public APIs must have `/// doc comment` in English.
 - Error messages in English.
-- Match type signatures in `docs/design/s1-foundation/types.rs` exactly.
+- Match type signatures in `docs/design/entry-ops-cli/types.rs` exactly.
 
 ## Step 4: Verify
 

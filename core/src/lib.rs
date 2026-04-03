@@ -6,6 +6,8 @@ pub mod legacy;
 pub mod policy;
 pub mod vault;
 
+pub use error::DiaryError;
+
 /// Top-level facade for pq-diary-core.
 ///
 /// Individual methods (`unlock`, `lock`, `new_entry`, …) will be added

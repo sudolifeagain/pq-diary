@@ -4,7 +4,7 @@
 
 ### S1: 基盤構築
 - [ ] Cargoワークスペース (core/ + cli/)
-- [ ] DiaryError定義 (thiserror)
+- [x] DiaryError定義 (thiserror)
 - [ ] SecureBuffer / ZeroizingKey自前実装
 - [ ] clap CLIスケルトン (全コマンドのサブコマンド定義)
 - [ ] CI (cargo test, clippy, audit)

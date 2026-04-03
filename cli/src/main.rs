@@ -1,3 +1,5 @@
+mod password;
+
 use clap::{Parser, Subcommand};
 
 /// Post-quantum cryptography CLI journal.

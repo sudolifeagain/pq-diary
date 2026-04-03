@@ -1,3 +1,4 @@
+use crate::error::DiaryError;
 use secrecy::SecretBox;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -107,6 +108,18 @@ impl CryptoEngine {
     pub fn is_unlocked(&self) -> bool {
         self.master_key.is_some()
     }
+
+    /// Returns `Ok(())` when the engine is unlocked.
+    ///
+    /// Returns `Err(DiaryError::NotUnlocked)` if the engine is still in the
+    /// locked state (i.e. no master key has been loaded yet).
+    pub fn ensure_unlocked(&self) -> Result<(), DiaryError> {
+        if self.is_unlocked() {
+            Ok(())
+        } else {
+            Err(DiaryError::NotUnlocked)
+        }
+    }
 }
 
 impl Default for CryptoEngine {
@@ -202,5 +215,39 @@ mod tests {
         let mut key = ZeroizingKey::new([0xFFu8; 32]);
         key.zeroize();
         assert_eq!(key.as_ref(), &[0u8; 32]);
+    }
+
+    /// TC-003-02: ZeroizingKey zeroes its bytes when dropped (0xBB pattern).
+    #[test]
+    fn zeroizing_key_tc_003_02_zeroize_on_drop() {
+        let mut key = ZeroizingKey::new([0xBBu8; 32]);
+        key.zeroize();
+        assert_eq!(key.as_ref(), &[0u8; 32]);
+    }
+
+    /// TC-003-E01: ensure_unlocked returns NotUnlocked when engine is locked.
+    #[test]
+    fn crypto_engine_ensure_unlocked_when_locked() {
+        let engine = CryptoEngine::new();
+        let result = engine.ensure_unlocked();
+        assert!(
+            matches!(result, Err(crate::error::DiaryError::NotUnlocked)),
+            "expected NotUnlocked, got {:?}",
+            result
+        );
+    }
+
+    /// TC-003-03: MasterKey zeroes all fields when zeroize() is called.
+    #[test]
+    fn master_key_zeroize_clears_all_fields() {
+        let mut mk = MasterKey {
+            sym_key: [0xBBu8; 32],
+            dsa_sk: vec![0xCCu8; 16].into_boxed_slice(),
+            kem_sk: vec![0xDDu8; 16].into_boxed_slice(),
+        };
+        mk.zeroize();
+        assert_eq!(mk.sym_key, [0u8; 32]);
+        assert!(mk.dsa_sk.iter().all(|&b| b == 0), "dsa_sk not zeroed");
+        assert!(mk.kem_sk.iter().all(|&b| b == 0), "kem_sk not zeroed");
     }
 }

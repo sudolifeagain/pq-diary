@@ -267,13 +267,17 @@ main() {
             # --- COMMIT ---
             show_progress "${current}" "${total}" "${task_id}" "COMMIT"
             git add -A
-            git commit -m "$(cat <<EOF
+            if git diff --cached --quiet; then
+                log_warn "[${task_id}] No changes to commit (review/verify made no modifications)"
+            else
+                git commit -m "$(cat <<EOF
 feat(s4): implement ${task_id} - ${task_name}
 
 Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
 EOF
-            )"
-            log_ok "[${task_id}] Committed"
+                )"
+                log_ok "[${task_id}] Committed"
+            fi
 
             task_success=true
             break

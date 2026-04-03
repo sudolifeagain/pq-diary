@@ -1,11 +1,21 @@
-//! Entry CRUD foundational types.
+//! Entry CRUD foundational types and operations.
 //!
-//! Provides [`EntryPlaintext`], [`EntryMeta`], [`Tag`], and [`IdPrefix`] used
-//! by all entry operations. CRUD function implementations are added in
-//! subsequent Sprint 4 tasks (TASK-0028 onwards).
+//! Provides [`EntryPlaintext`], [`EntryMeta`], [`Tag`], and [`IdPrefix`] types,
+//! along with [`create_entry`] and other CRUD functions implemented in Sprint 4.
 
-use crate::error::DiaryError;
+use crate::{
+    crypto::CryptoEngine,
+    error::DiaryError,
+    vault::{
+        format::{generate_entry_padding, EntryRecord, RECORD_TYPE_ENTRY},
+        reader::read_vault,
+        writer::write_vault,
+    },
+};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
+use uuid::Uuid;
+use zeroize::Zeroizing;
 
 /// Entry plaintext payload serialized before AES-256-GCM encryption.
 ///
@@ -172,6 +182,82 @@ impl IdPrefix {
         let hex: String = uuid.iter().map(|b| format!("{:02x}", b)).collect();
         hex.starts_with(&self.0)
     }
+}
+
+// =============================================================================
+// CRUD functions
+// =============================================================================
+
+/// Create a new entry in the vault and return its UUID.
+///
+/// Processing pipeline:
+/// 1. Generate a UUID v4.
+/// 2. Serialize `plaintext` to JSON bytes via `serde_json::to_vec`.
+/// 3. Encrypt the JSON bytes with AES-256-GCM: `engine.encrypt()` → `(ciphertext, iv)`.
+/// 4. Sign the ciphertext with ML-DSA-65: `engine.dsa_sign()` → `signature`.
+/// 5. Compute HMAC-SHA256 over the ciphertext: `engine.hmac()` → `content_hmac`.
+/// 6. Build an [`EntryRecord`] with `record_type=0x01`, `legacy_flag=0x00`,
+///    `attachment_count=0`, and a random entry padding.
+/// 7. Read the vault, append the new record, and write it back.
+///
+/// # Errors
+///
+/// Returns [`DiaryError::Io`] on vault I/O failure.
+/// Returns [`DiaryError::Entry`] if JSON serialization fails.
+/// Returns [`DiaryError::NotUnlocked`] if the engine is locked.
+/// Returns [`DiaryError::Crypto`] on encryption or signing failure.
+pub fn create_entry(
+    vault_path: &Path,
+    engine: &CryptoEngine,
+    plaintext: &EntryPlaintext,
+) -> Result<Uuid, DiaryError> {
+    // Step 1: Generate UUID v4.
+    let uuid = Uuid::new_v4();
+
+    // Step 2: Serialize EntryPlaintext to JSON bytes (zeroized on drop).
+    let json_bytes = Zeroizing::new(
+        serde_json::to_vec(plaintext)
+            .map_err(|e| DiaryError::Entry(format!("serialization failed: {e}")))?,
+    );
+
+    // Step 3: Encrypt.
+    let (ciphertext, iv) = engine.encrypt(&json_bytes)?;
+
+    // Step 4: Sign the ciphertext.
+    let signature = engine.dsa_sign(&ciphertext)?;
+
+    // Step 5: Compute HMAC over the ciphertext.
+    let content_hmac = engine.hmac(&ciphertext)?;
+
+    // Step 6: Capture current Unix timestamp.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| DiaryError::Entry(format!("system time error: {e}")))?
+        .as_secs();
+
+    // Step 7: Build EntryRecord.
+    let record = EntryRecord {
+        record_type: RECORD_TYPE_ENTRY,
+        uuid: *uuid.as_bytes(),
+        created_at: now,
+        updated_at: now,
+        iv,
+        ciphertext,
+        signature,
+        content_hmac,
+        legacy_flag: 0x00,
+        legacy_key_block: vec![],
+        attachment_count: 0,
+        attachment_offset: 0,
+        padding: generate_entry_padding(),
+    };
+
+    // Step 8: read-modify-write vault.
+    let (header, mut entries) = read_vault(vault_path)?;
+    entries.push(record);
+    write_vault(vault_path, header, &entries)?;
+
+    Ok(uuid)
 }
 
 #[cfg(test)]
@@ -530,5 +616,174 @@ mod tests {
     fn test_tag_new_multiple_consecutive_slashes() {
         let tag = Tag::new("a///b////c").expect("should be Ok");
         assert_eq!(tag.as_str(), "a/b/c");
+    }
+
+    // =========================================================================
+    // TASK-0029: create_entry
+    // =========================================================================
+
+    use crate::{
+        crypto::{dsa, CryptoEngine},
+        vault::{format::VaultHeader, reader::read_vault, writer::write_vault},
+    };
+    use tempfile::tempdir;
+
+    /// Build a CryptoEngine with a fresh DSA key pair for testing.
+    fn make_test_engine() -> CryptoEngine {
+        let kp = dsa::keygen().expect("dsa keygen");
+        let sym_key = [0x42u8; 32];
+        CryptoEngine::new_for_testing(sym_key, kp.signing_key.as_ref().to_vec())
+    }
+
+    /// Write an empty vault to `path`.
+    fn init_test_vault(path: &Path) {
+        write_vault(path, VaultHeader::new(), &[]).expect("write_vault");
+    }
+
+    /// TC-0029-01: create_entry round-trip — create, read back, decrypt, compare.
+    #[test]
+    fn test_create_entry_roundtrip() {
+        let dir = tempdir().expect("tempdir");
+        let vault_path = dir.path().join("vault.pqd");
+        let engine = make_test_engine();
+        init_test_vault(&vault_path);
+
+        let plaintext = EntryPlaintext {
+            title: "Test Entry".to_string(),
+            tags: vec!["work".to_string(), "test".to_string()],
+            body: "Hello, world!".to_string(),
+        };
+
+        let uuid = create_entry(&vault_path, &engine, &plaintext).expect("create_entry");
+
+        let (_header, entries) = read_vault(&vault_path).expect("read_vault");
+        assert_eq!(entries.len(), 1, "expected exactly 1 entry");
+
+        let record = &entries[0];
+
+        // UUID bytes in the record must match the returned UUID.
+        assert_eq!(&record.uuid, uuid.as_bytes());
+
+        // Decrypt and deserialize — must match the original plaintext.
+        let decrypted = engine
+            .decrypt(&record.iv, &record.ciphertext)
+            .expect("decrypt");
+        let restored: EntryPlaintext =
+            serde_json::from_slice(decrypted.as_ref()).expect("from_slice");
+
+        assert_eq!(restored.title, plaintext.title);
+        assert_eq!(restored.tags, plaintext.tags);
+        assert_eq!(restored.body, plaintext.body);
+    }
+
+    /// TC-0029-02: three consecutive create_entry calls produce exactly 3 entries,
+    /// each decrypting to the correct plaintext.
+    #[test]
+    fn test_create_entry_multiple() {
+        let dir = tempdir().expect("tempdir");
+        let vault_path = dir.path().join("vault.pqd");
+        let engine = make_test_engine();
+        init_test_vault(&vault_path);
+
+        let originals = vec![
+            EntryPlaintext {
+                title: "Entry 1".to_string(),
+                tags: vec!["alpha".to_string()],
+                body: "Body 1".to_string(),
+            },
+            EntryPlaintext {
+                title: "Entry 2".to_string(),
+                tags: vec!["beta".to_string()],
+                body: "Body 2".to_string(),
+            },
+            EntryPlaintext {
+                title: "Entry 3".to_string(),
+                tags: vec!["gamma".to_string()],
+                body: "Body 3".to_string(),
+            },
+        ];
+
+        for pt in &originals {
+            create_entry(&vault_path, &engine, pt).expect("create_entry");
+        }
+
+        let (_header, entries) = read_vault(&vault_path).expect("read_vault");
+        assert_eq!(entries.len(), 3, "expected 3 entries");
+
+        for (i, record) in entries.iter().enumerate() {
+            let decrypted = engine
+                .decrypt(&record.iv, &record.ciphertext)
+                .expect("decrypt");
+            let restored: EntryPlaintext =
+                serde_json::from_slice(decrypted.as_ref()).expect("from_slice");
+            assert_eq!(restored, originals[i], "entry {} mismatch", i);
+        }
+    }
+
+    /// TC-0029-03: UUIDs returned by successive create_entry calls are all distinct.
+    #[test]
+    fn test_create_entry_uuid_uniqueness() {
+        let dir = tempdir().expect("tempdir");
+        let vault_path = dir.path().join("vault.pqd");
+        let engine = make_test_engine();
+        init_test_vault(&vault_path);
+
+        let pt = EntryPlaintext {
+            title: "UUID test".to_string(),
+            tags: vec![],
+            body: "body".to_string(),
+        };
+
+        let u1 = create_entry(&vault_path, &engine, &pt).expect("create 1");
+        let u2 = create_entry(&vault_path, &engine, &pt).expect("create 2");
+        let u3 = create_entry(&vault_path, &engine, &pt).expect("create 3");
+
+        assert_ne!(u1, u2, "uuid1 and uuid2 must differ");
+        assert_ne!(u2, u3, "uuid2 and uuid3 must differ");
+        assert_ne!(u1, u3, "uuid1 and uuid3 must differ");
+    }
+
+    /// TC-0029-04: created_at == updated_at and both fall within the current time window.
+    #[test]
+    fn test_create_entry_timestamps() {
+        let dir = tempdir().expect("tempdir");
+        let vault_path = dir.path().join("vault.pqd");
+        let engine = make_test_engine();
+        init_test_vault(&vault_path);
+
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_secs();
+
+        let pt = EntryPlaintext {
+            title: "Timestamp test".to_string(),
+            tags: vec![],
+            body: "body".to_string(),
+        };
+        create_entry(&vault_path, &engine, &pt).expect("create_entry");
+
+        let after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_secs();
+
+        let (_header, entries) = read_vault(&vault_path).expect("read_vault");
+        assert_eq!(entries.len(), 1);
+
+        let record = &entries[0];
+        assert_eq!(record.created_at, record.updated_at, "created_at must equal updated_at");
+        assert!(
+            record.created_at >= before,
+            "created_at ({}) must be >= before ({})",
+            record.created_at,
+            before
+        );
+        assert!(
+            record.created_at <= after,
+            "created_at ({}) must be <= after ({})",
+            record.created_at,
+            after
+        );
     }
 }

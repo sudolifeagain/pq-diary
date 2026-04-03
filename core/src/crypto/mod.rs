@@ -189,6 +189,27 @@ impl CryptoEngine {
     }
 }
 
+/// Test-only constructor for [`CryptoEngine`] with explicit key material.
+///
+/// Available only in test builds (`#[cfg(test)]`).
+/// Use `unlock()` in production code.
+#[cfg(test)]
+impl CryptoEngine {
+    /// Create a [`CryptoEngine`] pre-loaded with the given symmetric key and DSA signing key.
+    pub fn new_for_testing(sym_key: [u8; 32], dsa_sk: Vec<u8>) -> Self {
+        use secrecy::SecretBox;
+        let master_key = MasterKey {
+            sym_key,
+            dsa_sk: dsa_sk.into_boxed_slice(),
+            kem_sk: vec![].into_boxed_slice(),
+        };
+        Self {
+            master_key: Some(SecretBox::new(Box::new(master_key))),
+            legacy_key: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

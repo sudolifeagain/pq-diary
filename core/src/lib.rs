@@ -6,6 +6,7 @@ pub mod legacy;
 pub mod policy;
 pub mod vault;
 
+pub use crypto::SecureBuffer;
 pub use error::DiaryError;
 
 /// Top-level facade for pq-diary-core.

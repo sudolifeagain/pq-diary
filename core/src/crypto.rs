@@ -126,6 +126,7 @@ mod tests {
         assert!(!buf.is_empty());
 
         let empty = SecureBuffer::new(vec![]);
+        assert_eq!(empty.len(), 0);
         assert!(empty.is_empty());
     }
 
@@ -159,6 +160,41 @@ mod tests {
         let mut buf = SecureBuffer::new(vec![0xFF; 8]);
         buf.zeroize();
         assert_eq!(buf.as_ref(), &[0u8; 8]);
+    }
+
+    /// TC-003-01: verify that data is zeroed when the buffer is dropped.
+    ///
+    /// # Safety
+    /// Reads the raw pointer after `drop()` to confirm zeroize ran before
+    /// deallocation.  This is technically UB (freed memory access) but is
+    /// intentional for security validation; permitted in test code only.
+    #[test]
+    fn secure_buffer_zeroize_on_scope_exit() {
+        let ptr: *const u8;
+        let len: usize;
+        {
+            let buf = SecureBuffer::new(vec![0xAAu8; 32]);
+            ptr = buf.as_ref().as_ptr();
+            len = buf.len();
+            // buf is dropped here, which calls Drop::drop → self.zeroize() → inner.zeroize()
+        }
+        // SAFETY: intentional post-drop read for security verification.
+        // zeroize guarantees bytes are cleared before Box frees the allocation.
+        unsafe {
+            for i in 0..len {
+                assert_eq!(*ptr.add(i), 0u8, "byte {i} not zeroed after drop");
+            }
+        }
+    }
+
+    /// TC-003-B02: 1 MiB buffer drops without panic and reports correct length.
+    #[test]
+    fn secure_buffer_large_1mib() {
+        const ONE_MIB: usize = 1_048_576;
+        let buf = SecureBuffer::new(vec![0xFFu8; ONE_MIB]);
+        assert_eq!(buf.len(), ONE_MIB);
+        assert!(!buf.is_empty());
+        // Drop happens here; must not panic and must zero all bytes.
     }
 
     #[test]

@@ -18,7 +18,7 @@ pub mod secure_mem;
 pub use secure_mem::{CryptoEngine, MasterKey, SecureBuffer, ZeroizingKey};
 
 use crate::error::DiaryError;
-use secrecy::SecretBox;
+use secrecy::{ExposeSecret, SecretBox};
 
 impl CryptoEngine {
     /// Unlock the engine using the given password.
@@ -70,6 +70,117 @@ impl CryptoEngine {
     pub fn lock(&mut self) {
         self.master_key.take();
     }
+
+    /// Encrypt `plaintext` using the engine's internal symmetric key (AES-256-GCM).
+    ///
+    /// A fresh random nonce is generated via `OsRng` on every call.
+    /// Returns `(ciphertext, nonce)`.
+    ///
+    /// Returns [`DiaryError::NotUnlocked`] if the engine has not been unlocked.
+    pub fn encrypt(
+        &self,
+        plaintext: &[u8],
+    ) -> Result<(Vec<u8>, [u8; aead::NONCE_SIZE]), DiaryError> {
+        let mk = self.expose_master_key()?;
+        aead::encrypt(&mk.sym_key, plaintext)
+    }
+
+    /// Decrypt `ciphertext` using the engine's internal symmetric key (AES-256-GCM).
+    ///
+    /// Returns the plaintext as a [`SecureBuffer`] that zeroes its memory on drop.
+    ///
+    /// Returns [`DiaryError::NotUnlocked`] if the engine has not been unlocked.
+    pub fn decrypt(
+        &self,
+        nonce: &[u8; aead::NONCE_SIZE],
+        ciphertext: &[u8],
+    ) -> Result<SecureBuffer, DiaryError> {
+        let mk = self.expose_master_key()?;
+        aead::decrypt(&mk.sym_key, *nonce, ciphertext)
+    }
+
+    /// Generate a new ML-KEM-768 key pair.
+    ///
+    /// Returns [`DiaryError::NotUnlocked`] if the engine has not been unlocked.
+    pub fn kem_keygen(&self) -> Result<kem::KemKeyPair, DiaryError> {
+        self.ensure_unlocked()?;
+        kem::keygen()
+    }
+
+    /// Encapsulate a fresh shared secret using the given public encapsulation key.
+    ///
+    /// Returns `(kem_ciphertext, shared_secret)`.
+    ///
+    /// Returns [`DiaryError::NotUnlocked`] if the engine has not been unlocked.
+    pub fn kem_encapsulate(&self, ek: &[u8]) -> Result<(Vec<u8>, SecureBuffer), DiaryError> {
+        self.ensure_unlocked()?;
+        kem::encapsulate(ek)
+    }
+
+    /// Decapsulate `ct` using the engine's internal ML-KEM-768 secret key.
+    ///
+    /// Returns the shared secret as a [`SecureBuffer`].
+    ///
+    /// Returns [`DiaryError::NotUnlocked`] if the engine has not been unlocked.
+    pub fn kem_decapsulate(&self, ct: &[u8]) -> Result<SecureBuffer, DiaryError> {
+        let mk = self.expose_master_key()?;
+        let dk = SecureBuffer::new(mk.kem_sk.to_vec());
+        kem::decapsulate(&dk, ct)
+    }
+
+    /// Sign `message` using the engine's internal ML-DSA-65 secret key.
+    ///
+    /// Returns the encoded signature bytes.
+    ///
+    /// Returns [`DiaryError::NotUnlocked`] if the engine has not been unlocked.
+    pub fn dsa_sign(&self, message: &[u8]) -> Result<Vec<u8>, DiaryError> {
+        let mk = self.expose_master_key()?;
+        let sk = SecureBuffer::new(mk.dsa_sk.to_vec());
+        dsa::sign(&sk, message)
+    }
+
+    /// Verify `signature` on `message` using the given ML-DSA-65 public key.
+    ///
+    /// Returns `Ok(true)` if the signature is valid, `Ok(false)` otherwise.
+    ///
+    /// Returns [`DiaryError::NotUnlocked`] if the engine has not been unlocked.
+    pub fn dsa_verify(
+        &self,
+        pk: &[u8],
+        message: &[u8],
+        signature: &[u8],
+    ) -> Result<bool, DiaryError> {
+        self.ensure_unlocked()?;
+        dsa::verify(pk, message, signature)
+    }
+
+    /// Compute HMAC-SHA256 of `data` using the engine's internal symmetric key.
+    ///
+    /// Returns a 32-byte MAC value.
+    ///
+    /// Returns [`DiaryError::NotUnlocked`] if the engine has not been unlocked.
+    pub fn hmac(&self, data: &[u8]) -> Result<[u8; 32], DiaryError> {
+        let mk = self.expose_master_key()?;
+        Ok(hmac_util::compute(&mk.sym_key, data))
+    }
+
+    /// Verify HMAC-SHA256 of `data` against `expected` using the engine's internal symmetric key.
+    ///
+    /// Uses constant-time comparison.
+    ///
+    /// Returns [`DiaryError::NotUnlocked`] if the engine has not been unlocked.
+    pub fn hmac_verify(&self, data: &[u8], expected: &[u8; 32]) -> Result<bool, DiaryError> {
+        let mk = self.expose_master_key()?;
+        Ok(hmac_util::verify_hmac(&mk.sym_key, data, expected))
+    }
+
+    /// Expose the master key for internal use, returning [`DiaryError::NotUnlocked`] if locked.
+    fn expose_master_key(&self) -> Result<&MasterKey, DiaryError> {
+        self.master_key
+            .as_ref()
+            .map(|s| s.expose_secret())
+            .ok_or(DiaryError::NotUnlocked)
+    }
 }
 
 #[cfg(test)]
@@ -95,6 +206,17 @@ mod tests {
         let plaintext = [0u8; 32];
         let (ct, iv) = aead::encrypt(key.as_ref(), &plaintext).unwrap();
         (iv, ct)
+    }
+
+    /// Unlock a fresh CryptoEngine with test credentials.
+    fn unlocked_engine() -> CryptoEngine {
+        let params = fast_params();
+        let password = b"correct-password";
+        let salt = b"salt-16byte-long";
+        let (iv, ct) = make_verification_token(password, salt, &params);
+        let mut engine = CryptoEngine::new();
+        engine.unlock(password, salt, &params, iv, &ct).unwrap();
+        engine
     }
 
     /// TC-015-01: correct password → unlock succeeds, is_unlocked() == true.
@@ -171,8 +293,6 @@ mod tests {
     /// validation; permitted in test code only.
     #[test]
     fn tc_015_05_lock_zeroizes_master_key() {
-        use secrecy::ExposeSecret;
-
         let params = fast_params();
         let password = b"correct-password";
         let salt = b"salt-16byte-long";
@@ -197,5 +317,139 @@ mod tests {
                 assert_eq!(*ptr.add(i), 0u8, "sym_key byte {i} not zeroed after lock");
             }
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // TASK-0016 tests
+    // -------------------------------------------------------------------------
+
+    /// TC-016-01: unlock → encrypt/decrypt round-trip succeeds.
+    #[test]
+    fn tc_016_01_encrypt_decrypt_after_unlock() {
+        let engine = unlocked_engine();
+        let plaintext = b"secret journal entry";
+
+        let (ciphertext, nonce) = engine.encrypt(plaintext).unwrap();
+        let recovered = engine.decrypt(&nonce, &ciphertext).unwrap();
+
+        assert_eq!(recovered.as_ref(), plaintext);
+    }
+
+    /// TC-016-02: unlock → kem_keygen / kem_encapsulate / kem_decapsulate succeed.
+    #[test]
+    fn tc_016_02_kem_operations_after_unlock() {
+        // Generate a real KEM key pair to serve as the engine's internal secret key.
+        let kem_kp = kem::keygen().unwrap();
+        let ek_bytes = kem_kp.encapsulation_key.clone();
+
+        // Build a MasterKey with the real kem_sk seed.
+        let master_key = MasterKey {
+            sym_key: [0x42u8; 32],
+            dsa_sk: vec![].into_boxed_slice(),
+            kem_sk: kem_kp.decapsulation_key.as_ref().to_vec().into_boxed_slice(),
+        };
+        let mut engine = CryptoEngine::new();
+        engine.master_key = Some(SecretBox::new(Box::new(master_key)));
+
+        // kem_keygen should succeed when unlocked.
+        let _new_kp = engine.kem_keygen().unwrap();
+
+        // kem_encapsulate → kem_decapsulate: shared secrets must match.
+        let (ct, ss_sender) = engine.kem_encapsulate(&ek_bytes).unwrap();
+        let ss_receiver = engine.kem_decapsulate(&ct).unwrap();
+
+        assert_eq!(ss_sender.as_ref(), ss_receiver.as_ref());
+    }
+
+    /// TC-016-03: unlock → dsa_sign / dsa_verify succeed.
+    #[test]
+    fn tc_016_03_dsa_operations_after_unlock() {
+        // Generate a real DSA key pair to serve as the engine's internal signing key.
+        let dsa_kp = dsa::keygen().unwrap();
+        let vk_bytes = dsa_kp.verifying_key.clone();
+
+        let master_key = MasterKey {
+            sym_key: [0x42u8; 32],
+            dsa_sk: dsa_kp.signing_key.as_ref().to_vec().into_boxed_slice(),
+            kem_sk: vec![].into_boxed_slice(),
+        };
+        let mut engine = CryptoEngine::new();
+        engine.master_key = Some(SecretBox::new(Box::new(master_key)));
+
+        let message = b"test message for dsa";
+        let sig = engine.dsa_sign(message).unwrap();
+        let valid = engine.dsa_verify(&vk_bytes, message, &sig).unwrap();
+
+        assert!(valid, "signature produced by dsa_sign must verify as true");
+    }
+
+    /// TC-016-04: unlock → hmac / hmac_verify succeed.
+    #[test]
+    fn tc_016_04_hmac_after_unlock() {
+        let engine = unlocked_engine();
+        let data = b"entry content";
+
+        let mac = engine.hmac(data).unwrap();
+        assert_eq!(mac.len(), 32);
+        assert!(engine.hmac_verify(data, &mac).unwrap(), "hmac_verify must return true for the correct MAC");
+    }
+
+    /// TC-016-E01: locked engine → encrypt returns DiaryError::NotUnlocked.
+    #[test]
+    fn tc_016_e01_encrypt_when_locked_returns_not_unlocked() {
+        let engine = CryptoEngine::new();
+        let result = engine.encrypt(b"test");
+        assert!(
+            matches!(result, Err(DiaryError::NotUnlocked)),
+            "expected NotUnlocked, got {:?}",
+            result
+        );
+    }
+
+    /// TC-016-E02: locked engine → kem_keygen returns DiaryError::NotUnlocked.
+    #[test]
+    fn tc_016_e02_kem_keygen_when_locked_returns_not_unlocked() {
+        let engine = CryptoEngine::new();
+        let result = engine.kem_keygen();
+        assert!(
+            matches!(result, Err(DiaryError::NotUnlocked)),
+            "expected NotUnlocked"
+        );
+    }
+
+    /// TC-016-E03: locked engine → dsa_sign returns DiaryError::NotUnlocked.
+    #[test]
+    fn tc_016_e03_dsa_sign_when_locked_returns_not_unlocked() {
+        let engine = CryptoEngine::new();
+        let result = engine.dsa_sign(b"message");
+        assert!(
+            matches!(result, Err(DiaryError::NotUnlocked)),
+            "expected NotUnlocked, got {:?}",
+            result
+        );
+    }
+
+    /// TC-016-E04: locked engine → hmac returns DiaryError::NotUnlocked.
+    #[test]
+    fn tc_016_e04_hmac_when_locked_returns_not_unlocked() {
+        let engine = CryptoEngine::new();
+        let result = engine.hmac(b"data");
+        assert!(
+            matches!(result, Err(DiaryError::NotUnlocked)),
+            "expected NotUnlocked, got {:?}",
+            result
+        );
+    }
+
+    /// TC-016-E05: locked engine → hmac_verify returns DiaryError::NotUnlocked.
+    #[test]
+    fn tc_016_e05_hmac_verify_when_locked_returns_not_unlocked() {
+        let engine = CryptoEngine::new();
+        let result = engine.hmac_verify(b"data", &[0u8; 32]);
+        assert!(
+            matches!(result, Err(DiaryError::NotUnlocked)),
+            "expected NotUnlocked, got {:?}",
+            result
+        );
     }
 }

@@ -1,3 +1,4 @@
+mod editor;
 mod password;
 
 use clap::{Parser, Subcommand};

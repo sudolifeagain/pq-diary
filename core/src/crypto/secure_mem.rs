@@ -97,12 +97,12 @@ pub struct MasterKey {
 /// Cryptographic engine responsible for key storage and lock/unlock state.
 ///
 /// Starts in the locked state (`master_key` is `None`).
-/// Unlock / lock operations will be added in Sprint 2.
+/// `unlock` / `lock` operations are implemented in the parent `crypto` module.
 pub struct CryptoEngine {
-    master_key: Option<SecretBox<MasterKey>>,
+    pub(super) master_key: Option<SecretBox<MasterKey>>,
     // Reserved for Sprint 2 legacy-key unlock path.
     #[allow(dead_code)]
-    legacy_key: Option<SecretBox<[u8; 32]>>,
+    pub(super) legacy_key: Option<SecretBox<[u8; 32]>>,
 }
 
 impl CryptoEngine {

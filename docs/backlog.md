@@ -10,12 +10,12 @@
 - [x] CI (cargo test, clippy, audit)
 
 ### S2: 暗号コア
-- [ ] PQCフォーク作成 (ml-kem: zeroize補完, ml-dsa: Drop漏れ修正+CVE-2026-22705)
-- [ ] Argon2id鍵導出 (memory_cost 64MB, time_cost 3, parallelism 4)
-- [ ] AES-256-GCM暗号化/復号
-- [ ] ML-KEM-768鍵カプセル化/脱カプセル化
-- [ ] ML-DSA-65署名/検証
-- [ ] HMAC-SHA256 (content_hmac)
+- [x] PQCフォーク作成 (ml-kem: zeroize補完, ml-dsa: Drop漏れ修正+CVE-2026-22705)
+- [x] Argon2id鍵導出 (memory_cost 64MB, time_cost 3, parallelism 4)
+- [x] AES-256-GCM暗号化/復号
+- [x] ML-KEM-768鍵カプセル化/脱カプセル化
+- [x] ML-DSA-65署名/検証
+- [x] HMAC-SHA256 (content_hmac)
 
 ### S3: Vaultフォーマット + ストレージ
 - [ ] vault.pqd v4バイナリ読み書き

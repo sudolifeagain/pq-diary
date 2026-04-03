@@ -83,7 +83,28 @@ impl Tag {
             ));
         }
 
-        Ok(Tag(stripped.to_string()))
+        if stripped.chars().all(|c| c.is_ascii_digit()) {
+            return Err(DiaryError::InvalidArgument(
+                "tag must not consist of digits only".to_string(),
+            ));
+        }
+
+        // Normalize consecutive slashes: "a//b" → "a/b"
+        let mut normalized = String::with_capacity(stripped.len());
+        let mut prev_slash = false;
+        for ch in stripped.chars() {
+            if ch == '/' {
+                if !prev_slash {
+                    normalized.push(ch);
+                }
+                prev_slash = true;
+            } else {
+                normalized.push(ch);
+                prev_slash = false;
+            }
+        }
+
+        Ok(Tag(normalized))
     }
 
     /// Returns a reference to the inner normalized string.
@@ -367,5 +388,147 @@ mod tests {
         assert!(parent.is_prefix_of(&child));
         assert!(!parent.is_prefix_of(&unrelated));
         assert!(parent.is_prefix_of(&same));
+    }
+
+    // =========================================================================
+    // TASK-0028: is_prefix_of — exact match
+    // =========================================================================
+
+    /// TC-0028-01: Exact match returns true (Japanese).
+    #[test]
+    fn test_tag_is_prefix_of_exact_japanese() {
+        let tag = Tag::new("日記").expect("valid");
+        let other = Tag::new("日記").expect("valid");
+        assert!(tag.is_prefix_of(&other));
+    }
+
+    /// TC-0028-02: Exact match returns true (ASCII).
+    #[test]
+    fn test_tag_is_prefix_of_exact_ascii() {
+        let tag = Tag::new("work").expect("valid");
+        let other = Tag::new("work").expect("valid");
+        assert!(tag.is_prefix_of(&other));
+    }
+
+    // =========================================================================
+    // TASK-0028: is_prefix_of — child tag
+    // =========================================================================
+
+    /// TC-0028-03: Direct child tag returns true (Japanese).
+    #[test]
+    fn test_tag_is_prefix_of_child_japanese() {
+        let parent = Tag::new("日記").expect("valid");
+        let child = Tag::new("日記/振り返り").expect("valid");
+        assert!(parent.is_prefix_of(&child));
+    }
+
+    /// TC-0028-04: Direct child tag returns true (ASCII).
+    #[test]
+    fn test_tag_is_prefix_of_child_ascii() {
+        let parent = Tag::new("work").expect("valid");
+        let child = Tag::new("work/design").expect("valid");
+        assert!(parent.is_prefix_of(&child));
+    }
+
+    // =========================================================================
+    // TASK-0028: is_prefix_of — grandchild tag
+    // =========================================================================
+
+    /// TC-0028-05: Grandchild tag returns true.
+    #[test]
+    fn test_tag_is_prefix_of_grandchild() {
+        let grandparent = Tag::new("仕事").expect("valid");
+        let grandchild = Tag::new("仕事/設計/レビュー").expect("valid");
+        assert!(grandparent.is_prefix_of(&grandchild));
+    }
+
+    // =========================================================================
+    // TASK-0028: is_prefix_of — non-match (similar strings)
+    // =========================================================================
+
+    /// TC-0028-06: Similar Japanese string that is not a hierarchical child returns false.
+    #[test]
+    fn test_tag_is_prefix_of_similar_japanese_false() {
+        let tag = Tag::new("仕事").expect("valid");
+        let similar = Tag::new("仕事人").expect("valid");
+        assert!(!tag.is_prefix_of(&similar));
+    }
+
+    /// TC-0028-07: Similar ASCII string that is not a hierarchical child returns false.
+    #[test]
+    fn test_tag_is_prefix_of_similar_ascii_false() {
+        let tag = Tag::new("work").expect("valid");
+        let similar = Tag::new("workflow").expect("valid");
+        assert!(!tag.is_prefix_of(&similar));
+    }
+
+    /// TC-0028-08: Completely unrelated tag returns false.
+    #[test]
+    fn test_tag_is_prefix_of_unrelated_false() {
+        let tag = Tag::new("日記").expect("valid");
+        let other = Tag::new("仕事").expect("valid");
+        assert!(!tag.is_prefix_of(&other));
+    }
+
+    // =========================================================================
+    // TASK-0028: Unicode tag acceptance
+    // =========================================================================
+
+    /// TC-0028-09: Mixed Unicode and ASCII tag is accepted.
+    #[test]
+    fn test_tag_new_unicode_ascii_mixed() {
+        let tag = Tag::new("プロジェクト/alpha").expect("should be Ok");
+        assert_eq!(tag.as_str(), "プロジェクト/alpha");
+    }
+
+    /// TC-0028-10: Unicode tag with numeric suffix is accepted.
+    #[test]
+    fn test_tag_new_unicode_with_numbers() {
+        let tag = Tag::new("日記/2024").expect("should be Ok");
+        assert_eq!(tag.as_str(), "日記/2024");
+    }
+
+    /// TC-0028-11: Tag with underscore between Unicode characters is accepted.
+    #[test]
+    fn test_tag_new_unicode_underscore() {
+        let tag = Tag::new("感想_メモ").expect("should be Ok");
+        assert_eq!(tag.as_str(), "感想_メモ");
+    }
+
+    // =========================================================================
+    // TASK-0028: Edge cases
+    // =========================================================================
+
+    /// TC-0028-12: Slashes-only string is rejected (becomes empty after normalization).
+    #[test]
+    fn test_tag_new_slashes_only_is_err() {
+        assert!(Tag::new("///").is_err());
+    }
+
+    /// TC-0028-13: Digits-only string is rejected (Obsidian tag spec).
+    #[test]
+    fn test_tag_new_digits_only_is_err() {
+        assert!(Tag::new("123").is_err());
+    }
+
+    /// TC-0028-14: Leading and trailing slash are stripped, yielding the inner segment.
+    #[test]
+    fn test_tag_new_leading_trailing_slash() {
+        let tag = Tag::new("/leading/").expect("should be Ok");
+        assert_eq!(tag.as_str(), "leading");
+    }
+
+    /// TC-0028-15: Consecutive slashes are normalized to a single slash.
+    #[test]
+    fn test_tag_new_consecutive_slashes_normalized() {
+        let tag = Tag::new("work//design").expect("should be Ok");
+        assert_eq!(tag.as_str(), "work/design");
+    }
+
+    /// TC-0028-16: Multiple consecutive slashes in nested tag are normalized.
+    #[test]
+    fn test_tag_new_multiple_consecutive_slashes() {
+        let tag = Tag::new("a///b////c").expect("should be Ok");
+        assert_eq!(tag.as_str(), "a/b/c");
     }
 }

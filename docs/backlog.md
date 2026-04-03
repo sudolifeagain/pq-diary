@@ -3,11 +3,11 @@
 ## Phase 1 (Sprint 1-9)
 
 ### S1: 基盤構築
-- [ ] Cargoワークスペース (core/ + cli/)
+- [x] Cargoワークスペース (core/ + cli/)
 - [x] DiaryError定義 (thiserror)
-- [ ] SecureBuffer / ZeroizingKey自前実装
-- [ ] clap CLIスケルトン (全コマンドのサブコマンド定義)
-- [ ] CI (cargo test, clippy, audit)
+- [x] SecureBuffer / ZeroizingKey自前実装
+- [x] clap CLIスケルトン (全コマンドのサブコマンド定義)
+- [x] CI (cargo test, clippy, audit)
 
 ### S2: 暗号コア
 - [ ] PQCフォーク作成 (ml-kem: zeroize補完, ml-dsa: Drop漏れ修正+CVE-2026-22705)

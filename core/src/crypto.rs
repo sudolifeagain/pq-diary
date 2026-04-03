@@ -1,3 +1,13 @@
+//! Secure memory types for cryptographic key material.
+//!
+//! All types in this module guarantee that sensitive data is zeroed when
+//! the value is dropped, using [`zeroize::ZeroizeOnDrop`].
+//!
+//! - [`SecureBuffer`]: variable-length byte buffer, zeroed on drop
+//! - [`ZeroizingKey`]: fixed 32-byte symmetric key, zeroed on drop
+//! - [`MasterKey`]: full key set derived from the master password, zeroed on drop
+//! - [`CryptoEngine`]: lock/unlock state machine (unlock logic added in Sprint 2)
+
 use crate::error::DiaryError;
 use secrecy::SecretBox;
 use zeroize::{Zeroize, ZeroizeOnDrop};

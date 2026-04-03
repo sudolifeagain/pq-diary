@@ -1,3 +1,8 @@
+//! Unified error type for pq-diary-core operations.
+//!
+//! All fallible functions in this crate return [`DiaryError`].
+//! Error messages are in English. No secret material is included in messages.
+
 use thiserror::Error;
 
 /// Unified error type for pq-diary-core operations.

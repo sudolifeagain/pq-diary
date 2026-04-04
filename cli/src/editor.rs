@@ -2,10 +2,6 @@
 //!
 //! Provides a secure temporary directory selection strategy, header comment
 //! formatting for `$EDITOR`-edited temporary files, and editor process management.
-//!
-//! Items here are consumed by command handlers implemented in TASK-0037 and later.
-// Allow dead_code until the command handlers wire these up.
-#![allow(dead_code)]
 
 use pq_diary_core::{DiaryError, EntryPlaintext};
 use std::path::{Path, PathBuf};

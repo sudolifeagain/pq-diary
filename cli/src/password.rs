@@ -1,10 +1,5 @@
 //! Password acquisition for the pq-diary CLI.
 //!
-// Items in this module are used by the command handlers implemented in
-// subsequent tasks (TASK-0037 to TASK-0040).  Allow dead_code until those
-// handlers are wired up.
-#![allow(dead_code)]
-//!
 //! Implements a three-stage fallback mechanism for obtaining the vault master
 //! password:
 //! 1. `--password` CLI flag  (highest priority; warns about security risk)

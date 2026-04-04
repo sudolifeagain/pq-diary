@@ -480,6 +480,106 @@ where
     Ok(())
 }
 
+/// Prompt the user for deletion confirmation.
+///
+/// Prints `Delete "{title}" ({date})? [y/N]: ` to stderr and reads a line
+/// from `reader`.  Returns `true` only when the user responds with `y` or `Y`.
+fn confirm_delete(title: &str, date: &str, reader: &mut impl std::io::BufRead) -> anyhow::Result<bool> {
+    use std::io::Write as _;
+    eprint!("Delete \"{title}\" ({date})? [y/N]: ");
+    std::io::stderr()
+        .flush()
+        .map_err(|e| anyhow::anyhow!("Failed to flush stderr: {e}"))?;
+    let mut input = String::new();
+    reader
+        .read_line(&mut input)
+        .map_err(|e| anyhow::anyhow!("Failed to read input: {e}"))?;
+    let trimmed = input.trim();
+    Ok(trimmed == "y" || trimmed == "Y")
+}
+
+/// Execute the `pq-diary delete` command.
+///
+/// Fetches the entry identified by `id`, displays its title and date, and
+/// prompts for confirmation unless `force` or `--claude` is set.  Prints
+/// `Deleted: {prefix} "{title}"` on success, or `キャンセルしました` when
+/// the user declines.
+///
+/// # Errors
+///
+/// Returns an error if password acquisition, vault unlock, entry lookup, or
+/// entry deletion fails.
+pub fn cmd_delete(cli: &Cli, id: String, force: bool) -> anyhow::Result<()> {
+    cmd_delete_impl(cli, id, force, &mut std::io::BufReader::new(std::io::stdin()))
+}
+
+/// Internal implementation of `cmd_delete` with an injectable stdin reader.
+///
+/// Accepts any `BufRead` as the input source so that tests can inject mock
+/// input without touching a real terminal.
+fn cmd_delete_impl(
+    cli: &Cli,
+    id: String,
+    force: bool,
+    reader: &mut impl std::io::BufRead,
+) -> anyhow::Result<()> {
+    use secrecy::{ExposeSecret as _, SecretBox};
+
+    let password_source =
+        get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let vault_path = resolve_vault_path(cli)?;
+    let vault_str = vault_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Vault path contains non-UTF-8 characters"))?;
+
+    let mut core = DiaryCore::new(vault_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let secret_password: secrecy::SecretString =
+        SecretBox::new(Box::from(password_source.secret().expose_secret()));
+    core.unlock(secret_password)
+        .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+
+    let get_result = core.get_entry(&id);
+    let (record, plaintext) = match get_result {
+        Ok(r) => r,
+        Err(e) => {
+            core.lock();
+            return Err(anyhow::anyhow!("{e}"));
+        }
+    };
+
+    let title = plaintext.title.clone();
+    let date = format_timestamp(record.created_at);
+    let prefix = id[..id.len().min(8)].to_string();
+
+    // Determine whether to skip confirmation.
+    let skip_confirm = force || cli.claude;
+    let do_delete = if skip_confirm {
+        true
+    } else {
+        match confirm_delete(&title, &date, reader) {
+            Ok(v) => v,
+            Err(e) => {
+                core.lock();
+                return Err(e);
+            }
+        }
+    };
+
+    if do_delete {
+        let delete_result = core.delete_entry(&id);
+        core.lock();
+        delete_result.map_err(|e| anyhow::anyhow!("Failed to delete entry: {e}"))?;
+        println!("Deleted: {prefix} \"{title}\"");
+    } else {
+        core.lock();
+        println!("キャンセルしました");
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1352,6 +1452,289 @@ mod tests {
             vec![],
             vec![],
         );
+        assert!(result.is_err(), "Expected error for wrong password");
+    }
+
+    // =========================================================================
+    // TASK-0040: confirm_delete unit tests
+    // =========================================================================
+
+    /// TC-0040-U01: confirm_delete returns true for "y" input.
+    #[test]
+    fn tc_0040_u01_confirm_delete_y() {
+        let input = "y\n";
+        let mut reader = std::io::BufReader::new(input.as_bytes());
+        let result = confirm_delete("Test Title", "2026-01-01", &mut reader)
+            .expect("confirm_delete");
+        assert!(result, "Expected true for 'y'");
+    }
+
+    /// TC-0040-U02: confirm_delete returns true for "Y" input.
+    #[test]
+    fn tc_0040_u02_confirm_delete_capital_y() {
+        let input = "Y\n";
+        let mut reader = std::io::BufReader::new(input.as_bytes());
+        let result = confirm_delete("Test Title", "2026-01-01", &mut reader)
+            .expect("confirm_delete");
+        assert!(result, "Expected true for 'Y'");
+    }
+
+    /// TC-0040-U03: confirm_delete returns false for "n" input.
+    #[test]
+    fn tc_0040_u03_confirm_delete_n() {
+        let input = "n\n";
+        let mut reader = std::io::BufReader::new(input.as_bytes());
+        let result = confirm_delete("Test Title", "2026-01-01", &mut reader)
+            .expect("confirm_delete");
+        assert!(!result, "Expected false for 'n'");
+    }
+
+    /// TC-0040-U04: confirm_delete returns false for empty input (default No).
+    #[test]
+    fn tc_0040_u04_confirm_delete_empty() {
+        let input = "\n";
+        let mut reader = std::io::BufReader::new(input.as_bytes());
+        let result = confirm_delete("Test Title", "2026-01-01", &mut reader)
+            .expect("confirm_delete");
+        assert!(!result, "Expected false for empty input");
+    }
+
+    /// TC-0040-U05: confirm_delete returns false for "N" input.
+    #[test]
+    fn tc_0040_u05_confirm_delete_capital_n() {
+        let input = "N\n";
+        let mut reader = std::io::BufReader::new(input.as_bytes());
+        let result = confirm_delete("Test Title", "2026-01-01", &mut reader)
+            .expect("confirm_delete");
+        assert!(!result, "Expected false for 'N'");
+    }
+
+    /// TC-0040-U06: confirm_delete returns false for an arbitrary string.
+    #[test]
+    fn tc_0040_u06_confirm_delete_arbitrary() {
+        let input = "abc\n";
+        let mut reader = std::io::BufReader::new(input.as_bytes());
+        let result = confirm_delete("Test Title", "2026-01-01", &mut reader)
+            .expect("confirm_delete");
+        assert!(!result, "Expected false for 'abc'");
+    }
+
+    // =========================================================================
+    // TASK-0040: cmd_delete integration tests
+    // =========================================================================
+
+    /// Build a `Cli` targeting `vault_dir` for the `delete` command.
+    fn make_delete_cli(
+        vault_dir_str: &str,
+        password: Option<&str>,
+        id: &str,
+        force: bool,
+    ) -> crate::Cli {
+        let mut args: Vec<&str> = vec!["pq-diary", "-v", vault_dir_str];
+        if let Some(pw) = password {
+            args.extend_from_slice(&["--password", pw]);
+        }
+        args.push("delete");
+        if force {
+            args.push("--force");
+        }
+        args.push(id);
+        crate::Cli::try_parse_from(&args).expect("parse test CLI")
+    }
+
+    /// Build a `Cli` for delete with `--claude` global flag.
+    fn make_delete_cli_claude(
+        vault_dir_str: &str,
+        password: Option<&str>,
+        id: &str,
+    ) -> crate::Cli {
+        let mut args: Vec<&str> = vec!["pq-diary", "--claude", "-v", vault_dir_str];
+        if let Some(pw) = password {
+            args.extend_from_slice(&["--password", pw]);
+        }
+        args.push("delete");
+        args.push(id);
+        crate::Cli::try_parse_from(&args).expect("parse test CLI")
+    }
+
+    /// TC-0040-01: --force flag deletes the entry without confirmation.
+    #[test]
+    fn tc_0040_01_force_flag_deletes_without_confirm() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (vault_dir, prefix) =
+            setup_vault_with_entry(&dir, "Test Entry", "body", vec![]);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let delete_cli = make_delete_cli(vault_dir_str, Some("password"), &prefix, true);
+        let mut reader = std::io::BufReader::new("".as_bytes());
+        let result = cmd_delete_impl(&delete_cli, prefix.clone(), true, &mut reader);
+        assert!(result.is_ok(), "cmd_delete --force failed: {:?}", result.err());
+
+        let remaining = read_vault_entries(&vault_dir);
+        assert!(remaining.is_empty(), "Entry should have been deleted");
+    }
+
+    /// TC-0040-02: --force flag outputs the "Deleted:" success message.
+    #[test]
+    fn tc_0040_02_force_flag_succeeds_and_entry_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (vault_dir, prefix) =
+            setup_vault_with_entry(&dir, "Force Test", "body", vec![]);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let delete_cli = make_delete_cli(vault_dir_str, Some("password"), &prefix, true);
+        let mut reader = std::io::BufReader::new("".as_bytes());
+        let result = cmd_delete_impl(&delete_cli, prefix.clone(), true, &mut reader);
+        assert!(result.is_ok(), "Expected Ok: {:?}", result.err());
+
+        let remaining = read_vault_entries(&vault_dir);
+        assert!(remaining.is_empty(), "Entry must be removed after --force delete");
+    }
+
+    /// TC-0040-03: "y" input confirms deletion.
+    #[test]
+    fn tc_0040_03_y_input_triggers_deletion() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (vault_dir, prefix) =
+            setup_vault_with_entry(&dir, "Delete Me", "body", vec![]);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let delete_cli = make_delete_cli(vault_dir_str, Some("password"), &prefix, false);
+        let mut reader = std::io::BufReader::new("y\n".as_bytes());
+        let result = cmd_delete_impl(&delete_cli, prefix.clone(), false, &mut reader);
+        assert!(result.is_ok(), "Expected Ok: {:?}", result.err());
+
+        let remaining = read_vault_entries(&vault_dir);
+        assert!(remaining.is_empty(), "Entry should have been deleted");
+    }
+
+    /// TC-0040-04: "Y" input confirms deletion.
+    #[test]
+    fn tc_0040_04_capital_y_input_triggers_deletion() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (vault_dir, prefix) =
+            setup_vault_with_entry(&dir, "Delete Me Y", "body", vec![]);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let delete_cli = make_delete_cli(vault_dir_str, Some("password"), &prefix, false);
+        let mut reader = std::io::BufReader::new("Y\n".as_bytes());
+        let result = cmd_delete_impl(&delete_cli, prefix.clone(), false, &mut reader);
+        assert!(result.is_ok(), "Expected Ok: {:?}", result.err());
+
+        let remaining = read_vault_entries(&vault_dir);
+        assert!(remaining.is_empty(), "Entry should have been deleted");
+    }
+
+    /// TC-0040-05: "n" input cancels deletion.
+    #[test]
+    fn tc_0040_05_n_input_cancels_deletion() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (vault_dir, prefix) =
+            setup_vault_with_entry(&dir, "Keep Me", "body", vec![]);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let delete_cli = make_delete_cli(vault_dir_str, Some("password"), &prefix, false);
+        let mut reader = std::io::BufReader::new("n\n".as_bytes());
+        let result = cmd_delete_impl(&delete_cli, prefix.clone(), false, &mut reader);
+        assert!(result.is_ok(), "Expected Ok: {:?}", result.err());
+
+        let remaining = read_vault_entries(&vault_dir);
+        assert_eq!(remaining.len(), 1, "Entry should NOT have been deleted");
+    }
+
+    /// TC-0040-06: Empty input (Enter only) cancels deletion (default No).
+    #[test]
+    fn tc_0040_06_empty_input_cancels_deletion() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (vault_dir, prefix) =
+            setup_vault_with_entry(&dir, "Keep Me Too", "body", vec![]);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let delete_cli = make_delete_cli(vault_dir_str, Some("password"), &prefix, false);
+        let mut reader = std::io::BufReader::new("\n".as_bytes());
+        let result = cmd_delete_impl(&delete_cli, prefix.clone(), false, &mut reader);
+        assert!(result.is_ok(), "Expected Ok: {:?}", result.err());
+
+        let remaining = read_vault_entries(&vault_dir);
+        assert_eq!(remaining.len(), 1, "Entry should NOT have been deleted");
+    }
+
+    /// TC-0040-07: "N" input cancels deletion.
+    #[test]
+    fn tc_0040_07_capital_n_input_cancels_deletion() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (vault_dir, prefix) =
+            setup_vault_with_entry(&dir, "Stay", "body", vec![]);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let delete_cli = make_delete_cli(vault_dir_str, Some("password"), &prefix, false);
+        let mut reader = std::io::BufReader::new("N\n".as_bytes());
+        let result = cmd_delete_impl(&delete_cli, prefix.clone(), false, &mut reader);
+        assert!(result.is_ok(), "Expected Ok: {:?}", result.err());
+
+        let remaining = read_vault_entries(&vault_dir);
+        assert_eq!(remaining.len(), 1, "Entry should NOT have been deleted");
+    }
+
+    /// TC-0040-08: Arbitrary string input cancels deletion.
+    #[test]
+    fn tc_0040_08_arbitrary_input_cancels_deletion() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (vault_dir, prefix) =
+            setup_vault_with_entry(&dir, "Safe", "body", vec![]);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let delete_cli = make_delete_cli(vault_dir_str, Some("password"), &prefix, false);
+        let mut reader = std::io::BufReader::new("abc\n".as_bytes());
+        let result = cmd_delete_impl(&delete_cli, prefix.clone(), false, &mut reader);
+        assert!(result.is_ok(), "Expected Ok: {:?}", result.err());
+
+        let remaining = read_vault_entries(&vault_dir);
+        assert_eq!(remaining.len(), 1, "Entry should NOT have been deleted");
+    }
+
+    /// TC-0040-09: --claude global flag skips confirmation and deletes.
+    #[test]
+    fn tc_0040_09_claude_flag_skips_confirmation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (vault_dir, prefix) =
+            setup_vault_with_entry(&dir, "Claude Test", "body", vec![]);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let delete_cli = make_delete_cli_claude(vault_dir_str, Some("password"), &prefix);
+        let mut reader = std::io::BufReader::new("".as_bytes());
+        let result = cmd_delete_impl(&delete_cli, prefix.clone(), false, &mut reader);
+        assert!(result.is_ok(), "Expected Ok: {:?}", result.err());
+
+        let remaining = read_vault_entries(&vault_dir);
+        assert!(remaining.is_empty(), "Entry should have been deleted");
+    }
+
+    /// TC-0040-10: Non-existent ID returns an error.
+    #[test]
+    fn tc_0040_10_nonexistent_id_returns_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let delete_cli = make_delete_cli(vault_dir_str, Some("password"), "0000", true);
+        let mut reader = std::io::BufReader::new("".as_bytes());
+        let result = cmd_delete_impl(&delete_cli, "0000".to_string(), true, &mut reader);
+        assert!(result.is_err(), "Expected error for non-existent ID");
+    }
+
+    /// TC-0040-11: Wrong password returns an error.
+    #[test]
+    fn tc_0040_11_wrong_password_returns_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (vault_dir, prefix) =
+            setup_vault_with_entry(&dir, "Entry", "body", vec![]);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let delete_cli =
+            make_delete_cli(vault_dir_str, Some("wrong_password"), &prefix, true);
+        let mut reader = std::io::BufReader::new("".as_bytes());
+        let result = cmd_delete_impl(&delete_cli, prefix.clone(), true, &mut reader);
         assert!(result.is_err(), "Expected error for wrong password");
     }
 }

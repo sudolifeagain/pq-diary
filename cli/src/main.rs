@@ -92,8 +92,11 @@ pub enum Commands {
 
     /// Delete a diary entry
     Delete {
-        /// Entry ID or title
+        /// Entry ID prefix (minimum 4 hex characters)
         id: String,
+        /// Skip confirmation prompt
+        #[arg(short, long)]
+        force: bool,
     },
 
     /// Sync diary entries with configured remotes
@@ -274,7 +277,7 @@ fn dispatch(cli: &Cli) -> anyhow::Result<()> {
             add_tag.clone(),
             remove_tag.clone(),
         ),
-        Commands::Delete { .. } => not_implemented("delete", "Sprint 4"),
+        Commands::Delete { id, force } => commands::cmd_delete(cli, id.clone(), *force),
         Commands::Sync => not_implemented("sync", "Sprint 8"),
         Commands::Export => not_implemented("export", "Sprint 5"),
         Commands::ChangePassword => not_implemented("change-password", "Sprint 3"),

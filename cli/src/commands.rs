@@ -7,7 +7,8 @@
 use crate::editor::{self, EditorConfig};
 use crate::password::get_password;
 use crate::Cli;
-use pq_diary_core::{DiaryCore, EntryPlaintext};
+use chrono::{DateTime, Utc};
+use pq_diary_core::{DiaryCore, EntryMeta, EntryPlaintext, Tag};
 use std::path::PathBuf;
 
 // ---------------------------------------------------------------------------
@@ -32,6 +33,61 @@ fn resolve_vault_path(cli: &Cli) -> anyhow::Result<PathBuf> {
         None => PathBuf::from("vault.pqd"),
     };
     Ok(path)
+}
+
+// ---------------------------------------------------------------------------
+// Private helpers
+// ---------------------------------------------------------------------------
+
+/// Format a Unix timestamp (seconds) as `YYYY-MM-DD` in UTC.
+fn format_timestamp(ts: u64) -> String {
+    DateTime::<Utc>::from_timestamp(ts as i64, 0)
+        .map(|dt| dt.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "????-??-??".to_string())
+}
+
+/// Apply tag filter, keyword filter, sort by `updated_at` descending, and limit.
+///
+/// - `tag`: if `Some`, keeps only entries where at least one tag is matched by
+///   [`Tag::is_prefix_of`] (nested-tag prefix match).
+/// - `query`: if `Some`, keeps only entries whose title contains `query` as a
+///   case-insensitive substring.
+/// - `number`: truncates the result to at most this many entries.
+///
+/// # Errors
+///
+/// Returns an error if `tag` is not a valid [`Tag`] string.
+fn filter_and_sort(
+    mut entries: Vec<EntryMeta>,
+    tag: Option<&str>,
+    query: Option<&str>,
+    number: usize,
+) -> anyhow::Result<Vec<EntryMeta>> {
+    // Tag filter (prefix match for nested tags)
+    if let Some(tag_str) = tag {
+        let filter_tag = Tag::new(tag_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+        entries.retain(|e| {
+            e.tags.iter().any(|t| {
+                Tag::new(t)
+                    .map(|entry_tag| filter_tag.is_prefix_of(&entry_tag))
+                    .unwrap_or(false)
+            })
+        });
+    }
+
+    // Query filter (case-insensitive title partial match)
+    if let Some(q) = query {
+        let q_lower = q.to_lowercase();
+        entries.retain(|e| e.title.to_lowercase().contains(&q_lower));
+    }
+
+    // Sort by updated_at descending (newest first)
+    entries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+
+    // Limit to requested number
+    entries.truncate(number);
+
+    Ok(entries)
 }
 
 // ---------------------------------------------------------------------------
@@ -135,6 +191,128 @@ pub fn cmd_new(
     core.lock();
 
     Ok(())
+}
+
+/// Execute the `pq-diary list` command.
+///
+/// Lists diary entries sorted by `updated_at` descending (newest first),
+/// with optional tag filter (nested-tag prefix match), title keyword filter
+/// (case-insensitive), and a maximum display count (default 20).
+///
+/// Output format per line: `{id_prefix}  {date}  {title}  #{tag1}  #{tag2}`
+///
+/// # Errors
+///
+/// Returns an error if password acquisition, vault unlock, or entry listing fails.
+pub fn cmd_list(
+    cli: &Cli,
+    tag: Option<String>,
+    query: Option<String>,
+    number: usize,
+) -> anyhow::Result<()> {
+    use secrecy::{ExposeSecret as _, SecretBox};
+
+    let password_source =
+        get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let vault_path = resolve_vault_path(cli)?;
+    let vault_str = vault_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Vault path contains non-UTF-8 characters"))?;
+
+    let mut core = DiaryCore::new(vault_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let secret_password: secrecy::SecretString =
+        SecretBox::new(Box::from(password_source.secret().expose_secret()));
+    core.unlock(secret_password)
+        .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+
+    let entries = core
+        .list_entries(None)
+        .map_err(|e| anyhow::anyhow!("Failed to list entries: {e}"))?;
+
+    let filtered = filter_and_sort(entries, tag.as_deref(), query.as_deref(), number)?;
+
+    for meta in &filtered {
+        let prefix = meta.id_prefix(8);
+        let date = format_timestamp(meta.updated_at);
+        if meta.tags.is_empty() {
+            println!("{prefix}  {date}  {}", meta.title);
+        } else {
+            let tags_str = meta
+                .tags
+                .iter()
+                .map(|t| format!("#{t}"))
+                .collect::<Vec<_>>()
+                .join("  ");
+            println!("{prefix}  {date}  {}  {tags_str}", meta.title);
+        }
+    }
+
+    core.lock();
+    Ok(())
+}
+
+/// Execute the `pq-diary show` command.
+///
+/// Displays the full content of the entry identified by `id` (an ID prefix of
+/// at least 4 hex characters).  Output includes title, created/updated dates,
+/// tag list, a blank line, and the full body text.
+///
+/// # Errors
+///
+/// Returns an error if password acquisition, vault unlock, or entry lookup fails.
+/// Returns an error with a descriptive message when no entry matches or multiple
+/// entries match the given prefix.
+pub fn cmd_show(cli: &Cli, id: String) -> anyhow::Result<()> {
+    use secrecy::{ExposeSecret as _, SecretBox};
+
+    let password_source =
+        get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let vault_path = resolve_vault_path(cli)?;
+    let vault_str = vault_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Vault path contains non-UTF-8 characters"))?;
+
+    let mut core = DiaryCore::new(vault_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let secret_password: secrecy::SecretString =
+        SecretBox::new(Box::from(password_source.secret().expose_secret()));
+    core.unlock(secret_password)
+        .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+
+    let result = core.get_entry(&id);
+
+    match result {
+        Err(e) => {
+            core.lock();
+            Err(anyhow::anyhow!("{e}"))
+        }
+        Ok((record, plaintext)) => {
+            let created = format_timestamp(record.created_at);
+            let updated = format_timestamp(record.updated_at);
+
+            println!("Title:   {}", plaintext.title);
+            println!("Created: {created}  Updated: {updated}");
+            if plaintext.tags.is_empty() {
+                println!("Tags:    (none)");
+            } else {
+                let tags_str = plaintext
+                    .tags
+                    .iter()
+                    .map(|t| format!("#{t}"))
+                    .collect::<Vec<_>>()
+                    .join("  ");
+                println!("Tags:    {tags_str}");
+            }
+            println!();
+            print!("{}", plaintext.body);
+
+            core.lock();
+            Ok(())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -385,5 +563,262 @@ mod tests {
         let cli = crate::Cli::try_parse_from(["pq-diary", "new"]).expect("parse");
         let path = resolve_vault_path(&cli).expect("resolve_vault_path");
         assert_eq!(path, PathBuf::from("vault.pqd"));
+    }
+
+    // =========================================================================
+    // filter_and_sort unit tests (TASK-0038)
+    // =========================================================================
+
+    /// Build a minimal `EntryMeta` for unit testing filter/sort logic.
+    fn make_meta(uuid_hex: &str, title: &str, tags: &[&str], updated_at: u64) -> EntryMeta {
+        EntryMeta {
+            uuid_hex: uuid_hex.to_string(),
+            title: title.to_string(),
+            tags: tags.iter().map(|s| s.to_string()).collect(),
+            created_at: 0,
+            updated_at,
+        }
+    }
+
+    /// TC-0038-U01: Tag exact match filter keeps only matching entries.
+    #[test]
+    fn tc_0038_u01_tag_filter_exact_match() {
+        let entries = vec![
+            make_meta("aa000000", "A", &["日記"], 1),
+            make_meta("bb000000", "B", &["仕事"], 2),
+        ];
+        let result = filter_and_sort(entries, Some("日記"), None, 20).expect("filter");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].title, "A");
+    }
+
+    /// TC-0038-U02: Tag prefix match includes nested tags (e.g. "日記" matches "日記/旅行").
+    #[test]
+    fn tc_0038_u02_tag_prefix_matches_nested() {
+        let entries = vec![
+            make_meta("aa000000", "A", &["日記"], 1),
+            make_meta("bb000000", "B", &["日記/旅行"], 2),
+            make_meta("cc000000", "C", &["仕事"], 3),
+        ];
+        let result = filter_and_sort(entries, Some("日記"), None, 20).expect("filter");
+        assert_eq!(result.len(), 2);
+        let titles: Vec<&str> = result.iter().map(|e| e.title.as_str()).collect();
+        assert!(titles.contains(&"A"));
+        assert!(titles.contains(&"B"));
+    }
+
+    /// TC-0038-U03: Non-existent tag returns an empty list.
+    #[test]
+    fn tc_0038_u03_nonexistent_tag_returns_empty() {
+        let entries = vec![
+            make_meta("aa000000", "A", &["日記"], 1),
+            make_meta("bb000000", "B", &["仕事"], 2),
+        ];
+        let result = filter_and_sort(entries, Some("趣味"), None, 20).expect("filter");
+        assert!(result.is_empty());
+    }
+
+    /// TC-0038-U04: "仕事人" is NOT matched by tag filter "仕事" (requires `/` separator).
+    #[test]
+    fn tc_0038_u04_tag_filter_no_false_prefix() {
+        let entries = vec![
+            make_meta("aa000000", "A", &["仕事人"], 1),
+        ];
+        let result = filter_and_sort(entries, Some("仕事"), None, 20).expect("filter");
+        assert!(result.is_empty(), "仕事人 must not match 仕事 filter");
+    }
+
+    /// TC-0038-U05: Query filter matches title case-insensitively.
+    #[test]
+    fn tc_0038_u05_query_case_insensitive() {
+        let entries = vec![
+            make_meta("aa000000", "Hello World", &[], 1),
+            make_meta("bb000000", "hello world", &[], 2),
+            make_meta("cc000000", "Other", &[], 3),
+        ];
+        let result = filter_and_sort(entries, None, Some("hello"), 20).expect("filter");
+        assert_eq!(result.len(), 2);
+    }
+
+    /// TC-0038-U06: Query filter partial match on Japanese title.
+    #[test]
+    fn tc_0038_u06_query_partial_match_japanese() {
+        let entries = vec![
+            make_meta("aa000000", "テストエントリ", &[], 1),
+            make_meta("bb000000", "別のエントリ", &[], 2),
+        ];
+        let result = filter_and_sort(entries, None, Some("テスト"), 20).expect("filter");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].title, "テストエントリ");
+    }
+
+    /// TC-0038-U07: Entries are returned sorted by updated_at descending.
+    #[test]
+    fn tc_0038_u07_sort_updated_at_desc() {
+        let entries = vec![
+            make_meta("aa000000", "Old", &[], 100),
+            make_meta("bb000000", "Newest", &[], 300),
+            make_meta("cc000000", "Middle", &[], 200),
+        ];
+        let result = filter_and_sort(entries, None, None, 20).expect("filter");
+        assert_eq!(result[0].title, "Newest");
+        assert_eq!(result[1].title, "Middle");
+        assert_eq!(result[2].title, "Old");
+    }
+
+    /// TC-0038-U08: Default number=20 limits output to 20 entries.
+    #[test]
+    fn tc_0038_u08_default_number_limit_20() {
+        let entries: Vec<EntryMeta> = (0u64..30)
+            .map(|i| make_meta(&format!("{:032x}", i), "Entry", &[], i))
+            .collect();
+        let result = filter_and_sort(entries, None, None, 20).expect("filter");
+        assert_eq!(result.len(), 20);
+    }
+
+    /// TC-0038-U09: Custom number limit restricts output count.
+    #[test]
+    fn tc_0038_u09_custom_number_limit() {
+        let entries: Vec<EntryMeta> = (0u64..10)
+            .map(|i| make_meta(&format!("{:032x}", i), "Entry", &[], i))
+            .collect();
+        let result = filter_and_sort(entries, None, None, 5).expect("filter");
+        assert_eq!(result.len(), 5);
+    }
+
+    /// TC-0038-U10: When entry count < limit, all entries are returned.
+    #[test]
+    fn tc_0038_u10_fewer_entries_than_limit() {
+        let entries = vec![
+            make_meta("aa000000", "A", &[], 1),
+            make_meta("bb000000", "B", &[], 2),
+        ];
+        let result = filter_and_sort(entries, None, None, 20).expect("filter");
+        assert_eq!(result.len(), 2);
+    }
+
+    // =========================================================================
+    // cmd_list integration tests (TASK-0038)
+    // =========================================================================
+
+    /// Build a `Cli` targeting `vault_dir` for the `list` command.
+    fn make_list_cli(vault_dir_str: &str, password: Option<&str>) -> crate::Cli {
+        let mut args: Vec<&str> = vec!["pq-diary", "-v", vault_dir_str];
+        if let Some(pw) = password {
+            args.extend_from_slice(&["--password", pw]);
+        }
+        args.push("list");
+        crate::Cli::try_parse_from(&args).expect("parse test CLI")
+    }
+
+    /// Build a `Cli` targeting `vault_dir` for the `show` command.
+    fn make_show_cli(vault_dir_str: &str, password: Option<&str>, id: &str) -> crate::Cli {
+        let mut args: Vec<&str> = vec!["pq-diary", "-v", vault_dir_str];
+        if let Some(pw) = password {
+            args.extend_from_slice(&["--password", pw]);
+        }
+        args.extend_from_slice(&["show", id]);
+        crate::Cli::try_parse_from(&args).expect("parse test CLI")
+    }
+
+    /// TC-0038-01: cmd_list succeeds on a vault with entries.
+    #[test]
+    fn tc_0038_01_cmd_list_succeeds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        // Create an entry first
+        let new_cli = make_cli(vault_dir_str, Some("password"));
+        cmd_new(&new_cli, Some("Test".to_string()), Some("body".to_string()), vec![])
+            .expect("cmd_new");
+
+        let list_cli = make_list_cli(vault_dir_str, Some("password"));
+        let result = cmd_list(&list_cli, None, None, 20);
+        assert!(result.is_ok(), "cmd_list failed: {:?}", result.err());
+    }
+
+    /// TC-0038-02: cmd_list succeeds on an empty vault (zero entries).
+    #[test]
+    fn tc_0038_02_cmd_list_empty_vault() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let list_cli = make_list_cli(vault_dir_str, Some("password"));
+        let result = cmd_list(&list_cli, None, None, 20);
+        assert!(result.is_ok(), "cmd_list on empty vault failed: {:?}", result.err());
+    }
+
+    /// TC-0038-03: cmd_show retrieves an entry by 4-character ID prefix.
+    #[test]
+    fn tc_0038_03_cmd_show_by_prefix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let new_cli = make_cli(vault_dir_str, Some("password"));
+        cmd_new(
+            &new_cli,
+            Some("Show Test".to_string()),
+            Some("body text".to_string()),
+            vec![],
+        )
+        .expect("cmd_new");
+
+        let entries = read_vault_entries(&vault_dir);
+        let prefix4 = &entries[0].uuid_hex[..4];
+
+        let show_cli = make_show_cli(vault_dir_str, Some("password"), prefix4);
+        let result = cmd_show(&show_cli, prefix4.to_string());
+        assert!(result.is_ok(), "cmd_show by prefix failed: {:?}", result.err());
+    }
+
+    /// TC-0038-04: cmd_show retrieves an entry by full 32-character UUID hex.
+    #[test]
+    fn tc_0038_04_cmd_show_by_full_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let new_cli = make_cli(vault_dir_str, Some("password"));
+        cmd_new(
+            &new_cli,
+            Some("Full ID Show".to_string()),
+            Some("body".to_string()),
+            vec![],
+        )
+        .expect("cmd_new");
+
+        let entries = read_vault_entries(&vault_dir);
+        let full_id = entries[0].uuid_hex.clone();
+
+        let show_cli = make_show_cli(vault_dir_str, Some("password"), &full_id);
+        let result = cmd_show(&show_cli, full_id.clone());
+        assert!(result.is_ok(), "cmd_show by full ID failed: {:?}", result.err());
+    }
+
+    /// TC-0038-05: cmd_show returns an error for a non-existent ID prefix.
+    #[test]
+    fn tc_0038_05_cmd_show_nonexistent_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let show_cli = make_show_cli(vault_dir_str, Some("password"), "0000");
+        let result = cmd_show(&show_cli, "0000".to_string());
+        assert!(result.is_err(), "Expected error for non-existent ID");
+    }
+
+    /// TC-0038-06: cmd_list with wrong password returns an error.
+    #[test]
+    fn tc_0038_06_cmd_list_wrong_password() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let list_cli = make_list_cli(vault_dir_str, Some("wrong_password"));
+        let result = cmd_list(&list_cli, None, None, 20);
+        assert!(result.is_err(), "Expected error for wrong password");
     }
 }

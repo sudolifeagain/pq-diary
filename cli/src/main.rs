@@ -55,11 +55,23 @@ pub enum Commands {
     },
 
     /// List diary entries
-    List,
+    List {
+        /// Filter entries by tag (prefix match, supports nested tags)
+        #[arg(long)]
+        tag: Option<String>,
+
+        /// Filter entries by title (case-insensitive partial match)
+        #[arg(short, long)]
+        query: Option<String>,
+
+        /// Maximum number of entries to display
+        #[arg(short, long, default_value = "20")]
+        number: usize,
+    },
 
     /// Show a diary entry
     Show {
-        /// Entry ID or title
+        /// Entry ID prefix (minimum 4 hex characters)
         id: String,
     },
 
@@ -237,8 +249,10 @@ fn dispatch(cli: &Cli) -> anyhow::Result<()> {
             VaultCommands::Policy => not_implemented("vault policy", "Sprint 7"),
             VaultCommands::Delete { .. } => not_implemented("vault delete", "Sprint 2"),
         },
-        Commands::List => not_implemented("list", "Sprint 4"),
-        Commands::Show { .. } => not_implemented("show", "Sprint 4"),
+        Commands::List { tag, query, number } => {
+            commands::cmd_list(cli, tag.clone(), query.clone(), *number)
+        }
+        Commands::Show { id } => commands::cmd_show(cli, id.clone()),
         Commands::Edit { .. } => not_implemented("edit", "Sprint 4"),
         Commands::Delete { .. } => not_implemented("delete", "Sprint 4"),
         Commands::Sync => not_implemented("sync", "Sprint 8"),

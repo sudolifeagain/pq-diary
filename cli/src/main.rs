@@ -77,8 +77,17 @@ pub enum Commands {
 
     /// Edit a diary entry
     Edit {
-        /// Entry ID or title
+        /// Entry ID prefix (minimum 4 hex characters)
         id: String,
+        /// Change the entry title
+        #[arg(long)]
+        title: Option<String>,
+        /// Add a tag to the entry (repeatable: --add-tag t1 --add-tag t2)
+        #[arg(long)]
+        add_tag: Vec<String>,
+        /// Remove a tag from the entry (repeatable: --remove-tag t1 --remove-tag t2)
+        #[arg(long)]
+        remove_tag: Vec<String>,
     },
 
     /// Delete a diary entry
@@ -253,7 +262,18 @@ fn dispatch(cli: &Cli) -> anyhow::Result<()> {
             commands::cmd_list(cli, tag.clone(), query.clone(), *number)
         }
         Commands::Show { id } => commands::cmd_show(cli, id.clone()),
-        Commands::Edit { .. } => not_implemented("edit", "Sprint 4"),
+        Commands::Edit {
+            id,
+            title,
+            add_tag,
+            remove_tag,
+        } => commands::cmd_edit(
+            cli,
+            id.clone(),
+            title.clone(),
+            add_tag.clone(),
+            remove_tag.clone(),
+        ),
         Commands::Delete { .. } => not_implemented("delete", "Sprint 4"),
         Commands::Sync => not_implemented("sync", "Sprint 8"),
         Commands::Export => not_implemented("export", "Sprint 5"),
@@ -388,6 +408,109 @@ mod tests {
     // -------------------------------------------------------------------------
     // Commands::New parsing tests (TASK-0037)
     // -------------------------------------------------------------------------
+
+    // -------------------------------------------------------------------------
+    // Commands::Edit parsing tests (TASK-0039)
+    // -------------------------------------------------------------------------
+
+    /// TC-0039-P01: `edit <id>` with no flags parses with empty optional fields.
+    #[test]
+    fn tc_0039_p01_edit_id_only() {
+        let result = Cli::try_parse_from(["pq-diary", "edit", "abcd1234"]);
+        assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
+        let cli = result.unwrap();
+        match cli.command {
+            Commands::Edit {
+                id,
+                title,
+                add_tag,
+                remove_tag,
+            } => {
+                assert_eq!(id, "abcd1234");
+                assert_eq!(title, None);
+                assert!(add_tag.is_empty());
+                assert!(remove_tag.is_empty());
+            }
+            _ => panic!("Expected Commands::Edit"),
+        }
+    }
+
+    /// TC-0039-P02: `edit <id> --title "new title"` parses the title flag.
+    #[test]
+    fn tc_0039_p02_edit_with_title_flag() {
+        let result = Cli::try_parse_from(["pq-diary", "edit", "abcd", "--title", "New Title"]);
+        assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
+        let cli = result.unwrap();
+        match cli.command {
+            Commands::Edit { title, .. } => {
+                assert_eq!(title, Some("New Title".to_string()));
+            }
+            _ => panic!("Expected Commands::Edit"),
+        }
+    }
+
+    /// TC-0039-P03: `edit <id> --add-tag t1 --add-tag t2` accumulates multiple add-tag values.
+    #[test]
+    fn tc_0039_p03_edit_multiple_add_tag() {
+        let result = Cli::try_parse_from([
+            "pq-diary", "edit", "abcd", "--add-tag", "t1", "--add-tag", "t2",
+        ]);
+        assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
+        let cli = result.unwrap();
+        match cli.command {
+            Commands::Edit { add_tag, .. } => {
+                assert_eq!(add_tag, vec!["t1".to_string(), "t2".to_string()]);
+            }
+            _ => panic!("Expected Commands::Edit"),
+        }
+    }
+
+    /// TC-0039-P04: `edit <id> --remove-tag old` parses the remove-tag flag.
+    #[test]
+    fn tc_0039_p04_edit_remove_tag() {
+        let result =
+            Cli::try_parse_from(["pq-diary", "edit", "abcd", "--remove-tag", "old"]);
+        assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
+        let cli = result.unwrap();
+        match cli.command {
+            Commands::Edit { remove_tag, .. } => {
+                assert_eq!(remove_tag, vec!["old".to_string()]);
+            }
+            _ => panic!("Expected Commands::Edit"),
+        }
+    }
+
+    /// TC-0039-P05: Combined --title, --add-tag, and --remove-tag parse correctly.
+    #[test]
+    fn tc_0039_p05_edit_combined_flags() {
+        let result = Cli::try_parse_from([
+            "pq-diary",
+            "edit",
+            "abcd1234",
+            "--title",
+            "Updated",
+            "--add-tag",
+            "new",
+            "--remove-tag",
+            "old",
+        ]);
+        assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
+        let cli = result.unwrap();
+        match cli.command {
+            Commands::Edit {
+                id,
+                title,
+                add_tag,
+                remove_tag,
+            } => {
+                assert_eq!(id, "abcd1234");
+                assert_eq!(title, Some("Updated".to_string()));
+                assert_eq!(add_tag, vec!["new".to_string()]);
+                assert_eq!(remove_tag, vec!["old".to_string()]);
+            }
+            _ => panic!("Expected Commands::Edit"),
+        }
+    }
 
     /// TC-0037-P01: `new` with no arguments parses with all defaults.
     #[test]

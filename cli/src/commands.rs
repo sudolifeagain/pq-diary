@@ -315,6 +315,171 @@ pub fn cmd_show(cli: &Cli, id: String) -> anyhow::Result<()> {
     }
 }
 
+/// Execute the `pq-diary edit` command.
+///
+/// Two modes of operation:
+/// - **Flag mode**: when `--title`, `--add-tag`, or `--remove-tag` is specified,
+///   metadata is updated directly without launching an editor.
+/// - **Editor mode**: when no flags are given, `$EDITOR` is launched with a
+///   header-comment formatted temporary file.  If nothing changed, prints
+///   "変更がありませんでした" and returns `Ok(())`.  On header parse error, the
+///   original title and tags are preserved and only the body is updated.
+///
+/// The temporary file is always securely deleted regardless of editor success
+/// or failure.
+///
+/// # Errors
+///
+/// Returns an error if password acquisition, vault unlock, editor launch, or
+/// entry update fails.
+pub fn cmd_edit(
+    cli: &Cli,
+    id: String,
+    title: Option<String>,
+    add_tags: Vec<String>,
+    remove_tags: Vec<String>,
+) -> anyhow::Result<()> {
+    cmd_edit_impl(cli, id, title, add_tags, remove_tags, |tmpfile, config| {
+        editor::launch_editor(tmpfile, config)
+    })
+}
+
+/// Internal implementation of `cmd_edit` with an injectable editor launcher.
+///
+/// Accepts any `FnOnce` as the editor launcher so that tests can inject a mock
+/// without spawning a real process.
+fn cmd_edit_impl<F>(
+    cli: &Cli,
+    id: String,
+    title: Option<String>,
+    add_tags: Vec<String>,
+    remove_tags: Vec<String>,
+    launch_fn: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(&std::path::Path, &EditorConfig) -> Result<(), pq_diary_core::DiaryError>,
+{
+    use secrecy::{ExposeSecret as _, SecretBox};
+
+    let password_source =
+        get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let vault_path = resolve_vault_path(cli)?;
+    let vault_str = vault_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Vault path contains non-UTF-8 characters"))?;
+
+    let mut core = DiaryCore::new(vault_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let secret_password: secrecy::SecretString =
+        SecretBox::new(Box::from(password_source.secret().expose_secret()));
+    core.unlock(secret_password)
+        .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+
+    let get_result = core.get_entry(&id);
+    let (_record, original) = match get_result {
+        Ok(r) => r,
+        Err(e) => {
+            core.lock();
+            return Err(anyhow::anyhow!("{e}"));
+        }
+    };
+
+    let flag_mode = title.is_some() || !add_tags.is_empty() || !remove_tags.is_empty();
+
+    if flag_mode {
+        // Flag mode: apply metadata changes directly without launching an editor.
+        let mut new_plaintext = EntryPlaintext {
+            title: original.title.clone(),
+            tags: original.tags.clone(),
+            body: original.body.clone(),
+        };
+
+        if let Some(t) = title {
+            new_plaintext.title = t;
+        }
+
+        for tag in &add_tags {
+            if !new_plaintext.tags.contains(tag) {
+                new_plaintext.tags.push(tag.clone());
+            }
+        }
+
+        for tag in &remove_tags {
+            new_plaintext.tags.retain(|t| t != tag);
+        }
+
+        let update_result = core.update_entry(&id, &new_plaintext);
+        core.lock();
+        update_result.map_err(|e| anyhow::anyhow!("Failed to update entry: {e}"))?;
+        let prefix = &id[..id.len().min(8)];
+        println!("Updated: {prefix}");
+    } else {
+        // Editor mode: write header-comment temp file, launch editor, parse result.
+        let config = match EditorConfig::from_env() {
+            Ok(c) => c,
+            Err(e) => {
+                core.lock();
+                return Err(anyhow::anyhow!("{e}"));
+            }
+        };
+
+        let tmpfile = match editor::write_header_file(&config.secure_tmpdir, &original) {
+            Ok(p) => p,
+            Err(e) => {
+                core.lock();
+                return Err(anyhow::anyhow!("Failed to write temp file: {e}"));
+            }
+        };
+
+        // Always delete the temp file regardless of editor/read success.
+        let edit_result = launch_fn(&tmpfile, &config);
+        let read_result = editor::read_header_file(&tmpfile);
+        let _del = editor::secure_delete(&tmpfile);
+
+        if let Err(e) = edit_result {
+            core.lock();
+            return Err(anyhow::anyhow!("Editor failed: {e}"));
+        }
+
+        let header = match read_result {
+            Ok(h) => h,
+            Err(e) => {
+                core.lock();
+                return Err(anyhow::anyhow!("Failed to read temp file: {e}"));
+            }
+        };
+
+        // On header parse error, fall back to the original metadata.
+        let (new_title, new_tags) = match (header.title, header.tags) {
+            (Some(t), Some(tags)) => (t, tags),
+            _ => (original.title.clone(), original.tags.clone()),
+        };
+        let new_body = header.body;
+
+        // Change detection: skip update if nothing changed.
+        if new_title == original.title && new_tags == original.tags && new_body == original.body {
+            println!("変更がありませんでした");
+            core.lock();
+            return Ok(());
+        }
+
+        let new_plaintext = EntryPlaintext {
+            title: new_title,
+            tags: new_tags,
+            body: new_body,
+        };
+
+        let update_result = core.update_entry(&id, &new_plaintext);
+        core.lock();
+        update_result.map_err(|e| anyhow::anyhow!("Failed to update entry: {e}"))?;
+        let prefix = &id[..id.len().min(8)];
+        println!("Updated: {prefix}");
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -819,6 +984,374 @@ mod tests {
 
         let list_cli = make_list_cli(vault_dir_str, Some("wrong_password"));
         let result = cmd_list(&list_cli, None, None, 20);
+        assert!(result.is_err(), "Expected error for wrong password");
+    }
+
+    // =========================================================================
+    // cmd_edit integration tests (TASK-0039)
+    // =========================================================================
+
+    /// Build a `Cli` targeting `vault_dir` for the `edit` command.
+    fn make_edit_cli(vault_dir_str: &str, password: Option<&str>, id: &str) -> crate::Cli {
+        let mut args: Vec<&str> = vec!["pq-diary", "-v", vault_dir_str];
+        if let Some(pw) = password {
+            args.extend_from_slice(&["--password", pw]);
+        }
+        args.extend_from_slice(&["edit", id]);
+        crate::Cli::try_parse_from(&args).expect("parse test CLI")
+    }
+
+    /// Create a vault, add an entry, and return (vault_dir, entry_id_prefix).
+    fn setup_vault_with_entry(
+        dir: &tempfile::TempDir,
+        title: &str,
+        body: &str,
+        tags: Vec<&str>,
+    ) -> (std::path::PathBuf, String) {
+        let vault_dir = setup_vault(dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+        let cli = make_cli(vault_dir_str, Some("password"));
+        cmd_new(
+            &cli,
+            Some(title.to_string()),
+            Some(body.to_string()),
+            tags.iter().map(|s| s.to_string()).collect(),
+        )
+        .expect("cmd_new in setup");
+
+        let entries = read_vault_entries(&vault_dir);
+        assert_eq!(entries.len(), 1, "setup: expected 1 entry");
+        let prefix = entries[0].uuid_hex[..8].to_string();
+        (vault_dir, prefix)
+    }
+
+    /// TC-0039-01: --title flag changes the title, body is unchanged.
+    #[test]
+    fn tc_0039_01_flag_title_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (vault_dir, prefix) = setup_vault_with_entry(&dir, "Old Title", "body text", vec![]);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let edit_cli = make_edit_cli(vault_dir_str, Some("password"), &prefix);
+        let result = cmd_edit(
+            &edit_cli,
+            prefix.clone(),
+            Some("New Title".to_string()),
+            vec![],
+            vec![],
+        );
+        assert!(result.is_ok(), "cmd_edit failed: {:?}", result.err());
+
+        let plaintext = read_first_entry_plaintext(&vault_dir);
+        assert_eq!(plaintext.title, "New Title");
+        assert_eq!(plaintext.body, "body text", "body must be unchanged by flag edit");
+    }
+
+    /// TC-0039-02: --add-tag flag appends a tag to the entry.
+    #[test]
+    fn tc_0039_02_flag_add_tag() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (vault_dir, prefix) =
+            setup_vault_with_entry(&dir, "Title", "body", vec!["existing"]);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let edit_cli = make_edit_cli(vault_dir_str, Some("password"), &prefix);
+        let result = cmd_edit(
+            &edit_cli,
+            prefix.clone(),
+            None,
+            vec!["newtag".to_string()],
+            vec![],
+        );
+        assert!(result.is_ok(), "cmd_edit failed: {:?}", result.err());
+
+        let plaintext = read_first_entry_plaintext(&vault_dir);
+        assert!(
+            plaintext.tags.contains(&"existing".to_string()),
+            "original tag must be preserved"
+        );
+        assert!(
+            plaintext.tags.contains(&"newtag".to_string()),
+            "new tag must be added"
+        );
+        assert_eq!(plaintext.tags.len(), 2);
+    }
+
+    /// TC-0039-03: --remove-tag flag removes a tag from the entry.
+    #[test]
+    fn tc_0039_03_flag_remove_tag() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (vault_dir, prefix) =
+            setup_vault_with_entry(&dir, "Title", "body", vec!["keep", "remove_me"]);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let edit_cli = make_edit_cli(vault_dir_str, Some("password"), &prefix);
+        let result = cmd_edit(
+            &edit_cli,
+            prefix.clone(),
+            None,
+            vec![],
+            vec!["remove_me".to_string()],
+        );
+        assert!(result.is_ok(), "cmd_edit failed: {:?}", result.err());
+
+        let plaintext = read_first_entry_plaintext(&vault_dir);
+        assert!(
+            plaintext.tags.contains(&"keep".to_string()),
+            "kept tag must remain"
+        );
+        assert!(
+            !plaintext.tags.contains(&"remove_me".to_string()),
+            "removed tag must be absent"
+        );
+        assert_eq!(plaintext.tags.len(), 1);
+    }
+
+    /// TC-0039-04: Combined --title, --add-tag, --remove-tag all apply correctly.
+    #[test]
+    fn tc_0039_04_flag_combined() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (vault_dir, prefix) =
+            setup_vault_with_entry(&dir, "Old", "body", vec!["keep", "old"]);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let edit_cli = make_edit_cli(vault_dir_str, Some("password"), &prefix);
+        let result = cmd_edit(
+            &edit_cli,
+            prefix.clone(),
+            Some("New Title".to_string()),
+            vec!["fresh".to_string()],
+            vec!["old".to_string()],
+        );
+        assert!(result.is_ok(), "cmd_edit failed: {:?}", result.err());
+
+        let plaintext = read_first_entry_plaintext(&vault_dir);
+        assert_eq!(plaintext.title, "New Title");
+        assert!(plaintext.tags.contains(&"keep".to_string()));
+        assert!(plaintext.tags.contains(&"fresh".to_string()));
+        assert!(!plaintext.tags.contains(&"old".to_string()));
+    }
+
+    /// TC-0039-05: Flag edit does not modify the body.
+    #[test]
+    fn tc_0039_05_flag_body_unchanged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (vault_dir, prefix) =
+            setup_vault_with_entry(&dir, "Title", "Original body content", vec![]);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let edit_cli = make_edit_cli(vault_dir_str, Some("password"), &prefix);
+        let result = cmd_edit(
+            &edit_cli,
+            prefix.clone(),
+            Some("Changed Title".to_string()),
+            vec![],
+            vec![],
+        );
+        assert!(result.is_ok(), "cmd_edit failed: {:?}", result.err());
+
+        let plaintext = read_first_entry_plaintext(&vault_dir);
+        assert_eq!(plaintext.body, "Original body content", "body must not change");
+    }
+
+    /// TC-0039-06: --add-tag does not duplicate an already-existing tag.
+    #[test]
+    fn tc_0039_06_flag_add_tag_no_duplicate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (vault_dir, prefix) =
+            setup_vault_with_entry(&dir, "Title", "body", vec!["existing"]);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let edit_cli = make_edit_cli(vault_dir_str, Some("password"), &prefix);
+        let result = cmd_edit(
+            &edit_cli,
+            prefix.clone(),
+            None,
+            vec!["existing".to_string()],
+            vec![],
+        );
+        assert!(result.is_ok(), "cmd_edit failed: {:?}", result.err());
+
+        let plaintext = read_first_entry_plaintext(&vault_dir);
+        assert_eq!(
+            plaintext.tags.iter().filter(|t| *t == "existing").count(),
+            1,
+            "duplicate tag must not be added"
+        );
+    }
+
+    /// TC-0039-07: Editor mode with no-op mock → "変更がありませんでした" (no update).
+    #[test]
+    fn tc_0039_07_editor_no_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (vault_dir, prefix) =
+            setup_vault_with_entry(&dir, "Title", "body text", vec!["tag1"]);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let edit_cli = make_edit_cli(vault_dir_str, Some("password"), &prefix);
+
+        // No-op mock: does not modify the temp file.
+        let result = cmd_edit_impl(
+            &edit_cli,
+            prefix.clone(),
+            None,
+            vec![],
+            vec![],
+            |_tmpfile, _config| Ok(()),
+        );
+        assert!(result.is_ok(), "cmd_edit_impl failed: {:?}", result.err());
+
+        // Vault entry must be unchanged.
+        let plaintext = read_first_entry_plaintext(&vault_dir);
+        assert_eq!(plaintext.title, "Title");
+        assert_eq!(plaintext.body, "body text");
+        assert_eq!(plaintext.tags, vec!["tag1".to_string()]);
+    }
+
+    /// TC-0039-08: Editor mode with mock that modifies content → entry is updated.
+    #[test]
+    fn tc_0039_08_editor_with_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (vault_dir, prefix) =
+            setup_vault_with_entry(&dir, "Old Title", "old body", vec!["old_tag"]);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let edit_cli = make_edit_cli(vault_dir_str, Some("password"), &prefix);
+
+        // Mock: overwrite the temp file with new content.
+        let result = cmd_edit_impl(
+            &edit_cli,
+            prefix.clone(),
+            None,
+            vec![],
+            vec![],
+            |tmpfile, _config| {
+                use std::io::Write as _;
+                let mut f =
+                    std::fs::File::create(tmpfile).map_err(|e| pq_diary_core::DiaryError::Io(e))?;
+                f.write_all(b"# Title: New Title\n# Tags: new_tag\n# ---\n\nnew body")
+                    .map_err(pq_diary_core::DiaryError::Io)?;
+                Ok(())
+            },
+        );
+        assert!(result.is_ok(), "cmd_edit_impl failed: {:?}", result.err());
+
+        let plaintext = read_first_entry_plaintext(&vault_dir);
+        assert_eq!(plaintext.title, "New Title");
+        assert_eq!(plaintext.tags, vec!["new_tag".to_string()]);
+        assert_eq!(plaintext.body, "new body");
+    }
+
+    /// TC-0039-09: After editor mode, the temp file is securely deleted.
+    #[test]
+    fn tc_0039_09_editor_tmpfile_deleted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (vault_dir, prefix) =
+            setup_vault_with_entry(&dir, "Title", "body", vec![]);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let edit_cli = make_edit_cli(vault_dir_str, Some("password"), &prefix);
+
+        // Capture the tmpfile path via a shared cell.
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let captured: Rc<RefCell<Option<std::path::PathBuf>>> = Rc::new(RefCell::new(None));
+        let captured_clone = Rc::clone(&captured);
+
+        let result = cmd_edit_impl(
+            &edit_cli,
+            prefix.clone(),
+            None,
+            vec![],
+            vec![],
+            move |tmpfile, _config| {
+                *captured_clone.borrow_mut() = Some(tmpfile.to_path_buf());
+                Ok(())
+            },
+        );
+        assert!(result.is_ok(), "cmd_edit_impl failed: {:?}", result.err());
+
+        let path = captured.borrow().clone().expect("tmpfile path was not captured");
+        assert!(
+            !path.exists(),
+            "temp file must be deleted after editor mode: {path:?}"
+        );
+    }
+
+    /// TC-0039-10: Header parse error → original metadata preserved, body updated.
+    #[test]
+    fn tc_0039_10_editor_header_parse_error_preserves_metadata() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (vault_dir, prefix) =
+            setup_vault_with_entry(&dir, "Keep Title", "old body", vec!["keep_tag"]);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let edit_cli = make_edit_cli(vault_dir_str, Some("password"), &prefix);
+
+        // Mock: write file content without a "# ---" separator (invalid header).
+        let result = cmd_edit_impl(
+            &edit_cli,
+            prefix.clone(),
+            None,
+            vec![],
+            vec![],
+            |tmpfile, _config| {
+                use std::io::Write as _;
+                let mut f =
+                    std::fs::File::create(tmpfile).map_err(|e| pq_diary_core::DiaryError::Io(e))?;
+                f.write_all(b"updated body without header")
+                    .map_err(pq_diary_core::DiaryError::Io)?;
+                Ok(())
+            },
+        );
+        assert!(result.is_ok(), "cmd_edit_impl failed: {:?}", result.err());
+
+        let plaintext = read_first_entry_plaintext(&vault_dir);
+        // Original metadata must be preserved.
+        assert_eq!(plaintext.title, "Keep Title", "title must be preserved on header error");
+        assert_eq!(
+            plaintext.tags,
+            vec!["keep_tag".to_string()],
+            "tags must be preserved on header error"
+        );
+        // Body must be updated to the whole file content.
+        assert_eq!(plaintext.body, "updated body without header");
+    }
+
+    /// TC-0039-11: cmd_edit returns an error for a non-existent entry ID.
+    #[test]
+    fn tc_0039_11_nonexistent_id_returns_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let edit_cli = make_edit_cli(vault_dir_str, Some("password"), "0000");
+        let result = cmd_edit(
+            &edit_cli,
+            "0000".to_string(),
+            Some("New Title".to_string()),
+            vec![],
+            vec![],
+        );
+        assert!(result.is_err(), "Expected error for non-existent ID");
+    }
+
+    /// TC-0039-12: cmd_edit returns an error for an incorrect password.
+    #[test]
+    fn tc_0039_12_wrong_password_returns_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (vault_dir, prefix) =
+            setup_vault_with_entry(&dir, "Title", "body", vec![]);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let edit_cli = make_edit_cli(vault_dir_str, Some("wrong_password"), &prefix);
+        let result = cmd_edit(
+            &edit_cli,
+            prefix.clone(),
+            Some("New Title".to_string()),
+            vec![],
+            vec![],
+        );
         assert!(result.is_err(), "Expected error for wrong password");
     }
 }

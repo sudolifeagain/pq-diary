@@ -8,39 +8,51 @@ set -euo pipefail
 # =============================================================================
 
 # === 設定 ===
-SPRINT_NAME="s3-vault-storage"
+SPRINT_NAME="entry-ops-cli"
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TASKS_DIR="${PROJECT_ROOT}/docs/tasks/${SPRINT_NAME}"
 PROMPTS_DIR="$(dirname "$0")/prompts"
 LOG_DIR="${PROJECT_ROOT}/logs/sprint-${SPRINT_NAME}"
 
 # タスク一覧 (依存順)
-TASKS=(TASK-0018 TASK-0019 TASK-0020 TASK-0021 TASK-0022 TASK-0023 TASK-0024 TASK-0025 TASK-0026)
+TASKS=(TASK-0027 TASK-0028 TASK-0029 TASK-0030 TASK-0031 TASK-0032 TASK-0033 TASK-0034 TASK-0035 TASK-0036 TASK-0037 TASK-0038 TASK-0039 TASK-0040 TASK-0041)
 
 # タスクタイプ
 declare -A TASK_TYPES=(
-    [TASK-0018]="DIRECT"
-    [TASK-0019]="TDD"
-    [TASK-0020]="TDD"
-    [TASK-0021]="TDD"
-    [TASK-0022]="TDD"
-    [TASK-0023]="TDD"
-    [TASK-0024]="TDD"
-    [TASK-0025]="TDD"
-    [TASK-0026]="TDD"
+    [TASK-0027]="TDD"
+    [TASK-0028]="TDD"
+    [TASK-0029]="TDD"
+    [TASK-0030]="TDD"
+    [TASK-0031]="TDD"
+    [TASK-0032]="TDD"
+    [TASK-0033]="TDD"
+    [TASK-0034]="TDD"
+    [TASK-0035]="TDD"
+    [TASK-0036]="TDD"
+    [TASK-0037]="TDD"
+    [TASK-0038]="TDD"
+    [TASK-0039]="TDD"
+    [TASK-0040]="TDD"
+    [TASK-0041]="TDD"
 )
 
 # タスク名 (コミットメッセージ用)
 declare -A TASK_NAMES=(
-    [TASK-0018]="vault submodule split and serde/toml dependency setup"
-    [TASK-0019]="vault.toml and config.toml serde structs"
-    [TASK-0020]="vault.pqd v4 header constants and structs"
-    [TASK-0021]="vault.pqd header write (writer.rs)"
-    [TASK-0022]="vault.pqd header read (reader.rs)"
-    [TASK-0023]="entry and template record read/write"
-    [TASK-0024]="random padding and verification token"
-    [TASK-0025]="VaultManager multi-vault and init"
-    [TASK-0026]="integration tests and doc comments"
+    [TASK-0027]="EntryPlaintext, Tag, and IdPrefix type definitions"
+    [TASK-0028]="Tag validation and prefix matching"
+    [TASK-0029]="create_entry implementation"
+    [TASK-0030]="list_entries and EntryMeta implementation"
+    [TASK-0031]="get_entry and IdPrefix resolution"
+    [TASK-0032]="update_entry and delete_entry implementation"
+    [TASK-0033]="DiaryCore facade extension"
+    [TASK-0034]="three-tier password input"
+    [TASK-0035]="secure tmpdir and zeroize delete"
+    [TASK-0036]="editor launch and header comment parsing"
+    [TASK-0037]="clap update and new command"
+    [TASK-0038]="list and show commands"
+    [TASK-0039]="edit command"
+    [TASK-0040]="delete command with confirmation"
+    [TASK-0041]="integration tests and doc comments"
 )
 
 # モデル設定
@@ -84,8 +96,8 @@ check_prerequisites() {
 
     local branch
     branch="$(git branch --show-current)"
-    if [[ "${branch}" != "sprint/s3" ]]; then
-        log_warn "Expected 'sprint/s3', on '${branch}'"
+    if [[ "${branch}" != "sprint/s4" ]]; then
+        log_warn "Expected 'sprint/s4', on '${branch}'"
     fi
 
     log_ok "Prerequisites OK (claude, cargo, git)"
@@ -173,7 +185,7 @@ main() {
     log_info "Implement model: ${IMPLEMENT_MODEL}, Review model: ${REVIEW_MODEL}"
 
     # 開始タスクの決定
-    local start_task="${1:-TASK-0001}"
+    local start_task="${1:-TASK-0027}"
     local start_idx=0
     for i in "${!TASKS[@]}"; do
         if [[ "${TASKS[$i]}" == "${start_task}" ]]; then
@@ -255,13 +267,17 @@ main() {
             # --- COMMIT ---
             show_progress "${current}" "${total}" "${task_id}" "COMMIT"
             git add -A
-            git commit -m "$(cat <<EOF
-feat(s1): implement ${task_id} - ${task_name}
+            if git diff --cached --quiet; then
+                log_warn "[${task_id}] No changes to commit (review/verify made no modifications)"
+            else
+                git commit -m "$(cat <<EOF
+feat(s4): implement ${task_id} - ${task_name}
 
 Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
 EOF
-            )"
-            log_ok "[${task_id}] Committed"
+                )"
+                log_ok "[${task_id}] Committed"
+            fi
 
             task_success=true
             break

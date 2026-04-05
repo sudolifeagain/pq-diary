@@ -1,3 +1,7 @@
+mod commands;
+mod editor;
+mod password;
+
 use clap::{Parser, Subcommand};
 
 /// Post-quantum cryptography CLI journal.
@@ -37,27 +41,62 @@ pub enum Commands {
     },
 
     /// Create a new diary entry
-    New,
+    New {
+        /// Entry title (positional, optional)
+        title: Option<String>,
+
+        /// Body text; skips editor when specified
+        #[arg(short, long)]
+        body: Option<String>,
+
+        /// Tag to attach (repeatable: -t tag1 -t tag2)
+        #[arg(short, long = "tag")]
+        tag: Vec<String>,
+    },
 
     /// List diary entries
-    List,
+    List {
+        /// Filter entries by tag (prefix match, supports nested tags)
+        #[arg(long)]
+        tag: Option<String>,
+
+        /// Filter entries by title (case-insensitive partial match)
+        #[arg(short, long)]
+        query: Option<String>,
+
+        /// Maximum number of entries to display
+        #[arg(short, long, default_value = "20")]
+        number: usize,
+    },
 
     /// Show a diary entry
     Show {
-        /// Entry ID or title
+        /// Entry ID prefix (minimum 4 hex characters)
         id: String,
     },
 
     /// Edit a diary entry
     Edit {
-        /// Entry ID or title
+        /// Entry ID prefix (minimum 4 hex characters)
         id: String,
+        /// Change the entry title
+        #[arg(long)]
+        title: Option<String>,
+        /// Add a tag to the entry (repeatable: --add-tag t1 --add-tag t2)
+        #[arg(long)]
+        add_tag: Vec<String>,
+        /// Remove a tag from the entry (repeatable: --remove-tag t1 --remove-tag t2)
+        #[arg(long)]
+        remove_tag: Vec<String>,
     },
 
     /// Delete a diary entry
     Delete {
-        /// Entry ID or title
+        /// Entry ID prefix (minimum 4 hex characters)
         id: String,
+        /// Skip confirmation prompt
+        #[arg(short, long)]
+        force: bool,
     },
 
     /// Sync diary entries with configured remotes
@@ -210,60 +249,82 @@ pub enum TemplateCommands {
     },
 }
 
-fn dispatch(cli: &Cli) -> ! {
-    let (cmd_name, sprint) = match &cli.command {
-        Commands::Init => ("init", "Sprint 2"),
+fn dispatch(cli: &Cli) -> anyhow::Result<()> {
+    match &cli.command {
+        Commands::New { title, body, tag } => {
+            commands::cmd_new(cli, title.clone(), body.clone(), tag.clone())
+        }
+        Commands::Init => not_implemented("init", "Sprint 2"),
         Commands::Vault { subcommand } => match subcommand {
-            VaultCommands::Create { .. } => ("vault create", "Sprint 2"),
-            VaultCommands::List => ("vault list", "Sprint 2"),
-            VaultCommands::Policy => ("vault policy", "Sprint 7"),
-            VaultCommands::Delete { .. } => ("vault delete", "Sprint 2"),
+            VaultCommands::Create { .. } => not_implemented("vault create", "Sprint 2"),
+            VaultCommands::List => not_implemented("vault list", "Sprint 2"),
+            VaultCommands::Policy => not_implemented("vault policy", "Sprint 7"),
+            VaultCommands::Delete { .. } => not_implemented("vault delete", "Sprint 2"),
         },
-        Commands::New => ("new", "Sprint 4"),
-        Commands::List => ("list", "Sprint 4"),
-        Commands::Show { .. } => ("show", "Sprint 4"),
-        Commands::Edit { .. } => ("edit", "Sprint 4"),
-        Commands::Delete { .. } => ("delete", "Sprint 4"),
-        Commands::Sync => ("sync", "Sprint 8"),
-        Commands::Export => ("export", "Sprint 5"),
-        Commands::ChangePassword => ("change-password", "Sprint 3"),
-        Commands::Info { .. } => ("info", "Sprint 2"),
-        Commands::GitInit => ("git-init", "Sprint 8"),
-        Commands::GitPush => ("git-push", "Sprint 8"),
-        Commands::GitPull => ("git-pull", "Sprint 8"),
-        Commands::GitSync => ("git-sync", "Sprint 8"),
-        Commands::GitStatus => ("git-status", "Sprint 8"),
+        Commands::List { tag, query, number } => {
+            commands::cmd_list(cli, tag.clone(), query.clone(), *number)
+        }
+        Commands::Show { id } => commands::cmd_show(cli, id.clone()),
+        Commands::Edit {
+            id,
+            title,
+            add_tag,
+            remove_tag,
+        } => commands::cmd_edit(
+            cli,
+            id.clone(),
+            title.clone(),
+            add_tag.clone(),
+            remove_tag.clone(),
+        ),
+        Commands::Delete { id, force } => commands::cmd_delete(cli, id.clone(), *force),
+        Commands::Sync => not_implemented("sync", "Sprint 8"),
+        Commands::Export => not_implemented("export", "Sprint 5"),
+        Commands::ChangePassword => not_implemented("change-password", "Sprint 3"),
+        Commands::Info { .. } => not_implemented("info", "Sprint 2"),
+        Commands::GitInit => not_implemented("git-init", "Sprint 8"),
+        Commands::GitPush => not_implemented("git-push", "Sprint 8"),
+        Commands::GitPull => not_implemented("git-pull", "Sprint 8"),
+        Commands::GitSync => not_implemented("git-sync", "Sprint 8"),
+        Commands::GitStatus => not_implemented("git-status", "Sprint 8"),
         Commands::Legacy { subcommand } => match subcommand {
-            LegacyCommands::Init => ("legacy init", "Sprint 9"),
-            LegacyCommands::Rotate => ("legacy rotate", "Sprint 9"),
-            LegacyCommands::Set => ("legacy set", "Sprint 9"),
-            LegacyCommands::List => ("legacy list", "Sprint 9"),
+            LegacyCommands::Init => not_implemented("legacy init", "Sprint 9"),
+            LegacyCommands::Rotate => not_implemented("legacy rotate", "Sprint 9"),
+            LegacyCommands::Set => not_implemented("legacy set", "Sprint 9"),
+            LegacyCommands::List => not_implemented("legacy list", "Sprint 9"),
         },
-        Commands::LegacyAccess => ("legacy-access", "Sprint 9"),
+        Commands::LegacyAccess => not_implemented("legacy-access", "Sprint 9"),
         Commands::Daemon { subcommand } => match subcommand {
-            DaemonCommands::Start => ("daemon start", "Sprint 10"),
-            DaemonCommands::Stop => ("daemon stop", "Sprint 10"),
-            DaemonCommands::Status => ("daemon status", "Sprint 10"),
-            DaemonCommands::Lock => ("daemon lock", "Sprint 10"),
+            DaemonCommands::Start => not_implemented("daemon start", "Sprint 10"),
+            DaemonCommands::Stop => not_implemented("daemon stop", "Sprint 10"),
+            DaemonCommands::Status => not_implemented("daemon status", "Sprint 10"),
+            DaemonCommands::Lock => not_implemented("daemon lock", "Sprint 10"),
         },
-        Commands::Today => ("today", "Sprint 4"),
-        Commands::Search { .. } => ("search", "Sprint 5"),
-        Commands::Stats => ("stats", "Sprint 5"),
-        Commands::Import { .. } => ("import", "Sprint 6"),
+        Commands::Today => not_implemented("today", "Sprint 4"),
+        Commands::Search { .. } => not_implemented("search", "Sprint 5"),
+        Commands::Stats => not_implemented("stats", "Sprint 5"),
+        Commands::Import { .. } => not_implemented("import", "Sprint 6"),
         Commands::Template { subcommand } => match subcommand {
-            TemplateCommands::Add { .. } => ("template add", "Sprint 6"),
-            TemplateCommands::List => ("template list", "Sprint 6"),
-            TemplateCommands::Show { .. } => ("template show", "Sprint 6"),
-            TemplateCommands::Delete { .. } => ("template delete", "Sprint 6"),
+            TemplateCommands::Add { .. } => not_implemented("template add", "Sprint 6"),
+            TemplateCommands::List => not_implemented("template list", "Sprint 6"),
+            TemplateCommands::Show { .. } => not_implemented("template show", "Sprint 6"),
+            TemplateCommands::Delete { .. } => not_implemented("template delete", "Sprint 6"),
         },
-    };
+    }
+}
+
+/// Print a "not yet implemented" message and exit with code 1.
+///
+/// Returns the never type `!` which coerces to any `Result` type, allowing
+/// it to be used directly in match arms that return `anyhow::Result<()>`.
+fn not_implemented(cmd_name: &str, sprint: &str) -> anyhow::Result<()> {
     eprintln!("Command '{cmd_name}' is not yet implemented. Planned for {sprint}.");
     std::process::exit(1);
 }
 
-fn main() {
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    dispatch(&cli);
+    dispatch(&cli)
 }
 
 #[cfg(test)]
@@ -345,5 +406,207 @@ mod tests {
             result.unwrap_err().kind(),
             clap::error::ErrorKind::DisplayHelp
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Commands::New parsing tests (TASK-0037)
+    // -------------------------------------------------------------------------
+
+    // -------------------------------------------------------------------------
+    // Commands::Edit parsing tests (TASK-0039)
+    // -------------------------------------------------------------------------
+
+    /// TC-0039-P01: `edit <id>` with no flags parses with empty optional fields.
+    #[test]
+    fn tc_0039_p01_edit_id_only() {
+        let result = Cli::try_parse_from(["pq-diary", "edit", "abcd1234"]);
+        assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
+        let cli = result.unwrap();
+        match cli.command {
+            Commands::Edit {
+                id,
+                title,
+                add_tag,
+                remove_tag,
+            } => {
+                assert_eq!(id, "abcd1234");
+                assert_eq!(title, None);
+                assert!(add_tag.is_empty());
+                assert!(remove_tag.is_empty());
+            }
+            _ => panic!("Expected Commands::Edit"),
+        }
+    }
+
+    /// TC-0039-P02: `edit <id> --title "new title"` parses the title flag.
+    #[test]
+    fn tc_0039_p02_edit_with_title_flag() {
+        let result = Cli::try_parse_from(["pq-diary", "edit", "abcd", "--title", "New Title"]);
+        assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
+        let cli = result.unwrap();
+        match cli.command {
+            Commands::Edit { title, .. } => {
+                assert_eq!(title, Some("New Title".to_string()));
+            }
+            _ => panic!("Expected Commands::Edit"),
+        }
+    }
+
+    /// TC-0039-P03: `edit <id> --add-tag t1 --add-tag t2` accumulates multiple add-tag values.
+    #[test]
+    fn tc_0039_p03_edit_multiple_add_tag() {
+        let result = Cli::try_parse_from([
+            "pq-diary", "edit", "abcd", "--add-tag", "t1", "--add-tag", "t2",
+        ]);
+        assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
+        let cli = result.unwrap();
+        match cli.command {
+            Commands::Edit { add_tag, .. } => {
+                assert_eq!(add_tag, vec!["t1".to_string(), "t2".to_string()]);
+            }
+            _ => panic!("Expected Commands::Edit"),
+        }
+    }
+
+    /// TC-0039-P04: `edit <id> --remove-tag old` parses the remove-tag flag.
+    #[test]
+    fn tc_0039_p04_edit_remove_tag() {
+        let result =
+            Cli::try_parse_from(["pq-diary", "edit", "abcd", "--remove-tag", "old"]);
+        assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
+        let cli = result.unwrap();
+        match cli.command {
+            Commands::Edit { remove_tag, .. } => {
+                assert_eq!(remove_tag, vec!["old".to_string()]);
+            }
+            _ => panic!("Expected Commands::Edit"),
+        }
+    }
+
+    /// TC-0039-P05: Combined --title, --add-tag, and --remove-tag parse correctly.
+    #[test]
+    fn tc_0039_p05_edit_combined_flags() {
+        let result = Cli::try_parse_from([
+            "pq-diary",
+            "edit",
+            "abcd1234",
+            "--title",
+            "Updated",
+            "--add-tag",
+            "new",
+            "--remove-tag",
+            "old",
+        ]);
+        assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
+        let cli = result.unwrap();
+        match cli.command {
+            Commands::Edit {
+                id,
+                title,
+                add_tag,
+                remove_tag,
+            } => {
+                assert_eq!(id, "abcd1234");
+                assert_eq!(title, Some("Updated".to_string()));
+                assert_eq!(add_tag, vec!["new".to_string()]);
+                assert_eq!(remove_tag, vec!["old".to_string()]);
+            }
+            _ => panic!("Expected Commands::Edit"),
+        }
+    }
+
+    /// TC-0037-P01: `new` with no arguments parses with all defaults.
+    #[test]
+    fn tc_0037_p01_new_no_args_defaults() {
+        let result = Cli::try_parse_from(["pq-diary", "new"]);
+        assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
+        let cli = result.unwrap();
+        match cli.command {
+            Commands::New { title, body, tag } => {
+                assert_eq!(title, None);
+                assert_eq!(body, None);
+                assert!(tag.is_empty());
+            }
+            _ => panic!("Expected Commands::New"),
+        }
+    }
+
+    /// TC-0037-P02: `new "My Title"` parses the positional title argument.
+    #[test]
+    fn tc_0037_p02_new_with_title() {
+        let result = Cli::try_parse_from(["pq-diary", "new", "My Title"]);
+        assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
+        let cli = result.unwrap();
+        match cli.command {
+            Commands::New { title, body, tag } => {
+                assert_eq!(title, Some("My Title".to_string()));
+                assert_eq!(body, None);
+                assert!(tag.is_empty());
+            }
+            _ => panic!("Expected Commands::New"),
+        }
+    }
+
+    /// TC-0037-P03: `new --body "text"` parses the long body flag.
+    #[test]
+    fn tc_0037_p03_new_with_long_body_flag() {
+        let result = Cli::try_parse_from(["pq-diary", "new", "--body", "Hello World"]);
+        assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
+        let cli = result.unwrap();
+        match cli.command {
+            Commands::New { title, body, tag } => {
+                assert_eq!(title, None);
+                assert_eq!(body, Some("Hello World".to_string()));
+                assert!(tag.is_empty());
+            }
+            _ => panic!("Expected Commands::New"),
+        }
+    }
+
+    /// TC-0037-P04: `new -b "text"` parses the short body flag.
+    #[test]
+    fn tc_0037_p04_new_with_short_body_flag() {
+        let result = Cli::try_parse_from(["pq-diary", "new", "-b", "Short body"]);
+        assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
+        let cli = result.unwrap();
+        match cli.command {
+            Commands::New { body, .. } => {
+                assert_eq!(body, Some("Short body".to_string()));
+            }
+            _ => panic!("Expected Commands::New"),
+        }
+    }
+
+    /// TC-0037-P05: `-t tag1 --tag tag2` accumulates multiple tags.
+    #[test]
+    fn tc_0037_p05_new_with_multiple_tags() {
+        let result =
+            Cli::try_parse_from(["pq-diary", "new", "-t", "tag1", "--tag", "tag2"]);
+        assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
+        let cli = result.unwrap();
+        match cli.command {
+            Commands::New { tag, .. } => {
+                assert_eq!(tag, vec!["tag1".to_string(), "tag2".to_string()]);
+            }
+            _ => panic!("Expected Commands::New"),
+        }
+    }
+
+    /// TC-0037-P06: Combined title, body, and tags parse correctly together.
+    #[test]
+    fn tc_0037_p06_new_combined_args() {
+        let result = Cli::try_parse_from([
+            "pq-diary", "new", "Entry Title", "-b", "body text", "-t", "work",
+        ]);
+        assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
+        let cli = result.unwrap();
+        match cli.command {
+            Commands::New { title, body, tag } => {
+                assert_eq!(title, Some("Entry Title".to_string()));
+                assert_eq!(body, Some("body text".to_string()));
+                assert_eq!(tag, vec!["work".to_string()]);
+            }
+            _ => panic!("Expected Commands::New"),
+        }
     }
 }

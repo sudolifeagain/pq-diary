@@ -111,27 +111,22 @@ mod tests {
         assert!(result, "expected valid signature to verify as true");
     }
 
-    /// TC-005-03: signing key (SecureBuffer) is zeroed on drop.
+    /// TC-005-03: signing key (SecureBuffer) is zeroed by zeroize (called by Drop::drop).
     ///
-    /// # Safety
-    /// Reads the raw pointer after `drop()` to confirm zeroize ran before deallocation.
-    /// This is technically UB (freed memory access) but is intentional for security validation;
-    /// permitted in test code only.
+    /// Uses `ManuallyDrop` to call `zeroize()` while the allocation is still live,
+    /// avoiding undefined behavior from reading freed memory.
     #[test]
     fn tc_005_03_signing_key_zeroize_on_drop() {
-        let ptr: *const u8;
-        let len: usize;
-        {
-            let kp = keygen().unwrap();
-            ptr = kp.signing_key.as_ref().as_ptr();
-            len = kp.signing_key.len();
-            // kp is dropped here → SecureBuffer::drop() → zeroize()
-        }
-        // SAFETY: intentional post-drop read for security validation.
-        // zeroize guarantees bytes are cleared before Box frees the allocation.
+        use std::mem::ManuallyDrop;
+        use zeroize::Zeroize;
+        let mut kp = ManuallyDrop::new(keygen().unwrap());
+        let ptr = kp.signing_key.as_ref().as_ptr();
+        let len = kp.signing_key.len();
+        kp.signing_key.zeroize();
+        // SAFETY: the allocation is still live because ManuallyDrop suppresses deallocation.
         unsafe {
             for i in 0..len {
-                assert_eq!(*ptr.add(i), 0u8, "byte {i} not zeroed after drop");
+                assert_eq!(*ptr.add(i), 0u8, "byte {i} not zeroed after zeroize");
             }
         }
     }

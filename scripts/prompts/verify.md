@@ -5,7 +5,7 @@ You are the final verifier for {{TASK_ID}} in the pq-diary project. Your job is 
 ## Step 1: Read Requirements
 
 1. `CLAUDE.md` — project conventions
-2. `docs/tasks/s1-foundation/{{TASK_ID}}.md` — task file with completion criteria
+2. `docs/tasks/entry-ops-cli/{{TASK_ID}}.md` — task file with completion criteria
 3. `docs/definition-of-done.md` — Definition of Done checklist
 
 ## Step 2: Run All Checks
@@ -24,7 +24,7 @@ Go through EVERY item in "完了条件" of the task file. For each item, read th
 ## Step 4: Verify Test Coverage (TDD tasks only)
 
 For {{TASK_TYPE}} tasks:
-- Check that ALL test cases in "単体テスト要件" are implemented
+- Check that ALL test cases in "テスト要件" are implemented
 - Verify each test covers the Given/When/Then conditions
 - Run `cargo test --workspace -- --nocapture` to see output
 

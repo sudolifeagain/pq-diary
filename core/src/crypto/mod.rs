@@ -68,6 +68,69 @@ impl CryptoEngine {
         Ok(())
     }
 
+    /// Unlock the engine using the given password and load the full vault key material.
+    ///
+    /// Extends [`unlock`](CryptoEngine::unlock) by also decrypting and loading
+    /// the ML-KEM-768 decapsulation key and ML-DSA-65 signing key from the vault
+    /// header blobs.  Each blob has the format `IV (12 bytes) || AES-256-GCM ciphertext`.
+    ///
+    /// Returns [`DiaryError::Password`] for an empty password.
+    /// Returns [`DiaryError::Crypto`] if the password is wrong or key decryption fails.
+    #[allow(clippy::too_many_arguments)]
+    pub fn unlock_with_vault(
+        &mut self,
+        password: &[u8],
+        kdf_salt: &[u8],
+        params: &kdf::Argon2Params,
+        verification_iv: [u8; aead::NONCE_SIZE],
+        verification_ct: &[u8],
+        kem_encrypted_sk: &[u8],
+        dsa_encrypted_sk: &[u8],
+    ) -> Result<(), DiaryError> {
+        if password.is_empty() {
+            return Err(DiaryError::Password("password must not be empty".into()));
+        }
+
+        let sym_key = kdf::derive_key(password, kdf_salt, params)?;
+
+        // Verify the password against the stored verification token.
+        aead::decrypt(sym_key.as_ref(), verification_iv, verification_ct)
+            .map_err(|_| DiaryError::Crypto("invalid password".into()))?;
+
+        // Decrypt ML-KEM decapsulation key: strip the 12-byte IV prefix.
+        let kem_sk = if kem_encrypted_sk.len() > aead::NONCE_SIZE {
+            let iv: [u8; aead::NONCE_SIZE] = kem_encrypted_sk[..aead::NONCE_SIZE]
+                .try_into()
+                .map_err(|_| DiaryError::Crypto("invalid KEM key IV length".into()))?;
+            let ct = &kem_encrypted_sk[aead::NONCE_SIZE..];
+            aead::decrypt(sym_key.as_ref(), iv, ct)
+                .map_err(|_| DiaryError::Crypto("failed to decrypt KEM key".into()))?
+        } else {
+            SecureBuffer::new(vec![])
+        };
+
+        // Decrypt ML-DSA signing key: strip the 12-byte IV prefix.
+        let dsa_sk = if dsa_encrypted_sk.len() > aead::NONCE_SIZE {
+            let iv: [u8; aead::NONCE_SIZE] = dsa_encrypted_sk[..aead::NONCE_SIZE]
+                .try_into()
+                .map_err(|_| DiaryError::Crypto("invalid DSA key IV length".into()))?;
+            let ct = &dsa_encrypted_sk[aead::NONCE_SIZE..];
+            aead::decrypt(sym_key.as_ref(), iv, ct)
+                .map_err(|_| DiaryError::Crypto("failed to decrypt DSA key".into()))?
+        } else {
+            SecureBuffer::new(vec![])
+        };
+
+        let master_key = MasterKey {
+            sym_key: *sym_key.as_ref(),
+            kem_sk: kem_sk.as_ref().to_vec().into_boxed_slice(),
+            dsa_sk: dsa_sk.as_ref().to_vec().into_boxed_slice(),
+        };
+
+        self.master_key = Some(SecretBox::new(Box::new(master_key)));
+        Ok(())
+    }
+
     /// Lock the engine, securely erasing the master key from memory.
     ///
     /// After this call [`is_unlocked`](CryptoEngine::is_unlocked) returns `false`.
@@ -186,6 +249,27 @@ impl CryptoEngine {
             .as_ref()
             .map(|s| s.expose_secret())
             .ok_or(DiaryError::NotUnlocked)
+    }
+}
+
+/// Test-only constructor for [`CryptoEngine`] with explicit key material.
+///
+/// Available only in test builds (`#[cfg(test)]`).
+/// Use `unlock()` in production code.
+#[cfg(test)]
+impl CryptoEngine {
+    /// Create a [`CryptoEngine`] pre-loaded with the given symmetric key and DSA signing key.
+    pub fn new_for_testing(sym_key: [u8; 32], dsa_sk: Vec<u8>) -> Self {
+        use secrecy::SecretBox;
+        let master_key = MasterKey {
+            sym_key,
+            dsa_sk: dsa_sk.into_boxed_slice(),
+            kem_sk: vec![].into_boxed_slice(),
+        };
+        Self {
+            master_key: Some(SecretBox::new(Box::new(master_key))),
+            legacy_key: None,
+        }
     }
 }
 

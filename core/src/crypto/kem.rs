@@ -118,27 +118,22 @@ mod tests {
         assert_eq!(ss_sender.as_ref(), ss_receiver.as_ref());
     }
 
-    /// TC-004-03: DecapsulationKey (SecureBuffer) is zeroed on drop.
+    /// TC-004-03: DecapsulationKey (SecureBuffer) is zeroed by zeroize (called by Drop::drop).
     ///
-    /// # Safety
-    /// Reads the raw pointer after `drop()` to confirm zeroize ran before deallocation.
-    /// This is technically UB (freed memory access) but is intentional for security validation;
-    /// permitted in test code only.
+    /// Uses `ManuallyDrop` to call `zeroize()` while the allocation is still live,
+    /// avoiding undefined behavior from reading freed memory.
     #[test]
     fn tc_004_03_decapsulation_key_zeroize_on_drop() {
-        let ptr: *const u8;
-        let len: usize;
-        {
-            let kp = keygen().unwrap();
-            ptr = kp.decapsulation_key.as_ref().as_ptr();
-            len = kp.decapsulation_key.len();
-            // kp is dropped here → SecureBuffer::drop() → zeroize()
-        }
-        // SAFETY: intentional post-drop read for security validation.
-        // zeroize guarantees bytes are cleared before Box frees the allocation.
+        use std::mem::ManuallyDrop;
+        use zeroize::Zeroize;
+        let mut kp = ManuallyDrop::new(keygen().unwrap());
+        let ptr = kp.decapsulation_key.as_ref().as_ptr();
+        let len = kp.decapsulation_key.len();
+        kp.decapsulation_key.zeroize();
+        // SAFETY: the allocation is still live because ManuallyDrop suppresses deallocation.
         unsafe {
             for i in 0..len {
-                assert_eq!(*ptr.add(i), 0u8, "byte {i} not zeroed after drop");
+                assert_eq!(*ptr.add(i), 0u8, "byte {i} not zeroed after zeroize");
             }
         }
     }

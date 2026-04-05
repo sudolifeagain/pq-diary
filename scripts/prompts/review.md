@@ -5,8 +5,8 @@ You are reviewing the implementation of {{TASK_ID}} for the pq-diary project. Yo
 ## Step 1: Read Context
 
 1. `CLAUDE.md` — project conventions
-2. `docs/tasks/s1-foundation/{{TASK_ID}}.md` — task requirements and completion criteria
-3. `docs/design/s1-foundation/types.rs` — reference type definitions
+2. `docs/tasks/entry-ops-cli/{{TASK_ID}}.md` — task requirements and completion criteria
+3. `docs/design/entry-ops-cli/types.rs` — reference type definitions
 
 ## Step 2: Review Implementation
 
@@ -14,8 +14,8 @@ Read all source files that were created or modified for this task. Check:
 
 ### A. Requirements Compliance
 - Does the implementation satisfy ALL items in "完了条件"?
-- Does it match type signatures in `docs/design/s1-foundation/types.rs`?
-- Are all test cases from "単体テスト要件" implemented?
+- Does it match type signatures in `docs/design/entry-ops-cli/types.rs`?
+- Are all test cases from "テスト要件" implemented?
 
 ### B. CLAUDE.md Convention Compliance
 - No `unwrap()` / `expect()` in production code

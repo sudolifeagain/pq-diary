@@ -187,27 +187,25 @@ mod tests {
 
     /// TC-003-01: verify that data is zeroed when the buffer is dropped.
     ///
-    /// # Safety
-    /// Reads the raw pointer after `drop()` to confirm zeroize ran before
-    /// deallocation.  This is technically UB (freed memory access) but is
-    /// intentional for security validation; permitted in test code only.
+    /// Verifies that `SecureBuffer::zeroize()` (called by `Drop::drop`) clears all bytes.
+    ///
+    /// Uses `ManuallyDrop` to call `zeroize()` while the allocation is still live,
+    /// avoiding undefined behavior from reading freed memory.
     #[test]
     fn secure_buffer_zeroize_on_scope_exit() {
-        let ptr: *const u8;
-        let len: usize;
-        {
-            let buf = SecureBuffer::new(vec![0xAAu8; 32]);
-            ptr = buf.as_ref().as_ptr();
-            len = buf.len();
-            // buf is dropped here, which calls Drop::drop → self.zeroize() → inner.zeroize()
-        }
-        // SAFETY: intentional post-drop read for security verification.
-        // zeroize guarantees bytes are cleared before Box frees the allocation.
+        use std::mem::ManuallyDrop;
+        let mut buf = ManuallyDrop::new(SecureBuffer::new(vec![0xAAu8; 32]));
+        let ptr = buf.as_ref().as_ptr();
+        let len = buf.len();
+        // Call zeroize (the same method Drop::drop invokes) while memory is still allocated.
+        buf.zeroize();
+        // SAFETY: the allocation is still live because ManuallyDrop suppresses deallocation.
         unsafe {
             for i in 0..len {
-                assert_eq!(*ptr.add(i), 0u8, "byte {i} not zeroed after drop");
+                assert_eq!(*ptr.add(i), 0u8, "byte {i} not zeroed after zeroize");
             }
         }
+        // Intentional leak — the allocation is small and this is test code.
     }
 
     /// TC-003-B02: 1 MiB buffer drops without panic and reports correct length.

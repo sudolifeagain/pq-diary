@@ -209,6 +209,9 @@ pub fn list_entries(
     let (_header, records) = read_vault(vault_path)?;
     let mut metas = Vec::with_capacity(records.len());
     for record in records {
+        if record.record_type != RECORD_TYPE_ENTRY {
+            continue;
+        }
         let decrypted = engine.decrypt(&record.iv, &record.ciphertext)?;
         let plaintext: EntryPlaintext = serde_json::from_slice(decrypted.as_ref())
             .map_err(|e| DiaryError::Entry(format!("deserialization failed: {e}")))?;
@@ -321,7 +324,7 @@ pub fn get_entry(
 
     let mut matches: Vec<EntryRecord> = records
         .into_iter()
-        .filter(|r| prefix.matches(&r.uuid))
+        .filter(|r| r.record_type == RECORD_TYPE_ENTRY && prefix.matches(&r.uuid))
         .collect();
 
     match matches.len() {

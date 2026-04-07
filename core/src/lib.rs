@@ -17,6 +17,8 @@ pub mod crypto;
 pub mod error;
 /// Entry CRUD operations (implemented in Sprint 4).
 pub mod entry;
+/// Template CRUD operations (implemented in Sprint 5).
+pub mod template;
 /// Git synchronisation operations (implemented in Sprint 8).
 pub mod git;
 /// Digital-legacy operations (implemented in Phase 2).
@@ -32,6 +34,8 @@ pub use crypto::SecureBuffer;
 pub use error::DiaryError;
 /// Re-exported entry types for external crate use.
 pub use entry::{EntryMeta, EntryPlaintext, IdPrefix, Tag};
+/// Re-exported template types for external crate use.
+pub use template::{TemplateMeta, TemplateName, TemplatePlaintext};
 /// Re-exported vault format type for external crate use.
 pub use vault::format::EntryRecord;
 

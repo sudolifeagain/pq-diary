@@ -8,51 +8,44 @@ set -euo pipefail
 # =============================================================================
 
 # === 設定 ===
-SPRINT_NAME="entry-ops-cli"
+SPRINT_NAME="daily-note-template-link"
+SPRINT_TAG="s5"
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TASKS_DIR="${PROJECT_ROOT}/docs/tasks/${SPRINT_NAME}"
 PROMPTS_DIR="$(dirname "$0")/prompts"
 LOG_DIR="${PROJECT_ROOT}/logs/sprint-${SPRINT_NAME}"
 
 # タスク一覧 (依存順)
-TASKS=(TASK-0027 TASK-0028 TASK-0029 TASK-0030 TASK-0031 TASK-0032 TASK-0033 TASK-0034 TASK-0035 TASK-0036 TASK-0037 TASK-0038 TASK-0039 TASK-0040 TASK-0041)
+TASKS=(TASK-0042 TASK-0043 TASK-0044 TASK-0045 TASK-0046 TASK-0047 TASK-0048 TASK-0049 TASK-0050 TASK-0051 TASK-0052)
 
 # タスクタイプ
 declare -A TASK_TYPES=(
-    [TASK-0027]="TDD"
-    [TASK-0028]="TDD"
-    [TASK-0029]="TDD"
-    [TASK-0030]="TDD"
-    [TASK-0031]="TDD"
-    [TASK-0032]="TDD"
-    [TASK-0033]="TDD"
-    [TASK-0034]="TDD"
-    [TASK-0035]="TDD"
-    [TASK-0036]="TDD"
-    [TASK-0037]="TDD"
-    [TASK-0038]="TDD"
-    [TASK-0039]="TDD"
-    [TASK-0040]="TDD"
-    [TASK-0041]="TDD"
+    [TASK-0042]="TDD"
+    [TASK-0043]="TDD"
+    [TASK-0044]="TDD"
+    [TASK-0045]="TDD"
+    [TASK-0046]="TDD"
+    [TASK-0047]="TDD"
+    [TASK-0048]="TDD"
+    [TASK-0049]="TDD"
+    [TASK-0050]="TDD"
+    [TASK-0051]="TDD"
+    [TASK-0052]="TDD"
 )
 
 # タスク名 (コミットメッセージ用)
 declare -A TASK_NAMES=(
-    [TASK-0027]="EntryPlaintext, Tag, and IdPrefix type definitions"
-    [TASK-0028]="Tag validation and prefix matching"
-    [TASK-0029]="create_entry implementation"
-    [TASK-0030]="list_entries and EntryMeta implementation"
-    [TASK-0031]="get_entry and IdPrefix resolution"
-    [TASK-0032]="update_entry and delete_entry implementation"
-    [TASK-0033]="DiaryCore facade extension"
-    [TASK-0034]="three-tier password input"
-    [TASK-0035]="secure tmpdir and zeroize delete"
-    [TASK-0036]="editor launch and header comment parsing"
-    [TASK-0037]="clap update and new command"
-    [TASK-0038]="list and show commands"
-    [TASK-0039]="edit command"
-    [TASK-0040]="delete command with confirmation"
-    [TASK-0041]="integration tests and doc comments"
+    [TASK-0042]="TemplatePlaintext type and template CRUD"
+    [TASK-0043]="template engine variable expansion"
+    [TASK-0044]="LinkParser for wiki-link syntax"
+    [TASK-0045]="LinkIndex backlink index"
+    [TASK-0046]="DiaryCore facade extension for template and link"
+    [TASK-0047]="template add list show delete CLI commands"
+    [TASK-0048]="new --template flag and variable prompt"
+    [TASK-0049]="today command"
+    [TASK-0050]="show command link resolution and backlinks"
+    [TASK-0051]="vim completion function"
+    [TASK-0052]="integration tests and doc comments"
 )
 
 # モデル設定
@@ -96,8 +89,8 @@ check_prerequisites() {
 
     local branch
     branch="$(git branch --show-current)"
-    if [[ "${branch}" != "sprint/s4" ]]; then
-        log_warn "Expected 'sprint/s4', on '${branch}'"
+    if [[ "${branch}" != "sprint/${SPRINT_TAG}" ]]; then
+        log_warn "Expected 'sprint/${SPRINT_TAG}', on '${branch}'"
     fi
 
     log_ok "Prerequisites OK (claude, cargo, git)"
@@ -141,6 +134,7 @@ expand_prompt() {
 
     sed -e "s/{{TASK_ID}}/${task_id}/g" \
         -e "s/{{TASK_TYPE}}/${task_type}/g" \
+        -e "s/{{SPRINT_NAME}}/${SPRINT_NAME}/g" \
         "${template_file}"
 }
 
@@ -185,7 +179,7 @@ main() {
     log_info "Implement model: ${IMPLEMENT_MODEL}, Review model: ${REVIEW_MODEL}"
 
     # 開始タスクの決定
-    local start_task="${1:-TASK-0027}"
+    local start_task="${1:-${TASKS[0]}}"
     local start_idx=0
     for i in "${!TASKS[@]}"; do
         if [[ "${TASKS[$i]}" == "${start_task}" ]]; then
@@ -271,7 +265,7 @@ main() {
                 log_warn "[${task_id}] No changes to commit (review/verify made no modifications)"
             else
                 git commit -m "$(cat <<EOF
-feat(s4): implement ${task_id} - ${task_name}
+feat(${SPRINT_TAG}): implement ${task_id} - ${task_name}
 
 Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
 EOF

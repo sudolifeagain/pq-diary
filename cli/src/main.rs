@@ -6,7 +6,11 @@ use clap::{Parser, Subcommand};
 
 /// Post-quantum cryptography CLI journal.
 #[derive(Debug, Parser)]
-#[command(name = "pq-diary", version, about = "Post-quantum cryptography CLI journal")]
+#[command(
+    name = "pq-diary",
+    version,
+    about = "Post-quantum cryptography CLI journal"
+)]
 pub struct Cli {
     /// Vault path or name
     #[arg(short = 'v', long, global = true)]
@@ -52,6 +56,10 @@ pub enum Commands {
         /// Tag to attach (repeatable: -t tag1 -t tag2)
         #[arg(short, long = "tag")]
         tag: Vec<String>,
+
+        /// Template name to use as initial body content
+        #[arg(long)]
+        template: Option<String>,
     },
 
     /// List diary entries
@@ -246,14 +254,26 @@ pub enum TemplateCommands {
     Delete {
         /// Name of the template to delete
         name: String,
+        /// Skip confirmation prompt
+        #[arg(short, long)]
+        force: bool,
     },
 }
 
 fn dispatch(cli: &Cli) -> anyhow::Result<()> {
     match &cli.command {
-        Commands::New { title, body, tag } => {
-            commands::cmd_new(cli, title.clone(), body.clone(), tag.clone())
-        }
+        Commands::New {
+            title,
+            body,
+            tag,
+            template,
+        } => commands::cmd_new(
+            cli,
+            title.clone(),
+            body.clone(),
+            tag.clone(),
+            template.clone(),
+        ),
         Commands::Init => not_implemented("init", "Sprint 2"),
         Commands::Vault { subcommand } => match subcommand {
             VaultCommands::Create { .. } => not_implemented("vault create", "Sprint 2"),
@@ -300,15 +320,17 @@ fn dispatch(cli: &Cli) -> anyhow::Result<()> {
             DaemonCommands::Status => not_implemented("daemon status", "Sprint 10"),
             DaemonCommands::Lock => not_implemented("daemon lock", "Sprint 10"),
         },
-        Commands::Today => not_implemented("today", "Sprint 4"),
+        Commands::Today => commands::cmd_today(cli),
         Commands::Search { .. } => not_implemented("search", "Sprint 5"),
         Commands::Stats => not_implemented("stats", "Sprint 5"),
         Commands::Import { .. } => not_implemented("import", "Sprint 6"),
         Commands::Template { subcommand } => match subcommand {
-            TemplateCommands::Add { .. } => not_implemented("template add", "Sprint 6"),
-            TemplateCommands::List => not_implemented("template list", "Sprint 6"),
-            TemplateCommands::Show { .. } => not_implemented("template show", "Sprint 6"),
-            TemplateCommands::Delete { .. } => not_implemented("template delete", "Sprint 6"),
+            TemplateCommands::Add { name } => commands::cmd_template_add(cli, name.clone()),
+            TemplateCommands::List => commands::cmd_template_list(cli),
+            TemplateCommands::Show { name } => commands::cmd_template_show(cli, name.clone()),
+            TemplateCommands::Delete { name, force } => {
+                commands::cmd_template_delete(cli, name.clone(), *force)
+            }
         },
     }
 }
@@ -456,7 +478,13 @@ mod tests {
     #[test]
     fn tc_0039_p03_edit_multiple_add_tag() {
         let result = Cli::try_parse_from([
-            "pq-diary", "edit", "abcd", "--add-tag", "t1", "--add-tag", "t2",
+            "pq-diary",
+            "edit",
+            "abcd",
+            "--add-tag",
+            "t1",
+            "--add-tag",
+            "t2",
         ]);
         assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
         let cli = result.unwrap();
@@ -471,8 +499,7 @@ mod tests {
     /// TC-0039-P04: `edit <id> --remove-tag old` parses the remove-tag flag.
     #[test]
     fn tc_0039_p04_edit_remove_tag() {
-        let result =
-            Cli::try_parse_from(["pq-diary", "edit", "abcd", "--remove-tag", "old"]);
+        let result = Cli::try_parse_from(["pq-diary", "edit", "abcd", "--remove-tag", "old"]);
         assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
         let cli = result.unwrap();
         match cli.command {
@@ -522,10 +549,16 @@ mod tests {
         assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
         let cli = result.unwrap();
         match cli.command {
-            Commands::New { title, body, tag } => {
+            Commands::New {
+                title,
+                body,
+                tag,
+                template,
+            } => {
                 assert_eq!(title, None);
                 assert_eq!(body, None);
                 assert!(tag.is_empty());
+                assert_eq!(template, None);
             }
             _ => panic!("Expected Commands::New"),
         }
@@ -538,7 +571,9 @@ mod tests {
         assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
         let cli = result.unwrap();
         match cli.command {
-            Commands::New { title, body, tag } => {
+            Commands::New {
+                title, body, tag, ..
+            } => {
                 assert_eq!(title, Some("My Title".to_string()));
                 assert_eq!(body, None);
                 assert!(tag.is_empty());
@@ -554,7 +589,9 @@ mod tests {
         assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
         let cli = result.unwrap();
         match cli.command {
-            Commands::New { title, body, tag } => {
+            Commands::New {
+                title, body, tag, ..
+            } => {
                 assert_eq!(title, None);
                 assert_eq!(body, Some("Hello World".to_string()));
                 assert!(tag.is_empty());
@@ -580,8 +617,7 @@ mod tests {
     /// TC-0037-P05: `-t tag1 --tag tag2` accumulates multiple tags.
     #[test]
     fn tc_0037_p05_new_with_multiple_tags() {
-        let result =
-            Cli::try_parse_from(["pq-diary", "new", "-t", "tag1", "--tag", "tag2"]);
+        let result = Cli::try_parse_from(["pq-diary", "new", "-t", "tag1", "--tag", "tag2"]);
         assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
         let cli = result.unwrap();
         match cli.command {
@@ -596,12 +632,20 @@ mod tests {
     #[test]
     fn tc_0037_p06_new_combined_args() {
         let result = Cli::try_parse_from([
-            "pq-diary", "new", "Entry Title", "-b", "body text", "-t", "work",
+            "pq-diary",
+            "new",
+            "Entry Title",
+            "-b",
+            "body text",
+            "-t",
+            "work",
         ]);
         assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
         let cli = result.unwrap();
         match cli.command {
-            Commands::New { title, body, tag } => {
+            Commands::New {
+                title, body, tag, ..
+            } => {
                 assert_eq!(title, Some("Entry Title".to_string()));
                 assert_eq!(body, Some("body text".to_string()));
                 assert_eq!(tag, vec!["work".to_string()]);

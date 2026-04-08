@@ -125,8 +125,8 @@ impl VaultConfig {
     /// Returns [`DiaryError::Config`] on serialisation failures and
     /// [`DiaryError::Io`] on file-write failures.
     pub fn to_file(&self, path: &Path) -> Result<(), DiaryError> {
-        let content = toml::to_string_pretty(self)
-            .map_err(|e| DiaryError::Config(e.to_string()))?;
+        let content =
+            toml::to_string_pretty(self).map_err(|e| DiaryError::Config(e.to_string()))?;
         std::fs::write(path, content)?;
         Ok(())
     }
@@ -196,8 +196,8 @@ impl AppConfig {
     /// Returns [`DiaryError::Config`] on serialisation failures and
     /// [`DiaryError::Io`] on file-write failures.
     pub fn to_file(&self, path: &Path) -> Result<(), DiaryError> {
-        let content = toml::to_string_pretty(self)
-            .map_err(|e| DiaryError::Config(e.to_string()))?;
+        let content =
+            toml::to_string_pretty(self).map_err(|e| DiaryError::Config(e.to_string()))?;
         std::fs::write(path, content)?;
         Ok(())
     }

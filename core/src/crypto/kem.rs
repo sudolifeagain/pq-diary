@@ -5,8 +5,8 @@
 
 use crate::{crypto::secure_mem::SecureBuffer, error::DiaryError};
 use ml_kem::{
-    Ciphertext, Decapsulate, Encapsulate, Kem, Key, KeyExport, MlKem768,
-    EncapsulationKey768, DecapsulationKey768,
+    Ciphertext, Decapsulate, DecapsulationKey768, Encapsulate, EncapsulationKey768, Kem, Key,
+    KeyExport, MlKem768,
 };
 
 /// ML-KEM-768 key pair.

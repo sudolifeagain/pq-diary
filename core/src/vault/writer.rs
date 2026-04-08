@@ -157,7 +157,11 @@ pub fn write_entries<W: Write>(writer: &mut W, entries: &[EntryRecord]) -> Resul
 /// # Errors
 ///
 /// Returns [`DiaryError::Io`] on any I/O failure.
-pub fn write_vault(path: &Path, mut header: VaultHeader, entries: &[EntryRecord]) -> Result<(), DiaryError> {
+pub fn write_vault(
+    path: &Path,
+    mut header: VaultHeader,
+    entries: &[EntryRecord],
+) -> Result<(), DiaryError> {
     // Serialise entries first to measure the exact payload size.
     let mut entry_buf: Vec<u8> = Vec::new();
     write_entries(&mut entry_buf, entries)?;
@@ -235,8 +239,7 @@ mod tests {
         let bytes = std::fs::read(&path).expect("read file");
 
         // payload_size is at header offset 12..16
-        let payload_size =
-            u32::from_le_bytes(bytes[12..16].try_into().expect("4 bytes"));
+        let payload_size = u32::from_le_bytes(bytes[12..16].try_into().expect("4 bytes"));
 
         // Independently compute the expected entry-section size.
         let mut expected_entry_buf: Vec<u8> = Vec::new();
@@ -262,9 +265,7 @@ mod tests {
 
         write_vault(&path, VaultHeader::new(), &[]).expect("write_vault must not fail");
 
-        let file_size = std::fs::metadata(&path)
-            .expect("metadata")
-            .len() as usize;
+        let file_size = std::fs::metadata(&path).expect("metadata").len() as usize;
 
         // Compute the non-padding size by serialising header and entries independently.
         let mut entry_buf: Vec<u8> = Vec::new();

@@ -209,6 +209,9 @@ pub fn list_entries(
     let (_header, records) = read_vault(vault_path)?;
     let mut metas = Vec::with_capacity(records.len());
     for record in records {
+        if record.record_type != RECORD_TYPE_ENTRY {
+            continue;
+        }
         let decrypted = engine.decrypt(&record.iv, &record.ciphertext)?;
         let plaintext: EntryPlaintext = serde_json::from_slice(decrypted.as_ref())
             .map_err(|e| DiaryError::Entry(format!("deserialization failed: {e}")))?;
@@ -222,6 +225,43 @@ pub fn list_entries(
         });
     }
     Ok(metas)
+}
+
+/// List all entries in the vault returning metadata paired with the decrypted body text.
+///
+/// Used internally by [`DiaryCore::unlock`] to build the [`crate::link::LinkIndex`]
+/// in a single vault read.
+///
+/// # Errors
+///
+/// Returns [`DiaryError::Io`] on vault I/O failure.
+/// Returns [`DiaryError::Crypto`] if decryption fails for any record.
+/// Returns [`DiaryError::Entry`] if JSON deserialisation fails for any record.
+pub fn list_entries_with_body(
+    vault_path: &Path,
+    engine: &CryptoEngine,
+) -> Result<Vec<(EntryMeta, String)>, DiaryError> {
+    let (_header, records) = read_vault(vault_path)?;
+    let mut result = Vec::with_capacity(records.len());
+    for record in records {
+        if record.record_type != RECORD_TYPE_ENTRY {
+            continue;
+        }
+        let decrypted = engine.decrypt(&record.iv, &record.ciphertext)?;
+        let plaintext: EntryPlaintext = serde_json::from_slice(decrypted.as_ref())
+            .map_err(|e| DiaryError::Entry(format!("deserialization failed: {e}")))?;
+        let uuid_hex: String = record.uuid.iter().map(|b| format!("{:02x}", b)).collect();
+        let EntryPlaintext { title, tags, body } = plaintext;
+        let meta = EntryMeta {
+            uuid_hex,
+            title,
+            tags,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+        };
+        result.push((meta, body));
+    }
+    Ok(result)
 }
 
 /// Create a new entry in the vault and return its UUID.
@@ -321,7 +361,7 @@ pub fn get_entry(
 
     let mut matches: Vec<EntryRecord> = records
         .into_iter()
-        .filter(|r| prefix.matches(&r.uuid))
+        .filter(|r| r.record_type == RECORD_TYPE_ENTRY && prefix.matches(&r.uuid))
         .collect();
 
     match matches.len() {
@@ -336,7 +376,12 @@ pub fn get_entry(
         _ => {
             let candidates = matches
                 .iter()
-                .map(|r| r.uuid.iter().map(|b| format!("{:02x}", b)).collect::<String>())
+                .map(|r| {
+                    r.uuid
+                        .iter()
+                        .map(|b| format!("{:02x}", b))
+                        .collect::<String>()
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
             Err(DiaryError::Entry(format!(
@@ -944,9 +989,18 @@ mod tests {
         let meta = &metas[0];
         assert_eq!(meta.title, plaintext.title);
         assert_eq!(meta.tags, plaintext.tags);
-        assert_eq!(meta.uuid_hex, uuid.as_bytes().iter().map(|b| format!("{:02x}", b)).collect::<String>());
+        assert_eq!(
+            meta.uuid_hex,
+            uuid.as_bytes()
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>()
+        );
         assert!(meta.created_at > 0, "created_at must be positive");
-        assert!(meta.updated_at >= meta.created_at, "updated_at must be >= created_at");
+        assert!(
+            meta.updated_at >= meta.created_at,
+            "updated_at must be >= created_at"
+        );
     }
 
     /// TC-0030-03: list_entries returns all 3 entries with correct titles and tags.
@@ -983,7 +1037,11 @@ mod tests {
         assert_eq!(metas.len(), 3, "expected 3 metas");
 
         for (i, meta) in metas.iter().enumerate() {
-            assert_eq!(meta.title, originals[i].title, "title mismatch at index {}", i);
+            assert_eq!(
+                meta.title, originals[i].title,
+                "title mismatch at index {}",
+                i
+            );
             assert_eq!(meta.tags, originals[i].tags, "tags mismatch at index {}", i);
         }
     }
@@ -1011,13 +1069,18 @@ mod tests {
         // uuid_hex must be exactly 32 lowercase hex characters.
         assert_eq!(meta.uuid_hex.len(), 32, "uuid_hex must be 32 chars");
         assert!(
-            meta.uuid_hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+            meta.uuid_hex
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
             "uuid_hex must be lowercase hex"
         );
 
         // Timestamps must be positive.
         assert!(meta.created_at > 0, "created_at must be > 0");
-        assert!(meta.updated_at >= meta.created_at, "updated_at >= created_at");
+        assert!(
+            meta.updated_at >= meta.created_at,
+            "updated_at >= created_at"
+        );
 
         // id_prefix(4) must match the first 4 characters of uuid_hex.
         assert_eq!(meta.id_prefix(4), &meta.uuid_hex[..4]);
@@ -1052,7 +1115,10 @@ mod tests {
         assert_eq!(entries.len(), 1);
 
         let record = &entries[0];
-        assert_eq!(record.created_at, record.updated_at, "created_at must equal updated_at");
+        assert_eq!(
+            record.created_at, record.updated_at,
+            "created_at must equal updated_at"
+        );
         assert!(
             record.created_at >= before,
             "created_at ({}) must be >= before ({})",
@@ -1086,7 +1152,11 @@ mod tests {
         };
         let uuid = create_entry(&vault_path, &engine, &plaintext).expect("create_entry");
 
-        let uuid_hex: String = uuid.as_bytes().iter().map(|b| format!("{:02x}", b)).collect();
+        let uuid_hex: String = uuid
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
         let prefix = IdPrefix::new(&uuid_hex[..4]).expect("valid prefix");
 
         let (record, got) = get_entry(&vault_path, &engine, &prefix).expect("get_entry");
@@ -1198,7 +1268,11 @@ mod tests {
         };
         let uuid = create_entry(&vault_path, &engine, &plaintext).expect("create_entry");
 
-        let full_hex: String = uuid.as_bytes().iter().map(|b| format!("{:02x}", b)).collect();
+        let full_hex: String = uuid
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
         assert_eq!(full_hex.len(), 32, "UUID hex must be 32 chars");
 
         let prefix = IdPrefix::new(&full_hex).expect("valid 32-char prefix");
@@ -1234,7 +1308,11 @@ mod tests {
         update_entry(&vault_path, &engine, *uuid.as_bytes(), &updated).expect("update_entry");
 
         let prefix = IdPrefix::new(
-            &uuid.as_bytes().iter().map(|b| format!("{:02x}", b)).collect::<String>(),
+            &uuid
+                .as_bytes()
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>(),
         )
         .expect("valid prefix");
         let (_record, got) = get_entry(&vault_path, &engine, &prefix).expect("get_entry");
@@ -1264,7 +1342,11 @@ mod tests {
         update_entry(&vault_path, &engine, *uuid.as_bytes(), &updated).expect("update_entry");
 
         let prefix = IdPrefix::new(
-            &uuid.as_bytes().iter().map(|b| format!("{:02x}", b)).collect::<String>(),
+            &uuid
+                .as_bytes()
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>(),
         )
         .expect("valid prefix");
         let (_record, got) = get_entry(&vault_path, &engine, &prefix).expect("get_entry");
@@ -1294,7 +1376,11 @@ mod tests {
         update_entry(&vault_path, &engine, *uuid.as_bytes(), &updated).expect("update_entry");
 
         let prefix = IdPrefix::new(
-            &uuid.as_bytes().iter().map(|b| format!("{:02x}", b)).collect::<String>(),
+            &uuid
+                .as_bytes()
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>(),
         )
         .expect("valid prefix");
         let (_record, got) = get_entry(&vault_path, &engine, &prefix).expect("get_entry");
@@ -1329,7 +1415,10 @@ mod tests {
 
         let (_, entries_after) = read_vault(&vault_path).expect("read_vault");
         let record = &entries_after[0];
-        assert_eq!(record.created_at, created_at_before, "created_at must not change");
+        assert_eq!(
+            record.created_at, created_at_before,
+            "created_at must not change"
+        );
         assert!(
             record.updated_at >= record.created_at,
             "updated_at must be >= created_at"
@@ -1350,8 +1439,8 @@ mod tests {
             body: "body".to_string(),
         };
         let nonexistent_uuid = [0xffu8; 16];
-        let err = update_entry(&vault_path, &engine, nonexistent_uuid, &pt)
-            .expect_err("should be Err");
+        let err =
+            update_entry(&vault_path, &engine, nonexistent_uuid, &pt).expect_err("should be Err");
         assert!(matches!(err, DiaryError::Entry(_)));
     }
 
@@ -1407,8 +1496,7 @@ mod tests {
         init_test_vault(&vault_path);
 
         let nonexistent_uuid = [0xffu8; 16];
-        let err =
-            delete_entry(&vault_path, &engine, nonexistent_uuid).expect_err("should be Err");
+        let err = delete_entry(&vault_path, &engine, nonexistent_uuid).expect_err("should be Err");
         assert!(matches!(err, DiaryError::Entry(_)));
     }
 }

@@ -436,7 +436,11 @@ mod tests {
         let master_key = MasterKey {
             sym_key: [0x42u8; 32],
             dsa_sk: vec![].into_boxed_slice(),
-            kem_sk: kem_kp.decapsulation_key.as_ref().to_vec().into_boxed_slice(),
+            kem_sk: kem_kp
+                .decapsulation_key
+                .as_ref()
+                .to_vec()
+                .into_boxed_slice(),
         };
         let mut engine = CryptoEngine::new();
         engine.master_key = Some(SecretBox::new(Box::new(master_key)));
@@ -481,7 +485,10 @@ mod tests {
 
         let mac = engine.hmac(data).unwrap();
         assert_eq!(mac.len(), 32);
-        assert!(engine.hmac_verify(data, &mac).unwrap(), "hmac_verify must return true for the correct MAC");
+        assert!(
+            engine.hmac_verify(data, &mac).unwrap(),
+            "hmac_verify must return true for the correct MAC"
+        );
     }
 
     /// TC-016-E01: locked engine → encrypt returns DiaryError::NotUnlocked.
@@ -563,7 +570,10 @@ mod tests {
         let (iv, ct) = make_verification_token(password, salt, &params);
         let mut engine = CryptoEngine::new();
         engine.unlock(password, salt, &params, iv, &ct).unwrap();
-        assert!(engine.is_unlocked(), "engine must be unlocked after unlock()");
+        assert!(
+            engine.is_unlocked(),
+            "engine must be unlocked after unlock()"
+        );
 
         // Step 2: Generate full key material (DSA + KEM)
         let dsa_kp = dsa::keygen().unwrap();
@@ -576,7 +586,11 @@ mod tests {
         let master_key = MasterKey {
             sym_key,
             dsa_sk: dsa_kp.signing_key.as_ref().to_vec().into_boxed_slice(),
-            kem_sk: kem_kp.decapsulation_key.as_ref().to_vec().into_boxed_slice(),
+            kem_sk: kem_kp
+                .decapsulation_key
+                .as_ref()
+                .to_vec()
+                .into_boxed_slice(),
         };
         engine.master_key = Some(SecretBox::new(Box::new(master_key)));
 

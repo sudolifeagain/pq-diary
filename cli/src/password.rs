@@ -105,9 +105,9 @@ fn read_password_tty() -> Result<SecretString, DiaryError> {
 
     // Build new attributes with all ECHO flags disabled.
     let mut new_attrs = old_attrs.clone();
-    new_attrs.local_flags.remove(
-        LocalFlags::ECHO | LocalFlags::ECHOE | LocalFlags::ECHOK | LocalFlags::ECHONL,
-    );
+    new_attrs
+        .local_flags
+        .remove(LocalFlags::ECHO | LocalFlags::ECHOE | LocalFlags::ECHOK | LocalFlags::ECHONL);
     termios::tcsetattr(&tty, SetArg::TCSANOW, &new_attrs)
         .map_err(|e| DiaryError::Password(format!("tcsetattr failed: {e}")))?;
 

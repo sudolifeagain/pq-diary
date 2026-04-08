@@ -214,9 +214,7 @@ pub fn generate_entry_padding() -> Vec<u8> {
 ///
 /// Returns `(iv, ciphertext)` where `iv` is 12 bytes and `ciphertext` is
 /// 48 bytes (32-byte plaintext + 16-byte GCM authentication tag).
-pub fn generate_verification_token(
-    sym_key: &[u8; 32],
-) -> Result<([u8; 12], Vec<u8>), DiaryError> {
+pub fn generate_verification_token(sym_key: &[u8; 32]) -> Result<([u8; 12], Vec<u8>), DiaryError> {
     let mut plaintext = Zeroizing::new([0u8; 32]);
     OsRng.fill_bytes(&mut *plaintext);
     let (ciphertext, iv) = aead::encrypt(sym_key, &*plaintext)?;
@@ -290,7 +288,10 @@ mod tests {
     fn tc_008_03_file_padding_differs_between_calls() {
         let p1 = generate_file_padding();
         let p2 = generate_file_padding();
-        assert_ne!(p1, p2, "two calls to generate_file_padding must produce different data");
+        assert_ne!(
+            p1, p2,
+            "two calls to generate_file_padding must produce different data"
+        );
     }
 
     /// TC-007-01: generate_verification_token then verify_token with the same key → true.

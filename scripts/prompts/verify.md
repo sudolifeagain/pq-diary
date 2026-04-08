@@ -5,7 +5,7 @@ You are the final verifier for {{TASK_ID}} in the pq-diary project. Your job is 
 ## Step 1: Read Requirements
 
 1. `CLAUDE.md` — project conventions
-2. `docs/tasks/entry-ops-cli/{{TASK_ID}}.md` — task file with completion criteria
+2. `docs/tasks/{{SPRINT_NAME}}/{{TASK_ID}}.md` — task file with completion criteria
 3. `docs/definition-of-done.md` — Definition of Done checklist
 
 ## Step 2: Run All Checks

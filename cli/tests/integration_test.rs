@@ -1,9 +1,14 @@
-//! Integration tests for pq-diary CLI — Sprint 4 entry operations
+//! Integration tests for pq-diary CLI — Sprint 4 entry operations and Sprint 5 features
 //!
 //! Covers the full CRUD workflow, tag filtering, ID prefix resolution,
-//! password handling, and error cases using `pq_diary_core::DiaryCore`.
+//! password handling, error cases, template CRUD, today workflow,
+//! link resolution + backlinks, and template variable expansion.
 
-use pq_diary_core::{vault::init::VaultManager, DiaryCore, DiaryError, EntryPlaintext, IdPrefix, Tag};
+use pq_diary_core::{
+    template_engine::{expand, extract_variables, VariableKind, BUILTIN_DATE, BUILTIN_TITLE},
+    vault::init::VaultManager,
+    DiaryCore, DiaryError, EntryPlaintext, IdPrefix, Tag,
+};
 use secrecy::SecretBox;
 use tempfile::TempDir;
 
@@ -62,7 +67,11 @@ fn tc_0041_01_e2e_crud_workflow() {
 
     // Step 3: list shows the new entry.
     let after_create = core.list_entries(None).expect("list after create");
-    assert_eq!(after_create.len(), 1, "Must have exactly 1 entry after create");
+    assert_eq!(
+        after_create.len(),
+        1,
+        "Must have exactly 1 entry after create"
+    );
     assert_eq!(after_create[0].title, "初期タイトル");
     assert_eq!(after_create[0].tags, vec!["日記".to_string()]);
 
@@ -204,8 +213,14 @@ fn tc_0041_03a_tag_prefix_semantics() {
     let diary_jin = Tag::new("日記人").expect("日記人");
 
     assert!(diary.is_prefix_of(&diary_exact), "exact match must be true");
-    assert!(diary.is_prefix_of(&diary_travel), "hierarchical prefix must be true");
-    assert!(!diary.is_prefix_of(&diary_jin), "partial word must not match");
+    assert!(
+        diary.is_prefix_of(&diary_travel),
+        "hierarchical prefix must be true"
+    );
+    assert!(
+        !diary.is_prefix_of(&diary_jin),
+        "partial word must not match"
+    );
 }
 
 /// TC-0041-03b: Full tag filtering integration test.
@@ -329,19 +344,31 @@ fn tc_0041_04b_nonexistent_prefix_returns_error() {
 #[test]
 fn tc_0041_04c_id_prefix_validation() {
     // Too short (< 4 chars).
-    assert!(IdPrefix::new("abc").is_err(), "3-char prefix must be rejected");
+    assert!(
+        IdPrefix::new("abc").is_err(),
+        "3-char prefix must be rejected"
+    );
 
     // Non-hex characters.
-    assert!(IdPrefix::new("zzzz").is_err(), "Non-hex chars must be rejected");
+    assert!(
+        IdPrefix::new("zzzz").is_err(),
+        "Non-hex chars must be rejected"
+    );
     assert!(IdPrefix::new("gggg").is_err(), "'g' is not a hex char");
 
     // Valid lowercase hex.
-    assert!(IdPrefix::new("abcd").is_ok(), "4-char lowercase hex is valid");
+    assert!(
+        IdPrefix::new("abcd").is_ok(),
+        "4-char lowercase hex is valid"
+    );
     assert!(IdPrefix::new("deadbeef").is_ok(), "8-char hex is valid");
 
     // Uppercase is accepted and normalised.
     assert!(IdPrefix::new("ABCD").is_ok(), "Uppercase hex is accepted");
-    assert!(IdPrefix::new("DEADBEEF").is_ok(), "Uppercase 8-char hex accepted");
+    assert!(
+        IdPrefix::new("DEADBEEF").is_ok(),
+        "Uppercase 8-char hex accepted"
+    );
 }
 
 // =============================================================================
@@ -412,6 +439,267 @@ fn tc_0041_05d_locked_vault_rejects_operations() {
         matches!(result.unwrap_err(), DiaryError::NotUnlocked),
         "Must return DiaryError::NotUnlocked"
     );
+}
+
+// =============================================================================
+// TC-0041-06: Multiple entries — sort and filter
+// =============================================================================
+
+// =============================================================================
+// TC-S5-01: Template CRUD lifecycle — E2E integration test
+// =============================================================================
+
+/// TC-S5-01: new_template → list_templates → get_template → delete_template E2E lifecycle.
+///
+/// Exercises the full template CRUD flow using `DiaryCore` directly:
+/// create → list(1) → get(verify body) → delete → list(0).
+#[test]
+fn tc_s5_01_template_crud_lifecycle() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let vault_path = setup_vault(&dir, "tpl_crud_vault", b"tpl_password");
+
+    let mut core = DiaryCore::new(vault_path.to_str().expect("utf8")).expect("DiaryCore::new");
+    core.unlock(secret("tpl_password")).expect("unlock");
+
+    // Step 1: create template
+    let uuid_hex = core
+        .new_template("daily", "## {{date}}")
+        .expect("new_template");
+    assert_eq!(uuid_hex.len(), 32, "UUID hex must be 32 characters");
+
+    // Step 2: list → 1 template
+    let metas = core.list_templates().expect("list_templates");
+    assert_eq!(metas.len(), 1, "must have exactly 1 template");
+    assert_eq!(metas[0].name, "daily");
+
+    // Step 3: get → correct name and body
+    let got = core.get_template("daily").expect("get_template");
+    assert_eq!(got.name, "daily");
+    assert_eq!(got.body, "## {{date}}");
+
+    // Step 4: delete
+    core.delete_template("daily").expect("delete_template");
+
+    // Step 5: list → 0 templates
+    let metas2 = core.list_templates().expect("list_templates after delete");
+    assert_eq!(metas2.len(), 0, "template list must be empty after delete");
+
+    core.lock();
+}
+
+// =============================================================================
+// TC-S5-02: Today workflow — new entry + idempotency
+// =============================================================================
+
+/// TC-S5-02: today workflow creates an entry on first call and finds it on the second.
+///
+/// Simulates the `pq-diary today` logic at the DiaryCore level:
+/// - Empty vault → create entry titled `YYYY-MM-DD`.
+/// - Second call with the same date → finds the existing entry (no duplicate).
+#[test]
+fn tc_s5_02_today_new_and_existing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let vault_path = setup_vault(&dir, "today_vault", b"today_pass");
+
+    let mut core = DiaryCore::new(vault_path.to_str().expect("utf8")).expect("DiaryCore::new");
+    core.unlock(secret("today_pass")).expect("unlock");
+
+    let today = "2099-01-01";
+
+    // First call: no existing entry → simulate today logic: create it.
+    let entries = core.list_entries(None).expect("initial list");
+    let today_entry = entries.iter().find(|e| e.title == today);
+    assert!(
+        today_entry.is_none(),
+        "vault must start with no today entry"
+    );
+
+    let id = core
+        .new_entry(today, "", vec![])
+        .expect("new_entry for today");
+    assert_eq!(id.len(), 32, "UUID hex must be 32 characters");
+
+    // Second call: entry exists → simulate today logic: found by exact title match.
+    let entries2 = core.list_entries(None).expect("list after create");
+    let found = entries2.iter().find(|e| e.title == today);
+    assert!(found.is_some(), "today entry must be found on second call");
+    assert_eq!(found.unwrap().title, today);
+
+    // Verify no duplicate was created.
+    let all = core.list_entries(None).expect("list all");
+    let today_count = all.iter().filter(|e| e.title == today).count();
+    assert_eq!(today_count, 1, "must have exactly 1 today entry");
+
+    core.lock();
+}
+
+// =============================================================================
+// TC-S5-03: Today workflow with daily template
+// =============================================================================
+
+/// TC-S5-03: today workflow applies the "daily" template when available.
+///
+/// Simulates the `pq-diary today` logic:
+/// 1. Create "daily" template with `{{date}}` variable.
+/// 2. Simulate today logic: get template → expand with today's date → create entry.
+/// 3. Verify the created entry body matches the expanded template.
+#[test]
+fn tc_s5_03_today_with_daily_template() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let vault_path = setup_vault(&dir, "today_tpl_vault", b"today_tpl_pass");
+
+    let mut core = DiaryCore::new(vault_path.to_str().expect("utf8")).expect("DiaryCore::new");
+    core.unlock(secret("today_tpl_pass")).expect("unlock");
+
+    let today = "2026-04-05";
+
+    // Create the daily template.
+    core.new_template("daily", "## {{date}} の記録")
+        .expect("new_template");
+
+    // Simulate today logic: get template and expand variables.
+    let tpl = core.get_template("daily").expect("get_template");
+    let mut vars = std::collections::HashMap::new();
+    vars.insert(BUILTIN_DATE.to_string(), today.to_string());
+    vars.insert(BUILTIN_TITLE.to_string(), today.to_string());
+    let initial_body = expand(&tpl.body, &vars);
+
+    // Verify expansion result before creating entry.
+    assert_eq!(initial_body, "## 2026-04-05 の記録");
+
+    // Create the today entry with the expanded body.
+    let id = core
+        .new_entry(today, &initial_body, vec![])
+        .expect("new_entry with template body");
+    assert_eq!(id.len(), 32);
+
+    // Verify the stored entry body.
+    let (_, pt) = core.get_entry(&id[..8]).expect("get_entry");
+    assert_eq!(pt.title, today);
+    assert_eq!(pt.body, "## 2026-04-05 の記録");
+
+    core.lock();
+}
+
+// =============================================================================
+// TC-S5-04: Link resolution + backlinks — E2E integration test
+// =============================================================================
+
+/// TC-S5-04: `resolve_links` and `backlinks_for` work end-to-end.
+///
+/// Creates two entries where A links to B, then verifies:
+/// - `resolve_links("[[エントリB]] を参照")` finds exactly 1 match.
+/// - `backlinks_for("エントリB")` returns エントリA as the source.
+#[test]
+fn tc_s5_04_link_resolution_and_backlinks() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let vault_path = setup_vault(&dir, "link_vault", b"link_pass");
+
+    let mut core = DiaryCore::new(vault_path.to_str().expect("utf8")).expect("DiaryCore::new");
+    core.unlock(secret("link_pass")).expect("first unlock");
+
+    core.new_entry("エントリA", "[[エントリB]] を参照", vec![])
+        .expect("new_entry A");
+    core.new_entry("エントリB", "Bの内容", vec![])
+        .expect("new_entry B");
+    core.lock();
+
+    // Re-unlock to rebuild the LinkIndex from the saved entries.
+    core.unlock(secret("link_pass")).expect("second unlock");
+
+    // resolve_links → 1 resolved match
+    let resolved = core
+        .resolve_links("[[エントリB]] を参照")
+        .expect("resolve_links");
+    assert_eq!(resolved.len(), 1, "must find 1 link");
+    assert_eq!(resolved[0].title, "エントリB");
+    assert_eq!(
+        resolved[0].matches.len(),
+        1,
+        "link must resolve to exactly 1 entry"
+    );
+
+    // backlinks_for → エントリA is the source
+    let backlinks = core.backlinks_for("エントリB").expect("backlinks_for");
+    assert_eq!(backlinks.len(), 1, "エントリB must have 1 backlink");
+    assert_eq!(backlinks[0].source_title, "エントリA");
+
+    core.lock();
+}
+
+// =============================================================================
+// TC-S5-05: Duplicate title link resolution
+// =============================================================================
+
+/// TC-S5-05: `resolve_links` returns 2 candidates when 2 entries share the same title.
+///
+/// Creates two entries both titled "メモ", then verifies that
+/// `resolve_links("[[メモ]]")` returns exactly 2 matches (ambiguous link).
+#[test]
+fn tc_s5_05_duplicate_title_link_resolution() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let vault_path = setup_vault(&dir, "dup_vault", b"dup_pass");
+
+    let mut core = DiaryCore::new(vault_path.to_str().expect("utf8")).expect("DiaryCore::new");
+    core.unlock(secret("dup_pass")).expect("first unlock");
+
+    core.new_entry("メモ", "内容1", vec![])
+        .expect("new_entry メモ1");
+    core.new_entry("メモ", "内容2", vec![])
+        .expect("new_entry メモ2");
+    core.lock();
+
+    // Re-unlock to rebuild the LinkIndex.
+    core.unlock(secret("dup_pass")).expect("second unlock");
+
+    let resolved = core.resolve_links("[[メモ]]").expect("resolve_links");
+    assert_eq!(resolved.len(), 1, "must find 1 link reference");
+    assert_eq!(resolved[0].title, "メモ");
+    assert_eq!(
+        resolved[0].matches.len(),
+        2,
+        "ambiguous link must yield 2 candidates"
+    );
+
+    core.lock();
+}
+
+// =============================================================================
+// TC-S5-06: Template variable expansion — unit-level E2E
+// =============================================================================
+
+/// TC-S5-06: `extract_variables` + `expand` work correctly together.
+///
+/// Verifies:
+/// 1. `extract_variables("## {{date}} - {{project_name}}")` returns 2 refs.
+/// 2. `expand()` with `date="2026-04-05"` and `project_name="Alpha"` produces
+///    `"## 2026-04-05 - Alpha"`.
+#[test]
+fn tc_s5_06_template_variable_expansion() {
+    let body = "## {{date}} - {{project_name}}";
+
+    // Step 1: extract variables
+    let refs = extract_variables(body);
+    assert_eq!(refs.len(), 2, "must find exactly 2 variable references");
+    assert_eq!(refs[0].name, "date");
+    assert!(
+        matches!(refs[0].kind, VariableKind::Builtin),
+        "date must be Builtin"
+    );
+    assert_eq!(refs[1].name, "project_name");
+    assert!(
+        matches!(refs[1].kind, VariableKind::Custom),
+        "project_name must be Custom"
+    );
+
+    // Step 2: expand with values
+    let mut vars = std::collections::HashMap::new();
+    vars.insert("date".to_string(), "2026-04-05".to_string());
+    vars.insert("project_name".to_string(), "Alpha".to_string());
+    let result = expand(body, &vars);
+
+    // Step 3: verify result
+    assert_eq!(result, "## 2026-04-05 - Alpha");
 }
 
 // =============================================================================

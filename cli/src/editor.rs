@@ -239,6 +239,62 @@ pub fn read_header_file(path: &Path) -> Result<HeaderComment, DiaryError> {
     Ok(HeaderComment { title, tags, body })
 }
 
+/// Write a blank template body to a temporary plain-text file.
+///
+/// The file is created inside `tmpdir` with a UUID-based filename (`{uuid}.md`)
+/// and contains no content, allowing the user to write the template body from scratch.
+///
+/// # Errors
+///
+/// Returns [`DiaryError::Io`] on file creation failure.
+pub fn write_template_file(tmpdir: &Path) -> Result<PathBuf, DiaryError> {
+    let filename = format!("{}.md", uuid::Uuid::new_v4().as_simple());
+    let path = tmpdir.join(&filename);
+    std::fs::File::create(&path)?;
+    Ok(path)
+}
+
+/// Read the contents of a template temporary file as plain text.
+///
+/// Unlike [`read_header_file`], this function returns the raw file contents
+/// without any header parsing.
+///
+/// # Errors
+///
+/// Returns [`DiaryError::Io`] if the file cannot be read.
+pub fn read_template_file(path: &Path) -> Result<String, DiaryError> {
+    std::fs::read_to_string(path).map_err(DiaryError::from)
+}
+
+/// Write a list of entry titles to a temporary completion file.
+///
+/// The file is created inside `tmpdir` with a UUID-based filename
+/// (`{uuid}.completion`) and contains one title per line (joined by `"\n"`).
+/// Only titles are written — no body text or tag information.
+///
+/// # Errors
+///
+/// Returns [`DiaryError::Io`] on file creation or write failure.
+pub fn write_completion_file(tmpdir: &Path, titles: &[String]) -> Result<PathBuf, DiaryError> {
+    let filename = format!("{}.completion", uuid::Uuid::new_v4().as_simple());
+    let path = tmpdir.join(&filename);
+    let content = titles.join("\n");
+    std::fs::write(&path, content.as_bytes())?;
+    Ok(path)
+}
+
+/// Returns vim/neovim `[[title]]` completion options for the given completion file.
+///
+/// Reads `$EDITOR` (falling back to the platform default) to detect vim/nvim.
+/// For vim or nvim, returns `["-c", "<vim-script>"]` that defines the
+/// `PqDiaryComplete` completefunc, which reads titles from `completion_file`
+/// and filters them by the typed base string.
+/// Returns an empty vector for all other editors.
+pub fn vim_completion_options(completion_file: &Path) -> Vec<String> {
+    let command = std::env::var("EDITOR").unwrap_or_else(|_| default_editor());
+    vim_completion_options_for(&command, completion_file)
+}
+
 /// Launch `$EDITOR` for the given temporary file and wait for it to exit.
 ///
 /// - vim/neovim options (`-c "set noswapfile nobackup noundofile"`) are
@@ -260,9 +316,7 @@ pub fn launch_editor(tmpfile: &Path, config: &EditorConfig) -> Result<(), DiaryE
     cmd.arg(tmpfile);
 
     let tmpdir_str = config.secure_tmpdir.to_str().ok_or_else(|| {
-        DiaryError::Editor(
-            "Secure tmpdir path contains non-UTF-8 characters".to_string(),
-        )
+        DiaryError::Editor("Secure tmpdir path contains non-UTF-8 characters".to_string())
     })?;
 
     #[cfg(unix)]
@@ -270,9 +324,12 @@ pub fn launch_editor(tmpfile: &Path, config: &EditorConfig) -> Result<(), DiaryE
     cmd.env("TEMP", tmpdir_str);
     cmd.env("TMP", tmpdir_str);
 
-    let status = cmd
-        .status()
-        .map_err(|e| DiaryError::Editor(format!("Failed to launch editor '{}': {}", config.command, e)))?;
+    let status = cmd.status().map_err(|e| {
+        DiaryError::Editor(format!(
+            "Failed to launch editor '{}': {}",
+            config.command, e
+        ))
+    })?;
 
     if !status.success() {
         return Err(DiaryError::Editor(format!(
@@ -298,6 +355,49 @@ fn default_editor() -> String {
     } else {
         "vi".to_string()
     }
+}
+
+/// Returns vim/neovim completion `-c` options for the given editor command and file.
+///
+/// Returns `["-c", "<vim-script>"]` when the basename of `command` is `"vim"`
+/// or `"nvim"` (`.exe` suffix stripped on Windows).  The vim script defines
+/// `PqDiaryComplete` as the `completefunc` and reads titles from `completion_file`.
+/// Path separators in `completion_file` are normalised to `/` for vim script
+/// compatibility on Windows.
+/// Returns an empty vector for all other editors.
+fn vim_completion_options_for(command: &str, completion_file: &Path) -> Vec<String> {
+    let basename = Path::new(command)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(command);
+    let basename = basename.strip_suffix(".exe").unwrap_or(basename);
+
+    if basename != "vim" && basename != "nvim" {
+        return vec![];
+    }
+
+    // Normalise Windows backslashes to forward slashes for vim script.
+    let path_str = completion_file.to_str().unwrap_or("").replace('\\', "/");
+
+    let vim_script = format!(
+        "set completefunc=PqDiaryComplete\n\
+         function! PqDiaryComplete(findstart, base)\n\
+           if a:findstart\n\
+             let line = getline('.')\n\
+             let start = col('.') - 1\n\
+             while start > 1 && line[start-2:start-1] != '[['\n\
+               let start -= 1\n\
+             endwhile\n\
+             return start\n\
+           else\n\
+             let titles = readfile('{path}')\n\
+             return filter(titles, 'v:val =~ \"^\" . a:base')\n\
+           endif\n\
+         endfunction",
+        path = path_str
+    );
+
+    vec!["-c".to_string(), vim_script]
 }
 
 /// Returns the vim/neovim security options for the given editor command.
@@ -369,9 +469,8 @@ fn ensure_dir_0700(dir: &Path) -> Result<(), DiaryError> {
     use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 
     if dir.is_dir() {
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
-            DiaryError::Editor(format!("Failed to set tmpdir permissions: {e}"))
-        })?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| DiaryError::Editor(format!("Failed to set tmpdir permissions: {e}")))?;
         return Ok(());
     }
 
@@ -407,14 +506,11 @@ fn secure_tmpdir_windows() -> Result<PathBuf, DiaryError> {
 /// object-inherit + container-inherit full control (`(OI)(CI)F`).
 #[cfg(windows)]
 fn set_owner_only_acl(path: &Path) -> Result<(), DiaryError> {
-    let username = std::env::var("USERNAME").map_err(|_| {
-        DiaryError::Editor("USERNAME environment variable is not set".to_string())
-    })?;
+    let username = std::env::var("USERNAME")
+        .map_err(|_| DiaryError::Editor("USERNAME environment variable is not set".to_string()))?;
 
     let path_str = path.to_str().ok_or_else(|| {
-        DiaryError::Editor(
-            "Temp directory path contains non-UTF-8 characters".to_string(),
-        )
+        DiaryError::Editor("Temp directory path contains non-UTF-8 characters".to_string())
     })?;
 
     let status = std::process::Command::new("icacls")
@@ -600,7 +696,11 @@ mod tests {
         assert_eq!(header.title, Some("My Title".to_string()));
         assert_eq!(
             header.tags,
-            Some(vec!["tag1".to_string(), "tag2".to_string(), "tag3".to_string()])
+            Some(vec![
+                "tag1".to_string(),
+                "tag2".to_string(),
+                "tag3".to_string()
+            ])
         );
         assert_eq!(header.body, "Hello\nWorld");
     }
@@ -719,7 +819,10 @@ mod tests {
         let opts = vim_options_for("vim");
         assert_eq!(
             opts,
-            vec!["-c".to_string(), "set noswapfile nobackup noundofile".to_string()]
+            vec![
+                "-c".to_string(),
+                "set noswapfile nobackup noundofile".to_string()
+            ]
         );
     }
 
@@ -729,7 +832,10 @@ mod tests {
         let opts = vim_options_for("nvim");
         assert_eq!(
             opts,
-            vec!["-c".to_string(), "set noswapfile nobackup noundofile".to_string()]
+            vec![
+                "-c".to_string(),
+                "set noswapfile nobackup noundofile".to_string()
+            ]
         );
     }
 
@@ -740,7 +846,10 @@ mod tests {
         let opts = vim_options_for("/usr/bin/vim");
         assert_eq!(
             opts,
-            vec!["-c".to_string(), "set noswapfile nobackup noundofile".to_string()]
+            vec![
+                "-c".to_string(),
+                "set noswapfile nobackup noundofile".to_string()
+            ]
         );
     }
 
@@ -775,7 +884,10 @@ mod tests {
         let opts = vim_options_for("vim.exe");
         assert_eq!(
             opts,
-            vec!["-c".to_string(), "set noswapfile nobackup noundofile".to_string()]
+            vec![
+                "-c".to_string(),
+                "set noswapfile nobackup noundofile".to_string()
+            ]
         );
     }
 
@@ -810,5 +922,153 @@ mod tests {
         let p2 = write_header_file(dir.path(), &plaintext).expect("write 2");
 
         assert_ne!(p1, p2, "Each write must produce a unique filename");
+    }
+
+    // -------------------------------------------------------------------------
+    // write_completion_file tests (TASK-0051)
+    // -------------------------------------------------------------------------
+
+    /// TC-051-01: write_completion_file produces one-title-per-line content.
+    #[test]
+    fn tc_051_01_write_completion_file_content() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let titles = vec![
+            "日記A".to_string(),
+            "ミーティング".to_string(),
+            "TODO".to_string(),
+        ];
+
+        let path = write_completion_file(dir.path(), &titles).expect("write_completion_file");
+        let content = std::fs::read_to_string(&path).expect("read");
+
+        assert_eq!(content, "日記A\nミーティング\nTODO");
+    }
+
+    /// TC-051-02: write_completion_file contains titles only (no body or tag info).
+    #[test]
+    fn tc_051_02_write_completion_file_titles_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let titles = vec!["タイトル1".to_string(), "タイトル2".to_string()];
+
+        let path = write_completion_file(dir.path(), &titles).expect("write_completion_file");
+        let content = std::fs::read_to_string(&path).expect("read");
+
+        // Each line must be exactly one of the input titles.
+        for line in content.lines() {
+            assert!(
+                titles.contains(&line.to_string()),
+                "Completion file contains unexpected content: {line:?}"
+            );
+        }
+        // Number of lines must match number of titles.
+        assert_eq!(content.lines().count(), titles.len());
+    }
+
+    // -------------------------------------------------------------------------
+    // vim_completion_options tests (TASK-0051)
+    // -------------------------------------------------------------------------
+
+    /// TC-051-03: vim_completion_options_for returns "-c" options for "vim".
+    #[test]
+    fn tc_051_03_vim_completion_options_for_vim() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tc051_03.completion");
+        std::fs::write(&path, "").expect("write");
+
+        let opts = vim_completion_options_for("vim", &path);
+        assert!(!opts.is_empty(), "vim must produce completion options");
+        assert!(
+            opts.contains(&"-c".to_string()),
+            "options must contain \"-c\": {opts:?}"
+        );
+    }
+
+    /// TC-051-03b: vim_completion_options_for returns "-c" options for "nvim".
+    #[test]
+    fn tc_051_03b_vim_completion_options_for_nvim() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tc051_03b.completion");
+        std::fs::write(&path, "").expect("write");
+
+        let opts = vim_completion_options_for("nvim", &path);
+        assert!(!opts.is_empty(), "nvim must produce completion options");
+        assert!(opts.contains(&"-c".to_string()));
+    }
+
+    /// TC-051-04: vim_completion_options_for returns empty Vec for "nano".
+    #[test]
+    fn tc_051_04_vim_completion_options_for_nano() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tc051_04.completion");
+        std::fs::write(&path, "").expect("write");
+
+        let opts = vim_completion_options_for("nano", &path);
+        assert!(opts.is_empty(), "nano must not produce completion options");
+    }
+
+    /// TC-051-04b: vim_completion_options_for returns empty Vec for "emacs".
+    #[test]
+    fn tc_051_04b_vim_completion_options_for_emacs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tc051_04b.completion");
+        std::fs::write(&path, "").expect("write");
+
+        let opts = vim_completion_options_for("emacs", &path);
+        assert!(opts.is_empty(), "emacs must not produce completion options");
+    }
+
+    /// TC-051-05: secure_delete removes a completion file without trace.
+    #[test]
+    fn tc_051_05_secure_delete_removes_completion_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let titles = vec!["Entry A".to_string(), "Entry B".to_string()];
+        let path = write_completion_file(dir.path(), &titles).expect("write_completion_file");
+
+        assert!(path.exists(), "Completion file must exist before deletion");
+
+        let result = secure_delete(&path);
+        assert!(result.is_ok(), "secure_delete failed: {:?}", result.err());
+        assert!(
+            !path.exists(),
+            "Completion file must not exist after secure_delete"
+        );
+    }
+
+    /// write_completion_file produces a ".completion" extension file inside tmpdir.
+    #[test]
+    fn tc_051_file_extension_and_location() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let titles = vec!["A".to_string()];
+
+        let path = write_completion_file(dir.path(), &titles).expect("write_completion_file");
+
+        assert_eq!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("completion"),
+            "File must have .completion extension"
+        );
+        assert_eq!(
+            path.parent().expect("parent"),
+            dir.path(),
+            "File must be inside the given tmpdir"
+        );
+    }
+
+    /// vim_completion_options_for includes the completion file path in the script.
+    #[test]
+    fn tc_051_completion_script_contains_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("titles.completion");
+        std::fs::write(&path, "").expect("write");
+
+        let opts = vim_completion_options_for("vim", &path);
+        assert_eq!(opts.len(), 2, "Must return exactly [\"-c\", \"<script>\"]");
+
+        let script = &opts[1];
+        let path_forward = path.to_str().unwrap().replace('\\', "/");
+        assert!(
+            script.contains(&path_forward),
+            "vim script must reference the completion file path"
+        );
     }
 }

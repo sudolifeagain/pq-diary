@@ -74,6 +74,15 @@ pub enum DiaryError {
     /// CLI argument validation error.
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+
+    // --- Sprint 5 ---
+    /// Template not found in the vault.
+    #[error("template not found: {0}")]
+    TemplateNotFound(String),
+
+    /// Invalid template name.
+    #[error("invalid template name: {0}")]
+    InvalidTemplateName(String),
 }
 
 #[cfg(test)]
@@ -102,9 +111,11 @@ mod tests {
             DiaryError::Daemon("daemon not running".into()),
             DiaryError::Password("too short".into()),
             DiaryError::InvalidArgument("unknown flag".into()),
+            DiaryError::TemplateNotFound("daily".into()),
+            DiaryError::InvalidTemplateName("bad name".into()),
         ];
 
-        assert_eq!(errors.len(), 16, "expected exactly 16 variants");
+        assert_eq!(errors.len(), 18, "expected exactly 18 variants");
 
         for e in &errors {
             let msg = format!("{}", e);
@@ -143,10 +154,10 @@ mod tests {
         );
     }
 
-    /// TC-002-B01: all 16 variants compile and produce non-empty Display strings.
+    /// TC-002-B01: all 18 variants compile and produce non-empty Display strings.
     /// This is a compile-time exhaustiveness check + runtime Display check.
     #[test]
-    fn test_all_16_variants_exhaustive() {
+    fn test_all_18_variants_exhaustive() {
         fn check(e: &DiaryError) {
             assert!(!format!("{}", e).is_empty());
         }
@@ -166,5 +177,7 @@ mod tests {
         check(&DiaryError::Daemon("x".into()));
         check(&DiaryError::Password("x".into()));
         check(&DiaryError::InvalidArgument("x".into()));
+        check(&DiaryError::TemplateNotFound("x".into()));
+        check(&DiaryError::InvalidTemplateName("x".into()));
     }
 }

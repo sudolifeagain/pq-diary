@@ -312,7 +312,8 @@ pub fn cmd_list(
 ///
 /// Displays the full content of the entry identified by `id` (an ID prefix of
 /// at least 4 hex characters).  Output includes title, created/updated dates,
-/// tag list, a blank line, and the full body text.
+/// tag list, a blank line, the full body text, resolved `[[link]]` references
+/// (if any), and a `--- Backlinks ---` section (if the entry has incoming links).
 ///
 /// # Errors
 ///
@@ -320,6 +321,14 @@ pub fn cmd_list(
 /// Returns an error with a descriptive message when no entry matches or multiple
 /// entries match the given prefix.
 pub fn cmd_show(cli: &Cli, id: String) -> anyhow::Result<()> {
+    cmd_show_impl(cli, id, &mut std::io::stdout())
+}
+
+/// Internal implementation of `cmd_show` with an injectable writer.
+///
+/// Separating the writer allows tests to capture the output without spawning a
+/// subprocess or redirecting `stdout`.
+fn cmd_show_impl(cli: &Cli, id: String, out: &mut dyn std::io::Write) -> anyhow::Result<()> {
     use secrecy::{ExposeSecret as _, SecretBox};
 
     let password_source =
@@ -348,10 +357,13 @@ pub fn cmd_show(cli: &Cli, id: String) -> anyhow::Result<()> {
             let created = format_timestamp(record.created_at);
             let updated = format_timestamp(record.updated_at);
 
-            println!("Title:   {}", plaintext.title);
-            println!("Created: {created}  Updated: {updated}");
+            writeln!(out, "Title:   {}", plaintext.title)
+                .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+            writeln!(out, "Created: {created}  Updated: {updated}")
+                .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
             if plaintext.tags.is_empty() {
-                println!("Tags:    (none)");
+                writeln!(out, "Tags:    (none)")
+                    .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
             } else {
                 let tags_str = plaintext
                     .tags
@@ -359,15 +371,78 @@ pub fn cmd_show(cli: &Cli, id: String) -> anyhow::Result<()> {
                     .map(|t| format!("#{t}"))
                     .collect::<Vec<_>>()
                     .join("  ");
-                println!("Tags:    {tags_str}");
+                writeln!(out, "Tags:    {tags_str}")
+                    .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
             }
-            println!();
-            print!("{}", plaintext.body);
+            writeln!(out).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+            write!(out, "{}", plaintext.body)
+                .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+
+            // Resolve [[link]] references in the body.
+            let resolved = core
+                .resolve_links(&plaintext.body)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            if !resolved.is_empty() {
+                writeln!(out).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+                writeln!(out, "--- Links ---")
+                    .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+                for link in &resolved {
+                    match link.matches.len() {
+                        0 => writeln!(out, "  [[{}]] (未解決)", link.title)
+                            .map_err(|e| anyhow::anyhow!("Write error: {e}"))?,
+                        1 => writeln!(
+                            out,
+                            "  [[{}]] → [{}]",
+                            link.title, link.matches[0].id_prefix
+                        )
+                        .map_err(|e| anyhow::anyhow!("Write error: {e}"))?,
+                        _ => {
+                            writeln!(out, "  [[{}]] → 複数候補:", link.title)
+                                .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+                            for m in &link.matches {
+                                writeln!(out, "    [{}]", m.id_prefix)
+                                    .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Display backlinks (newest first).
+            let mut backlinks = core
+                .backlinks_for(&plaintext.title)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            if !backlinks.is_empty() {
+                backlinks.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+                writeln!(out).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+                writeln!(out, "--- Backlinks ---")
+                    .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+                for bl in &backlinks {
+                    let date = format_timestamp(bl.created_at);
+                    let prefix = backlink_uuid_prefix(&bl.source_uuid);
+                    writeln!(out, "  [{prefix}] {date} {}", bl.source_title)
+                        .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+                }
+            }
 
             core.lock();
             Ok(())
         }
     }
+}
+
+/// Convert the first 4 bytes of a raw UUID into an 8-character lowercase hex prefix.
+fn backlink_uuid_prefix(bytes: &[u8; 16]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(8);
+    for &b in bytes.iter().take(4) {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
 }
 
 /// Execute the `pq-diary edit` command.
@@ -2830,6 +2905,165 @@ mod tests {
         assert_eq!(
             plaintext.body, "## 2099-11-11",
             "body must be the expanded template"
+        );
+    }
+
+    // =========================================================================
+    // TASK-0050: cmd_show link resolution + backlink display tests
+    // =========================================================================
+
+    /// Seed the vault with entries directly via DiaryCore.
+    fn seed_entries(vault_dir: &std::path::Path, entries: &[(&str, &str)]) -> Vec<String> {
+        let vault_pqd = vault_dir.join("vault.pqd");
+        let vault_str = vault_pqd.to_str().expect("utf8");
+        let mut core = DiaryCore::new(vault_str).expect("DiaryCore::new");
+        let pw: secrecy::SecretString = secrecy::SecretBox::new(Box::from("password"));
+        core.unlock(pw).expect("unlock");
+        let mut ids = Vec::new();
+        for (title, body) in entries {
+            let id = core.new_entry(title, body, vec![]).expect("new_entry");
+            ids.push(id);
+        }
+        core.lock();
+        ids
+    }
+
+    /// Capture the output of cmd_show_impl into a String.
+    fn capture_show(vault_dir: &std::path::Path, id_prefix: &str) -> anyhow::Result<String> {
+        let vault_pqd = vault_dir.join("vault.pqd");
+        let vault_dir_str = vault_pqd.parent().unwrap().to_str().expect("utf8");
+        let cli = make_show_cli(vault_dir_str, Some("password"), id_prefix);
+        let mut buf: Vec<u8> = Vec::new();
+        cmd_show_impl(&cli, id_prefix.to_string(), &mut buf)?;
+        Ok(String::from_utf8(buf).expect("utf8 output"))
+    }
+
+    /// TC-050-01: Unique link resolution shows UUID prefix.
+    ///
+    /// Given entry A (body "[[B]]") and entry B, showing entry A must display
+    /// "[[B]] → [<prefix of B>]" in the Links section.
+    #[test]
+    fn tc_050_01_unique_link_shows_prefix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+
+        // Create entry B first so its UUID is known.
+        let ids = seed_entries(&vault_dir, &[("B", ""), ("A", "[[B]]")]);
+        let b_prefix = &ids[0][..8];
+        let a_prefix = &ids[1][..4];
+
+        let output = capture_show(&vault_dir, a_prefix).expect("cmd_show_impl");
+        assert!(
+            output.contains(&format!("[[B]] → [{b_prefix}]")),
+            "output must contain '[[B]] → [{b_prefix}]', got:\n{output}"
+        );
+    }
+
+    /// TC-050-02: Unresolved link shows "(未解決)".
+    ///
+    /// Given entry A (body "[[存在しない]]") with no entry titled "存在しない",
+    /// showing entry A must display "[[存在しない]] (未解決)".
+    #[test]
+    fn tc_050_02_unresolved_link_shows_unresolved() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+
+        let ids = seed_entries(&vault_dir, &[("A", "[[存在しない]]")]);
+        let a_prefix = &ids[0][..4];
+
+        let output = capture_show(&vault_dir, a_prefix).expect("cmd_show_impl");
+        assert!(
+            output.contains("[[存在しない]] (未解決)"),
+            "output must contain '[[存在しない]] (未解決)', got:\n{output}"
+        );
+    }
+
+    /// TC-050-03: Ambiguous link (multiple matching entries) shows candidate list.
+    ///
+    /// Given entries A and B both titled "メモ", and entry C (body "[[メモ]]"),
+    /// showing entry C must list 2 candidates.
+    #[test]
+    fn tc_050_03_ambiguous_link_shows_candidates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+
+        let ids = seed_entries(
+            &vault_dir,
+            &[("メモ", ""), ("メモ", ""), ("C", "[[メモ]]")],
+        );
+        let c_prefix = &ids[2][..4];
+
+        let output = capture_show(&vault_dir, c_prefix).expect("cmd_show_impl");
+        assert!(
+            output.contains("[[メモ]] → 複数候補:"),
+            "output must contain '[[メモ]] → 複数候補:', got:\n{output}"
+        );
+        // Count occurrences of "    [" to verify two candidates are listed.
+        let candidate_count = output.matches("    [").count();
+        assert_eq!(
+            candidate_count, 2,
+            "must list exactly 2 candidates, got:\n{output}"
+        );
+    }
+
+    /// TC-050-04: Backlinks section appears when entry is referenced.
+    ///
+    /// Given entry A (body "[[B]]") and entry B, showing entry B must display
+    /// "--- Backlinks ---" with entry A listed.
+    #[test]
+    fn tc_050_04_backlinks_section_shows_referencing_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+
+        let ids = seed_entries(&vault_dir, &[("B", ""), ("A", "[[B]]")]);
+        let b_prefix = &ids[0][..4];
+
+        let output = capture_show(&vault_dir, b_prefix).expect("cmd_show_impl");
+        assert!(
+            output.contains("--- Backlinks ---"),
+            "output must contain '--- Backlinks ---', got:\n{output}"
+        );
+        assert!(
+            output.contains("A"),
+            "backlinks section must include entry A's title, got:\n{output}"
+        );
+    }
+
+    /// TC-050-05: No backlinks → "--- Backlinks ---" section is absent.
+    ///
+    /// Given an entry not referenced by any other entry, showing it must NOT
+    /// display the "--- Backlinks ---" section.
+    #[test]
+    fn tc_050_05_no_backlinks_section_hidden() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+
+        let ids = seed_entries(&vault_dir, &[("Standalone", "no links here")]);
+        let prefix = &ids[0][..4];
+
+        let output = capture_show(&vault_dir, prefix).expect("cmd_show_impl");
+        assert!(
+            !output.contains("--- Backlinks ---"),
+            "output must NOT contain '--- Backlinks ---' for an unreferenced entry, got:\n{output}"
+        );
+    }
+
+    /// TC-050-06: Entry with no [[links]] shows no Links section.
+    ///
+    /// Given an entry whose body contains no "[[" patterns, showing it must NOT
+    /// display the "--- Links ---" section.
+    #[test]
+    fn tc_050_06_no_links_in_body_no_links_section() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+
+        let ids = seed_entries(&vault_dir, &[("Plain", "plain text without any links")]);
+        let prefix = &ids[0][..4];
+
+        let output = capture_show(&vault_dir, prefix).expect("cmd_show_impl");
+        assert!(
+            !output.contains("--- Links ---"),
+            "output must NOT contain '--- Links ---' for an entry with no links, got:\n{output}"
         );
     }
 }

@@ -122,6 +122,12 @@ run_tests() {
         return 1
     fi
 
+    log_info "${label}: cargo fmt --check"
+    if ! cargo fmt --check >> "${LOG_DIR}/${CURRENT_TASK}_fmt.log" 2>&1; then
+        log_warn "${label}: cargo fmt found issues, auto-fixing"
+        cargo fmt >> "${LOG_DIR}/${CURRENT_TASK}_fmt.log" 2>&1
+    fi
+
     log_ok "${label}: all checks passed"
     return 0
 }

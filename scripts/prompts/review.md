@@ -30,10 +30,49 @@ Read all source files that were created or modified for this task. Check:
 - Error messages in English
 - Test modules use `#[cfg(test)] mod tests`
 
-### D. Security Invariants
-- Drop implementations call `zeroize()`
-- No secret data in error messages
-- No plaintext written to disk
+### D. Security Patterns (MUST check all)
+
+**D-1: Resource cleanup guarantee**
+- If the code calls `core.unlock()`, trace EVERY subsequent error path
+  (every `?`, every `return Err`, every early return). Does each one call
+  `core.lock()` before returning? If there are more than 3 `?` operators
+  after unlock, require a closure/guard pattern instead of individual checks.
+- If the code creates temp files, is `secure_delete` called on ALL paths
+  (success AND failure)?
+
+**D-2: Error silencing on security operations**
+- Search for `let _ =` and `let _var =` patterns. If the ignored result
+  is from a security-critical function (secure_delete, zeroize, lock,
+  permission change), it MUST be replaced with `if let Err(e) = ... { eprintln!(...) }`.
+
+**D-3: Secret data lifecycle**
+- Trace any variable holding passwords, keys, or decrypted plaintext.
+  Is it wrapped in `SecretString`/`SecretBox`/`Zeroizing`? Or is it a
+  raw `String`/`Vec<u8>` that survives beyond its immediate use?
+- Check for intermediate copies: `.to_vec()`, `.clone()`, `.to_string()`
+  on secret data — these create unzeroized copies.
+- If `std::env::var()` reads a secret, is the env var removed afterward
+  with `std::env::remove_var()`?
+
+**D-4: Input validation and bounds**
+- Any `read` from a file/network that allocates based on a length field:
+  is there a maximum size check BEFORE the allocation? (Prevents OOM.)
+- Any `as u32`, `as u16`, `as u8` cast on a `usize`: could it silently
+  truncate? Use `try_from()` instead.
+- Are empty/zero-length inputs explicitly rejected where they are invalid?
+
+**D-5: I/O safety**
+- File writes: are they atomic (write to temp, then rename)? Or does a
+  crash mid-write corrupt data?
+- Temp files: are permissions restricted (0o600 on Unix)?
+- Editor integration: does the vim/nvim command include `noswapfile`,
+  `nobackup`, `noundofile`, `nowritebackup`, and `viminfo=NONE` / `shada=NONE`?
+
+**D-6: Interaction with existing code**
+- Does this task add new validation (e.g., uniqueness check, format
+  restriction)? If so, trace ALL existing callers and code paths that
+  might now fail. For example, a new "duplicate name" check could break
+  an existing "overwrite" flow.
 
 ## Step 3: Fix Issues
 

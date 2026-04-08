@@ -6,7 +6,11 @@ use clap::{Parser, Subcommand};
 
 /// Post-quantum cryptography CLI journal.
 #[derive(Debug, Parser)]
-#[command(name = "pq-diary", version, about = "Post-quantum cryptography CLI journal")]
+#[command(
+    name = "pq-diary",
+    version,
+    about = "Post-quantum cryptography CLI journal"
+)]
 pub struct Cli {
     /// Vault path or name
     #[arg(short = 'v', long, global = true)]
@@ -474,7 +478,13 @@ mod tests {
     #[test]
     fn tc_0039_p03_edit_multiple_add_tag() {
         let result = Cli::try_parse_from([
-            "pq-diary", "edit", "abcd", "--add-tag", "t1", "--add-tag", "t2",
+            "pq-diary",
+            "edit",
+            "abcd",
+            "--add-tag",
+            "t1",
+            "--add-tag",
+            "t2",
         ]);
         assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
         let cli = result.unwrap();
@@ -489,8 +499,7 @@ mod tests {
     /// TC-0039-P04: `edit <id> --remove-tag old` parses the remove-tag flag.
     #[test]
     fn tc_0039_p04_edit_remove_tag() {
-        let result =
-            Cli::try_parse_from(["pq-diary", "edit", "abcd", "--remove-tag", "old"]);
+        let result = Cli::try_parse_from(["pq-diary", "edit", "abcd", "--remove-tag", "old"]);
         assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
         let cli = result.unwrap();
         match cli.command {
@@ -563,10 +572,7 @@ mod tests {
         let cli = result.unwrap();
         match cli.command {
             Commands::New {
-                title,
-                body,
-                tag,
-                ..
+                title, body, tag, ..
             } => {
                 assert_eq!(title, Some("My Title".to_string()));
                 assert_eq!(body, None);
@@ -611,8 +617,7 @@ mod tests {
     /// TC-0037-P05: `-t tag1 --tag tag2` accumulates multiple tags.
     #[test]
     fn tc_0037_p05_new_with_multiple_tags() {
-        let result =
-            Cli::try_parse_from(["pq-diary", "new", "-t", "tag1", "--tag", "tag2"]);
+        let result = Cli::try_parse_from(["pq-diary", "new", "-t", "tag1", "--tag", "tag2"]);
         assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
         let cli = result.unwrap();
         match cli.command {
@@ -627,7 +632,13 @@ mod tests {
     #[test]
     fn tc_0037_p06_new_combined_args() {
         let result = Cli::try_parse_from([
-            "pq-diary", "new", "Entry Title", "-b", "body text", "-t", "work",
+            "pq-diary",
+            "new",
+            "Entry Title",
+            "-b",
+            "body text",
+            "-t",
+            "work",
         ]);
         assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
         let cli = result.unwrap();

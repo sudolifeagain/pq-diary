@@ -104,11 +104,13 @@ pub fn extract_variables(body: &str) -> Vec<VariableRef> {
 pub fn expand(body: &str, vars: &HashMap<String, String>) -> String {
     var_regex()
         .replace_all(body, |caps: &regex::Captures| match caps.get(1) {
-            Some(name_match) => vars
-                .get(name_match.as_str())
-                .cloned()
-                .unwrap_or_else(|| caps.get(0).map_or_else(String::new, |m| m.as_str().to_string())),
-            None => caps.get(0).map_or_else(String::new, |m| m.as_str().to_string()),
+            Some(name_match) => vars.get(name_match.as_str()).cloned().unwrap_or_else(|| {
+                caps.get(0)
+                    .map_or_else(String::new, |m| m.as_str().to_string())
+            }),
+            None => caps
+                .get(0)
+                .map_or_else(String::new, |m| m.as_str().to_string()),
         })
         .into_owned()
 }
@@ -211,7 +213,10 @@ mod tests {
     fn tc_043_07_mixed_variable_kinds() {
         let refs = extract_variables("{{date}} - {{project_name}} by {{title}}");
         assert_eq!(refs.len(), 3);
-        assert!(matches!(refs[0].kind, VariableKind::Builtin), "date→Builtin");
+        assert!(
+            matches!(refs[0].kind, VariableKind::Builtin),
+            "date→Builtin"
+        );
         assert!(
             matches!(refs[1].kind, VariableKind::Custom),
             "project_name→Custom"

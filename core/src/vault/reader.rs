@@ -271,7 +271,9 @@ pub fn read_vault(path: &Path) -> Result<(VaultHeader, Vec<EntryRecord>), DiaryE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vault::format::{VaultHeader, RECORD_TYPE_ENTRY, RECORD_TYPE_TEMPLATE, SCHEMA_VERSION};
+    use crate::vault::format::{
+        VaultHeader, RECORD_TYPE_ENTRY, RECORD_TYPE_TEMPLATE, SCHEMA_VERSION,
+    };
     use crate::vault::writer::{write_entries, write_header, write_vault};
 
     /// Build a [`VaultHeader`] with recognisable non-zero field values.
@@ -373,7 +375,10 @@ mod tests {
         let parsed = read_header(&mut cursor).expect("read_header must not fail");
 
         assert_eq!(parsed.kdf_salt, original.kdf_salt, "kdf_salt mismatch");
-        assert_eq!(parsed.legacy_salt, original.legacy_salt, "legacy_salt mismatch");
+        assert_eq!(
+            parsed.legacy_salt, original.legacy_salt,
+            "legacy_salt mismatch"
+        );
     }
 
     /// TC-001-E01: invalid magic bytes → DiaryError::Vault.
@@ -431,8 +436,7 @@ mod tests {
         let original_header = make_test_header();
         let original_entries = vec![make_test_entry()];
 
-        write_vault(&path, original_header, &original_entries)
-            .expect("write_vault must not fail");
+        write_vault(&path, original_header, &original_entries).expect("write_vault must not fail");
 
         let (header, entries) = read_vault(&path).expect("read_vault must not fail");
 
@@ -560,7 +564,10 @@ mod tests {
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].attachment_count, 0, "attachment_count must be 0");
-        assert_eq!(entries[0].attachment_offset, 0, "attachment_offset must be 0");
+        assert_eq!(
+            entries[0].attachment_offset, 0,
+            "attachment_offset must be 0"
+        );
     }
 
     /// TC-003-01: template record write→read roundtrip.
@@ -623,7 +630,10 @@ mod tests {
 
         assert_eq!(entries.len(), 1);
         let expected_padding: Vec<u8> = (0u8..128).collect();
-        assert_eq!(entries[0].padding, expected_padding, "padding must survive roundtrip");
+        assert_eq!(
+            entries[0].padding, expected_padding,
+            "padding must survive roundtrip"
+        );
     }
 
     /// TC-002-06: maximum padding (255 B) survives round trip.
@@ -642,7 +652,11 @@ mod tests {
         let entries = read_entries(&mut cursor).expect("read_entries");
 
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].padding, vec![0xFEu8; 255], "max padding must survive roundtrip");
+        assert_eq!(
+            entries[0].padding,
+            vec![0xFEu8; 255],
+            "max padding must survive roundtrip"
+        );
     }
 
     /// TC-002-B01: empty vault (zero entries) is read without error.
@@ -668,11 +682,13 @@ mod tests {
     /// match the original.
     #[test]
     fn test_tc_002_b02_bulk_100_entries() {
-        let entries: Vec<EntryRecord> = (0u8..100).map(|i| {
-            let mut e = make_test_entry();
-            e.uuid = [i; 16];
-            e
-        }).collect();
+        let entries: Vec<EntryRecord> = (0u8..100)
+            .map(|i| {
+                let mut e = make_test_entry();
+                e.uuid = [i; 16];
+                e
+            })
+            .collect();
 
         let mut buf: Vec<u8> = Vec::new();
         write_entries(&mut buf, &entries).expect("write_entries");

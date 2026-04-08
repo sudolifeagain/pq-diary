@@ -5,8 +5,8 @@
 
 use crate::{crypto::secure_mem::SecureBuffer, error::DiaryError};
 use ml_dsa::{
-    EncodedVerifyingKey, KeyGen, MlDsa65, Signature, VerifyingKey,
     signature::{Keypair, Signer, Verifier},
+    EncodedVerifyingKey, KeyGen, MlDsa65, Signature, VerifyingKey,
 };
 use rand::RngCore;
 use zeroize::Zeroizing;

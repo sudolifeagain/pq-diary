@@ -9,7 +9,7 @@ use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    crypto::{aead, dsa, kem, kdf},
+    crypto::{aead, dsa, kdf, kem},
     error::DiaryError,
     vault::{
         config::{AppConfig, VaultConfig},
@@ -128,14 +128,12 @@ impl VaultManager {
         let sym_key = kdf::derive_key(password, &kdf_salt, &self.kdf_params)?;
 
         // Generate the AES-256-GCM verification token (stored in header).
-        let (verification_iv, verification_ct) =
-            generate_verification_token(sym_key.as_ref())?;
+        let (verification_iv, verification_ct) = generate_verification_token(sym_key.as_ref())?;
 
         // Generate ML-KEM-768 key pair.
         // The decapsulation key seed is AES-GCM-encrypted; IV is prepended.
         let kem_kp = kem::keygen()?;
-        let (kem_ct, kem_iv) =
-            aead::encrypt(sym_key.as_ref(), kem_kp.decapsulation_key.as_ref())?;
+        let (kem_ct, kem_iv) = aead::encrypt(sym_key.as_ref(), kem_kp.decapsulation_key.as_ref())?;
         let mut kem_encrypted_sk = Vec::with_capacity(kem_iv.len() + kem_ct.len());
         kem_encrypted_sk.extend_from_slice(&kem_iv);
         kem_encrypted_sk.extend_from_slice(&kem_ct);
@@ -143,8 +141,7 @@ impl VaultManager {
         // Generate ML-DSA-65 key pair.
         // The signing key seed is AES-GCM-encrypted; IV is prepended.
         let dsa_kp = dsa::keygen()?;
-        let (dsa_ct, dsa_iv) =
-            aead::encrypt(sym_key.as_ref(), dsa_kp.signing_key.as_ref())?;
+        let (dsa_ct, dsa_iv) = aead::encrypt(sym_key.as_ref(), dsa_kp.signing_key.as_ref())?;
         let mut dsa_encrypted_sk = Vec::with_capacity(dsa_iv.len() + dsa_ct.len());
         dsa_encrypted_sk.extend_from_slice(&dsa_iv);
         dsa_encrypted_sk.extend_from_slice(&dsa_ct);
@@ -257,12 +254,16 @@ mod tests {
             .expect("VaultManager::new")
             .with_kdf_params(fast_params());
 
-        mgr.init_vault("myvault", b"test-password").expect("init_vault");
+        mgr.init_vault("myvault", b"test-password")
+            .expect("init_vault");
 
         let vault_dir = dir.path().join("myvault");
         assert!(vault_dir.exists(), "vault directory must exist");
         assert!(vault_dir.join("vault.pqd").exists(), "vault.pqd must exist");
-        assert!(vault_dir.join("vault.toml").exists(), "vault.toml must exist");
+        assert!(
+            vault_dir.join("vault.toml").exists(),
+            "vault.toml must exist"
+        );
         assert!(
             vault_dir.join("entries").exists(),
             "entries/ directory must exist"
@@ -306,13 +307,21 @@ mod tests {
             .expect("VaultManager::new")
             .with_kdf_params(fast_params());
 
-        mgr.init_vault("alpha", b"password").expect("init_vault alpha");
-        mgr.init_vault("beta", b"password").expect("init_vault beta");
-        mgr.init_vault("gamma", b"password").expect("init_vault gamma");
+        mgr.init_vault("alpha", b"password")
+            .expect("init_vault alpha");
+        mgr.init_vault("beta", b"password")
+            .expect("init_vault beta");
+        mgr.init_vault("gamma", b"password")
+            .expect("init_vault gamma");
 
         let vaults = mgr.list_vaults().expect("list_vaults");
 
-        assert_eq!(vaults.len(), 3, "must list exactly 3 vaults, got {:?}", vaults);
+        assert_eq!(
+            vaults.len(),
+            3,
+            "must list exactly 3 vaults, got {:?}",
+            vaults
+        );
         assert!(vaults.contains(&"alpha".to_owned()), "missing 'alpha'");
         assert!(vaults.contains(&"beta".to_owned()), "missing 'beta'");
         assert!(vaults.contains(&"gamma".to_owned()), "missing 'gamma'");
@@ -334,8 +343,7 @@ mod tests {
             .to_file(&dir.path().join("config.toml"))
             .expect("write config.toml");
 
-        let mgr =
-            VaultManager::new(dir.path().to_path_buf()).expect("VaultManager::new");
+        let mgr = VaultManager::new(dir.path().to_path_buf()).expect("VaultManager::new");
 
         assert_eq!(mgr.default_vault(), "my_vault");
     }
@@ -352,7 +360,8 @@ mod tests {
             .expect("VaultManager::new")
             .with_kdf_params(fast_params());
 
-        mgr.init_vault("dupe", b"password").expect("first init_vault");
+        mgr.init_vault("dupe", b"password")
+            .expect("first init_vault");
         let result = mgr.init_vault("dupe", b"password");
 
         assert!(
@@ -382,8 +391,7 @@ mod tests {
     #[test]
     fn test_default_vault_falls_back_to_default() {
         let dir = tempdir().expect("tempdir");
-        let mgr =
-            VaultManager::new(dir.path().to_path_buf()).expect("VaultManager::new");
+        let mgr = VaultManager::new(dir.path().to_path_buf()).expect("VaultManager::new");
 
         assert_eq!(mgr.default_vault(), "default");
     }

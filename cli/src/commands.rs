@@ -174,8 +174,7 @@ pub fn cmd_new(
         // Prompt for each unique custom variable once.
         let mut prompted: HashSet<String> = HashSet::new();
         for var_ref in &var_refs {
-            if matches!(var_ref.kind, VariableKind::Custom)
-                && prompted.insert(var_ref.name.clone())
+            if matches!(var_ref.kind, VariableKind::Custom) && prompted.insert(var_ref.name.clone())
             {
                 use std::io::Write as _;
                 print!("{}: ", var_ref.name);
@@ -235,7 +234,9 @@ pub fn cmd_new(
             None
         };
         if let Some(ref cp) = completion_file {
-            config.vim_options.extend(editor::vim_completion_options(cp));
+            config
+                .vim_options
+                .extend(editor::vim_completion_options(cp));
         }
 
         // Launch editor and read result; always delete temp files afterward.
@@ -429,8 +430,7 @@ fn cmd_show_impl(cli: &Cli, id: String, out: &mut dyn std::io::Write) -> anyhow:
                     .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
             }
             writeln!(out).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-            write!(out, "{}", plaintext.body)
-                .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+            write!(out, "{}", plaintext.body).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
 
             // Resolve [[link]] references in the body.
             let resolved = core
@@ -439,8 +439,7 @@ fn cmd_show_impl(cli: &Cli, id: String, out: &mut dyn std::io::Write) -> anyhow:
 
             if !resolved.is_empty() {
                 writeln!(out).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-                writeln!(out, "--- Links ---")
-                    .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+                writeln!(out, "--- Links ---").map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
                 for link in &resolved {
                     match link.matches.len() {
                         0 => writeln!(out, "  [[{}]] (未解決)", link.title)
@@ -625,7 +624,9 @@ where
             None
         };
         if let Some(ref cp) = completion_file {
-            config.vim_options.extend(editor::vim_completion_options(cp));
+            config
+                .vim_options
+                .extend(editor::vim_completion_options(cp));
         }
 
         // Always delete temp files regardless of editor/read success.
@@ -687,7 +688,11 @@ where
 ///
 /// Prints `Delete "{title}" ({date})? [y/N]: ` to stderr and reads a line
 /// from `reader`.  Returns `true` only when the user responds with `y` or `Y`.
-fn confirm_delete(title: &str, date: &str, reader: &mut impl std::io::BufRead) -> anyhow::Result<bool> {
+fn confirm_delete(
+    title: &str,
+    date: &str,
+    reader: &mut impl std::io::BufRead,
+) -> anyhow::Result<bool> {
     use std::io::Write as _;
     eprint!("Delete \"{title}\" ({date})? [y/N]: ");
     std::io::stderr()
@@ -713,7 +718,12 @@ fn confirm_delete(title: &str, date: &str, reader: &mut impl std::io::BufRead) -
 /// Returns an error if password acquisition, vault unlock, entry lookup, or
 /// entry deletion fails.
 pub fn cmd_delete(cli: &Cli, id: String, force: bool) -> anyhow::Result<()> {
-    cmd_delete_impl(cli, id, force, &mut std::io::BufReader::new(std::io::stdin()))
+    cmd_delete_impl(
+        cli,
+        id,
+        force,
+        &mut std::io::BufReader::new(std::io::stdin()),
+    )
 }
 
 /// Internal implementation of `cmd_delete` with an injectable stdin reader.
@@ -897,8 +907,8 @@ where
     let edit_result = launch_fn(&tmpfile, &config);
     let read_result = editor::read_template_file(&tmpfile);
     if let Err(e) = editor::secure_delete(&tmpfile) {
-            eprintln!("Warning: failed to securely delete temp file: {e}");
-        }
+        eprintln!("Warning: failed to securely delete temp file: {e}");
+    }
 
     if let Err(e) = edit_result {
         core.lock();
@@ -949,8 +959,7 @@ pub fn cmd_template_list(cli: &Cli) -> anyhow::Result<()> {
     let result = core.list_templates();
     core.lock();
 
-    let mut templates =
-        result.map_err(|e| anyhow::anyhow!("Failed to list templates: {e}"))?;
+    let mut templates = result.map_err(|e| anyhow::anyhow!("Failed to list templates: {e}"))?;
     templates.sort_by(|a, b| a.name.cmp(&b.name));
 
     for meta in &templates {
@@ -1068,8 +1077,7 @@ fn cmd_template_delete_impl(
     if do_delete {
         let delete_result = core.delete_template(&name);
         core.lock();
-        delete_result
-            .map_err(|e| anyhow::anyhow!("Failed to delete template: {e}"))?;
+        delete_result.map_err(|e| anyhow::anyhow!("Failed to delete template: {e}"))?;
         println!("Deleted template: \"{name}\"");
     } else {
         core.lock();
@@ -1106,11 +1114,7 @@ pub fn cmd_today(cli: &Cli) -> anyhow::Result<()> {
 ///
 /// Accepts any `FnOnce` as the editor launcher so that tests can inject a mock
 /// without spawning a real process.
-fn cmd_today_impl<F>(
-    cli: &Cli,
-    today: &str,
-    launch_fn: F,
-) -> anyhow::Result<()>
+fn cmd_today_impl<F>(cli: &Cli, today: &str, launch_fn: F) -> anyhow::Result<()>
 where
     F: FnOnce(&std::path::Path, &EditorConfig) -> Result<(), pq_diary_core::DiaryError>,
 {
@@ -1204,18 +1208,20 @@ where
         None
     };
     if let Some(ref cp) = completion_file {
-        config.vim_options.extend(editor::vim_completion_options(cp));
+        config
+            .vim_options
+            .extend(editor::vim_completion_options(cp));
     }
 
     let edit_result = launch_fn(&tmpfile, &config);
     let read_result = editor::read_header_file(&tmpfile);
     if let Err(e) = editor::secure_delete(&tmpfile) {
-            eprintln!("Warning: failed to securely delete temp file: {e}");
-        }
+        eprintln!("Warning: failed to securely delete temp file: {e}");
+    }
     if let Some(cp) = completion_file {
         if let Err(e) = editor::secure_delete(&cp) {
-                eprintln!("Warning: failed to securely delete completion file: {e}");
-            }
+            eprintln!("Warning: failed to securely delete completion file: {e}");
+        }
     }
 
     if let Err(e) = edit_result {
@@ -1313,9 +1319,7 @@ mod tests {
     }
 
     /// Open the test vault and return the plaintext of the first entry.
-    fn read_first_entry_plaintext(
-        vault_dir: &std::path::Path,
-    ) -> pq_diary_core::EntryPlaintext {
+    fn read_first_entry_plaintext(vault_dir: &std::path::Path) -> pq_diary_core::EntryPlaintext {
         let vault_pqd = vault_dir.join("vault.pqd");
         let vault_str = vault_pqd.to_str().expect("utf8");
         let mut core = DiaryCore::new(vault_str).expect("DiaryCore::new");
@@ -1361,7 +1365,13 @@ mod tests {
         let vault_dir_str = vault_dir.to_str().expect("utf8");
 
         let cli = make_cli(vault_dir_str, Some("password"));
-        let result = cmd_new(&cli, Some(String::new()), Some("body".to_string()), vec![], None);
+        let result = cmd_new(
+            &cli,
+            Some(String::new()),
+            Some("body".to_string()),
+            vec![],
+            None,
+        );
         assert!(result.is_ok(), "cmd_new failed: {:?}", result.err());
 
         let entries = read_vault_entries(&vault_dir);
@@ -1460,7 +1470,10 @@ mod tests {
         assert!(result.is_ok(), "cmd_new failed: {:?}", result.err());
 
         let plaintext = read_first_entry_plaintext(&vault_dir);
-        assert!(plaintext.tags.is_empty(), "tags must be empty when none specified");
+        assert!(
+            plaintext.tags.is_empty(),
+            "tags must be empty when none specified"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -1486,8 +1499,8 @@ mod tests {
     /// TC-0037-08: A directory vault path gets `vault.pqd` appended.
     #[test]
     fn tc_0037_08_resolve_vault_path_appends_pqd() {
-        let cli = crate::Cli::try_parse_from(["pq-diary", "-v", "/some/dir", "new"])
-            .expect("parse");
+        let cli =
+            crate::Cli::try_parse_from(["pq-diary", "-v", "/some/dir", "new"]).expect("parse");
         let path = resolve_vault_path(&cli).expect("resolve_vault_path");
         assert_eq!(path, PathBuf::from("/some/dir/vault.pqd"));
     }
@@ -1565,9 +1578,7 @@ mod tests {
     /// TC-0038-U04: "仕事人" is NOT matched by tag filter "仕事" (requires `/` separator).
     #[test]
     fn tc_0038_u04_tag_filter_no_false_prefix() {
-        let entries = vec![
-            make_meta("aa000000", "A", &["仕事人"], 1),
-        ];
+        let entries = vec![make_meta("aa000000", "A", &["仕事人"], 1)];
         let result = filter_and_sort(entries, Some("仕事"), None, 20).expect("filter");
         assert!(result.is_empty(), "仕事人 must not match 仕事 filter");
     }
@@ -1697,7 +1708,11 @@ mod tests {
 
         let list_cli = make_list_cli(vault_dir_str, Some("password"));
         let result = cmd_list(&list_cli, None, None, 20);
-        assert!(result.is_ok(), "cmd_list on empty vault failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "cmd_list on empty vault failed: {:?}",
+            result.err()
+        );
     }
 
     /// TC-0038-03: cmd_show retrieves an entry by 4-character ID prefix.
@@ -1722,7 +1737,11 @@ mod tests {
 
         let show_cli = make_show_cli(vault_dir_str, Some("password"), prefix4);
         let result = cmd_show(&show_cli, prefix4.to_string());
-        assert!(result.is_ok(), "cmd_show by prefix failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "cmd_show by prefix failed: {:?}",
+            result.err()
+        );
     }
 
     /// TC-0038-04: cmd_show retrieves an entry by full 32-character UUID hex.
@@ -1747,7 +1766,11 @@ mod tests {
 
         let show_cli = make_show_cli(vault_dir_str, Some("password"), &full_id);
         let result = cmd_show(&show_cli, full_id.clone());
-        assert!(result.is_ok(), "cmd_show by full ID failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "cmd_show by full ID failed: {:?}",
+            result.err()
+        );
     }
 
     /// TC-0038-05: cmd_show returns an error for a non-existent ID prefix.
@@ -1832,15 +1855,17 @@ mod tests {
 
         let plaintext = read_first_entry_plaintext(&vault_dir);
         assert_eq!(plaintext.title, "New Title");
-        assert_eq!(plaintext.body, "body text", "body must be unchanged by flag edit");
+        assert_eq!(
+            plaintext.body, "body text",
+            "body must be unchanged by flag edit"
+        );
     }
 
     /// TC-0039-02: --add-tag flag appends a tag to the entry.
     #[test]
     fn tc_0039_02_flag_add_tag() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (vault_dir, prefix) =
-            setup_vault_with_entry(&dir, "Title", "body", vec!["existing"]);
+        let (vault_dir, prefix) = setup_vault_with_entry(&dir, "Title", "body", vec!["existing"]);
         let vault_dir_str = vault_dir.to_str().expect("utf8");
 
         let edit_cli = make_edit_cli(vault_dir_str, Some("password"), &prefix);
@@ -1899,8 +1924,7 @@ mod tests {
     #[test]
     fn tc_0039_04_flag_combined() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (vault_dir, prefix) =
-            setup_vault_with_entry(&dir, "Old", "body", vec!["keep", "old"]);
+        let (vault_dir, prefix) = setup_vault_with_entry(&dir, "Old", "body", vec!["keep", "old"]);
         let vault_dir_str = vault_dir.to_str().expect("utf8");
 
         let edit_cli = make_edit_cli(vault_dir_str, Some("password"), &prefix);
@@ -1939,15 +1963,17 @@ mod tests {
         assert!(result.is_ok(), "cmd_edit failed: {:?}", result.err());
 
         let plaintext = read_first_entry_plaintext(&vault_dir);
-        assert_eq!(plaintext.body, "Original body content", "body must not change");
+        assert_eq!(
+            plaintext.body, "Original body content",
+            "body must not change"
+        );
     }
 
     /// TC-0039-06: --add-tag does not duplicate an already-existing tag.
     #[test]
     fn tc_0039_06_flag_add_tag_no_duplicate() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (vault_dir, prefix) =
-            setup_vault_with_entry(&dir, "Title", "body", vec!["existing"]);
+        let (vault_dir, prefix) = setup_vault_with_entry(&dir, "Title", "body", vec!["existing"]);
         let vault_dir_str = vault_dir.to_str().expect("utf8");
 
         let edit_cli = make_edit_cli(vault_dir_str, Some("password"), &prefix);
@@ -1972,8 +1998,7 @@ mod tests {
     #[test]
     fn tc_0039_07_editor_no_change() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (vault_dir, prefix) =
-            setup_vault_with_entry(&dir, "Title", "body text", vec!["tag1"]);
+        let (vault_dir, prefix) = setup_vault_with_entry(&dir, "Title", "body text", vec!["tag1"]);
         let vault_dir_str = vault_dir.to_str().expect("utf8");
 
         let edit_cli = make_edit_cli(vault_dir_str, Some("password"), &prefix);
@@ -2034,8 +2059,7 @@ mod tests {
     #[test]
     fn tc_0039_09_editor_tmpfile_deleted() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (vault_dir, prefix) =
-            setup_vault_with_entry(&dir, "Title", "body", vec![]);
+        let (vault_dir, prefix) = setup_vault_with_entry(&dir, "Title", "body", vec![]);
         let vault_dir_str = vault_dir.to_str().expect("utf8");
 
         let edit_cli = make_edit_cli(vault_dir_str, Some("password"), &prefix);
@@ -2059,7 +2083,10 @@ mod tests {
         );
         assert!(result.is_ok(), "cmd_edit_impl failed: {:?}", result.err());
 
-        let path = captured.borrow().clone().expect("tmpfile path was not captured");
+        let path = captured
+            .borrow()
+            .clone()
+            .expect("tmpfile path was not captured");
         assert!(
             !path.exists(),
             "temp file must be deleted after editor mode: {path:?}"
@@ -2096,7 +2123,10 @@ mod tests {
 
         let plaintext = read_first_entry_plaintext(&vault_dir);
         // Original metadata must be preserved.
-        assert_eq!(plaintext.title, "Keep Title", "title must be preserved on header error");
+        assert_eq!(
+            plaintext.title, "Keep Title",
+            "title must be preserved on header error"
+        );
         assert_eq!(
             plaintext.tags,
             vec!["keep_tag".to_string()],
@@ -2128,8 +2158,7 @@ mod tests {
     #[test]
     fn tc_0039_12_wrong_password_returns_error() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (vault_dir, prefix) =
-            setup_vault_with_entry(&dir, "Title", "body", vec![]);
+        let (vault_dir, prefix) = setup_vault_with_entry(&dir, "Title", "body", vec![]);
         let vault_dir_str = vault_dir.to_str().expect("utf8");
 
         let edit_cli = make_edit_cli(vault_dir_str, Some("wrong_password"), &prefix);
@@ -2152,8 +2181,8 @@ mod tests {
     fn tc_0040_u01_confirm_delete_y() {
         let input = "y\n";
         let mut reader = std::io::BufReader::new(input.as_bytes());
-        let result = confirm_delete("Test Title", "2026-01-01", &mut reader)
-            .expect("confirm_delete");
+        let result =
+            confirm_delete("Test Title", "2026-01-01", &mut reader).expect("confirm_delete");
         assert!(result, "Expected true for 'y'");
     }
 
@@ -2162,8 +2191,8 @@ mod tests {
     fn tc_0040_u02_confirm_delete_capital_y() {
         let input = "Y\n";
         let mut reader = std::io::BufReader::new(input.as_bytes());
-        let result = confirm_delete("Test Title", "2026-01-01", &mut reader)
-            .expect("confirm_delete");
+        let result =
+            confirm_delete("Test Title", "2026-01-01", &mut reader).expect("confirm_delete");
         assert!(result, "Expected true for 'Y'");
     }
 
@@ -2172,8 +2201,8 @@ mod tests {
     fn tc_0040_u03_confirm_delete_n() {
         let input = "n\n";
         let mut reader = std::io::BufReader::new(input.as_bytes());
-        let result = confirm_delete("Test Title", "2026-01-01", &mut reader)
-            .expect("confirm_delete");
+        let result =
+            confirm_delete("Test Title", "2026-01-01", &mut reader).expect("confirm_delete");
         assert!(!result, "Expected false for 'n'");
     }
 
@@ -2182,8 +2211,8 @@ mod tests {
     fn tc_0040_u04_confirm_delete_empty() {
         let input = "\n";
         let mut reader = std::io::BufReader::new(input.as_bytes());
-        let result = confirm_delete("Test Title", "2026-01-01", &mut reader)
-            .expect("confirm_delete");
+        let result =
+            confirm_delete("Test Title", "2026-01-01", &mut reader).expect("confirm_delete");
         assert!(!result, "Expected false for empty input");
     }
 
@@ -2192,8 +2221,8 @@ mod tests {
     fn tc_0040_u05_confirm_delete_capital_n() {
         let input = "N\n";
         let mut reader = std::io::BufReader::new(input.as_bytes());
-        let result = confirm_delete("Test Title", "2026-01-01", &mut reader)
-            .expect("confirm_delete");
+        let result =
+            confirm_delete("Test Title", "2026-01-01", &mut reader).expect("confirm_delete");
         assert!(!result, "Expected false for 'N'");
     }
 
@@ -2202,8 +2231,8 @@ mod tests {
     fn tc_0040_u06_confirm_delete_arbitrary() {
         let input = "abc\n";
         let mut reader = std::io::BufReader::new(input.as_bytes());
-        let result = confirm_delete("Test Title", "2026-01-01", &mut reader)
-            .expect("confirm_delete");
+        let result =
+            confirm_delete("Test Title", "2026-01-01", &mut reader).expect("confirm_delete");
         assert!(!result, "Expected false for 'abc'");
     }
 
@@ -2231,11 +2260,7 @@ mod tests {
     }
 
     /// Build a `Cli` for delete with `--claude` global flag.
-    fn make_delete_cli_claude(
-        vault_dir_str: &str,
-        password: Option<&str>,
-        id: &str,
-    ) -> crate::Cli {
+    fn make_delete_cli_claude(vault_dir_str: &str, password: Option<&str>, id: &str) -> crate::Cli {
         let mut args: Vec<&str> = vec!["pq-diary", "--claude", "-v", vault_dir_str];
         if let Some(pw) = password {
             args.extend_from_slice(&["--password", pw]);
@@ -2249,14 +2274,17 @@ mod tests {
     #[test]
     fn tc_0040_01_force_flag_deletes_without_confirm() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (vault_dir, prefix) =
-            setup_vault_with_entry(&dir, "Test Entry", "body", vec![]);
+        let (vault_dir, prefix) = setup_vault_with_entry(&dir, "Test Entry", "body", vec![]);
         let vault_dir_str = vault_dir.to_str().expect("utf8");
 
         let delete_cli = make_delete_cli(vault_dir_str, Some("password"), &prefix, true);
         let mut reader = std::io::BufReader::new("".as_bytes());
         let result = cmd_delete_impl(&delete_cli, prefix.clone(), true, &mut reader);
-        assert!(result.is_ok(), "cmd_delete --force failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "cmd_delete --force failed: {:?}",
+            result.err()
+        );
 
         let remaining = read_vault_entries(&vault_dir);
         assert!(remaining.is_empty(), "Entry should have been deleted");
@@ -2266,8 +2294,7 @@ mod tests {
     #[test]
     fn tc_0040_02_force_flag_succeeds_and_entry_removed() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (vault_dir, prefix) =
-            setup_vault_with_entry(&dir, "Force Test", "body", vec![]);
+        let (vault_dir, prefix) = setup_vault_with_entry(&dir, "Force Test", "body", vec![]);
         let vault_dir_str = vault_dir.to_str().expect("utf8");
 
         let delete_cli = make_delete_cli(vault_dir_str, Some("password"), &prefix, true);
@@ -2276,15 +2303,17 @@ mod tests {
         assert!(result.is_ok(), "Expected Ok: {:?}", result.err());
 
         let remaining = read_vault_entries(&vault_dir);
-        assert!(remaining.is_empty(), "Entry must be removed after --force delete");
+        assert!(
+            remaining.is_empty(),
+            "Entry must be removed after --force delete"
+        );
     }
 
     /// TC-0040-03: "y" input confirms deletion.
     #[test]
     fn tc_0040_03_y_input_triggers_deletion() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (vault_dir, prefix) =
-            setup_vault_with_entry(&dir, "Delete Me", "body", vec![]);
+        let (vault_dir, prefix) = setup_vault_with_entry(&dir, "Delete Me", "body", vec![]);
         let vault_dir_str = vault_dir.to_str().expect("utf8");
 
         let delete_cli = make_delete_cli(vault_dir_str, Some("password"), &prefix, false);
@@ -2300,8 +2329,7 @@ mod tests {
     #[test]
     fn tc_0040_04_capital_y_input_triggers_deletion() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (vault_dir, prefix) =
-            setup_vault_with_entry(&dir, "Delete Me Y", "body", vec![]);
+        let (vault_dir, prefix) = setup_vault_with_entry(&dir, "Delete Me Y", "body", vec![]);
         let vault_dir_str = vault_dir.to_str().expect("utf8");
 
         let delete_cli = make_delete_cli(vault_dir_str, Some("password"), &prefix, false);
@@ -2317,8 +2345,7 @@ mod tests {
     #[test]
     fn tc_0040_05_n_input_cancels_deletion() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (vault_dir, prefix) =
-            setup_vault_with_entry(&dir, "Keep Me", "body", vec![]);
+        let (vault_dir, prefix) = setup_vault_with_entry(&dir, "Keep Me", "body", vec![]);
         let vault_dir_str = vault_dir.to_str().expect("utf8");
 
         let delete_cli = make_delete_cli(vault_dir_str, Some("password"), &prefix, false);
@@ -2334,8 +2361,7 @@ mod tests {
     #[test]
     fn tc_0040_06_empty_input_cancels_deletion() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (vault_dir, prefix) =
-            setup_vault_with_entry(&dir, "Keep Me Too", "body", vec![]);
+        let (vault_dir, prefix) = setup_vault_with_entry(&dir, "Keep Me Too", "body", vec![]);
         let vault_dir_str = vault_dir.to_str().expect("utf8");
 
         let delete_cli = make_delete_cli(vault_dir_str, Some("password"), &prefix, false);
@@ -2351,8 +2377,7 @@ mod tests {
     #[test]
     fn tc_0040_07_capital_n_input_cancels_deletion() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (vault_dir, prefix) =
-            setup_vault_with_entry(&dir, "Stay", "body", vec![]);
+        let (vault_dir, prefix) = setup_vault_with_entry(&dir, "Stay", "body", vec![]);
         let vault_dir_str = vault_dir.to_str().expect("utf8");
 
         let delete_cli = make_delete_cli(vault_dir_str, Some("password"), &prefix, false);
@@ -2368,8 +2393,7 @@ mod tests {
     #[test]
     fn tc_0040_08_arbitrary_input_cancels_deletion() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (vault_dir, prefix) =
-            setup_vault_with_entry(&dir, "Safe", "body", vec![]);
+        let (vault_dir, prefix) = setup_vault_with_entry(&dir, "Safe", "body", vec![]);
         let vault_dir_str = vault_dir.to_str().expect("utf8");
 
         let delete_cli = make_delete_cli(vault_dir_str, Some("password"), &prefix, false);
@@ -2385,8 +2409,7 @@ mod tests {
     #[test]
     fn tc_0040_09_claude_flag_skips_confirmation() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (vault_dir, prefix) =
-            setup_vault_with_entry(&dir, "Claude Test", "body", vec![]);
+        let (vault_dir, prefix) = setup_vault_with_entry(&dir, "Claude Test", "body", vec![]);
         let vault_dir_str = vault_dir.to_str().expect("utf8");
 
         let delete_cli = make_delete_cli_claude(vault_dir_str, Some("password"), &prefix);
@@ -2415,12 +2438,10 @@ mod tests {
     #[test]
     fn tc_0040_11_wrong_password_returns_error() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (vault_dir, prefix) =
-            setup_vault_with_entry(&dir, "Entry", "body", vec![]);
+        let (vault_dir, prefix) = setup_vault_with_entry(&dir, "Entry", "body", vec![]);
         let vault_dir_str = vault_dir.to_str().expect("utf8");
 
-        let delete_cli =
-            make_delete_cli(vault_dir_str, Some("wrong_password"), &prefix, true);
+        let delete_cli = make_delete_cli(vault_dir_str, Some("wrong_password"), &prefix, true);
         let mut reader = std::io::BufReader::new("".as_bytes());
         let result = cmd_delete_impl(&delete_cli, prefix.clone(), true, &mut reader);
         assert!(result.is_err(), "Expected error for wrong password");
@@ -2509,13 +2530,21 @@ mod tests {
 
         seed_templates(
             &vault_dir,
-            &[("weekly", "week body"), ("daily", "day body"), ("meeting", "mtg body")],
+            &[
+                ("weekly", "week body"),
+                ("daily", "day body"),
+                ("meeting", "mtg body"),
+            ],
         );
 
         let vault_dir_str = vault_dir.to_str().expect("utf8");
         let cli = make_template_list_cli(vault_dir_str, Some("password"));
         let result = cmd_template_list(&cli);
-        assert!(result.is_ok(), "cmd_template_list failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "cmd_template_list failed: {:?}",
+            result.err()
+        );
 
         // Verify alphabetical order via core read.
         let sorted = read_template_names_sorted(&vault_dir);
@@ -2535,7 +2564,11 @@ mod tests {
         let vault_dir_str = vault_dir.to_str().expect("utf8");
         let cli = make_template_show_cli(vault_dir_str, Some("password"), "daily");
         let result = cmd_template_show(&cli, "daily".to_string());
-        assert!(result.is_ok(), "cmd_template_show failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "cmd_template_show failed: {:?}",
+            result.err()
+        );
     }
 
     /// TC-047-03: cmd_template_show returns an error for a nonexistent template.
@@ -2570,11 +2603,18 @@ mod tests {
         let cli = make_template_delete_cli(vault_dir_str, Some("password"), "daily", true);
         let mut reader = std::io::BufReader::new("".as_bytes());
         let result = cmd_template_delete_impl(&cli, "daily".to_string(), true, &mut reader);
-        assert!(result.is_ok(), "cmd_template_delete failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "cmd_template_delete failed: {:?}",
+            result.err()
+        );
 
         // Verify the template is gone.
         let names = read_template_names_sorted(&vault_dir);
-        assert!(names.is_empty(), "Template must be deleted; names={names:?}");
+        assert!(
+            names.is_empty(),
+            "Template must be deleted; names={names:?}"
+        );
     }
 
     /// TC-047-05: cmd_template_delete with "n" input cancels.
@@ -2589,11 +2629,19 @@ mod tests {
         let cli = make_template_delete_cli(vault_dir_str, Some("password"), "daily", false);
         let mut reader = std::io::BufReader::new("n\n".as_bytes());
         let result = cmd_template_delete_impl(&cli, "daily".to_string(), false, &mut reader);
-        assert!(result.is_ok(), "Expected Ok on cancel; got: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Expected Ok on cancel; got: {:?}",
+            result.err()
+        );
 
         // Verify the template still exists.
         let names = read_template_names_sorted(&vault_dir);
-        assert_eq!(names, vec!["daily"], "Template must still exist after cancel");
+        assert_eq!(
+            names,
+            vec!["daily"],
+            "Template must still exist after cancel"
+        );
     }
 
     /// TC-047-06: cmd_template_add stores the template body written by the editor.
@@ -2609,13 +2657,15 @@ mod tests {
 
         // Inject a fake editor that writes "## 週次レビュー" into the temp file.
         let mock_launch = |tmpfile: &std::path::Path, _config: &EditorConfig| {
-            std::fs::write(tmpfile, "## 週次レビュー").map_err(|e| {
-                pq_diary_core::DiaryError::Io(e)
-            })
+            std::fs::write(tmpfile, "## 週次レビュー").map_err(|e| pq_diary_core::DiaryError::Io(e))
         };
         let mut reader = std::io::BufReader::new("".as_bytes());
         let result = cmd_template_add_impl(&cli, "weekly".to_string(), mock_launch, &mut reader);
-        assert!(result.is_ok(), "cmd_template_add_impl failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "cmd_template_add_impl failed: {:?}",
+            result.err()
+        );
 
         // Verify the stored body.
         let vault_pqd = vault_dir.join("vault.pqd");
@@ -2659,7 +2709,11 @@ mod tests {
             vec![],
             Some("t1".to_string()),
         );
-        assert!(result.is_ok(), "cmd_new with template failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "cmd_new with template failed: {:?}",
+            result.err()
+        );
 
         let plaintext = read_first_entry_plaintext(&vault_dir);
         // Verify that {{date}} was replaced by a YYYY-MM-DD string.
@@ -2687,13 +2741,7 @@ mod tests {
         let vault_dir_str = vault_dir.to_str().expect("utf8");
         let cli = make_cli(vault_dir_str, Some("password"));
         // No custom vars in "固定 {{date}}" → cmd_new must succeed without reading stdin.
-        let result = cmd_new(
-            &cli,
-            None,
-            None,
-            vec![],
-            Some("t2".to_string()),
-        );
+        let result = cmd_new(&cli, None, None, vec![], Some("t2".to_string()));
         assert!(
             result.is_ok(),
             "cmd_new with builtin-only template must succeed without prompts: {:?}",
@@ -2712,13 +2760,7 @@ mod tests {
 
         let vault_dir_str = vault_dir.to_str().expect("utf8");
         let cli = make_cli(vault_dir_str, Some("password"));
-        let result = cmd_new(
-            &cli,
-            None,
-            None,
-            vec![],
-            Some("nonexistent".to_string()),
-        );
+        let result = cmd_new(&cli, None, None, vec![], Some("nonexistent".to_string()));
         assert!(result.is_err(), "Expected error for nonexistent template");
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -3081,10 +3123,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let vault_dir = setup_vault(&dir);
 
-        let ids = seed_entries(
-            &vault_dir,
-            &[("メモ", ""), ("メモ", ""), ("C", "[[メモ]]")],
-        );
+        let ids = seed_entries(&vault_dir, &[("メモ", ""), ("メモ", ""), ("C", "[[メモ]]")]);
         let c_prefix = &ids[2][..4];
 
         let output = capture_show(&vault_dir, c_prefix).expect("cmd_show_impl");

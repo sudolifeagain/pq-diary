@@ -175,9 +175,7 @@ impl LinkIndex {
                 .or_default()
                 .push(uuid_bytes);
             index.uuid_to_title.insert(uuid_bytes, meta.title.clone());
-            index
-                .uuid_to_created_at
-                .insert(uuid_bytes, meta.created_at);
+            index.uuid_to_created_at.insert(uuid_bytes, meta.created_at);
         }
 
         // Second pass: build reverse map (UUID → backlinks) by parsing each body.
@@ -560,7 +558,11 @@ mod tests {
 
         let resolved = index.resolve("メモ");
         assert_eq!(resolved.matches.len(), 2, "both メモ entries must match");
-        let found_uuids: Vec<&str> = resolved.matches.iter().map(|m| m.uuid_hex.as_str()).collect();
+        let found_uuids: Vec<&str> = resolved
+            .matches
+            .iter()
+            .map(|m| m.uuid_hex.as_str())
+            .collect();
         assert!(found_uuids.contains(&UUID_A), "UUID_A must be in matches");
         assert!(found_uuids.contains(&UUID_B), "UUID_B must be in matches");
     }
@@ -572,10 +574,7 @@ mod tests {
     /// TC-045-03: A link to a non-existent title resolves to an empty matches list.
     #[test]
     fn tc_045_03_unresolved_link() {
-        let entries = vec![(
-            make_meta(UUID_A, "A", 100),
-            "[[存在しない]]".to_string(),
-        )];
+        let entries = vec![(make_meta(UUID_A, "A", 100), "[[存在しない]]".to_string())];
         let index = LinkIndex::build(&entries);
 
         let resolved = index.resolve("存在しない");
@@ -662,7 +661,10 @@ mod tests {
         let mut index = LinkIndex::build(&entries);
         index.zeroize();
 
-        assert!(index.all_titles().is_empty(), "titles must be empty after zeroize");
+        assert!(
+            index.all_titles().is_empty(),
+            "titles must be empty after zeroize"
+        );
         assert!(
             index.resolve("A").matches.is_empty(),
             "resolve must be empty after zeroize"

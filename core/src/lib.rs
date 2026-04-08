@@ -13,35 +13,35 @@ use secrecy::ExposeSecret;
 
 /// Secure memory types: [`SecureBuffer`], [`ZeroizingKey`], [`MasterKey`], [`CryptoEngine`].
 pub mod crypto;
-/// Unified error type: [`DiaryError`].
-pub mod error;
 /// Entry CRUD operations (implemented in Sprint 4).
 pub mod entry;
-/// Template CRUD operations (implemented in Sprint 5).
-pub mod template;
-/// Template variable extraction and expansion engine (implemented in Sprint 5).
-pub mod template_engine;
-/// `[[title]]` wiki-link parser (implemented in Sprint 5).
-pub mod link;
+/// Unified error type: [`DiaryError`].
+pub mod error;
 /// Git synchronisation operations (implemented in Sprint 8).
 pub mod git;
 /// Digital-legacy operations (implemented in Phase 2).
 pub mod legacy;
+/// `[[title]]` wiki-link parser (implemented in Sprint 5).
+pub mod link;
 /// Access-policy evaluation (implemented in Sprint 7).
 pub mod policy;
+/// Template CRUD operations (implemented in Sprint 5).
+pub mod template;
+/// Template variable extraction and expansion engine (implemented in Sprint 5).
+pub mod template_engine;
 /// Vault format read/write operations (implemented in Sprint 3).
 pub mod vault;
 
 /// Re-exported for convenience: see [`crypto::SecureBuffer`].
 pub use crypto::SecureBuffer;
-/// Re-exported for convenience: see [`error::DiaryError`].
-pub use error::DiaryError;
 /// Re-exported entry types for external crate use.
 pub use entry::{EntryMeta, EntryPlaintext, IdPrefix, Tag};
-/// Re-exported template types for external crate use.
-pub use template::{TemplateMeta, TemplateName, TemplatePlaintext};
+/// Re-exported for convenience: see [`error::DiaryError`].
+pub use error::DiaryError;
 /// Re-exported link types for external crate use.
 pub use link::{BacklinkEntry, LinkIndex, ResolvedLink};
+/// Re-exported template types for external crate use.
+pub use template::{TemplateMeta, TemplateName, TemplatePlaintext};
 /// Re-exported vault format type for external crate use.
 pub use vault::format::EntryRecord;
 
@@ -445,8 +445,7 @@ mod tests {
         let vault_pqd = setup_test_vault(&dir);
 
         // Step 1: DiaryCore::new
-        let mut core =
-            DiaryCore::new(vault_pqd.to_str().expect("utf8")).expect("DiaryCore::new");
+        let mut core = DiaryCore::new(vault_pqd.to_str().expect("utf8")).expect("DiaryCore::new");
 
         // Step 2: unlock
         core.unlock(secret("password")).expect("unlock");
@@ -505,16 +504,14 @@ mod tests {
         let vault_pqd = setup_test_vault(&dir);
 
         // Before unlock: new_entry must fail
-        let core =
-            DiaryCore::new(vault_pqd.to_str().expect("utf8")).expect("DiaryCore::new");
+        let core = DiaryCore::new(vault_pqd.to_str().expect("utf8")).expect("DiaryCore::new");
         assert!(
             core.new_entry("title", "body", vec![]).is_err(),
             "new_entry on locked vault must return an error"
         );
 
         // After lock: list_entries must fail
-        let mut core =
-            DiaryCore::new(vault_pqd.to_str().expect("utf8")).expect("DiaryCore::new");
+        let mut core = DiaryCore::new(vault_pqd.to_str().expect("utf8")).expect("DiaryCore::new");
         core.unlock(secret("password")).expect("unlock");
         core.lock();
         assert!(
@@ -536,8 +533,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let vault_pqd = setup_test_vault(&dir);
 
-        let mut core =
-            DiaryCore::new(vault_pqd.to_str().expect("utf8")).expect("DiaryCore::new");
+        let mut core = DiaryCore::new(vault_pqd.to_str().expect("utf8")).expect("DiaryCore::new");
 
         // First unlock: create entry
         core.unlock(secret("password")).expect("first unlock");
@@ -574,9 +570,12 @@ mod tests {
         core.unlock(secret("password")).expect("first unlock");
 
         // Create 3 entries
-        core.new_entry("エントリA", "本文A", vec![]).expect("new_entry A");
-        core.new_entry("エントリB", "本文B", vec![]).expect("new_entry B");
-        core.new_entry("エントリC", "本文C", vec![]).expect("new_entry C");
+        core.new_entry("エントリA", "本文A", vec![])
+            .expect("new_entry A");
+        core.new_entry("エントリB", "本文B", vec![])
+            .expect("new_entry B");
+        core.new_entry("エントリC", "本文C", vec![])
+            .expect("new_entry C");
         core.lock();
 
         // Re-unlock: LinkIndex must be built with the 3 entries
@@ -601,7 +600,9 @@ mod tests {
         core.unlock(secret("password")).expect("unlock");
         core.lock();
 
-        let err = core.resolve_links("[[test]]").expect_err("must fail when locked");
+        let err = core
+            .resolve_links("[[test]]")
+            .expect_err("must fail when locked");
         assert!(
             matches!(err, DiaryError::NotUnlocked),
             "expected NotUnlocked, got {:?}",
@@ -669,7 +670,10 @@ mod tests {
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].title, "A");
         assert_eq!(resolved[0].matches.len(), 1, "must match exactly one entry");
-        assert_eq!(resolved[0].matches[0].uuid_hex, id_a, "UUID must match entry A");
+        assert_eq!(
+            resolved[0].matches[0].uuid_hex, id_a,
+            "UUID must match entry A"
+        );
     }
 
     // =========================================================================

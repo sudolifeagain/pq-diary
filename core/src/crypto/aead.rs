@@ -26,8 +26,7 @@ pub fn encrypt(
     key: &[u8; 32],
     plaintext: &[u8],
 ) -> Result<(Vec<u8>, [u8; NONCE_SIZE]), DiaryError> {
-    let cipher =
-        Aes256Gcm::new_from_slice(key).map_err(|e| DiaryError::Crypto(e.to_string()))?;
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| DiaryError::Crypto(e.to_string()))?;
 
     let mut nonce_bytes = [0u8; NONCE_SIZE];
     OsRng.fill_bytes(&mut nonce_bytes);
@@ -52,8 +51,7 @@ pub fn decrypt(
     nonce: [u8; NONCE_SIZE],
     ciphertext: &[u8],
 ) -> Result<SecureBuffer, DiaryError> {
-    let cipher =
-        Aes256Gcm::new_from_slice(key).map_err(|e| DiaryError::Crypto(e.to_string()))?;
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| DiaryError::Crypto(e.to_string()))?;
 
     let nonce = Nonce::from_slice(&nonce);
 

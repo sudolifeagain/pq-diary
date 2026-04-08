@@ -67,7 +67,11 @@ fn tc_0041_01_e2e_crud_workflow() {
 
     // Step 3: list shows the new entry.
     let after_create = core.list_entries(None).expect("list after create");
-    assert_eq!(after_create.len(), 1, "Must have exactly 1 entry after create");
+    assert_eq!(
+        after_create.len(),
+        1,
+        "Must have exactly 1 entry after create"
+    );
     assert_eq!(after_create[0].title, "初期タイトル");
     assert_eq!(after_create[0].tags, vec!["日記".to_string()]);
 
@@ -209,8 +213,14 @@ fn tc_0041_03a_tag_prefix_semantics() {
     let diary_jin = Tag::new("日記人").expect("日記人");
 
     assert!(diary.is_prefix_of(&diary_exact), "exact match must be true");
-    assert!(diary.is_prefix_of(&diary_travel), "hierarchical prefix must be true");
-    assert!(!diary.is_prefix_of(&diary_jin), "partial word must not match");
+    assert!(
+        diary.is_prefix_of(&diary_travel),
+        "hierarchical prefix must be true"
+    );
+    assert!(
+        !diary.is_prefix_of(&diary_jin),
+        "partial word must not match"
+    );
 }
 
 /// TC-0041-03b: Full tag filtering integration test.
@@ -334,19 +344,31 @@ fn tc_0041_04b_nonexistent_prefix_returns_error() {
 #[test]
 fn tc_0041_04c_id_prefix_validation() {
     // Too short (< 4 chars).
-    assert!(IdPrefix::new("abc").is_err(), "3-char prefix must be rejected");
+    assert!(
+        IdPrefix::new("abc").is_err(),
+        "3-char prefix must be rejected"
+    );
 
     // Non-hex characters.
-    assert!(IdPrefix::new("zzzz").is_err(), "Non-hex chars must be rejected");
+    assert!(
+        IdPrefix::new("zzzz").is_err(),
+        "Non-hex chars must be rejected"
+    );
     assert!(IdPrefix::new("gggg").is_err(), "'g' is not a hex char");
 
     // Valid lowercase hex.
-    assert!(IdPrefix::new("abcd").is_ok(), "4-char lowercase hex is valid");
+    assert!(
+        IdPrefix::new("abcd").is_ok(),
+        "4-char lowercase hex is valid"
+    );
     assert!(IdPrefix::new("deadbeef").is_ok(), "8-char hex is valid");
 
     // Uppercase is accepted and normalised.
     assert!(IdPrefix::new("ABCD").is_ok(), "Uppercase hex is accepted");
-    assert!(IdPrefix::new("DEADBEEF").is_ok(), "Uppercase 8-char hex accepted");
+    assert!(
+        IdPrefix::new("DEADBEEF").is_ok(),
+        "Uppercase 8-char hex accepted"
+    );
 }
 
 // =============================================================================
@@ -487,7 +509,10 @@ fn tc_s5_02_today_new_and_existing() {
     // First call: no existing entry → simulate today logic: create it.
     let entries = core.list_entries(None).expect("initial list");
     let today_entry = entries.iter().find(|e| e.title == today);
-    assert!(today_entry.is_none(), "vault must start with no today entry");
+    assert!(
+        today_entry.is_none(),
+        "vault must start with no today entry"
+    );
 
     let id = core
         .new_entry(today, "", vec![])
@@ -618,8 +643,10 @@ fn tc_s5_05_duplicate_title_link_resolution() {
     let mut core = DiaryCore::new(vault_path.to_str().expect("utf8")).expect("DiaryCore::new");
     core.unlock(secret("dup_pass")).expect("first unlock");
 
-    core.new_entry("メモ", "内容1", vec![]).expect("new_entry メモ1");
-    core.new_entry("メモ", "内容2", vec![]).expect("new_entry メモ2");
+    core.new_entry("メモ", "内容1", vec![])
+        .expect("new_entry メモ1");
+    core.new_entry("メモ", "内容2", vec![])
+        .expect("new_entry メモ2");
     core.lock();
 
     // Re-unlock to rebuild the LinkIndex.

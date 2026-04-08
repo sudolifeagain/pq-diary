@@ -316,9 +316,7 @@ pub fn launch_editor(tmpfile: &Path, config: &EditorConfig) -> Result<(), DiaryE
     cmd.arg(tmpfile);
 
     let tmpdir_str = config.secure_tmpdir.to_str().ok_or_else(|| {
-        DiaryError::Editor(
-            "Secure tmpdir path contains non-UTF-8 characters".to_string(),
-        )
+        DiaryError::Editor("Secure tmpdir path contains non-UTF-8 characters".to_string())
     })?;
 
     #[cfg(unix)]
@@ -326,9 +324,12 @@ pub fn launch_editor(tmpfile: &Path, config: &EditorConfig) -> Result<(), DiaryE
     cmd.env("TEMP", tmpdir_str);
     cmd.env("TMP", tmpdir_str);
 
-    let status = cmd
-        .status()
-        .map_err(|e| DiaryError::Editor(format!("Failed to launch editor '{}': {}", config.command, e)))?;
+    let status = cmd.status().map_err(|e| {
+        DiaryError::Editor(format!(
+            "Failed to launch editor '{}': {}",
+            config.command, e
+        ))
+    })?;
 
     if !status.success() {
         return Err(DiaryError::Editor(format!(
@@ -376,10 +377,7 @@ fn vim_completion_options_for(command: &str, completion_file: &Path) -> Vec<Stri
     }
 
     // Normalise Windows backslashes to forward slashes for vim script.
-    let path_str = completion_file
-        .to_str()
-        .unwrap_or("")
-        .replace('\\', "/");
+    let path_str = completion_file.to_str().unwrap_or("").replace('\\', "/");
 
     let vim_script = format!(
         "set completefunc=PqDiaryComplete\n\
@@ -471,9 +469,8 @@ fn ensure_dir_0700(dir: &Path) -> Result<(), DiaryError> {
     use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 
     if dir.is_dir() {
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
-            DiaryError::Editor(format!("Failed to set tmpdir permissions: {e}"))
-        })?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| DiaryError::Editor(format!("Failed to set tmpdir permissions: {e}")))?;
         return Ok(());
     }
 
@@ -509,14 +506,11 @@ fn secure_tmpdir_windows() -> Result<PathBuf, DiaryError> {
 /// object-inherit + container-inherit full control (`(OI)(CI)F`).
 #[cfg(windows)]
 fn set_owner_only_acl(path: &Path) -> Result<(), DiaryError> {
-    let username = std::env::var("USERNAME").map_err(|_| {
-        DiaryError::Editor("USERNAME environment variable is not set".to_string())
-    })?;
+    let username = std::env::var("USERNAME")
+        .map_err(|_| DiaryError::Editor("USERNAME environment variable is not set".to_string()))?;
 
     let path_str = path.to_str().ok_or_else(|| {
-        DiaryError::Editor(
-            "Temp directory path contains non-UTF-8 characters".to_string(),
-        )
+        DiaryError::Editor("Temp directory path contains non-UTF-8 characters".to_string())
     })?;
 
     let status = std::process::Command::new("icacls")
@@ -702,7 +696,11 @@ mod tests {
         assert_eq!(header.title, Some("My Title".to_string()));
         assert_eq!(
             header.tags,
-            Some(vec!["tag1".to_string(), "tag2".to_string(), "tag3".to_string()])
+            Some(vec![
+                "tag1".to_string(),
+                "tag2".to_string(),
+                "tag3".to_string()
+            ])
         );
         assert_eq!(header.body, "Hello\nWorld");
     }
@@ -821,7 +819,10 @@ mod tests {
         let opts = vim_options_for("vim");
         assert_eq!(
             opts,
-            vec!["-c".to_string(), "set noswapfile nobackup noundofile".to_string()]
+            vec![
+                "-c".to_string(),
+                "set noswapfile nobackup noundofile".to_string()
+            ]
         );
     }
 
@@ -831,7 +832,10 @@ mod tests {
         let opts = vim_options_for("nvim");
         assert_eq!(
             opts,
-            vec!["-c".to_string(), "set noswapfile nobackup noundofile".to_string()]
+            vec![
+                "-c".to_string(),
+                "set noswapfile nobackup noundofile".to_string()
+            ]
         );
     }
 
@@ -842,7 +846,10 @@ mod tests {
         let opts = vim_options_for("/usr/bin/vim");
         assert_eq!(
             opts,
-            vec!["-c".to_string(), "set noswapfile nobackup noundofile".to_string()]
+            vec![
+                "-c".to_string(),
+                "set noswapfile nobackup noundofile".to_string()
+            ]
         );
     }
 
@@ -877,7 +884,10 @@ mod tests {
         let opts = vim_options_for("vim.exe");
         assert_eq!(
             opts,
-            vec!["-c".to_string(), "set noswapfile nobackup noundofile".to_string()]
+            vec![
+                "-c".to_string(),
+                "set noswapfile nobackup noundofile".to_string()
+            ]
         );
     }
 

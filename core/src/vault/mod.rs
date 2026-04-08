@@ -26,13 +26,10 @@ pub mod writer;
 mod tests {
     use tempfile::tempdir;
 
-    use crate::vault::{
-        config::VaultConfig,
-        format::SCHEMA_VERSION,
-        init::VaultManager,
-        reader::read_vault,
-    };
     use crate::crypto::kdf;
+    use crate::vault::{
+        config::VaultConfig, format::SCHEMA_VERSION, init::VaultManager, reader::read_vault,
+    };
 
     /// Fast Argon2id parameters — avoids the slow 64 MiB default during tests.
     fn fast_params() -> kdf::Argon2Params {
@@ -58,7 +55,8 @@ mod tests {
             .with_kdf_params(fast_params());
 
         let password = b"e2e-test-password";
-        mgr.init_vault("e2e_vault", password).expect("init_vault must succeed");
+        mgr.init_vault("e2e_vault", password)
+            .expect("init_vault must succeed");
 
         // Read the vault.pqd file back.
         let vault_pqd = dir.path().join("e2e_vault").join("vault.pqd");
@@ -75,13 +73,11 @@ mod tests {
 
         // Salts are randomly generated — verify they are non-zero.
         assert_ne!(
-            header.kdf_salt,
-            [0u8; 32],
+            header.kdf_salt, [0u8; 32],
             "kdf_salt must be randomly generated (non-zero)"
         );
         assert_ne!(
-            header.legacy_salt,
-            [0u8; 32],
+            header.legacy_salt, [0u8; 32],
             "legacy_salt must be randomly generated (non-zero)"
         );
 
@@ -103,8 +99,7 @@ mod tests {
 
         // DSA public-key hash must be non-zero (SHA-256 of the verifying key).
         assert_ne!(
-            header.dsa_pk_hash,
-            [0u8; 32],
+            header.dsa_pk_hash, [0u8; 32],
             "dsa_pk_hash must be non-zero after init_vault"
         );
 

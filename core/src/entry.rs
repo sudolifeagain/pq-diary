@@ -227,6 +227,43 @@ pub fn list_entries(
     Ok(metas)
 }
 
+/// List all entries in the vault returning metadata paired with the decrypted body text.
+///
+/// Used internally by [`DiaryCore::unlock`] to build the [`crate::link::LinkIndex`]
+/// in a single vault read.
+///
+/// # Errors
+///
+/// Returns [`DiaryError::Io`] on vault I/O failure.
+/// Returns [`DiaryError::Crypto`] if decryption fails for any record.
+/// Returns [`DiaryError::Entry`] if JSON deserialisation fails for any record.
+pub fn list_entries_with_body(
+    vault_path: &Path,
+    engine: &CryptoEngine,
+) -> Result<Vec<(EntryMeta, String)>, DiaryError> {
+    let (_header, records) = read_vault(vault_path)?;
+    let mut result = Vec::with_capacity(records.len());
+    for record in records {
+        if record.record_type != RECORD_TYPE_ENTRY {
+            continue;
+        }
+        let decrypted = engine.decrypt(&record.iv, &record.ciphertext)?;
+        let plaintext: EntryPlaintext = serde_json::from_slice(decrypted.as_ref())
+            .map_err(|e| DiaryError::Entry(format!("deserialization failed: {e}")))?;
+        let uuid_hex: String = record.uuid.iter().map(|b| format!("{:02x}", b)).collect();
+        let EntryPlaintext { title, tags, body } = plaintext;
+        let meta = EntryMeta {
+            uuid_hex,
+            title,
+            tags,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+        };
+        result.push((meta, body));
+    }
+    Ok(result)
+}
+
 /// Create a new entry in the vault and return its UUID.
 ///
 /// Processing pipeline:

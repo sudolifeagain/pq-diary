@@ -203,7 +203,7 @@ pub fn cmd_new(
         (content, title, tags)
     } else {
         // $EDITOR: write header-comment temp file, launch editor, read back.
-        let config = EditorConfig::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut config = EditorConfig::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
 
         let initial = EntryPlaintext {
             title: title.clone().unwrap_or_else(|| "Untitled".to_string()),
@@ -214,10 +214,25 @@ pub fn cmd_new(
         let tmpfile = editor::write_header_file(&config.secure_tmpdir, &initial)
             .map_err(|e| anyhow::anyhow!("Failed to write temp file: {e}"))?;
 
-        // Launch editor and read result; always delete the temp file afterward.
+        // Inject vim completion for [[title]] links (vim/nvim only).
+        let is_vim = !config.vim_options.is_empty();
+        let completion_file = if is_vim {
+            let titles = core.all_titles().unwrap_or_default();
+            editor::write_completion_file(&config.secure_tmpdir, &titles).ok()
+        } else {
+            None
+        };
+        if let Some(ref cp) = completion_file {
+            config.vim_options.extend(editor::vim_completion_options(cp));
+        }
+
+        // Launch editor and read result; always delete temp files afterward.
         let edit_result = editor::launch_editor(&tmpfile, &config);
         let read_result = editor::read_header_file(&tmpfile);
         let _del = editor::secure_delete(&tmpfile);
+        if let Some(cp) = completion_file {
+            let _ = editor::secure_delete(&cp);
+        }
 
         edit_result.map_err(|e| anyhow::anyhow!("Editor failed: {e}"))?;
         let header = read_result.map_err(|e| anyhow::anyhow!("Failed to read temp file: {e}"))?;
@@ -546,7 +561,7 @@ where
         println!("Updated: {prefix}");
     } else {
         // Editor mode: write header-comment temp file, launch editor, parse result.
-        let config = match EditorConfig::from_env() {
+        let mut config = match EditorConfig::from_env() {
             Ok(c) => c,
             Err(e) => {
                 core.lock();
@@ -562,10 +577,25 @@ where
             }
         };
 
-        // Always delete the temp file regardless of editor/read success.
+        // Inject vim completion for [[title]] links (vim/nvim only).
+        let is_vim = !config.vim_options.is_empty();
+        let completion_file = if is_vim {
+            let titles = core.all_titles().unwrap_or_default();
+            editor::write_completion_file(&config.secure_tmpdir, &titles).ok()
+        } else {
+            None
+        };
+        if let Some(ref cp) = completion_file {
+            config.vim_options.extend(editor::vim_completion_options(cp));
+        }
+
+        // Always delete temp files regardless of editor/read success.
         let edit_result = launch_fn(&tmpfile, &config);
         let read_result = editor::read_header_file(&tmpfile);
         let _del = editor::secure_delete(&tmpfile);
+        if let Some(cp) = completion_file {
+            let _ = editor::secure_delete(&cp);
+        }
 
         if let Err(e) = edit_result {
             core.lock();
@@ -1104,7 +1134,7 @@ where
         }
     };
 
-    let config = match EditorConfig::from_env() {
+    let mut config = match EditorConfig::from_env() {
         Ok(c) => c,
         Err(e) => {
             core.lock();
@@ -1120,9 +1150,24 @@ where
         }
     };
 
+    // Inject vim completion for [[title]] links (vim/nvim only).
+    let is_vim = !config.vim_options.is_empty();
+    let completion_file = if is_vim {
+        let titles = core.all_titles().unwrap_or_default();
+        editor::write_completion_file(&config.secure_tmpdir, &titles).ok()
+    } else {
+        None
+    };
+    if let Some(ref cp) = completion_file {
+        config.vim_options.extend(editor::vim_completion_options(cp));
+    }
+
     let edit_result = launch_fn(&tmpfile, &config);
     let read_result = editor::read_header_file(&tmpfile);
     let _del = editor::secure_delete(&tmpfile);
+    if let Some(cp) = completion_file {
+        let _ = editor::secure_delete(&cp);
+    }
 
     if let Err(e) = edit_result {
         core.lock();

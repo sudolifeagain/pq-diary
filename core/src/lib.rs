@@ -21,6 +21,8 @@ pub mod entry;
 pub mod template;
 /// Template variable extraction and expansion engine (implemented in Sprint 5).
 pub mod template_engine;
+/// `[[title]]` wiki-link parser (implemented in Sprint 5).
+pub mod link;
 /// Git synchronisation operations (implemented in Sprint 8).
 pub mod git;
 /// Digital-legacy operations (implemented in Phase 2).

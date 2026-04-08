@@ -409,80 +409,88 @@ fn cmd_show_impl(cli: &Cli, id: String, out: &mut dyn std::io::Write) -> anyhow:
             Err(anyhow::anyhow!("{e}"))
         }
         Ok((record, plaintext)) => {
-            let created = format_timestamp(record.created_at);
-            let updated = format_timestamp(record.updated_at);
+            // Execute all output logic inside a closure so that core.lock()
+            // is guaranteed to run regardless of write/resolve errors.
+            let show_result = (|| -> anyhow::Result<()> {
+                let created = format_timestamp(record.created_at);
+                let updated = format_timestamp(record.updated_at);
 
-            writeln!(out, "Title:   {}", plaintext.title)
-                .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-            writeln!(out, "Created: {created}  Updated: {updated}")
-                .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-            if plaintext.tags.is_empty() {
-                writeln!(out, "Tags:    (none)")
+                writeln!(out, "Title:   {}", plaintext.title)
                     .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-            } else {
-                let tags_str = plaintext
-                    .tags
-                    .iter()
-                    .map(|t| format!("#{t}"))
-                    .collect::<Vec<_>>()
-                    .join("  ");
-                writeln!(out, "Tags:    {tags_str}")
+                writeln!(out, "Created: {created}  Updated: {updated}")
                     .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-            }
-            writeln!(out).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-            write!(out, "{}", plaintext.body).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-
-            // Resolve [[link]] references in the body.
-            let resolved = core
-                .resolve_links(&plaintext.body)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-            if !resolved.is_empty() {
+                if plaintext.tags.is_empty() {
+                    writeln!(out, "Tags:    (none)")
+                        .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+                } else {
+                    let tags_str = plaintext
+                        .tags
+                        .iter()
+                        .map(|t| format!("#{t}"))
+                        .collect::<Vec<_>>()
+                        .join("  ");
+                    writeln!(out, "Tags:    {tags_str}")
+                        .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+                }
                 writeln!(out).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-                writeln!(out, "--- Links ---").map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-                for link in &resolved {
-                    match link.matches.len() {
-                        0 => writeln!(out, "  [[{}]] (未解決)", link.title)
+                write!(out, "{}", plaintext.body)
+                    .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+
+                // Resolve [[link]] references in the body.
+                let resolved = core
+                    .resolve_links(&plaintext.body)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+                if !resolved.is_empty() {
+                    writeln!(out).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+                    writeln!(out, "--- Links ---")
+                        .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+                    for link in &resolved {
+                        match link.matches.len() {
+                            0 => writeln!(out, "  [[{}]] (未解決)", link.title)
+                                .map_err(|e| anyhow::anyhow!("Write error: {e}"))?,
+                            1 => writeln!(
+                                out,
+                                "  [[{}]] → [{}]",
+                                link.title, link.matches[0].id_prefix
+                            )
                             .map_err(|e| anyhow::anyhow!("Write error: {e}"))?,
-                        1 => writeln!(
-                            out,
-                            "  [[{}]] → [{}]",
-                            link.title, link.matches[0].id_prefix
-                        )
-                        .map_err(|e| anyhow::anyhow!("Write error: {e}"))?,
-                        _ => {
-                            writeln!(out, "  [[{}]] → 複数候補:", link.title)
-                                .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-                            for m in &link.matches {
-                                writeln!(out, "    [{}]", m.id_prefix)
+                            _ => {
+                                writeln!(out, "  [[{}]] → 複数候補:", link.title)
                                     .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+                                for m in &link.matches {
+                                    writeln!(out, "    [{}]", m.id_prefix)
+                                        .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+                                }
                             }
                         }
                     }
                 }
-            }
 
-            // Display backlinks (newest first).
-            let mut backlinks = core
-                .backlinks_for(&plaintext.title)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                // Display backlinks (newest first).
+                let mut backlinks = core
+                    .backlinks_for(&plaintext.title)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-            if !backlinks.is_empty() {
-                backlinks.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                if !backlinks.is_empty() {
+                    backlinks.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
-                writeln!(out).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-                writeln!(out, "--- Backlinks ---")
-                    .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-                for bl in &backlinks {
-                    let date = format_timestamp(bl.created_at);
-                    let prefix = backlink_uuid_prefix(&bl.source_uuid);
-                    writeln!(out, "  [{prefix}] {date} {}", bl.source_title)
+                    writeln!(out).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+                    writeln!(out, "--- Backlinks ---")
                         .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+                    for bl in &backlinks {
+                        let date = format_timestamp(bl.created_at);
+                        let prefix = backlink_uuid_prefix(&bl.source_uuid);
+                        writeln!(out, "  [{prefix}] {date} {}", bl.source_title)
+                            .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+                    }
                 }
-            }
+
+                Ok(())
+            })();
 
             core.lock();
-            Ok(())
+            show_result
         }
     }
 }
@@ -923,10 +931,22 @@ where
         }
     };
 
+    // Delete the existing template before creating the replacement.
+    if already_exists {
+        if let Err(e) = core.delete_template(&name) {
+            core.lock();
+            return Err(anyhow::anyhow!("Failed to delete old template: {e}"));
+        }
+    }
+
     let result = core.new_template(&name, &body);
     core.lock();
     result.map_err(|e| anyhow::anyhow!("Failed to create template: {e}"))?;
-    println!("Template created: \"{name}\"");
+    if already_exists {
+        println!("Template replaced: \"{name}\"");
+    } else {
+        println!("Template created: \"{name}\"");
+    }
     Ok(())
 }
 

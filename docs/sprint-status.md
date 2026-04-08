@@ -1,6 +1,6 @@
 # Sprint Status
 
-## Current: Sprint 5 — デイリーノート + テンプレート + リンク (in progress)
+## Current: Sprint 5 — デイリーノート + テンプレート + リンク (completed)
 
 ## Progress
 
@@ -10,11 +10,11 @@
 | S2 | 暗号コア | completed (s2-done) | 2 |
 | S3 | Vaultフォーマット | completed (s3-done) | 3 |
 | S4 | エントリ操作 + CLI | completed (s4-done) | 4 |
-| S5 | デイリーノート + テンプレート + リンク | in progress | 5 |
-| S6 | 検索 + 統計 + インポート | blocked by S5 | 6 |
-| S7 | アクセス制御 + Claude連携 | blocked by S5 | 7 |
-| S8 | Git連携 | blocked by S4 | 8 |
-| S9 | セキュリティ硬化 + 統合テスト | blocked by S5-S8 | 9 |
+| S5 | デイリーノート + テンプレート + リンク | completed (s5-done) | 5 |
+| S6 | 検索 + 統計 + インポート + 技術的負債 | ready | 6 |
+| S7 | アクセス制御 + Claude連携 | blocked by S6 | 7 |
+| S8 | Git連携 | ready | 8 |
+| S9 | セキュリティ硬化 + 統合テスト + S1-S2負債 | blocked by S6-S8 | 9 |
 
 ## Sprint Scope
 

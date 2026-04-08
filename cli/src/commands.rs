@@ -7,7 +7,7 @@
 use crate::editor::{self, EditorConfig};
 use crate::password::get_password;
 use crate::Cli;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use pq_diary_core::{DiaryCore, EntryMeta, EntryPlaintext, Tag};
 use std::path::PathBuf;
 
@@ -115,9 +115,10 @@ pub fn cmd_new(
     title: Option<String>,
     body: Option<String>,
     tags: Vec<String>,
+    template: Option<String>,
 ) -> anyhow::Result<()> {
     use secrecy::{ExposeSecret as _, SecretBox};
-    use std::io::{IsTerminal as _, Read as _};
+    use std::io::{BufRead as _, IsTerminal as _, Read as _};
 
     // Step 1: Obtain password and unlock the vault.
     let password_source =
@@ -137,8 +138,62 @@ pub fn cmd_new(
 
     // Step 2: Determine body text and potentially update title/tags.
     let (final_body, final_title, final_tags) = if let Some(b) = body {
-        // -b / --body flag: highest priority; editor is NOT launched.
+        // -b / --body flag: highest priority; template is ignored; editor is NOT launched.
         (b, title, tags)
+    } else if let Some(tmpl_name) = template {
+        // --template: expand template variables and use as body; editor is NOT launched.
+        use pq_diary_core::template_engine::{
+            expand, extract_variables, VariableKind, BUILTIN_DATE, BUILTIN_DATETIME, BUILTIN_TITLE,
+        };
+        use std::collections::{HashMap, HashSet};
+
+        let tmpl = match core.get_template(&tmpl_name) {
+            Ok(t) => t,
+            Err(e) => {
+                core.lock();
+                return Err(anyhow::anyhow!("{e}"));
+            }
+        };
+
+        let var_refs = extract_variables(&tmpl.body);
+
+        // Populate builtin variables.
+        let mut vars: HashMap<String, String> = HashMap::new();
+        let now = Local::now();
+        let title_for_tmpl = title
+            .clone()
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| "Untitled".to_string());
+        vars.insert(BUILTIN_DATE.to_string(), now.format("%Y-%m-%d").to_string());
+        vars.insert(
+            BUILTIN_DATETIME.to_string(),
+            now.format("%Y-%m-%d %H:%M:%S").to_string(),
+        );
+        vars.insert(BUILTIN_TITLE.to_string(), title_for_tmpl);
+
+        // Prompt for each unique custom variable once.
+        let mut prompted: HashSet<String> = HashSet::new();
+        for var_ref in &var_refs {
+            if matches!(var_ref.kind, VariableKind::Custom)
+                && prompted.insert(var_ref.name.clone())
+            {
+                use std::io::Write as _;
+                print!("{}: ", var_ref.name);
+                if let Err(e) = std::io::stdout().flush() {
+                    core.lock();
+                    return Err(anyhow::anyhow!("Failed to flush stdout: {e}"));
+                }
+                let mut input = String::new();
+                if let Err(e) = std::io::stdin().lock().read_line(&mut input) {
+                    core.lock();
+                    return Err(anyhow::anyhow!("Failed to read variable input: {e}"));
+                }
+                vars.insert(var_ref.name.clone(), input.trim().to_string());
+            }
+        }
+
+        let expanded = expand(&tmpl.body, &vars);
+        (expanded, title, tags)
     } else if !std::io::stdin().is_terminal() {
         // Piped stdin: read all content.
         let mut content = String::new();
@@ -958,7 +1013,7 @@ mod tests {
         let vault_dir_str = vault_dir.to_str().expect("utf8");
 
         let cli = make_cli(vault_dir_str, Some("password"));
-        let result = cmd_new(&cli, None, Some("body text".to_string()), vec![]);
+        let result = cmd_new(&cli, None, Some("body text".to_string()), vec![], None);
         assert!(result.is_ok(), "cmd_new failed: {:?}", result.err());
 
         let entries = read_vault_entries(&vault_dir);
@@ -978,7 +1033,7 @@ mod tests {
         let vault_dir_str = vault_dir.to_str().expect("utf8");
 
         let cli = make_cli(vault_dir_str, Some("password"));
-        let result = cmd_new(&cli, Some(String::new()), Some("body".to_string()), vec![]);
+        let result = cmd_new(&cli, Some(String::new()), Some("body".to_string()), vec![], None);
         assert!(result.is_ok(), "cmd_new failed: {:?}", result.err());
 
         let entries = read_vault_entries(&vault_dir);
@@ -1003,6 +1058,7 @@ mod tests {
             Some("My Diary Entry".to_string()),
             Some("body text".to_string()),
             vec![],
+            None,
         );
         assert!(result.is_ok(), "cmd_new failed: {:?}", result.err());
 
@@ -1028,6 +1084,7 @@ mod tests {
             Some("Title".to_string()),
             Some("Hello World body text".to_string()),
             vec![],
+            None,
         );
         assert!(result.is_ok(), "cmd_new failed: {:?}", result.err());
 
@@ -1052,7 +1109,7 @@ mod tests {
             "tag2".to_string(),
             "work/project".to_string(),
         ];
-        let result = cmd_new(&cli, None, Some("body".to_string()), tags.clone());
+        let result = cmd_new(&cli, None, Some("body".to_string()), tags.clone(), None);
         assert!(result.is_ok(), "cmd_new failed: {:?}", result.err());
 
         let plaintext = read_first_entry_plaintext(&vault_dir);
@@ -1071,7 +1128,7 @@ mod tests {
         let vault_dir_str = vault_dir.to_str().expect("utf8");
 
         let cli = make_cli(vault_dir_str, Some("password"));
-        let result = cmd_new(&cli, None, Some("body".to_string()), vec![]);
+        let result = cmd_new(&cli, None, Some("body".to_string()), vec![], None);
         assert!(result.is_ok(), "cmd_new failed: {:?}", result.err());
 
         let plaintext = read_first_entry_plaintext(&vault_dir);
@@ -1090,7 +1147,7 @@ mod tests {
         let vault_dir_str = vault_dir.to_str().expect("utf8");
 
         let cli = make_cli(vault_dir_str, Some("wrong_password"));
-        let result = cmd_new(&cli, None, Some("body".to_string()), vec![]);
+        let result = cmd_new(&cli, None, Some("body".to_string()), vec![], None);
         assert!(result.is_err(), "Expected error for wrong password");
     }
 
@@ -1289,8 +1346,14 @@ mod tests {
 
         // Create an entry first
         let new_cli = make_cli(vault_dir_str, Some("password"));
-        cmd_new(&new_cli, Some("Test".to_string()), Some("body".to_string()), vec![])
-            .expect("cmd_new");
+        cmd_new(
+            &new_cli,
+            Some("Test".to_string()),
+            Some("body".to_string()),
+            vec![],
+            None,
+        )
+        .expect("cmd_new");
 
         let list_cli = make_list_cli(vault_dir_str, Some("password"));
         let result = cmd_list(&list_cli, None, None, 20);
@@ -1322,6 +1385,7 @@ mod tests {
             Some("Show Test".to_string()),
             Some("body text".to_string()),
             vec![],
+            None,
         )
         .expect("cmd_new");
 
@@ -1346,6 +1410,7 @@ mod tests {
             Some("Full ID Show".to_string()),
             Some("body".to_string()),
             vec![],
+            None,
         )
         .expect("cmd_new");
 
@@ -1410,6 +1475,7 @@ mod tests {
             Some(title.to_string()),
             Some(body.to_string()),
             tags.iter().map(|s| s.to_string()).collect(),
+            None,
         )
         .expect("cmd_new in setup");
 
@@ -2232,5 +2298,129 @@ mod tests {
         let tpl = core.get_template("weekly").expect("get_template");
         core.lock();
         assert_eq!(tpl.body, "## 週次レビュー");
+    }
+
+    // =========================================================================
+    // TC-048: --template flag tests (TASK-0048)
+    // =========================================================================
+
+    /// Add a template directly to the vault without going through the editor.
+    fn add_template_to_vault(vault_dir: &std::path::Path, name: &str, body: &str) {
+        let vault_pqd = vault_dir.join("vault.pqd");
+        let vault_str = vault_pqd.to_str().expect("utf8");
+        let mut core = DiaryCore::new(vault_str).expect("DiaryCore::new");
+        let pw: secrecy::SecretString = secrecy::SecretBox::new(Box::from("password"));
+        core.unlock(pw).expect("unlock");
+        core.new_template(name, body).expect("new_template");
+        core.lock();
+    }
+
+    /// TC-048-01: --template expands {{date}} as YYYY-MM-DD in the created entry body.
+    #[test]
+    fn tc_048_01_template_date_variable_expanded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        add_template_to_vault(&vault_dir, "t1", "日付: {{date}}");
+
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+        let cli = make_cli(vault_dir_str, Some("password"));
+        let result = cmd_new(
+            &cli,
+            Some("Test Entry".to_string()),
+            None,
+            vec![],
+            Some("t1".to_string()),
+        );
+        assert!(result.is_ok(), "cmd_new with template failed: {:?}", result.err());
+
+        let plaintext = read_first_entry_plaintext(&vault_dir);
+        // Verify that {{date}} was replaced by a YYYY-MM-DD string.
+        assert!(
+            plaintext.body.starts_with("日付: "),
+            "body must start with '日付: ', got: {:?}",
+            plaintext.body
+        );
+        let date_part = plaintext.body.trim_start_matches("日付: ");
+        // Must match YYYY-MM-DD format (10 chars, digits and hyphens).
+        assert_eq!(date_part.len(), 10, "date must be 10 chars (YYYY-MM-DD)");
+        assert!(
+            date_part.chars().all(|c| c.is_ascii_digit() || c == '-'),
+            "date must contain only digits and hyphens, got: {date_part:?}"
+        );
+    }
+
+    /// TC-048-02: --template with no custom variables completes without any prompt.
+    #[test]
+    fn tc_048_02_template_no_custom_vars_no_prompt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        add_template_to_vault(&vault_dir, "t2", "固定 {{date}}");
+
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+        let cli = make_cli(vault_dir_str, Some("password"));
+        // No custom vars in "固定 {{date}}" → cmd_new must succeed without reading stdin.
+        let result = cmd_new(
+            &cli,
+            None,
+            None,
+            vec![],
+            Some("t2".to_string()),
+        );
+        assert!(
+            result.is_ok(),
+            "cmd_new with builtin-only template must succeed without prompts: {:?}",
+            result.err()
+        );
+
+        let entries = read_vault_entries(&vault_dir);
+        assert_eq!(entries.len(), 1, "exactly one entry must be created");
+    }
+
+    /// TC-048-03: --template with a nonexistent name returns an error.
+    #[test]
+    fn tc_048_03_nonexistent_template_returns_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+        let cli = make_cli(vault_dir_str, Some("password"));
+        let result = cmd_new(
+            &cli,
+            None,
+            None,
+            vec![],
+            Some("nonexistent".to_string()),
+        );
+        assert!(result.is_err(), "Expected error for nonexistent template");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("nonexistent"),
+            "error must mention the template name, got: {err_msg:?}"
+        );
+    }
+
+    /// TC-048-04: --body takes priority over --template (template is ignored).
+    #[test]
+    fn tc_048_04_body_takes_priority_over_template() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        add_template_to_vault(&vault_dir, "t3", "template body {{date}}");
+
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+        let cli = make_cli(vault_dir_str, Some("password"));
+        let result = cmd_new(
+            &cli,
+            None,
+            Some("direct body".to_string()),
+            vec![],
+            Some("t3".to_string()),
+        );
+        assert!(result.is_ok(), "cmd_new failed: {:?}", result.err());
+
+        let plaintext = read_first_entry_plaintext(&vault_dir);
+        assert_eq!(
+            plaintext.body, "direct body",
+            "--body must take priority over --template"
+        );
     }
 }

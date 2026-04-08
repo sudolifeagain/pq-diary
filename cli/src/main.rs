@@ -52,6 +52,10 @@ pub enum Commands {
         /// Tag to attach (repeatable: -t tag1 -t tag2)
         #[arg(short, long = "tag")]
         tag: Vec<String>,
+
+        /// Template name to use as initial body content
+        #[arg(long)]
+        template: Option<String>,
     },
 
     /// List diary entries
@@ -254,9 +258,18 @@ pub enum TemplateCommands {
 
 fn dispatch(cli: &Cli) -> anyhow::Result<()> {
     match &cli.command {
-        Commands::New { title, body, tag } => {
-            commands::cmd_new(cli, title.clone(), body.clone(), tag.clone())
-        }
+        Commands::New {
+            title,
+            body,
+            tag,
+            template,
+        } => commands::cmd_new(
+            cli,
+            title.clone(),
+            body.clone(),
+            tag.clone(),
+            template.clone(),
+        ),
         Commands::Init => not_implemented("init", "Sprint 2"),
         Commands::Vault { subcommand } => match subcommand {
             VaultCommands::Create { .. } => not_implemented("vault create", "Sprint 2"),
@@ -527,10 +540,16 @@ mod tests {
         assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
         let cli = result.unwrap();
         match cli.command {
-            Commands::New { title, body, tag } => {
+            Commands::New {
+                title,
+                body,
+                tag,
+                template,
+            } => {
                 assert_eq!(title, None);
                 assert_eq!(body, None);
                 assert!(tag.is_empty());
+                assert_eq!(template, None);
             }
             _ => panic!("Expected Commands::New"),
         }
@@ -543,7 +562,12 @@ mod tests {
         assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
         let cli = result.unwrap();
         match cli.command {
-            Commands::New { title, body, tag } => {
+            Commands::New {
+                title,
+                body,
+                tag,
+                ..
+            } => {
                 assert_eq!(title, Some("My Title".to_string()));
                 assert_eq!(body, None);
                 assert!(tag.is_empty());
@@ -559,7 +583,9 @@ mod tests {
         assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
         let cli = result.unwrap();
         match cli.command {
-            Commands::New { title, body, tag } => {
+            Commands::New {
+                title, body, tag, ..
+            } => {
                 assert_eq!(title, None);
                 assert_eq!(body, Some("Hello World".to_string()));
                 assert!(tag.is_empty());
@@ -606,7 +632,9 @@ mod tests {
         assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
         let cli = result.unwrap();
         match cli.command {
-            Commands::New { title, body, tag } => {
+            Commands::New {
+                title, body, tag, ..
+            } => {
                 assert_eq!(title, Some("Entry Title".to_string()));
                 assert_eq!(body, Some("body text".to_string()));
                 assert_eq!(tag, vec!["work".to_string()]);

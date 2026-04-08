@@ -581,6 +581,300 @@ fn cmd_delete_impl(
 }
 
 // ---------------------------------------------------------------------------
+// Template command handlers
+// ---------------------------------------------------------------------------
+
+/// Prompt the user for template deletion confirmation.
+///
+/// Prints `Delete template "{name}"? [y/N]: ` to stderr and reads a line from
+/// `reader`.  Returns `true` only when the user responds with `y` or `Y`.
+fn confirm_template_delete(name: &str, reader: &mut impl std::io::BufRead) -> anyhow::Result<bool> {
+    use std::io::Write as _;
+    eprint!("Delete template \"{name}\"? [y/N]: ");
+    std::io::stderr()
+        .flush()
+        .map_err(|e| anyhow::anyhow!("Failed to flush stderr: {e}"))?;
+    let mut input = String::new();
+    reader
+        .read_line(&mut input)
+        .map_err(|e| anyhow::anyhow!("Failed to read input: {e}"))?;
+    let trimmed = input.trim();
+    Ok(trimmed == "y" || trimmed == "Y")
+}
+
+/// Execute the `pq-diary template add` command.
+///
+/// Opens `$EDITOR` with a blank temporary file; on save, stores the file
+/// contents as the body of a new template named `name`.
+///
+/// If a template with the same `name` already exists, the user is prompted to
+/// confirm overwriting (unless `--claude` is set, in which case overwrite
+/// proceeds silently).
+///
+/// # Errors
+///
+/// Returns an error if password acquisition, vault unlock, editor launch,
+/// or template creation fails.
+pub fn cmd_template_add(cli: &Cli, name: String) -> anyhow::Result<()> {
+    cmd_template_add_impl(
+        cli,
+        name,
+        editor::launch_editor,
+        &mut std::io::BufReader::new(std::io::stdin()),
+    )
+}
+
+/// Internal implementation of `cmd_template_add` with injectable editor launcher and reader.
+fn cmd_template_add_impl<F>(
+    cli: &Cli,
+    name: String,
+    launch_fn: F,
+    reader: &mut impl std::io::BufRead,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(&std::path::Path, &EditorConfig) -> Result<(), pq_diary_core::DiaryError>,
+{
+    use secrecy::{ExposeSecret as _, SecretBox};
+
+    let password_source =
+        get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let vault_path = resolve_vault_path(cli)?;
+    let vault_str = vault_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Vault path contains non-UTF-8 characters"))?;
+
+    let mut core = DiaryCore::new(vault_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let secret_password: secrecy::SecretString =
+        SecretBox::new(Box::from(password_source.secret().expose_secret()));
+    core.unlock(secret_password)
+        .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+
+    // Check for an existing template with the same name.
+    let already_exists = core.get_template(&name).is_ok();
+    if already_exists && !cli.claude {
+        use std::io::Write as _;
+        eprint!("Template \"{name}\" already exists. Overwrite? [y/N]: ");
+        if let Err(e) = std::io::stderr().flush() {
+            core.lock();
+            return Err(anyhow::anyhow!("Failed to flush stderr: {e}"));
+        }
+        let mut input = String::new();
+        if let Err(e) = reader.read_line(&mut input) {
+            core.lock();
+            return Err(anyhow::anyhow!("Failed to read input: {e}"));
+        }
+        let trimmed = input.trim();
+        if trimmed != "y" && trimmed != "Y" {
+            core.lock();
+            println!("キャンセルしました");
+            return Ok(());
+        }
+    }
+
+    // Set up editor config.
+    let config = match editor::EditorConfig::from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            core.lock();
+            return Err(anyhow::anyhow!("{e}"));
+        }
+    };
+
+    // Write a blank temp file and launch editor.
+    let tmpfile = match editor::write_template_file(&config.secure_tmpdir) {
+        Ok(p) => p,
+        Err(e) => {
+            core.lock();
+            return Err(anyhow::anyhow!("Failed to write temp file: {e}"));
+        }
+    };
+
+    let edit_result = launch_fn(&tmpfile, &config);
+    let read_result = editor::read_template_file(&tmpfile);
+    let _del = editor::secure_delete(&tmpfile);
+
+    if let Err(e) = edit_result {
+        core.lock();
+        return Err(anyhow::anyhow!("Editor failed: {e}"));
+    }
+
+    let body = match read_result {
+        Ok(b) => b,
+        Err(e) => {
+            core.lock();
+            return Err(anyhow::anyhow!("Failed to read temp file: {e}"));
+        }
+    };
+
+    let result = core.new_template(&name, &body);
+    core.lock();
+    result.map_err(|e| anyhow::anyhow!("Failed to create template: {e}"))?;
+    println!("Template created: \"{name}\"");
+    Ok(())
+}
+
+/// Execute the `pq-diary template list` command.
+///
+/// Lists all templates stored in the vault sorted alphabetically by name.
+/// Prints one name per line.
+///
+/// # Errors
+///
+/// Returns an error if password acquisition, vault unlock, or template listing fails.
+pub fn cmd_template_list(cli: &Cli) -> anyhow::Result<()> {
+    use secrecy::{ExposeSecret as _, SecretBox};
+
+    let password_source =
+        get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let vault_path = resolve_vault_path(cli)?;
+    let vault_str = vault_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Vault path contains non-UTF-8 characters"))?;
+
+    let mut core = DiaryCore::new(vault_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let secret_password: secrecy::SecretString =
+        SecretBox::new(Box::from(password_source.secret().expose_secret()));
+    core.unlock(secret_password)
+        .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+
+    let result = core.list_templates();
+    core.lock();
+
+    let mut templates =
+        result.map_err(|e| anyhow::anyhow!("Failed to list templates: {e}"))?;
+    templates.sort_by(|a, b| a.name.cmp(&b.name));
+
+    for meta in &templates {
+        println!("{}", meta.name);
+    }
+
+    Ok(())
+}
+
+/// Execute the `pq-diary template show` command.
+///
+/// Displays the body text of the template identified by `name`.
+///
+/// # Errors
+///
+/// Returns an error if password acquisition, vault unlock, or template lookup fails.
+/// Returns `DiaryError::TemplateNotFound` (wrapped in anyhow) when no template
+/// with the given name exists.
+pub fn cmd_template_show(cli: &Cli, name: String) -> anyhow::Result<()> {
+    use secrecy::{ExposeSecret as _, SecretBox};
+
+    let password_source =
+        get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let vault_path = resolve_vault_path(cli)?;
+    let vault_str = vault_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Vault path contains non-UTF-8 characters"))?;
+
+    let mut core = DiaryCore::new(vault_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let secret_password: secrecy::SecretString =
+        SecretBox::new(Box::from(password_source.secret().expose_secret()));
+    core.unlock(secret_password)
+        .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+
+    let result = core.get_template(&name);
+    match result {
+        Err(e) => {
+            core.lock();
+            Err(anyhow::anyhow!("{e}"))
+        }
+        Ok(plaintext) => {
+            print!("{}", plaintext.body);
+            core.lock();
+            Ok(())
+        }
+    }
+}
+
+/// Execute the `pq-diary template delete` command.
+///
+/// Looks up the template identified by `name`, then prompts for confirmation
+/// unless `force` or `--claude` is set.  Prints `Deleted template: "{name}"` on
+/// success, or `キャンセルしました` when the user declines.
+///
+/// # Errors
+///
+/// Returns an error if password acquisition, vault unlock, template lookup, or
+/// template deletion fails.
+pub fn cmd_template_delete(cli: &Cli, name: String, force: bool) -> anyhow::Result<()> {
+    cmd_template_delete_impl(
+        cli,
+        name,
+        force,
+        &mut std::io::BufReader::new(std::io::stdin()),
+    )
+}
+
+/// Internal implementation of `cmd_template_delete` with an injectable stdin reader.
+fn cmd_template_delete_impl(
+    cli: &Cli,
+    name: String,
+    force: bool,
+    reader: &mut impl std::io::BufRead,
+) -> anyhow::Result<()> {
+    use secrecy::{ExposeSecret as _, SecretBox};
+
+    let password_source =
+        get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let vault_path = resolve_vault_path(cli)?;
+    let vault_str = vault_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Vault path contains non-UTF-8 characters"))?;
+
+    let mut core = DiaryCore::new(vault_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let secret_password: secrecy::SecretString =
+        SecretBox::new(Box::from(password_source.secret().expose_secret()));
+    core.unlock(secret_password)
+        .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+
+    // Verify the template exists.
+    let get_result = core.get_template(&name);
+    if let Err(e) = get_result {
+        core.lock();
+        return Err(anyhow::anyhow!("{e}"));
+    }
+
+    // Determine whether to skip confirmation.
+    let skip_confirm = force || cli.claude;
+    let do_delete = if skip_confirm {
+        true
+    } else {
+        match confirm_template_delete(&name, reader) {
+            Ok(v) => v,
+            Err(e) => {
+                core.lock();
+                return Err(e);
+            }
+        }
+    };
+
+    if do_delete {
+        let delete_result = core.delete_template(&name);
+        core.lock();
+        delete_result
+            .map_err(|e| anyhow::anyhow!("Failed to delete template: {e}"))?;
+        println!("Deleted template: \"{name}\"");
+    } else {
+        core.lock();
+        println!("キャンセルしました");
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1736,5 +2030,207 @@ mod tests {
         let mut reader = std::io::BufReader::new("".as_bytes());
         let result = cmd_delete_impl(&delete_cli, prefix.clone(), true, &mut reader);
         assert!(result.is_err(), "Expected error for wrong password");
+    }
+
+    // =========================================================================
+    // Template command tests (TASK-0047)
+    // =========================================================================
+
+    /// Build a `Cli` targeting `vault_dir` for `template list`.
+    fn make_template_list_cli(vault_dir_str: &str, password: Option<&str>) -> crate::Cli {
+        let mut args: Vec<&str> = vec!["pq-diary", "-v", vault_dir_str];
+        if let Some(pw) = password {
+            args.extend_from_slice(&["--password", pw]);
+        }
+        args.extend_from_slice(&["template", "list"]);
+        crate::Cli::try_parse_from(&args).expect("parse test CLI")
+    }
+
+    /// Build a `Cli` targeting `vault_dir` for `template show <name>`.
+    fn make_template_show_cli(
+        vault_dir_str: &str,
+        password: Option<&str>,
+        name: &str,
+    ) -> crate::Cli {
+        let mut args: Vec<&str> = vec!["pq-diary", "-v", vault_dir_str];
+        if let Some(pw) = password {
+            args.extend_from_slice(&["--password", pw]);
+        }
+        args.extend_from_slice(&["template", "show", name]);
+        crate::Cli::try_parse_from(&args).expect("parse test CLI")
+    }
+
+    /// Build a `Cli` targeting `vault_dir` for `template delete <name>`.
+    fn make_template_delete_cli(
+        vault_dir_str: &str,
+        password: Option<&str>,
+        name: &str,
+        force: bool,
+    ) -> crate::Cli {
+        let mut args: Vec<&str> = vec!["pq-diary", "-v", vault_dir_str];
+        if let Some(pw) = password {
+            args.extend_from_slice(&["--password", pw]);
+        }
+        args.extend_from_slice(&["template", "delete", name]);
+        if force {
+            args.push("--force");
+        }
+        crate::Cli::try_parse_from(&args).expect("parse test CLI")
+    }
+
+    /// Seed the vault with templates via DiaryCore directly.
+    fn seed_templates(vault_dir: &std::path::Path, templates: &[(&str, &str)]) {
+        let vault_pqd = vault_dir.join("vault.pqd");
+        let vault_str = vault_pqd.to_str().expect("utf8");
+        let mut core = DiaryCore::new(vault_str).expect("DiaryCore::new");
+        let pw: secrecy::SecretString = secrecy::SecretBox::new(Box::from("password"));
+        core.unlock(pw).expect("unlock");
+        for (name, body) in templates {
+            core.new_template(name, body).expect("new_template");
+        }
+        core.lock();
+    }
+
+    /// Read template names from the vault, sorted alphabetically.
+    fn read_template_names_sorted(vault_dir: &std::path::Path) -> Vec<String> {
+        let vault_pqd = vault_dir.join("vault.pqd");
+        let vault_str = vault_pqd.to_str().expect("utf8");
+        let mut core = DiaryCore::new(vault_str).expect("DiaryCore::new");
+        let pw: secrecy::SecretString = secrecy::SecretBox::new(Box::from("password"));
+        core.unlock(pw).expect("unlock");
+        let mut metas = core.list_templates().expect("list_templates");
+        core.lock();
+        metas.sort_by(|a, b| a.name.cmp(&b.name));
+        metas.into_iter().map(|m| m.name).collect()
+    }
+
+    /// TC-047-01: cmd_template_list returns Ok and templates are in alphabetical order.
+    ///
+    /// Given "weekly", "daily", "meeting" seeded (insertion order out of alpha),
+    /// the sorted result must be ["daily", "meeting", "weekly"].
+    #[test]
+    fn tc_047_01_template_list_alphabetical_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+
+        seed_templates(
+            &vault_dir,
+            &[("weekly", "week body"), ("daily", "day body"), ("meeting", "mtg body")],
+        );
+
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+        let cli = make_template_list_cli(vault_dir_str, Some("password"));
+        let result = cmd_template_list(&cli);
+        assert!(result.is_ok(), "cmd_template_list failed: {:?}", result.err());
+
+        // Verify alphabetical order via core read.
+        let sorted = read_template_names_sorted(&vault_dir);
+        assert_eq!(sorted, vec!["daily", "meeting", "weekly"]);
+    }
+
+    /// TC-047-02: cmd_template_show outputs the registered body text.
+    ///
+    /// Given template "daily" with body "## 振り返り", cmd_template_show must succeed.
+    #[test]
+    fn tc_047_02_template_show_outputs_body() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+
+        seed_templates(&vault_dir, &[("daily", "## 振り返り")]);
+
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+        let cli = make_template_show_cli(vault_dir_str, Some("password"), "daily");
+        let result = cmd_template_show(&cli, "daily".to_string());
+        assert!(result.is_ok(), "cmd_template_show failed: {:?}", result.err());
+    }
+
+    /// TC-047-03: cmd_template_show returns an error for a nonexistent template.
+    ///
+    /// Given an empty vault, requesting "nonexistent" must return
+    /// DiaryError::TemplateNotFound (propagated as anyhow error).
+    #[test]
+    fn tc_047_03_template_show_nonexistent_returns_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+        let cli = make_template_show_cli(vault_dir_str, Some("password"), "nonexistent");
+        let result = cmd_template_show(&cli, "nonexistent".to_string());
+        assert!(result.is_err(), "Expected error for nonexistent template");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("nonexistent"),
+            "Error message must name the missing template; got: {err_msg}"
+        );
+    }
+
+    /// TC-047-04: cmd_template_delete with --force removes the template.
+    #[test]
+    fn tc_047_04_template_delete_force_removes_template() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+
+        seed_templates(&vault_dir, &[("daily", "body")]);
+
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+        let cli = make_template_delete_cli(vault_dir_str, Some("password"), "daily", true);
+        let mut reader = std::io::BufReader::new("".as_bytes());
+        let result = cmd_template_delete_impl(&cli, "daily".to_string(), true, &mut reader);
+        assert!(result.is_ok(), "cmd_template_delete failed: {:?}", result.err());
+
+        // Verify the template is gone.
+        let names = read_template_names_sorted(&vault_dir);
+        assert!(names.is_empty(), "Template must be deleted; names={names:?}");
+    }
+
+    /// TC-047-05: cmd_template_delete with "n" input cancels.
+    #[test]
+    fn tc_047_05_template_delete_cancel_keeps_template() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+
+        seed_templates(&vault_dir, &[("daily", "body")]);
+
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+        let cli = make_template_delete_cli(vault_dir_str, Some("password"), "daily", false);
+        let mut reader = std::io::BufReader::new("n\n".as_bytes());
+        let result = cmd_template_delete_impl(&cli, "daily".to_string(), false, &mut reader);
+        assert!(result.is_ok(), "Expected Ok on cancel; got: {:?}", result.err());
+
+        // Verify the template still exists.
+        let names = read_template_names_sorted(&vault_dir);
+        assert_eq!(names, vec!["daily"], "Template must still exist after cancel");
+    }
+
+    /// TC-047-06: cmd_template_add stores the template body written by the editor.
+    #[test]
+    fn tc_047_06_template_add_stores_body() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let mut args = vec!["pq-diary", "-v", vault_dir_str, "--password", "password"];
+        args.extend_from_slice(&["template", "add", "weekly"]);
+        let cli = crate::Cli::try_parse_from(&args).expect("parse");
+
+        // Inject a fake editor that writes "## 週次レビュー" into the temp file.
+        let mock_launch = |tmpfile: &std::path::Path, _config: &EditorConfig| {
+            std::fs::write(tmpfile, "## 週次レビュー").map_err(|e| {
+                pq_diary_core::DiaryError::Io(e)
+            })
+        };
+        let mut reader = std::io::BufReader::new("".as_bytes());
+        let result = cmd_template_add_impl(&cli, "weekly".to_string(), mock_launch, &mut reader);
+        assert!(result.is_ok(), "cmd_template_add_impl failed: {:?}", result.err());
+
+        // Verify the stored body.
+        let vault_pqd = vault_dir.join("vault.pqd");
+        let vault_str = vault_pqd.to_str().expect("utf8");
+        let mut core = DiaryCore::new(vault_str).expect("DiaryCore::new");
+        let pw: secrecy::SecretString = secrecy::SecretBox::new(Box::from("password"));
+        core.unlock(pw).expect("unlock");
+        let tpl = core.get_template("weekly").expect("get_template");
+        core.lock();
+        assert_eq!(tpl.body, "## 週次レビュー");
     }
 }

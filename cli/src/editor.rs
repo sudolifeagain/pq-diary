@@ -239,6 +239,33 @@ pub fn read_header_file(path: &Path) -> Result<HeaderComment, DiaryError> {
     Ok(HeaderComment { title, tags, body })
 }
 
+/// Write a blank template body to a temporary plain-text file.
+///
+/// The file is created inside `tmpdir` with a UUID-based filename (`{uuid}.md`)
+/// and contains no content, allowing the user to write the template body from scratch.
+///
+/// # Errors
+///
+/// Returns [`DiaryError::Io`] on file creation failure.
+pub fn write_template_file(tmpdir: &Path) -> Result<PathBuf, DiaryError> {
+    let filename = format!("{}.md", uuid::Uuid::new_v4().as_simple());
+    let path = tmpdir.join(&filename);
+    std::fs::File::create(&path)?;
+    Ok(path)
+}
+
+/// Read the contents of a template temporary file as plain text.
+///
+/// Unlike [`read_header_file`], this function returns the raw file contents
+/// without any header parsing.
+///
+/// # Errors
+///
+/// Returns [`DiaryError::Io`] if the file cannot be read.
+pub fn read_template_file(path: &Path) -> Result<String, DiaryError> {
+    std::fs::read_to_string(path).map_err(DiaryError::from)
+}
+
 /// Launch `$EDITOR` for the given temporary file and wait for it to exit.
 ///
 /// - vim/neovim options (`-c "set noswapfile nobackup noundofile"`) are

@@ -246,6 +246,9 @@ pub enum TemplateCommands {
     Delete {
         /// Name of the template to delete
         name: String,
+        /// Skip confirmation prompt
+        #[arg(short, long)]
+        force: bool,
     },
 }
 
@@ -305,10 +308,12 @@ fn dispatch(cli: &Cli) -> anyhow::Result<()> {
         Commands::Stats => not_implemented("stats", "Sprint 5"),
         Commands::Import { .. } => not_implemented("import", "Sprint 6"),
         Commands::Template { subcommand } => match subcommand {
-            TemplateCommands::Add { .. } => not_implemented("template add", "Sprint 6"),
-            TemplateCommands::List => not_implemented("template list", "Sprint 6"),
-            TemplateCommands::Show { .. } => not_implemented("template show", "Sprint 6"),
-            TemplateCommands::Delete { .. } => not_implemented("template delete", "Sprint 6"),
+            TemplateCommands::Add { name } => commands::cmd_template_add(cli, name.clone()),
+            TemplateCommands::List => commands::cmd_template_list(cli),
+            TemplateCommands::Show { name } => commands::cmd_template_show(cli, name.clone()),
+            TemplateCommands::Delete { name, force } => {
+                commands::cmd_template_delete(cli, name.clone(), *force)
+            }
         },
     }
 }

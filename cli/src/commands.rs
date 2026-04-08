@@ -197,13 +197,20 @@ pub fn cmd_new(
     } else if !std::io::stdin().is_terminal() {
         // Piped stdin: read all content.
         let mut content = String::new();
-        std::io::stdin()
-            .read_to_string(&mut content)
-            .map_err(|e| anyhow::anyhow!("Failed to read stdin: {e}"))?;
+        if let Err(e) = std::io::stdin().read_to_string(&mut content) {
+            core.lock();
+            return Err(anyhow::anyhow!("Failed to read stdin: {e}"));
+        }
         (content, title, tags)
     } else {
         // $EDITOR: write header-comment temp file, launch editor, read back.
-        let mut config = EditorConfig::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut config = match EditorConfig::from_env() {
+            Ok(c) => c,
+            Err(e) => {
+                core.lock();
+                return Err(anyhow::anyhow!("{e}"));
+            }
+        };
 
         let initial = EntryPlaintext {
             title: title.clone().unwrap_or_else(|| "Untitled".to_string()),
@@ -211,8 +218,13 @@ pub fn cmd_new(
             body: String::new(),
         };
 
-        let tmpfile = editor::write_header_file(&config.secure_tmpdir, &initial)
-            .map_err(|e| anyhow::anyhow!("Failed to write temp file: {e}"))?;
+        let tmpfile = match editor::write_header_file(&config.secure_tmpdir, &initial) {
+            Ok(p) => p,
+            Err(e) => {
+                core.lock();
+                return Err(anyhow::anyhow!("Failed to write temp file: {e}"));
+            }
+        };
 
         // Inject vim completion for [[title]] links (vim/nvim only).
         let is_vim = !config.vim_options.is_empty();
@@ -229,13 +241,26 @@ pub fn cmd_new(
         // Launch editor and read result; always delete temp files afterward.
         let edit_result = editor::launch_editor(&tmpfile, &config);
         let read_result = editor::read_header_file(&tmpfile);
-        let _del = editor::secure_delete(&tmpfile);
+        if let Err(e) = editor::secure_delete(&tmpfile) {
+            eprintln!("Warning: failed to securely delete temp file: {e}");
+        }
         if let Some(cp) = completion_file {
-            let _ = editor::secure_delete(&cp);
+            if let Err(e) = editor::secure_delete(&cp) {
+                eprintln!("Warning: failed to securely delete completion file: {e}");
+            }
         }
 
-        edit_result.map_err(|e| anyhow::anyhow!("Editor failed: {e}"))?;
-        let header = read_result.map_err(|e| anyhow::anyhow!("Failed to read temp file: {e}"))?;
+        if let Err(e) = edit_result {
+            core.lock();
+            return Err(anyhow::anyhow!("Editor failed: {e}"));
+        }
+        let header = match read_result {
+            Ok(h) => h,
+            Err(e) => {
+                core.lock();
+                return Err(anyhow::anyhow!("Failed to read temp file: {e}"));
+            }
+        };
 
         // Prefer header-parsed title/tags over CLI-supplied values.
         let new_title = header.title.or(title);
@@ -249,9 +274,13 @@ pub fn cmd_new(
         .unwrap_or_else(|| "Untitled".to_string());
 
     // Step 4: Create the entry.
-    let uuid_hex = core
-        .new_entry(&actual_title, &final_body, final_tags)
-        .map_err(|e| anyhow::anyhow!("Failed to create entry: {e}"))?;
+    let uuid_hex = match core.new_entry(&actual_title, &final_body, final_tags) {
+        Ok(h) => h,
+        Err(e) => {
+            core.lock();
+            return Err(anyhow::anyhow!("Failed to create entry: {e}"));
+        }
+    };
 
     // Step 5: Print success message with an 8-character ID prefix.
     let prefix = &uuid_hex[..8];
@@ -297,11 +326,21 @@ pub fn cmd_list(
     core.unlock(secret_password)
         .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
 
-    let entries = core
-        .list_entries(None)
-        .map_err(|e| anyhow::anyhow!("Failed to list entries: {e}"))?;
+    let entries = match core.list_entries(None) {
+        Ok(e) => e,
+        Err(e) => {
+            core.lock();
+            return Err(anyhow::anyhow!("Failed to list entries: {e}"));
+        }
+    };
 
-    let filtered = filter_and_sort(entries, tag.as_deref(), query.as_deref(), number)?;
+    let filtered = match filter_and_sort(entries, tag.as_deref(), query.as_deref(), number) {
+        Ok(f) => f,
+        Err(e) => {
+            core.lock();
+            return Err(e);
+        }
+    };
 
     for meta in &filtered {
         let prefix = meta.id_prefix(8);
@@ -592,9 +631,13 @@ where
         // Always delete temp files regardless of editor/read success.
         let edit_result = launch_fn(&tmpfile, &config);
         let read_result = editor::read_header_file(&tmpfile);
-        let _del = editor::secure_delete(&tmpfile);
+        if let Err(e) = editor::secure_delete(&tmpfile) {
+            eprintln!("Warning: failed to securely delete temp file: {e}");
+        }
         if let Some(cp) = completion_file {
-            let _ = editor::secure_delete(&cp);
+            if let Err(e) = editor::secure_delete(&cp) {
+                eprintln!("Warning: failed to securely delete completion file: {e}");
+            }
         }
 
         if let Err(e) = edit_result {
@@ -853,7 +896,9 @@ where
 
     let edit_result = launch_fn(&tmpfile, &config);
     let read_result = editor::read_template_file(&tmpfile);
-    let _del = editor::secure_delete(&tmpfile);
+    if let Err(e) = editor::secure_delete(&tmpfile) {
+            eprintln!("Warning: failed to securely delete temp file: {e}");
+        }
 
     if let Err(e) = edit_result {
         core.lock();
@@ -1164,9 +1209,13 @@ where
 
     let edit_result = launch_fn(&tmpfile, &config);
     let read_result = editor::read_header_file(&tmpfile);
-    let _del = editor::secure_delete(&tmpfile);
+    if let Err(e) = editor::secure_delete(&tmpfile) {
+            eprintln!("Warning: failed to securely delete temp file: {e}");
+        }
     if let Some(cp) = completion_file {
-        let _ = editor::secure_delete(&cp);
+        if let Err(e) = editor::secure_delete(&cp) {
+                eprintln!("Warning: failed to securely delete completion file: {e}");
+            }
     }
 
     if let Err(e) = edit_result {

@@ -287,6 +287,14 @@ impl DiaryCore {
     pub fn new_template(&self, name: &str, body: &str) -> Result<String, DiaryError> {
         let engine = self.require_engine()?;
         template::TemplateName::new(name)?;
+        // Reject duplicate template names.
+        let existing = template::list_templates(&self.vault_path, engine)?;
+        if existing.iter().any(|m| m.name == name) {
+            return Err(DiaryError::Template(format!(
+                "template '{}' already exists",
+                name
+            )));
+        }
         let plaintext = template::TemplatePlaintext {
             name: name.to_string(),
             body: body.to_string(),

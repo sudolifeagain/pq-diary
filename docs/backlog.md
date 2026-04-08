@@ -47,7 +47,7 @@
 - [x] $EDITOR内vimカスタム補完関数 ([[入力時タイトル候補表示)
 - [x] 補完用一時ファイル (/dev/shm, zeroize削除)
 
-### S6: 検索 + 統計 + インポート
+### S6: 検索 + 統計 + インポート + S5技術的負債
 - [ ] search コマンド (復号後インメモリ正規表現grep)
 - [ ] 検索結果のコンテキスト表示 (前後N行)
 - [ ] stats コマンド (執筆頻度, 文字数推移, タグ分布)
@@ -55,6 +55,11 @@
 - [ ] [[wiki-link]] → [[タイトル]] 自動変換
 - [ ] #ネスト/タグ 自動変換
 - [ ] インポート結果サマリー表示
+- [ ] EntryPlaintext に Zeroize/ZeroizeOnDrop 追加 (S4技術的負債 H-1)
+- [ ] list_entries_with_body の中間 Vec<String> zeroize 対応 (H-2)
+- [ ] 読み取り時の署名/HMAC 検証 (S4技術的負債 H-3、S9で対応も可)
+- [ ] Win32コンソールAPI unsafe の ADR 作成 (M-7)
+- [ ] CLI vault操作のボイラープレート抽出 (L-2、drop guard パターン)
 
 ### S7: アクセス制御 + Claude連携
 - [ ] vault.toml access.policy (none/write_only/full)

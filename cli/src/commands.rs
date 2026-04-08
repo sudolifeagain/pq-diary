@@ -930,6 +930,165 @@ fn cmd_template_delete_impl(
 }
 
 // ---------------------------------------------------------------------------
+// Today command handler
+// ---------------------------------------------------------------------------
+
+/// Execute the `pq-diary today` command.
+///
+/// Opens or creates today's diary entry (title `YYYY-MM-DD` in local time).
+/// - If an entry with today's title already exists, opens it in `$EDITOR`.
+/// - If no such entry exists, creates one using the `daily` template (with
+///   `{{date}}` and `{{title}}` expanded) or an empty body, then opens it
+///   in `$EDITOR`.
+///
+/// # Errors
+///
+/// Returns an error if password acquisition, vault unlock, entry creation,
+/// or editor launch fails.
+pub fn cmd_today(cli: &Cli) -> anyhow::Result<()> {
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    cmd_today_impl(cli, &today, |tmpfile, config| {
+        editor::launch_editor(tmpfile, config)
+    })
+}
+
+/// Internal implementation of `cmd_today` with injectable date string and editor launcher.
+///
+/// Accepts any `FnOnce` as the editor launcher so that tests can inject a mock
+/// without spawning a real process.
+fn cmd_today_impl<F>(
+    cli: &Cli,
+    today: &str,
+    launch_fn: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(&std::path::Path, &EditorConfig) -> Result<(), pq_diary_core::DiaryError>,
+{
+    use pq_diary_core::template_engine::{expand, BUILTIN_DATE, BUILTIN_TITLE};
+    use secrecy::{ExposeSecret as _, SecretBox};
+    use std::collections::HashMap;
+
+    let password_source =
+        get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let vault_path = resolve_vault_path(cli)?;
+    let vault_str = vault_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Vault path contains non-UTF-8 characters"))?;
+
+    let mut core = DiaryCore::new(vault_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let secret_password: secrecy::SecretString =
+        SecretBox::new(Box::from(password_source.secret().expose_secret()));
+    core.unlock(secret_password)
+        .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+
+    // Search for today's entry by exact title match.
+    let entries = match core.list_entries(None) {
+        Ok(e) => e,
+        Err(e) => {
+            core.lock();
+            return Err(anyhow::anyhow!("Failed to list entries: {e}"));
+        }
+    };
+    let today_entry = entries.iter().find(|e| e.title == today);
+
+    let entry_id = if let Some(meta) = today_entry {
+        // Entry exists: reuse its UUID hex.
+        meta.uuid_hex.clone()
+    } else {
+        // Entry does not exist: determine initial body from template or empty string.
+        let initial_body = match core.get_template("daily") {
+            Ok(tmpl) => {
+                let mut vars: HashMap<String, String> = HashMap::new();
+                vars.insert(BUILTIN_DATE.to_string(), today.to_string());
+                vars.insert(BUILTIN_TITLE.to_string(), today.to_string());
+                expand(&tmpl.body, &vars)
+            }
+            Err(_) => String::new(),
+        };
+
+        // Create the entry.
+        match core.new_entry(today, &initial_body, vec![]) {
+            Ok(uuid_hex) => uuid_hex,
+            Err(e) => {
+                core.lock();
+                return Err(anyhow::anyhow!("Failed to create entry: {e}"));
+            }
+        }
+    };
+
+    // Open the entry in the editor (edit flow).
+    let id_prefix = entry_id[..entry_id.len().min(8)].to_string();
+    let get_result = core.get_entry(&id_prefix);
+    let (_record, original) = match get_result {
+        Ok(r) => r,
+        Err(e) => {
+            core.lock();
+            return Err(anyhow::anyhow!("{e}"));
+        }
+    };
+
+    let config = match EditorConfig::from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            core.lock();
+            return Err(anyhow::anyhow!("{e}"));
+        }
+    };
+
+    let tmpfile = match editor::write_header_file(&config.secure_tmpdir, &original) {
+        Ok(p) => p,
+        Err(e) => {
+            core.lock();
+            return Err(anyhow::anyhow!("Failed to write temp file: {e}"));
+        }
+    };
+
+    let edit_result = launch_fn(&tmpfile, &config);
+    let read_result = editor::read_header_file(&tmpfile);
+    let _del = editor::secure_delete(&tmpfile);
+
+    if let Err(e) = edit_result {
+        core.lock();
+        return Err(anyhow::anyhow!("Editor failed: {e}"));
+    }
+
+    let header = match read_result {
+        Ok(h) => h,
+        Err(e) => {
+            core.lock();
+            return Err(anyhow::anyhow!("Failed to read temp file: {e}"));
+        }
+    };
+
+    let (new_title, new_tags) = match (header.title, header.tags) {
+        (Some(t), Some(tags)) => (t, tags),
+        _ => (original.title.clone(), original.tags.clone()),
+    };
+    let new_body = header.body;
+
+    if new_title == original.title && new_tags == original.tags && new_body == original.body {
+        println!("変更がありませんでした");
+        core.lock();
+        return Ok(());
+    }
+
+    let new_plaintext = EntryPlaintext {
+        title: new_title,
+        tags: new_tags,
+        body: new_body,
+    };
+
+    let update_result = core.update_entry(&id_prefix, &new_plaintext);
+    core.lock();
+    update_result.map_err(|e| anyhow::anyhow!("Failed to update entry: {e}"))?;
+    println!("Updated: {id_prefix}");
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2421,6 +2580,256 @@ mod tests {
         assert_eq!(
             plaintext.body, "direct body",
             "--body must take priority over --template"
+        );
+    }
+
+    // =========================================================================
+    // TASK-0049: cmd_today tests
+    // =========================================================================
+
+    /// Build a `Cli` targeting `vault_dir` for the `today` command.
+    fn make_today_cli(vault_dir_str: &str, password: Option<&str>) -> crate::Cli {
+        let mut args: Vec<&str> = vec!["pq-diary", "-v", vault_dir_str];
+        if let Some(pw) = password {
+            args.extend_from_slice(&["--password", pw]);
+        }
+        args.push("today");
+        crate::Cli::try_parse_from(&args).expect("parse test CLI")
+    }
+
+    /// Open a vault and return the plaintext of the entry with the given title.
+    fn read_entry_by_title(
+        vault_dir: &std::path::Path,
+        title: &str,
+    ) -> Option<pq_diary_core::EntryPlaintext> {
+        let vault_pqd = vault_dir.join("vault.pqd");
+        let vault_str = vault_pqd.to_str().expect("utf8");
+        let mut core = DiaryCore::new(vault_str).expect("DiaryCore::new");
+        let pw: secrecy::SecretString = secrecy::SecretBox::new(Box::from("password"));
+        core.unlock(pw).expect("unlock");
+        let entries = core.list_entries(None).expect("list_entries");
+        let found = entries.iter().find(|e| e.title == title)?;
+        let prefix = found.uuid_hex[..4].to_string();
+        let (_, plaintext) = core.get_entry(&prefix).expect("get_entry");
+        core.lock();
+        Some(plaintext)
+    }
+
+    /// TC-049-01: Empty vault, no template → creates entry with today's title and empty body.
+    ///
+    /// Tests the DiaryCore-level logic used by cmd_today when neither an entry
+    /// nor a "daily" template exists.
+    #[test]
+    fn tc_049_01_no_entry_no_template_creates_entry() {
+        use pq_diary_core::template_engine::{expand, BUILTIN_DATE, BUILTIN_TITLE};
+        use std::collections::HashMap;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        let today = "2099-01-01";
+
+        let vault_pqd = vault_dir.join("vault.pqd");
+        let vault_str = vault_pqd.to_str().expect("utf8");
+        let mut core = DiaryCore::new(vault_str).expect("DiaryCore::new");
+        let pw: secrecy::SecretString = secrecy::SecretBox::new(Box::from("password"));
+        core.unlock(pw).expect("unlock");
+
+        // Simulate today logic: search for entry.
+        let entries = core.list_entries(None).expect("list_entries");
+        let today_entry = entries.iter().find(|e| e.title == today);
+        assert!(today_entry.is_none(), "vault must start empty");
+
+        // Simulate today logic: try daily template.
+        let initial_body = match core.get_template("daily") {
+            Ok(tmpl) => {
+                let mut vars: HashMap<String, String> = HashMap::new();
+                vars.insert(BUILTIN_DATE.to_string(), today.to_string());
+                vars.insert(BUILTIN_TITLE.to_string(), today.to_string());
+                expand(&tmpl.body, &vars)
+            }
+            Err(_) => String::new(),
+        };
+        assert_eq!(initial_body, "", "no template → body must be empty");
+
+        // Create the entry.
+        core.new_entry(today, &initial_body, vec![])
+            .expect("new_entry");
+        core.lock();
+
+        // Verify entry was created with today's title.
+        let entries = read_vault_entries(&vault_dir);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].title, today);
+    }
+
+    /// TC-049-02: Entry with today's title exists → found by list_entries exact-match.
+    #[test]
+    fn tc_049_02_existing_entry_found_by_title() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        let today = "2026-04-05";
+
+        // Create an entry with today's title.
+        let cli = make_cli(vault_dir.to_str().expect("utf8"), Some("password"));
+        cmd_new(
+            &cli,
+            Some(today.to_string()),
+            Some("initial body".to_string()),
+            vec![],
+            None,
+        )
+        .expect("cmd_new");
+
+        // Simulate today logic: search for entry by exact title match.
+        let vault_pqd = vault_dir.join("vault.pqd");
+        let vault_str = vault_pqd.to_str().expect("utf8");
+        let mut core = DiaryCore::new(vault_str).expect("DiaryCore::new");
+        let pw: secrecy::SecretString = secrecy::SecretBox::new(Box::from("password"));
+        core.unlock(pw).expect("unlock");
+
+        let entries = core.list_entries(None).expect("list_entries");
+        let found = entries.iter().find(|e| e.title == today);
+        core.lock();
+
+        assert!(found.is_some(), "today entry must be found");
+        assert_eq!(found.unwrap().title, today);
+    }
+
+    /// TC-049-03: "daily" template with `{{date}}` → expanded with today's date.
+    #[test]
+    fn tc_049_03_daily_template_expanded() {
+        use pq_diary_core::template_engine::{expand, BUILTIN_DATE, BUILTIN_TITLE};
+        use std::collections::HashMap;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        let today = "2026-04-05";
+
+        // Seed the "daily" template.
+        seed_templates(&vault_dir, &[("daily", "## {{date}}")]);
+
+        // Simulate today logic: get template and expand.
+        let vault_pqd = vault_dir.join("vault.pqd");
+        let vault_str = vault_pqd.to_str().expect("utf8");
+        let mut core = DiaryCore::new(vault_str).expect("DiaryCore::new");
+        let pw: secrecy::SecretString = secrecy::SecretBox::new(Box::from("password"));
+        core.unlock(pw).expect("unlock");
+
+        let tmpl = core.get_template("daily").expect("get_template");
+        let mut vars: HashMap<String, String> = HashMap::new();
+        vars.insert(BUILTIN_DATE.to_string(), today.to_string());
+        vars.insert(BUILTIN_TITLE.to_string(), today.to_string());
+        let expanded = expand(&tmpl.body, &vars);
+        core.lock();
+
+        assert_eq!(expanded, "## 2026-04-05");
+    }
+
+    /// TC-049-04: No "daily" template → initial body is an empty string.
+    #[test]
+    fn tc_049_04_no_template_empty_body() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        let today = "2026-04-05";
+
+        let vault_pqd = vault_dir.join("vault.pqd");
+        let vault_str = vault_pqd.to_str().expect("utf8");
+        let mut core = DiaryCore::new(vault_str).expect("DiaryCore::new");
+        let pw: secrecy::SecretString = secrecy::SecretBox::new(Box::from("password"));
+        core.unlock(pw).expect("unlock");
+
+        let initial_body = match core.get_template("daily") {
+            Ok(tmpl) => {
+                use pq_diary_core::template_engine::{expand, BUILTIN_DATE, BUILTIN_TITLE};
+                use std::collections::HashMap;
+                let mut vars: HashMap<String, String> = HashMap::new();
+                vars.insert(BUILTIN_DATE.to_string(), today.to_string());
+                vars.insert(BUILTIN_TITLE.to_string(), today.to_string());
+                expand(&tmpl.body, &vars)
+            }
+            Err(_) => String::new(),
+        };
+        core.lock();
+
+        assert_eq!(initial_body, "", "no template → body must be empty");
+    }
+
+    /// TC-049-05: cmd_today_impl with no-op mock editor creates new entry.
+    ///
+    /// Verifies the full cmd_today_impl flow: vault unlock → no existing entry →
+    /// create entry with empty body → open in mock editor (no-op) → "変更がありませんでした".
+    #[test]
+    fn tc_049_05_cmd_today_impl_creates_entry_with_mock_editor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+        let today = "2099-12-31";
+
+        let cli = make_today_cli(vault_dir_str, Some("password"));
+
+        // No-op mock: does not modify the temp file; change detection will find no changes.
+        let result = cmd_today_impl(&cli, today, |_tmpfile, _config| Ok(()));
+        assert!(result.is_ok(), "cmd_today_impl failed: {:?}", result.err());
+
+        // Verify the entry was created with today's title.
+        let entries = read_vault_entries(&vault_dir);
+        assert_eq!(entries.len(), 1, "exactly one entry must be created");
+        assert_eq!(entries[0].title, today);
+    }
+
+    /// TC-049-06: cmd_today_impl with existing entry uses existing entry via mock editor.
+    ///
+    /// Verifies that when today's entry already exists, cmd_today_impl opens it
+    /// (does not create a duplicate).
+    #[test]
+    fn tc_049_06_cmd_today_impl_uses_existing_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+        let today = "2099-12-30";
+
+        // Pre-create the entry.
+        let new_cli = make_cli(vault_dir_str, Some("password"));
+        cmd_new(
+            &new_cli,
+            Some(today.to_string()),
+            Some("existing body".to_string()),
+            vec![],
+            None,
+        )
+        .expect("cmd_new");
+
+        let cli = make_today_cli(vault_dir_str, Some("password"));
+        let result = cmd_today_impl(&cli, today, |_tmpfile, _config| Ok(()));
+        assert!(result.is_ok(), "cmd_today_impl failed: {:?}", result.err());
+
+        // Must still be exactly one entry (no duplicate created).
+        let entries = read_vault_entries(&vault_dir);
+        assert_eq!(entries.len(), 1, "must not create duplicate entry");
+        assert_eq!(entries[0].title, today);
+    }
+
+    /// TC-049-07: cmd_today_impl with daily template creates entry with expanded body.
+    #[test]
+    fn tc_049_07_cmd_today_impl_applies_daily_template() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+        let today = "2099-11-11";
+
+        // Seed "daily" template with a {{date}} variable.
+        seed_templates(&vault_dir, &[("daily", "## {{date}}")]);
+
+        let cli = make_today_cli(vault_dir_str, Some("password"));
+        let result = cmd_today_impl(&cli, today, |_tmpfile, _config| Ok(()));
+        assert!(result.is_ok(), "cmd_today_impl failed: {:?}", result.err());
+
+        // Verify the created entry body has the expanded date.
+        let plaintext =
+            read_entry_by_title(&vault_dir, today).expect("entry with today's title must exist");
+        assert_eq!(
+            plaintext.body, "## 2099-11-11",
+            "body must be the expanded template"
         );
     }
 }

@@ -316,7 +316,7 @@ fn dispatch(cli: &Cli) -> anyhow::Result<()> {
             DaemonCommands::Status => not_implemented("daemon status", "Sprint 10"),
             DaemonCommands::Lock => not_implemented("daemon lock", "Sprint 10"),
         },
-        Commands::Today => not_implemented("today", "Sprint 4"),
+        Commands::Today => commands::cmd_today(cli),
         Commands::Search { .. } => not_implemented("search", "Sprint 5"),
         Commands::Stats => not_implemented("stats", "Sprint 5"),
         Commands::Import { .. } => not_implemented("import", "Sprint 6"),

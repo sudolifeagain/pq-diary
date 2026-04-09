@@ -25,6 +25,8 @@ pub mod legacy;
 pub mod link;
 /// Access-policy evaluation (implemented in Sprint 7).
 pub mod policy;
+/// Full-text regex search across vault entries (implemented in Sprint 6).
+pub mod search;
 /// Template CRUD operations (implemented in Sprint 5).
 pub mod template;
 /// Template variable extraction and expansion engine (implemented in Sprint 5).
@@ -392,6 +394,27 @@ impl DiaryCore {
     pub fn all_titles(&self) -> Result<Vec<String>, DiaryError> {
         let index = self.link_index.as_ref().ok_or(DiaryError::NotUnlocked)?;
         Ok(index.all_titles())
+    }
+
+    // =========================================================================
+    // Search operations
+    // =========================================================================
+
+    /// Search all journal entries and templates for `query.pattern`.
+    ///
+    /// Uses a streaming strategy: each record is decrypted, searched, and its
+    /// plaintext is zeroed via [`zeroize::ZeroizeOnDrop`] before the next
+    /// record is processed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DiaryError::NotUnlocked`] if the vault is locked.
+    /// Returns [`DiaryError::Search`] if `query.pattern` is not a valid regex.
+    /// Returns [`DiaryError::Io`] on vault I/O failure.
+    /// Returns [`DiaryError::Crypto`] on decryption failure.
+    pub fn search(&self, query: &search::SearchQuery) -> Result<search::SearchResults, DiaryError> {
+        let engine = self.require_engine()?;
+        search::search_entries(&self.vault_path, engine, query)
     }
 }
 

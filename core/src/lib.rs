@@ -27,6 +27,8 @@ pub mod link;
 pub mod policy;
 /// Full-text regex search across vault entries (implemented in Sprint 6).
 pub mod search;
+/// Vault-wide statistics collection (implemented in Sprint 6).
+pub mod stats;
 /// Template CRUD operations (implemented in Sprint 5).
 pub mod template;
 /// Template variable extraction and expansion engine (implemented in Sprint 5).
@@ -394,6 +396,27 @@ impl DiaryCore {
     pub fn all_titles(&self) -> Result<Vec<String>, DiaryError> {
         let index = self.link_index.as_ref().ok_or(DiaryError::NotUnlocked)?;
         Ok(index.all_titles())
+    }
+
+    // =========================================================================
+    // Stats operations
+    // =========================================================================
+
+    /// Collect vault-wide statistics.
+    ///
+    /// Iterates over all journal entry records, decrypts each one, and
+    /// aggregates entry count, character statistics, tag distribution, and
+    /// daily activity into a [`stats::VaultStats`] value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DiaryError::NotUnlocked`] if the vault is locked.
+    /// Returns [`DiaryError::Entry`] if JSON deserialisation fails.
+    /// Returns [`DiaryError::Crypto`] on decryption failure.
+    /// Returns [`DiaryError::Io`] on vault I/O failure.
+    pub fn stats(&self) -> Result<stats::VaultStats, DiaryError> {
+        let engine = self.require_engine()?;
+        stats::collect_stats(&self.vault_path, engine)
     }
 
     // =========================================================================

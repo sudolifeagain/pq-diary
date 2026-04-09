@@ -19,6 +19,8 @@ pub mod entry;
 pub mod error;
 /// Git synchronisation operations (implemented in Sprint 8).
 pub mod git;
+/// Obsidian-compatible Markdown file importer (implemented in Sprint 6).
+pub mod importer;
 /// Digital-legacy operations (implemented in Phase 2).
 pub mod legacy;
 /// `[[title]]` wiki-link parser (implemented in Sprint 5).

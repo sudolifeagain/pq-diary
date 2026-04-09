@@ -422,6 +422,38 @@ impl DiaryCore {
     }
 
     // =========================================================================
+    // Import operations
+    // =========================================================================
+
+    /// Import all Markdown files from `source_dir` into the vault.
+    ///
+    /// Recursively walks `source_dir`, skipping `.obsidian/` directories and
+    /// non-`.md` files.  Each `.md` file is parsed and imported as a journal
+    /// entry.  All entries are written with a single `write_vault` call.
+    ///
+    /// When `dry_run` is `true` the vault is not modified; the returned
+    /// [`importer::ImportResult`] has `imported: 0` and the other fields
+    /// reflect what *would* have happened.
+    ///
+    /// Source files are **never** deleted or modified.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DiaryError::NotUnlocked`] if the vault is locked.
+    /// Returns [`DiaryError::Import`] if `source_dir` does not exist or contains
+    ///   no `.md` files.
+    /// Returns [`DiaryError::Io`] on file-read or vault I/O failure.
+    /// Returns [`DiaryError::Crypto`] on encryption or signing failure.
+    pub fn import(
+        &self,
+        source_dir: &std::path::Path,
+        dry_run: bool,
+    ) -> Result<importer::ImportResult, DiaryError> {
+        let engine = self.require_engine()?;
+        importer::import_directory(&self.vault_path, engine, source_dir, dry_run)
+    }
+
+    // =========================================================================
     // Search operations
     // =========================================================================
 

@@ -3,13 +3,31 @@
 //! Provides types and functions for parsing Markdown files with YAML frontmatter,
 //! converting Obsidian wiki-links, extracting inline `#tag` notation, and
 //! filtering paths during directory traversal.
+//!
+//! # Batch import
+//!
+//! [`import_directory`] walks a source directory recursively, parses each `.md`
+//! file via [`parse_markdown`], and writes all resulting entries to the vault
+//! with a single [`batch_create_entries`] call (i.e., one `write_vault`
+//! invocation regardless of the number of files).
 
 use std::path::{Path, PathBuf};
 
 use regex::Regex;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use uuid::Uuid;
+use walkdir::WalkDir;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-use crate::error::DiaryError;
+use crate::{
+    crypto::CryptoEngine,
+    entry::EntryPlaintext,
+    error::DiaryError,
+    vault::{
+        format::{generate_entry_padding, EntryRecord, RECORD_TYPE_ENTRY},
+        reader::read_vault,
+        writer::write_vault,
+    },
+};
 
 // =========================================================================
 // Public types
@@ -129,6 +147,191 @@ pub fn parse_markdown(
 /// Used during directory traversal to skip Obsidian metadata directories.
 pub fn should_skip_path(path: &Path) -> bool {
     path.components().any(|c| c.as_os_str() == ".obsidian")
+}
+
+/// Create multiple vault entries in a single `write_vault` call.
+///
+/// Reads the existing vault, encrypts and signs every [`MarkdownFile`] as an
+/// [`EntryRecord`], appends all records to the existing list, then calls
+/// `write_vault` **exactly once**.  This is the performance-critical path for
+/// bulk import: O(n) encryption + O(1) vault I/O.
+///
+/// Returns an [`ImportResult`] with `imported` set to the number of entries
+/// written and all other counters at zero; callers such as
+/// [`import_directory`] are expected to fill in the remaining fields.
+///
+/// # Errors
+///
+/// Returns [`DiaryError::Io`] on vault I/O failure.
+/// Returns [`DiaryError::Import`] if JSON serialisation fails or the system
+///   clock is unavailable.
+/// Returns [`DiaryError::Crypto`] on encryption or signing failure.
+pub fn batch_create_entries(
+    vault_path: &Path,
+    engine: &CryptoEngine,
+    files: Vec<MarkdownFile>,
+) -> Result<ImportResult, DiaryError> {
+    let (header, mut records) = read_vault(vault_path)?;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| DiaryError::Import(format!("system time error: {e}")))?
+        .as_secs();
+
+    let imported = files.len();
+
+    for file in files {
+        let uuid = Uuid::new_v4();
+
+        let plaintext = EntryPlaintext {
+            title: file.title.clone(),
+            tags: file.tags.clone(),
+            body: file.body.clone(),
+        };
+
+        let json_bytes = Zeroizing::new(
+            serde_json::to_vec(&plaintext)
+                .map_err(|e| DiaryError::Import(format!("serialization failed: {e}")))?,
+        );
+
+        let (ciphertext, iv) = engine.encrypt(&json_bytes)?;
+        let signature = engine.dsa_sign(&ciphertext)?;
+        let content_hmac = engine.hmac(&ciphertext)?;
+
+        let record = EntryRecord {
+            record_type: RECORD_TYPE_ENTRY,
+            uuid: *uuid.as_bytes(),
+            created_at: now,
+            updated_at: now,
+            iv,
+            ciphertext,
+            signature,
+            content_hmac,
+            legacy_flag: 0x00,
+            legacy_key_block: vec![],
+            attachment_count: 0,
+            attachment_offset: 0,
+            padding: generate_entry_padding(),
+        };
+
+        records.push(record);
+    }
+
+    write_vault(vault_path, header, &records)?;
+
+    Ok(ImportResult {
+        imported,
+        skipped: 0,
+        links_converted: 0,
+        tags_converted: 0,
+        skip_details: vec![],
+    })
+}
+
+/// Import all Markdown files found under `source_dir` into the vault.
+///
+/// Recursively walks `source_dir` using [`walkdir`], skipping `.obsidian/`
+/// directories and non-`.md` files.  Each `.md` file is read into a
+/// `Zeroizing<String>` buffer (ensuring the raw content is erased on drop),
+/// parsed with [`parse_markdown`], and collected into a batch.  All entries
+/// are then written to the vault in a single [`batch_create_entries`] call.
+///
+/// Source files are **never** deleted or modified.
+///
+/// When `dry_run` is `true` the vault file is not touched; the returned
+/// [`ImportResult`] has `imported: 0` and the remaining fields reflect what
+/// *would* have happened.
+///
+/// # Errors
+///
+/// Returns [`DiaryError::Import`] if `source_dir` does not exist.
+/// Returns [`DiaryError::Import`] if no `.md` files are found under `source_dir`.
+/// Returns [`DiaryError::Io`] on file-read or vault I/O failure.
+/// Returns [`DiaryError::Import`] on directory walk errors.
+/// Returns [`DiaryError::Crypto`] on encryption or signing failure.
+pub fn import_directory(
+    vault_path: &Path,
+    engine: &CryptoEngine,
+    source_dir: &Path,
+    dry_run: bool,
+) -> Result<ImportResult, DiaryError> {
+    if !source_dir.exists() {
+        return Err(DiaryError::Import(format!(
+            "source directory does not exist: {}",
+            source_dir.display()
+        )));
+    }
+
+    let mut parsed_files: Vec<MarkdownFile> = Vec::new();
+    let mut skip_details: Vec<SkipDetail> = Vec::new();
+    let mut links_converted: usize = 0;
+    let mut tags_converted: usize = 0;
+
+    for entry in WalkDir::new(source_dir) {
+        let entry = entry.map_err(|e| DiaryError::Import(format!("directory walk error: {e}")))?;
+        let path = entry.path();
+
+        // Directories are traversed but not counted.
+        if entry.file_type().is_dir() {
+            continue;
+        }
+
+        // Files inside .obsidian/ are skipped with a reason recorded.
+        if should_skip_path(path) {
+            skip_details.push(SkipDetail {
+                path: path.to_string_lossy().into_owned(),
+                reason: "inside .obsidian directory".to_string(),
+            });
+            continue;
+        }
+
+        // Non-Markdown files are skipped with a reason recorded.
+        let is_md = path.extension().and_then(|s| s.to_str()) == Some("md");
+        if !is_md {
+            skip_details.push(SkipDetail {
+                path: path.to_string_lossy().into_owned(),
+                reason: "not a Markdown (.md) file".to_string(),
+            });
+            continue;
+        }
+
+        // Parse the .md file.  Wrap raw content in Zeroizing so it is erased
+        // from memory as soon as it goes out of scope.
+        let filename = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown.md");
+
+        let content = Zeroizing::new(std::fs::read_to_string(path)?);
+        let (md_file, lc, tc) = parse_markdown(&content, filename)?;
+        links_converted += lc;
+        tags_converted += tc;
+        parsed_files.push(md_file);
+    }
+
+    if parsed_files.is_empty() {
+        return Err(DiaryError::Import("No Markdown files found".to_string()));
+    }
+
+    let skipped = skip_details.len();
+
+    if dry_run {
+        return Ok(ImportResult {
+            imported: 0,
+            skipped,
+            links_converted,
+            tags_converted,
+            skip_details,
+        });
+    }
+
+    let mut result = batch_create_entries(vault_path, engine, parsed_files)?;
+    result.skipped = skipped;
+    result.links_converted = links_converted;
+    result.tags_converted = tags_converted;
+    result.skip_details = skip_details;
+
+    Ok(result)
 }
 
 // =========================================================================
@@ -300,7 +503,39 @@ fn extract_tags(body: &str) -> Result<(Vec<String>, String, usize), DiaryError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        crypto::kdf::Argon2Params,
+        vault::{init::VaultManager, reader::read_vault},
+        DiaryCore,
+    };
+    use secrecy::SecretBox;
     use std::path::Path;
+    use tempfile::TempDir;
+
+    // -------------------------------------------------------------------------
+    // Shared helpers
+    // -------------------------------------------------------------------------
+
+    fn fast_params() -> Argon2Params {
+        Argon2Params {
+            memory_cost_kb: 8,
+            time_cost: 1,
+            parallelism: 1,
+        }
+    }
+
+    /// Initialise a test vault and return the path to `vault.pqd`.
+    fn setup_test_vault(dir: &TempDir) -> std::path::PathBuf {
+        let mgr = VaultManager::new(dir.path().to_path_buf())
+            .expect("VaultManager::new")
+            .with_kdf_params(fast_params());
+        mgr.init_vault("test", b"password").expect("init_vault");
+        dir.path().join("test").join("vault.pqd")
+    }
+
+    fn secret(s: &str) -> secrecy::SecretString {
+        SecretBox::new(s.into())
+    }
 
     // -------------------------------------------------------------------------
     // TC-D01-03: filename becomes title when no frontmatter
@@ -439,5 +674,220 @@ mod tests {
         fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
         assert_zeroize::<MarkdownFile>();
         assert_zeroize_on_drop::<MarkdownFile>();
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-D01-01: .md file is imported as an entry
+    // -------------------------------------------------------------------------
+
+    /// TC-D01-01: A single `note1.md` in the source dir is imported as one entry
+    /// whose title equals "note1".
+    #[test]
+    fn tc_d01_01_single_md_file_imported() {
+        let vault_dir = tempfile::tempdir().expect("vault tempdir");
+        let vault_pqd = setup_test_vault(&vault_dir);
+
+        let source_dir = tempfile::tempdir().expect("source tempdir");
+        std::fs::write(source_dir.path().join("note1.md"), "Hello world").expect("write note1.md");
+
+        let mut core = DiaryCore::new(vault_pqd.to_str().expect("utf8")).expect("DiaryCore::new");
+        core.unlock(secret("password")).expect("unlock");
+
+        let result = core.import(source_dir.path(), false).expect("import");
+        assert_eq!(result.imported, 1, "one entry must be imported");
+
+        let entries = core.list_entries(None).expect("list_entries");
+        assert_eq!(entries.len(), 1, "vault must contain exactly one entry");
+        assert_eq!(entries[0].title, "note1", "title must match filename stem");
+
+        core.lock();
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-D01-02: subdirectory recursive import
+    // -------------------------------------------------------------------------
+
+    /// TC-D01-02: `root.md` and `sub/nested.md` are both imported; `imported == 2`.
+    #[test]
+    fn tc_d01_02_subdirectory_recursion() {
+        let vault_dir = tempfile::tempdir().expect("vault tempdir");
+        let vault_pqd = setup_test_vault(&vault_dir);
+
+        let source_dir = tempfile::tempdir().expect("source tempdir");
+        std::fs::write(source_dir.path().join("root.md"), "Root note").expect("write root.md");
+        let sub = source_dir.path().join("sub");
+        std::fs::create_dir(&sub).expect("create sub dir");
+        std::fs::write(sub.join("nested.md"), "Nested note").expect("write nested.md");
+
+        let mut core = DiaryCore::new(vault_pqd.to_str().expect("utf8")).expect("DiaryCore::new");
+        core.unlock(secret("password")).expect("unlock");
+
+        let result = core.import(source_dir.path(), false).expect("import");
+        assert_eq!(
+            result.imported, 2,
+            "both root.md and sub/nested.md must be imported"
+        );
+
+        core.lock();
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-D01-05: non-.md files are skipped
+    // -------------------------------------------------------------------------
+
+    /// TC-D01-05: `note.md` is imported; `image.png` and `data.json` are skipped.
+    #[test]
+    fn tc_d01_05_non_md_files_skipped() {
+        let vault_dir = tempfile::tempdir().expect("vault tempdir");
+        let vault_pqd = setup_test_vault(&vault_dir);
+
+        let source_dir = tempfile::tempdir().expect("source tempdir");
+        std::fs::write(source_dir.path().join("note.md"), "A note").expect("write note.md");
+        std::fs::write(source_dir.path().join("image.png"), b"\x89PNG").expect("write image.png");
+        std::fs::write(source_dir.path().join("data.json"), "{}").expect("write data.json");
+
+        let mut core = DiaryCore::new(vault_pqd.to_str().expect("utf8")).expect("DiaryCore::new");
+        core.unlock(secret("password")).expect("unlock");
+
+        let result = core.import(source_dir.path(), false).expect("import");
+        assert_eq!(result.imported, 1, "only note.md must be imported");
+        assert_eq!(result.skipped, 2, "image.png and data.json must be skipped");
+
+        let skipped_paths: Vec<&str> = result
+            .skip_details
+            .iter()
+            .map(|d| d.path.as_str())
+            .collect();
+        let has_png = skipped_paths.iter().any(|p| p.contains("image.png"));
+        let has_json = skipped_paths.iter().any(|p| p.contains("data.json"));
+        assert!(has_png, "skip_details must contain image.png");
+        assert!(has_json, "skip_details must contain data.json");
+
+        core.lock();
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-D07-01: --dry-run does not write the vault
+    // -------------------------------------------------------------------------
+
+    /// TC-D07-01: dry_run=true leaves the vault file unchanged and returns imported=0.
+    #[test]
+    fn tc_d07_01_dry_run_no_write() {
+        let vault_dir = tempfile::tempdir().expect("vault tempdir");
+        let vault_pqd = setup_test_vault(&vault_dir);
+
+        let source_dir = tempfile::tempdir().expect("source tempdir");
+        std::fs::write(source_dir.path().join("note.md"), "Dry run test").expect("write note.md");
+
+        let before = std::fs::read(&vault_pqd).expect("read vault before");
+
+        let mut core = DiaryCore::new(vault_pqd.to_str().expect("utf8")).expect("DiaryCore::new");
+        core.unlock(secret("password")).expect("unlock");
+
+        let result = core
+            .import(source_dir.path(), true)
+            .expect("dry-run import");
+        assert_eq!(result.imported, 0, "dry_run must report imported=0");
+
+        core.lock();
+
+        let after = std::fs::read(&vault_pqd).expect("read vault after");
+        assert_eq!(before, after, "vault bytes must be identical after dry_run");
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-D10-01: 100 files imported via single batch write
+    // -------------------------------------------------------------------------
+
+    /// TC-D10-01: 100 `.md` files are imported; `imported == 100` and
+    /// `read_vault` finds exactly 100 ENTRY records after the call.
+    #[test]
+    fn tc_d10_01_batch_100_files() {
+        let vault_dir = tempfile::tempdir().expect("vault tempdir");
+        let vault_pqd = setup_test_vault(&vault_dir);
+
+        let source_dir = tempfile::tempdir().expect("source tempdir");
+        for i in 0..100u32 {
+            let name = format!("note{i:03}.md");
+            std::fs::write(source_dir.path().join(&name), format!("Content {i}"))
+                .expect("write note");
+        }
+
+        let mut core = DiaryCore::new(vault_pqd.to_str().expect("utf8")).expect("DiaryCore::new");
+        core.unlock(secret("password")).expect("unlock");
+
+        let result = core.import(source_dir.path(), false).expect("import 100");
+        assert_eq!(
+            result.imported, 100,
+            "all 100 entries must be reported as imported"
+        );
+
+        // Verify via read_vault that exactly 100 ENTRY records exist.
+        let (_header, records) = read_vault(&vault_pqd).expect("read_vault");
+        let entry_count = records
+            .iter()
+            .filter(|r| r.record_type == crate::vault::format::RECORD_TYPE_ENTRY)
+            .count();
+        assert_eq!(
+            entry_count, 100,
+            "vault must contain exactly 100 ENTRY records"
+        );
+
+        core.lock();
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-D11-01: Zeroizing<String> is used for file content (static/compile check)
+    // -------------------------------------------------------------------------
+
+    /// TC-D11-01: Verify that `Zeroizing<String>` can be passed to `parse_markdown`
+    /// via deref coercion.  This is the pattern used in `import_directory` to
+    /// guarantee the raw file content is erased on drop.
+    #[test]
+    fn tc_d11_01_zeroizing_string_used_for_content() {
+        // Ensure Zeroizing<String> derefs to &str, compatible with parse_markdown.
+        let raw = "# Hello\nBody text.".to_string();
+        let content: Zeroizing<String> = Zeroizing::new(raw);
+        // parse_markdown takes &str; Zeroizing<String> derefs transparently.
+        let result = parse_markdown(&content, "hello.md");
+        assert!(
+            result.is_ok(),
+            "parse_markdown must accept Zeroizing<String> via deref"
+        );
+        let (md, _, _) = result.expect("parse");
+        assert_eq!(md.title, "hello");
+        // content is dropped (and zeroed) at end of scope.
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-D12-01: source files are not deleted after import
+    // -------------------------------------------------------------------------
+
+    /// TC-D12-01: After `import_directory` the original `note.md` must still
+    /// exist with its original content unchanged.
+    #[test]
+    fn tc_d12_01_source_files_not_deleted() {
+        let vault_dir = tempfile::tempdir().expect("vault tempdir");
+        let vault_pqd = setup_test_vault(&vault_dir);
+
+        let source_dir = tempfile::tempdir().expect("source tempdir");
+        let note_path = source_dir.path().join("note.md");
+        let original_content = "Original content that must survive import.";
+        std::fs::write(&note_path, original_content).expect("write note.md");
+
+        let mut core = DiaryCore::new(vault_pqd.to_str().expect("utf8")).expect("DiaryCore::new");
+        core.unlock(secret("password")).expect("unlock");
+        core.import(source_dir.path(), false).expect("import");
+        core.lock();
+
+        assert!(
+            note_path.exists(),
+            "source note.md must still exist after import"
+        );
+        let after = std::fs::read_to_string(&note_path).expect("read note.md after import");
+        assert_eq!(
+            after, original_content,
+            "source file content must be unchanged"
+        );
     }
 }

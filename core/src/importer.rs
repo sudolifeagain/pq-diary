@@ -69,6 +69,8 @@ pub struct ImportResult {
     pub tags_converted: usize,
     /// Per-file details for each skipped entry.
     pub skip_details: Vec<SkipDetail>,
+    /// Number of files that would have been imported (populated only in dry-run mode).
+    pub would_import: usize,
 }
 
 /// Details about a single skipped file during import.
@@ -225,6 +227,7 @@ pub fn batch_create_entries(
         links_converted: 0,
         tags_converted: 0,
         skip_details: vec![],
+        would_import: 0,
     })
 }
 
@@ -322,6 +325,7 @@ pub fn import_directory(
             links_converted,
             tags_converted,
             skip_details,
+            would_import: parsed_files.len(),
         });
     }
 

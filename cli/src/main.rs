@@ -44,6 +44,17 @@ pub struct StatsArgs {
     pub heatmap: bool,
 }
 
+/// Arguments for the `import` subcommand.
+#[derive(Debug, Args)]
+pub struct ImportArgs {
+    /// Source directory containing .md files.
+    pub dir: std::path::PathBuf,
+
+    /// Preview import without writing to vault.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
 /// Arguments for the `search` subcommand.
 #[derive(Debug, Args)]
 pub struct SearchArgs {
@@ -193,11 +204,8 @@ pub enum Commands {
     /// Show vault statistics.
     Stats(StatsArgs),
 
-    /// Import entries from an external source
-    Import {
-        /// Source file or directory path
-        source: String,
-    },
+    /// Import Markdown files from a directory.
+    Import(ImportArgs),
 
     /// Manage entry templates
     Template {
@@ -351,7 +359,7 @@ fn dispatch(cli: &Cli) -> anyhow::Result<()> {
         Commands::Today => commands::cmd_today(cli),
         Commands::Search(args) => commands::cmd_search(cli, args),
         Commands::Stats(args) => commands::cmd_stats(cli, args),
-        Commands::Import { .. } => not_implemented("import", "Sprint 6"),
+        Commands::Import(args) => commands::cmd_import(cli, args),
         Commands::Template { subcommand } => match subcommand {
             TemplateCommands::Add { name } => commands::cmd_template_add(cli, name.clone()),
             TemplateCommands::List => commands::cmd_template_list(cli),

@@ -1436,6 +1436,98 @@ fn render_heatmap(daily_activity: &[pq_diary_core::stats::DailyActivity]) -> Str
 }
 
 // ---------------------------------------------------------------------------
+// Import command
+// ---------------------------------------------------------------------------
+
+/// Execute the `pq-diary import` command, writing output to stdout.
+///
+/// Recursively imports all `.md` files from `args.dir` into the vault.
+/// When `args.dry_run` is `true`, no entries are written; a preview summary
+/// is printed instead.  The `VaultGuard` pattern ensures the vault is locked
+/// on every exit path.
+///
+/// # Errors
+///
+/// Returns an error if the directory does not exist, is not a directory,
+/// password acquisition fails, vault unlock fails, or import fails.
+pub fn cmd_import(cli: &Cli, args: &crate::ImportArgs) -> anyhow::Result<()> {
+    cmd_import_to(cli, args, &mut std::io::stdout())
+}
+
+/// Inner implementation of [`cmd_import`] that writes output to `out`.
+///
+/// Separated from `cmd_import` to enable output capture in tests.
+pub(crate) fn cmd_import_to(
+    cli: &Cli,
+    args: &crate::ImportArgs,
+    out: &mut dyn std::io::Write,
+) -> anyhow::Result<()> {
+    use secrecy::{ExposeSecret as _, SecretBox};
+
+    // 1. Validate source directory before touching the vault.
+    if !args.dir.exists() {
+        return Err(anyhow::anyhow!(
+            "Error: Directory '{}' does not exist",
+            args.dir.display()
+        ));
+    }
+    if !args.dir.is_dir() {
+        return Err(anyhow::anyhow!(
+            "Error: '{}' is not a directory",
+            args.dir.display()
+        ));
+    }
+
+    // 2. Acquire password.
+    let password_source =
+        get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // 3. Open and unlock vault.
+    let vault_path = resolve_vault_path(cli)?;
+    let vault_str = vault_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Vault path contains non-UTF-8 characters"))?;
+
+    let mut core = DiaryCore::new(vault_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let secret_password: secrecy::SecretString =
+        SecretBox::new(Box::from(password_source.secret().expose_secret()));
+    core.unlock(secret_password)
+        .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+    let guard = VaultGuard::new(&mut core);
+
+    // 4. Run import (dry_run flag is forwarded to core).
+    let result = guard
+        .import(&args.dir, args.dry_run)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // 5. Display results.
+    if args.dry_run {
+        writeln!(
+            out,
+            "[DRY RUN] Would import {} files from '{}'",
+            result.would_import,
+            args.dir.display()
+        )?;
+        writeln!(out, "  Links to convert: {}", result.links_converted)?;
+        writeln!(out, "  Tags to extract: {}", result.tags_converted)?;
+        writeln!(out, "  Files to skip: {}", result.skipped)?;
+        for detail in &result.skip_details {
+            writeln!(out, "    - {} ({})", detail.path, detail.reason)?;
+        }
+    } else {
+        writeln!(
+            out,
+            "Imported: {}, Skipped: {}, Links converted: {}, Tags converted: {}",
+            result.imported, result.skipped, result.links_converted, result.tags_converted
+        )?;
+    }
+
+    // guard drops here, automatically calling lock().
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -3874,6 +3966,229 @@ mod tests {
         assert!(
             output.contains("Entries:        0"),
             "output must show 0 entries: {output}"
+        );
+    }
+
+    // =========================================================================
+    // TASK-0064: cmd_import tests
+    // =========================================================================
+
+    /// Build a `Cli` targeting `vault_dir_str` for the `import` subcommand.
+    fn parse_import_cli(
+        vault_dir_str: &str,
+        import_dir_str: &str,
+        extra_args: &[&str],
+    ) -> crate::Cli {
+        let mut args: Vec<&str> = vec![
+            "pq-diary",
+            "-v",
+            vault_dir_str,
+            "--password",
+            "password",
+            "import",
+            import_dir_str,
+        ];
+        args.extend_from_slice(extra_args);
+        crate::Cli::try_parse_from(&args).expect("parse test CLI")
+    }
+
+    /// Extract `ImportArgs` from a parsed CLI.
+    fn extract_import_args(cli: &crate::Cli) -> &crate::ImportArgs {
+        match &cli.command {
+            crate::Commands::Import(args) => args,
+            _ => panic!("Expected Commands::Import"),
+        }
+    }
+
+    /// TC-D01-06: `import <DIR>` imports `.md` files and shows "Imported: 1".
+    #[test]
+    fn tc_d01_06_import_md_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let src_dir = tempfile::tempdir().expect("src tempdir");
+        std::fs::write(
+            src_dir.path().join("note.md"),
+            "# Test Note\n\nHello world.",
+        )
+        .expect("write md");
+
+        let cli = parse_import_cli(vault_dir_str, src_dir.path().to_str().expect("utf8"), &[]);
+        let import_args = extract_import_args(&cli);
+
+        let mut out = Vec::new();
+        cmd_import_to(&cli, import_args, &mut out).expect("cmd_import_to");
+        let output = String::from_utf8(out).expect("utf8");
+
+        assert!(
+            output.contains("Imported: 1"),
+            "output must contain 'Imported: 1': {output}"
+        );
+    }
+
+    /// TC-D07-02: `--dry-run` shows `[DRY RUN]` and `Would import` preview.
+    #[test]
+    fn tc_d07_02_dry_run_preview() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let src_dir = tempfile::tempdir().expect("src tempdir");
+        std::fs::write(
+            src_dir.path().join("note.md"),
+            "# Test Note\n\nHello world.",
+        )
+        .expect("write md");
+
+        let cli = parse_import_cli(
+            vault_dir_str,
+            src_dir.path().to_str().expect("utf8"),
+            &["--dry-run"],
+        );
+        let import_args = extract_import_args(&cli);
+
+        let mut out = Vec::new();
+        cmd_import_to(&cli, import_args, &mut out).expect("cmd_import_to");
+        let output = String::from_utf8(out).expect("utf8");
+
+        assert!(
+            output.contains("[DRY RUN]"),
+            "output must contain '[DRY RUN]': {output}"
+        );
+        assert!(
+            output.contains("Would import"),
+            "output must contain 'Would import': {output}"
+        );
+    }
+
+    /// TC-D07-03: `--dry-run` does not change vault file size.
+    #[test]
+    fn tc_d07_03_dry_run_no_vault_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        let vault_pqd = vault_dir.join("vault.pqd");
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let src_dir = tempfile::tempdir().expect("src tempdir");
+        std::fs::write(
+            src_dir.path().join("note.md"),
+            "# Test Note\n\nHello world.",
+        )
+        .expect("write md");
+
+        let size_before = std::fs::metadata(&vault_pqd)
+            .expect("metadata before")
+            .len();
+
+        let cli = parse_import_cli(
+            vault_dir_str,
+            src_dir.path().to_str().expect("utf8"),
+            &["--dry-run"],
+        );
+        let import_args = extract_import_args(&cli);
+
+        let mut out = Vec::new();
+        cmd_import_to(&cli, import_args, &mut out).expect("cmd_import_to");
+
+        let size_after = std::fs::metadata(&vault_pqd).expect("metadata after").len();
+        assert_eq!(
+            size_before, size_after,
+            "vault size must not change in dry-run mode"
+        );
+    }
+
+    /// TC-D09-01: Summary output contains all four items (imported/skipped/links/tags).
+    #[test]
+    fn tc_d09_01_summary_all_four_items() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let src_dir = tempfile::tempdir().expect("src tempdir");
+        // File with a wiki-link and an inline tag so links/tags counts are non-zero.
+        std::fs::write(
+            src_dir.path().join("note.md"),
+            "# Test\n\nSee [[other note]] and #work/project.\n",
+        )
+        .expect("write md");
+
+        let cli = parse_import_cli(vault_dir_str, src_dir.path().to_str().expect("utf8"), &[]);
+        let import_args = extract_import_args(&cli);
+
+        let mut out = Vec::new();
+        cmd_import_to(&cli, import_args, &mut out).expect("cmd_import_to");
+        let output = String::from_utf8(out).expect("utf8");
+
+        assert!(
+            output.contains("Imported:"),
+            "output must contain 'Imported:': {output}"
+        );
+        assert!(
+            output.contains("Skipped:"),
+            "output must contain 'Skipped:': {output}"
+        );
+        assert!(
+            output.contains("Links converted:"),
+            "output must contain 'Links converted:': {output}"
+        );
+        assert!(
+            output.contains("Tags converted:"),
+            "output must contain 'Tags converted:': {output}"
+        );
+    }
+
+    /// TC-EDGE-01: Nonexistent directory returns error containing "does not exist".
+    #[test]
+    fn tc_d_edge_01_nonexistent_directory() {
+        // Directory check happens before vault operations, so no real vault is needed.
+        let cli = crate::Cli::try_parse_from([
+            "pq-diary",
+            "-v",
+            "nonexistent.pqd",
+            "--password",
+            "pw",
+            "import",
+            "/tmp/nonexistent_dir_task0064_xxxxx",
+        ])
+        .expect("parse cli");
+        let import_args = extract_import_args(&cli);
+
+        let mut out = Vec::new();
+        let result = cmd_import_to(&cli, import_args, &mut out);
+
+        assert!(
+            result.is_err(),
+            "must return error for nonexistent directory"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("does not exist"),
+            "error must mention 'does not exist': {err_msg}"
+        );
+    }
+
+    /// TC-EDGE-02: Empty directory returns error containing "No Markdown files found".
+    #[test]
+    fn tc_d_edge_02_empty_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        // Source directory exists but contains no .md files.
+        let src_dir = tempfile::tempdir().expect("src tempdir");
+
+        let cli = parse_import_cli(vault_dir_str, src_dir.path().to_str().expect("utf8"), &[]);
+        let import_args = extract_import_args(&cli);
+
+        let mut out = Vec::new();
+        let result = cmd_import_to(&cli, import_args, &mut out);
+
+        assert!(result.is_err(), "must return error for empty directory");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("No Markdown files found"),
+            "error must mention 'No Markdown files found': {err_msg}"
         );
     }
 }

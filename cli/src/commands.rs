@@ -1261,6 +1261,181 @@ fn write_search_results(
 }
 
 // ---------------------------------------------------------------------------
+// Stats command
+// ---------------------------------------------------------------------------
+
+/// Execute the `pq-diary stats` command, writing output to stdout.
+///
+/// Collects vault-wide statistics and prints them in text, JSON, or heatmap
+/// format depending on the flags in `args`.  The `VaultGuard` pattern ensures
+/// the vault is locked on every exit path.
+///
+/// # Errors
+///
+/// Returns an error if password acquisition, vault unlock, or statistics
+/// collection fails.
+pub fn cmd_stats(cli: &Cli, args: &crate::StatsArgs) -> anyhow::Result<()> {
+    cmd_stats_to(cli, args, &mut std::io::stdout())
+}
+
+/// Inner implementation of [`cmd_stats`] that writes output to `out`.
+///
+/// Separated from `cmd_stats` to enable output capture in tests.
+pub(crate) fn cmd_stats_to(
+    cli: &Cli,
+    args: &crate::StatsArgs,
+    out: &mut dyn std::io::Write,
+) -> anyhow::Result<()> {
+    use secrecy::{ExposeSecret as _, SecretBox};
+
+    let password_source =
+        get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let vault_path = resolve_vault_path(cli)?;
+    let vault_str = vault_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Vault path contains non-UTF-8 characters"))?;
+
+    let mut core = DiaryCore::new(vault_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let secret_password: secrecy::SecretString =
+        SecretBox::new(Box::from(password_source.secret().expose_secret()));
+    core.unlock(secret_password)
+        .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+    let guard = VaultGuard::new(&mut core);
+
+    let stats = guard.stats().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if args.json {
+        let json = serde_json::to_string_pretty(&stats)
+            .map_err(|e| anyhow::anyhow!("JSON serialization failed: {e}"))?;
+        writeln!(out, "{json}")?;
+    } else if args.heatmap {
+        let heatmap = render_heatmap(&stats.daily_activity);
+        writeln!(out, "{heatmap}")?;
+    } else {
+        let first_date = stats
+            .first_entry_date
+            .map(format_timestamp)
+            .unwrap_or_else(|| "N/A".to_string());
+        let last_date = stats
+            .last_entry_date
+            .map(format_timestamp)
+            .unwrap_or_else(|| "N/A".to_string());
+
+        writeln!(out, "=== Vault Statistics ===")?;
+        writeln!(out)?;
+        writeln!(out, "Entries:        {}", stats.entry_count)?;
+        writeln!(out, "Tags:           {}", stats.tag_count)?;
+        writeln!(out, "First entry:    {first_date}")?;
+        writeln!(out, "Last entry:     {last_date}")?;
+        writeln!(out, "Active days (30d): {}", stats.active_days_30d)?;
+        writeln!(out)?;
+        writeln!(out, "Characters:")?;
+        writeln!(out, "  Total:        {}", stats.char_stats.total)?;
+        writeln!(out, "  Average:      {}", stats.char_stats.average)?;
+        writeln!(out, "  Maximum:      {}", stats.char_stats.max)?;
+        writeln!(out)?;
+        if stats.tag_distribution.is_empty() {
+            writeln!(out, "Top Tags: N/A")?;
+        } else {
+            writeln!(out, "Top Tags:")?;
+            for (i, tc) in stats.tag_distribution.iter().enumerate() {
+                writeln!(out, "  {}. {} ({})", i + 1, tc.tag, tc.count)?;
+            }
+        }
+    }
+
+    // guard drops here, automatically calling lock().
+    Ok(())
+}
+
+/// Render a 7-row × 52-column ASCII heatmap of daily writing activity.
+///
+/// Each cell maps an entry count to a Unicode block character:
+/// - `░` — 0 entries
+/// - `▒` — 1 entry
+/// - `▓` — 2–3 entries
+/// - `█` — 4 or more entries
+///
+/// The grid covers the last 52 weeks (364 days) ending today.  Rows are
+/// weekdays (Mon–Sun) and columns are calendar weeks (oldest left, newest
+/// right).  A month-abbreviation header and a legend line are appended.
+fn render_heatmap(daily_activity: &[pq_diary_core::stats::DailyActivity]) -> String {
+    use chrono::{Datelike as _, Duration, Utc};
+    use std::collections::HashMap;
+
+    let activity_map: HashMap<String, usize> = daily_activity
+        .iter()
+        .map(|a| (a.date.clone(), a.count))
+        .collect();
+
+    let today = Utc::now().date_naive();
+    let start_date = today - Duration::days(363);
+
+    const WEEKS: usize = 52;
+    // grid[weekday][week]: weekday 0 = Mon … 6 = Sun
+    let mut grid = [[0usize; WEEKS]; 7];
+
+    for day_offset in 0..364i64 {
+        let date = start_date + Duration::days(day_offset);
+        let week = (day_offset / 7) as usize;
+        let weekday = date.weekday().num_days_from_monday() as usize;
+        let date_str = date.format("%Y-%m-%d").to_string();
+        let count = activity_map.get(&date_str).copied().unwrap_or(0);
+        if week < WEEKS {
+            grid[weekday][week] = count;
+        }
+    }
+
+    let count_to_char = |c: usize| -> char {
+        match c {
+            0 => '░',
+            1 => '▒',
+            2 | 3 => '▓',
+            _ => '█',
+        }
+    };
+
+    const MONTH_NAMES: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+
+    // Build the month header: 5-char indent ("     ") followed by 52 chars.
+    // Month abbreviations (3 chars) are written left-aligned at the column
+    // where the month first appears; they may overlap with the next label.
+    let mut header_chars: Vec<char> = std::iter::repeat_n(' ', 5 + WEEKS).collect();
+    let mut last_month: u32 = 0;
+    for week in 0..WEEKS {
+        let date = start_date + Duration::days((week * 7) as i64);
+        let month = date.month();
+        if month != last_month {
+            let m_str = MONTH_NAMES[(month - 1) as usize];
+            let pos = 5 + week;
+            for (i, ch) in m_str.chars().enumerate() {
+                if pos + i < header_chars.len() {
+                    header_chars[pos + i] = ch;
+                }
+            }
+            last_month = month;
+        }
+    }
+    let header: String = header_chars.into_iter().collect();
+
+    let day_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    let mut lines = vec![header];
+    for (weekday, week_counts) in grid.iter().enumerate() {
+        let mut row = format!("{} ", day_labels[weekday]);
+        for &count in week_counts.iter() {
+            row.push(count_to_char(count));
+        }
+        lines.push(row);
+    }
+    lines.push("Legend: ░ 0  ▒ 1  ▓ 2-3  █ 4+".to_string());
+    lines.join("\n")
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -3470,5 +3645,235 @@ mod tests {
         let output = String::from_utf8(out).expect("utf8").trim().to_string();
 
         assert_eq!(output, "No matches found");
+    }
+
+    // -------------------------------------------------------------------------
+    // TASK-0061: cmd_stats tests
+    // -------------------------------------------------------------------------
+
+    /// Set up a fresh vault for stats tests and return its directory path.
+    fn setup_stats_vault(dir: &tempfile::TempDir) -> PathBuf {
+        use pq_diary_core::vault::init::VaultManager;
+        let mgr = VaultManager::new(dir.path().to_path_buf())
+            .expect("VaultManager::new")
+            .with_kdf_params(fast_params());
+        mgr.init_vault("stv", b"password").expect("init_vault");
+        dir.path().join("stv")
+    }
+
+    /// Parse a `Cli` targeting `vault_dir` with the `stats` subcommand.
+    fn parse_stats_cli(vault_dir_str: &str, extra: &[&str]) -> crate::Cli {
+        use clap::Parser as _;
+        let mut args = vec![
+            "pq-diary",
+            "-v",
+            vault_dir_str,
+            "--password",
+            "password",
+            "stats",
+        ];
+        args.extend_from_slice(extra);
+        crate::Cli::try_parse_from(&args).expect("parse test CLI")
+    }
+
+    /// Extract `StatsArgs` from a parsed `Cli`.
+    fn extract_stats_args(cli: &crate::Cli) -> &crate::StatsArgs {
+        match &cli.command {
+            crate::Commands::Stats(a) => a,
+            _ => panic!("Expected Commands::Stats"),
+        }
+    }
+
+    /// TC-C03-01: Default output contains "Vault Statistics" header and "Entries:" label.
+    #[test]
+    fn tc_c03_01_default_output_text_format() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_stats_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        add_entry(&vault_dir, "テスト", "本文", vec![]);
+
+        let cli = parse_stats_cli(vault_dir_str, &[]);
+        let args = extract_stats_args(&cli);
+
+        let mut out = Vec::new();
+        cmd_stats_to(&cli, args, &mut out).expect("cmd_stats_to");
+        let output = String::from_utf8(out).expect("utf8");
+
+        assert!(
+            output.contains("Vault Statistics"),
+            "output must contain 'Vault Statistics': {output}"
+        );
+        assert!(
+            output.contains("Entries:"),
+            "output must contain 'Entries:': {output}"
+        );
+    }
+
+    /// TC-C03-02: Text output contains all expected statistics fields.
+    #[test]
+    fn tc_c03_02_text_output_all_fields() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_stats_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        add_entry(
+            &vault_dir,
+            "記事A",
+            "本文テキスト",
+            vec!["日記".to_string()],
+        );
+
+        let cli = parse_stats_cli(vault_dir_str, &[]);
+        let args = extract_stats_args(&cli);
+
+        let mut out = Vec::new();
+        cmd_stats_to(&cli, args, &mut out).expect("cmd_stats_to");
+        let output = String::from_utf8(out).expect("utf8");
+
+        for label in &[
+            "Entries:",
+            "Tags:",
+            "First entry:",
+            "Last entry:",
+            "Active days (30d):",
+            "Characters:",
+            "Total:",
+            "Average:",
+            "Maximum:",
+            "Top Tags:",
+        ] {
+            assert!(
+                output.contains(label),
+                "output must contain '{label}': {output}"
+            );
+        }
+    }
+
+    /// TC-C04-01: --json outputs valid JSON.
+    #[test]
+    fn tc_c04_01_json_output_is_valid() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_stats_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        add_entry(&vault_dir, "記事", "本文", vec![]);
+
+        let cli = parse_stats_cli(vault_dir_str, &["--json"]);
+        let args = extract_stats_args(&cli);
+
+        let mut out = Vec::new();
+        cmd_stats_to(&cli, args, &mut out).expect("cmd_stats_to");
+        let output = String::from_utf8(out).expect("utf8");
+
+        let parsed: serde_json::Result<serde_json::Value> = serde_json::from_str(&output);
+        assert!(parsed.is_ok(), "--json output must be valid JSON: {output}");
+    }
+
+    /// TC-C04-02: --json output contains all VaultStats fields.
+    #[test]
+    fn tc_c04_02_json_output_all_fields() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_stats_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        add_entry(&vault_dir, "記事", "本文", vec!["tech".to_string()]);
+
+        let cli = parse_stats_cli(vault_dir_str, &["--json"]);
+        let args = extract_stats_args(&cli);
+
+        let mut out = Vec::new();
+        cmd_stats_to(&cli, args, &mut out).expect("cmd_stats_to");
+        let output = String::from_utf8(out).expect("utf8");
+
+        let value: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+        for key in &[
+            "entry_count",
+            "tag_count",
+            "char_stats",
+            "tag_distribution",
+            "daily_activity",
+        ] {
+            assert!(
+                value.get(key).is_some(),
+                "JSON must contain key '{key}': {output}"
+            );
+        }
+    }
+
+    /// TC-C05-01: --heatmap output contains at least one heatmap character.
+    #[test]
+    fn tc_c05_01_heatmap_contains_block_chars() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_stats_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        add_entry(&vault_dir, "記事", "本文", vec![]);
+
+        let cli = parse_stats_cli(vault_dir_str, &["--heatmap"]);
+        let args = extract_stats_args(&cli);
+
+        let mut out = Vec::new();
+        cmd_stats_to(&cli, args, &mut out).expect("cmd_stats_to");
+        let output = String::from_utf8(out).expect("utf8");
+
+        let has_block = output.contains('░')
+            || output.contains('▒')
+            || output.contains('▓')
+            || output.contains('█');
+        assert!(
+            has_block,
+            "--heatmap output must contain block characters: {output}"
+        );
+    }
+
+    /// TC-C05-02: --heatmap output ends with a "Legend:" line.
+    #[test]
+    fn tc_c05_02_heatmap_has_legend() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_stats_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let cli = parse_stats_cli(vault_dir_str, &["--heatmap"]);
+        let args = extract_stats_args(&cli);
+
+        let mut out = Vec::new();
+        cmd_stats_to(&cli, args, &mut out).expect("cmd_stats_to");
+        let output = String::from_utf8(out).expect("utf8");
+
+        assert!(
+            output.contains("Legend:"),
+            "--heatmap output must contain 'Legend:': {output}"
+        );
+    }
+
+    /// TC-EDGE-01: Empty vault does not error and shows "Entries:" with "0".
+    #[test]
+    fn tc_c_edge_01_empty_vault_shows_zero_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_stats_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        // No entries added.
+        let cli = parse_stats_cli(vault_dir_str, &[]);
+        let args = extract_stats_args(&cli);
+
+        let mut out = Vec::new();
+        let result = cmd_stats_to(&cli, args, &mut out);
+        assert!(
+            result.is_ok(),
+            "empty vault must not error: {:?}",
+            result.err()
+        );
+
+        let output = String::from_utf8(out).expect("utf8");
+        assert!(
+            output.contains("Entries:"),
+            "output must contain 'Entries:': {output}"
+        );
+        assert!(
+            output.contains("Entries:        0"),
+            "output must show 0 entries: {output}"
+        );
     }
 }

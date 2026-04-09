@@ -32,6 +32,18 @@ pub struct Cli {
     pub command: Commands,
 }
 
+/// Arguments for the `stats` subcommand.
+#[derive(Debug, Args)]
+pub struct StatsArgs {
+    /// Output statistics as JSON.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Show ASCII heatmap of writing activity (last 52 weeks).
+    #[arg(long)]
+    pub heatmap: bool,
+}
+
 /// Arguments for the `search` subcommand.
 #[derive(Debug, Args)]
 pub struct SearchArgs {
@@ -178,8 +190,8 @@ pub enum Commands {
     /// Search entries by regex pattern.
     Search(SearchArgs),
 
-    /// Show diary statistics
-    Stats,
+    /// Show vault statistics.
+    Stats(StatsArgs),
 
     /// Import entries from an external source
     Import {
@@ -338,7 +350,7 @@ fn dispatch(cli: &Cli) -> anyhow::Result<()> {
         },
         Commands::Today => commands::cmd_today(cli),
         Commands::Search(args) => commands::cmd_search(cli, args),
-        Commands::Stats => not_implemented("stats", "Sprint 5"),
+        Commands::Stats(args) => commands::cmd_stats(cli, args),
         Commands::Import { .. } => not_implemented("import", "Sprint 6"),
         Commands::Template { subcommand } => match subcommand {
             TemplateCommands::Add { name } => commands::cmd_template_add(cli, name.clone()),

@@ -15,7 +15,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use uuid::Uuid;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// Entry plaintext payload serialized before AES-256-GCM encryption.
 ///
@@ -24,7 +24,10 @@ use zeroize::Zeroizing;
 ///
 /// Decryption flow:
 /// `EntryRecord.ciphertext` → `CryptoEngine::decrypt()` → `serde_json::from_slice()` → `EntryPlaintext`
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+///
+/// The struct derives `Zeroize` and `ZeroizeOnDrop` because entry content is
+/// secret data that must be erased from memory when no longer needed.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Zeroize, ZeroizeOnDrop)]
 pub struct EntryPlaintext {
     /// Entry title.
     pub title: String,
@@ -213,16 +216,17 @@ pub fn list_entries(
             continue;
         }
         let decrypted = engine.decrypt(&record.iv, &record.ciphertext)?;
-        let plaintext: EntryPlaintext = serde_json::from_slice(decrypted.as_ref())
+        let mut plaintext: EntryPlaintext = serde_json::from_slice(decrypted.as_ref())
             .map_err(|e| DiaryError::Entry(format!("deserialization failed: {e}")))?;
         let uuid_hex: String = record.uuid.iter().map(|b| format!("{:02x}", b)).collect();
         metas.push(EntryMeta {
             uuid_hex,
-            title: plaintext.title,
-            tags: plaintext.tags,
+            title: std::mem::take(&mut plaintext.title),
+            tags: std::mem::take(&mut plaintext.tags),
             created_at: record.created_at,
             updated_at: record.updated_at,
         });
+        // plaintext drops here; ZeroizeOnDrop zeroes any remaining data.
     }
     Ok(metas)
 }
@@ -248,10 +252,13 @@ pub fn list_entries_with_body(
             continue;
         }
         let decrypted = engine.decrypt(&record.iv, &record.ciphertext)?;
-        let plaintext: EntryPlaintext = serde_json::from_slice(decrypted.as_ref())
+        let mut plaintext: EntryPlaintext = serde_json::from_slice(decrypted.as_ref())
             .map_err(|e| DiaryError::Entry(format!("deserialization failed: {e}")))?;
         let uuid_hex: String = record.uuid.iter().map(|b| format!("{:02x}", b)).collect();
-        let EntryPlaintext { title, tags, body } = plaintext;
+        let title = std::mem::take(&mut plaintext.title);
+        let tags = std::mem::take(&mut plaintext.tags);
+        let body = std::mem::take(&mut plaintext.body);
+        // plaintext drops here; ZeroizeOnDrop zeroes the now-empty fields.
         let meta = EntryMeta {
             uuid_hex,
             title,
@@ -472,6 +479,43 @@ pub fn delete_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // =========================================================================
+    // TC-A10-01: EntryPlaintext ZeroizeOnDrop
+    // =========================================================================
+
+    /// TC-A10-01: zeroize() clears all fields of EntryPlaintext.
+    ///
+    /// Uses `ManuallyDrop` to call `zeroize()` while the allocation is still live,
+    /// avoiding undefined behavior from reading freed memory.
+    #[test]
+    fn tc_a10_01_entry_plaintext_zeroize_on_drop() {
+        use std::mem::ManuallyDrop;
+
+        let mut pt = ManuallyDrop::new(EntryPlaintext {
+            title: "secret title".to_string(),
+            tags: vec!["tag1".to_string(), "tag2".to_string()],
+            body: "secret body content".to_string(),
+        });
+
+        let title_ptr = pt.title.as_ptr();
+        let title_len = pt.title.len();
+        let body_ptr = pt.body.as_ptr();
+        let body_len = pt.body.len();
+
+        pt.zeroize();
+
+        // SAFETY: ManuallyDrop suppresses deallocation; allocations are still live.
+        unsafe {
+            for i in 0..title_len {
+                assert_eq!(*title_ptr.add(i), 0u8, "title byte {i} not zeroed");
+            }
+            for i in 0..body_len {
+                assert_eq!(*body_ptr.add(i), 0u8, "body byte {i} not zeroed");
+            }
+        }
+        // Intentional leak — allocation is small and this is test code.
+    }
 
     // =========================================================================
     // EntryPlaintext serde round-trip

@@ -244,7 +244,7 @@ pub fn list_entries(
 pub fn list_entries_with_body(
     vault_path: &Path,
     engine: &CryptoEngine,
-) -> Result<Vec<(EntryMeta, String)>, DiaryError> {
+) -> Result<Vec<(EntryMeta, Zeroizing<String>)>, DiaryError> {
     let (_header, records) = read_vault(vault_path)?;
     let mut result = Vec::with_capacity(records.len());
     for record in records {
@@ -257,7 +257,7 @@ pub fn list_entries_with_body(
         let uuid_hex: String = record.uuid.iter().map(|b| format!("{:02x}", b)).collect();
         let title = std::mem::take(&mut plaintext.title);
         let tags = std::mem::take(&mut plaintext.tags);
-        let body = std::mem::take(&mut plaintext.body);
+        let body = Zeroizing::new(std::mem::take(&mut plaintext.body));
         // plaintext drops here; ZeroizeOnDrop zeroes the now-empty fields.
         let meta = EntryMeta {
             uuid_hex,

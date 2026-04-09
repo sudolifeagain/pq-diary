@@ -12,11 +12,32 @@
 //! invocation regardless of the number of files).
 
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use regex::Regex;
 use uuid::Uuid;
 use walkdir::WalkDir;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+
+// =========================================================================
+// Static regexes (compiled once via LazyLock)
+// =========================================================================
+
+static WIKI_LINK_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]").unwrap()
+});
+
+static TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"#([\w/]+)").unwrap()
+});
+
+static FENCED_CODE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)```[^\n]*\n.*?```").unwrap()
+});
+
+static INLINE_CODE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"`[^`]+`").unwrap()
+});
 
 use crate::{
     crypto::CryptoEngine,
@@ -108,8 +129,11 @@ pub fn parse_markdown(
     content: &str,
     filename: &str,
 ) -> Result<(MarkdownFile, usize, usize), DiaryError> {
+    // 0. Normalize CRLF → LF
+    let content = Zeroizing::new(content.replace("\r\n", "\n"));
+
     // 1. Parse YAML frontmatter
-    let (frontmatter_title, frontmatter_tags, body_raw) = parse_frontmatter(content);
+    let (frontmatter_title, frontmatter_tags, body_raw) = parse_frontmatter(&content);
 
     // 2. Determine title: frontmatter title takes priority over filename stem
     let title = frontmatter_title.unwrap_or_else(|| {
@@ -182,13 +206,13 @@ pub fn batch_create_entries(
 
     let imported = files.len();
 
-    for file in files {
+    for mut file in files.into_iter() {
         let uuid = Uuid::new_v4();
 
         let plaintext = EntryPlaintext {
-            title: file.title.clone(),
-            tags: file.tags.clone(),
-            body: file.body.clone(),
+            title: std::mem::take(&mut file.title),
+            tags: std::mem::take(&mut file.tags),
+            body: std::mem::take(&mut file.body),
         };
 
         let json_bytes = Zeroizing::new(
@@ -270,7 +294,7 @@ pub fn import_directory(
     let mut links_converted: usize = 0;
     let mut tags_converted: usize = 0;
 
-    for entry in WalkDir::new(source_dir) {
+    for entry in WalkDir::new(source_dir).follow_links(false) {
         let entry = entry.map_err(|e| DiaryError::Import(format!("directory walk error: {e}")))?;
         let path = entry.path();
 
@@ -456,8 +480,7 @@ fn extract_frontmatter_tags(fm: &str) -> Vec<String> {
 ///
 /// Returns [`DiaryError::Import`] if the regex fails to compile.
 fn convert_wiki_links(body: &str) -> Result<(String, usize), DiaryError> {
-    let re = Regex::new(r"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]")
-        .map_err(|e| DiaryError::Import(format!("wiki-link regex compile error: {e}")))?;
+    let re = &*WIKI_LINK_RE;
 
     let mut count = 0usize;
     let result = re.replace_all(body, |caps: &regex::Captures| {
@@ -484,15 +507,34 @@ fn convert_wiki_links(body: &str) -> Result<(String, usize), DiaryError> {
 ///
 /// Returns [`DiaryError::Import`] if the regex fails to compile.
 fn extract_tags(body: &str) -> Result<(Vec<String>, String, usize), DiaryError> {
-    let re = Regex::new(r"#([\w/]+)")
-        .map_err(|e| DiaryError::Import(format!("tag regex compile error: {e}")))?;
+    let re = &*TAG_RE;
+
+    // Build a set of byte-offset ranges that fall inside code blocks
+    // (fenced ```...``` and inline `...`).  Tags inside these ranges are ignored.
+    let mut code_ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    for m in FENCED_CODE_RE.find_iter(body) {
+        code_ranges.push(m.start()..m.end());
+    }
+    for m in INLINE_CODE_RE.find_iter(body) {
+        code_ranges.push(m.start()..m.end());
+    }
+
+    let in_code = |pos: usize| -> bool { code_ranges.iter().any(|r| r.contains(&pos)) };
 
     let mut tags: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     let mut count = 0usize;
 
     let cleaned = re.replace_all(body, |caps: &regex::Captures| {
-        let tag = caps.get(1).map_or("", |m| m.as_str()).to_string();
-        tags.push(tag);
+        let m = caps.get(0).unwrap();
+        if in_code(m.start()) {
+            // Inside a code block — keep the original text untouched.
+            return m.as_str().to_string();
+        }
+        let tag_name = caps.get(1).map_or("", |m| m.as_str()).to_string();
+        if seen.insert(tag_name.clone()) {
+            tags.push(tag_name);
+        }
         count += 1;
         String::new()
     });

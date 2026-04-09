@@ -2,8 +2,9 @@
 //!
 //! Implements a streaming search strategy: each entry is decrypted, searched,
 //! and then its plaintext is dropped (zeroed via [`zeroize::ZeroizeOnDrop`])
-//! before moving to the next entry.  Memory usage is O(1 entry) regardless of
-//! vault size.
+//! before moving to the next entry.  Plaintext memory is O(1 entry) — each
+//! entry is decrypted, searched, and zeroized before the next.  However, all
+//! encrypted records are loaded into memory by `read_vault()`.
 //!
 //! # Search fields
 //!
@@ -75,6 +76,8 @@ pub struct SearchResults {
     /// Number of distinct records (entries or templates) with at least one match.
     pub matched_entry_count: usize,
     /// Total number of individual lines that matched across all fields.
+    ///
+    /// Available for future `--count --verbose` mode extension in the CLI.
     pub matched_line_count: usize,
 }
 

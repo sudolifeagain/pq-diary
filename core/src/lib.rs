@@ -139,10 +139,17 @@ impl DiaryCore {
         self.engine = Some(engine);
 
         // Build the link index from all current entries.
-        let entries_with_body = {
+        // list_entries_with_body returns Zeroizing<String> bodies; convert to
+        // plain Strings for LinkIndex::build.  The intermediate Vec is dropped
+        // immediately after index construction.
+        let zeroizing_entries = {
             let e = self.require_engine()?;
             entry::list_entries_with_body(&self.vault_path, e)?
         };
+        let entries_with_body: Vec<(entry::EntryMeta, String)> = zeroizing_entries
+            .into_iter()
+            .map(|(meta, body)| (meta, body.as_str().to_owned()))
+            .collect();
         self.link_index = Some(link::LinkIndex::build(&entries_with_body));
 
         Ok(())

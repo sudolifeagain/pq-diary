@@ -56,6 +56,10 @@ pub struct CharStats {
 }
 
 /// Tag name and occurrence count.
+///
+/// Tag names are treated as non-secret metadata (they appear in list output).
+/// Only entry body content is considered secret and is zeroized after
+/// aggregation.
 #[derive(Serialize)]
 pub struct TagCount {
     /// Tag name.
@@ -90,6 +94,14 @@ pub struct DailyActivity {
 /// Template records are skipped.  Each [`crate::entry::EntryPlaintext`] is
 /// zeroed (via [`zeroize::ZeroizeOnDrop`]) as soon as its fields have been
 /// aggregated.
+///
+/// # Security note
+///
+/// Tag names and dates are treated as non-secret metadata (they appear in
+/// `pq-diary list` output).  Only entry body content is considered secret
+/// and is zeroized after aggregation.  Wrapping these values in `Zeroizing`
+/// would complicate `Serialize` without meaningful security benefit, since
+/// other commands already expose them in plaintext.
 ///
 /// # Errors
 ///

@@ -1377,10 +1377,13 @@ fn render_heatmap(daily_activity: &[pq_diary_core::stats::DailyActivity]) -> Str
     // grid[weekday][week]: weekday 0 = Mon … 6 = Sun
     let mut grid = [[0usize; WEEKS]; 7];
 
+    // Align grid to calendar week boundaries: Monday is always row 0.
+    let start_weekday = start_date.weekday().num_days_from_monday() as usize; // 0=Mon
     for day_offset in 0..364i64 {
         let date = start_date + Duration::days(day_offset);
-        let week = (day_offset / 7) as usize;
-        let weekday = date.weekday().num_days_from_monday() as usize;
+        let adjusted_offset = day_offset as usize + start_weekday;
+        let week = adjusted_offset / 7;
+        let weekday = adjusted_offset % 7;
         let date_str = date.format("%Y-%m-%d").to_string();
         let count = activity_map.get(&date_str).copied().unwrap_or(0);
         if week < WEEKS {
@@ -1407,7 +1410,8 @@ fn render_heatmap(daily_activity: &[pq_diary_core::stats::DailyActivity]) -> Str
     let mut header_chars: Vec<char> = std::iter::repeat_n(' ', 5 + WEEKS).collect();
     let mut last_month: u32 = 0;
     for week in 0..WEEKS {
-        let date = start_date + Duration::days((week * 7) as i64);
+        // The Monday (row 0) of each grid column: offset back by start_weekday.
+        let date = start_date + Duration::days((week * 7) as i64 - start_weekday as i64);
         let month = date.month();
         if month != last_month {
             let m_str = MONTH_NAMES[(month - 1) as usize];

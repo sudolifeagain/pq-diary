@@ -91,6 +91,40 @@ fn filter_and_sort(
 }
 
 // ---------------------------------------------------------------------------
+// VaultGuard — RAII drop guard for vault lock/unlock lifecycle
+// ---------------------------------------------------------------------------
+
+/// RAII guard that automatically calls [`DiaryCore::lock`] when dropped.
+///
+/// Create this guard immediately after a successful [`DiaryCore::unlock`] call.
+/// The guard borrows the core mutably, so all vault operations must be
+/// performed through `Deref` coercion (`guard.method()` instead of
+/// `core.method()`).  When the guard goes out of scope — on success, on `?`
+/// early return, or on panic — `lock()` is guaranteed to be called, securely
+/// erasing the master key from memory.
+struct VaultGuard<'a>(&'a mut DiaryCore);
+
+impl<'a> VaultGuard<'a> {
+    /// Wrap an already-unlocked `DiaryCore` in a guard.
+    fn new(core: &'a mut DiaryCore) -> Self {
+        Self(core)
+    }
+}
+
+impl Drop for VaultGuard<'_> {
+    fn drop(&mut self) {
+        self.0.lock();
+    }
+}
+
+impl std::ops::Deref for VaultGuard<'_> {
+    type Target = DiaryCore;
+    fn deref(&self) -> &DiaryCore {
+        self.0
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public command handlers
 // ---------------------------------------------------------------------------
 
@@ -135,6 +169,7 @@ pub fn cmd_new(
         SecretBox::new(Box::from(password_source.secret().expose_secret()));
     core.unlock(secret_password)
         .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+    let guard = VaultGuard::new(&mut core);
 
     // Step 2: Determine body text and potentially update title/tags.
     let (final_body, final_title, final_tags) = if let Some(b) = body {
@@ -147,13 +182,9 @@ pub fn cmd_new(
         };
         use std::collections::{HashMap, HashSet};
 
-        let tmpl = match core.get_template(&tmpl_name) {
-            Ok(t) => t,
-            Err(e) => {
-                core.lock();
-                return Err(anyhow::anyhow!("{e}"));
-            }
-        };
+        let tmpl = guard
+            .get_template(&tmpl_name)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         let var_refs = extract_variables(&tmpl.body);
 
@@ -178,15 +209,14 @@ pub fn cmd_new(
             {
                 use std::io::Write as _;
                 print!("{}: ", var_ref.name);
-                if let Err(e) = std::io::stdout().flush() {
-                    core.lock();
-                    return Err(anyhow::anyhow!("Failed to flush stdout: {e}"));
-                }
+                std::io::stdout()
+                    .flush()
+                    .map_err(|e| anyhow::anyhow!("Failed to flush stdout: {e}"))?;
                 let mut input = String::new();
-                if let Err(e) = std::io::stdin().lock().read_line(&mut input) {
-                    core.lock();
-                    return Err(anyhow::anyhow!("Failed to read variable input: {e}"));
-                }
+                std::io::stdin()
+                    .lock()
+                    .read_line(&mut input)
+                    .map_err(|e| anyhow::anyhow!("Failed to read variable input: {e}"))?;
                 vars.insert(var_ref.name.clone(), input.trim().to_string());
             }
         }
@@ -196,20 +226,13 @@ pub fn cmd_new(
     } else if !std::io::stdin().is_terminal() {
         // Piped stdin: read all content.
         let mut content = String::new();
-        if let Err(e) = std::io::stdin().read_to_string(&mut content) {
-            core.lock();
-            return Err(anyhow::anyhow!("Failed to read stdin: {e}"));
-        }
+        std::io::stdin()
+            .read_to_string(&mut content)
+            .map_err(|e| anyhow::anyhow!("Failed to read stdin: {e}"))?;
         (content, title, tags)
     } else {
         // $EDITOR: write header-comment temp file, launch editor, read back.
-        let mut config = match EditorConfig::from_env() {
-            Ok(c) => c,
-            Err(e) => {
-                core.lock();
-                return Err(anyhow::anyhow!("{e}"));
-            }
-        };
+        let mut config = EditorConfig::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
 
         let initial = EntryPlaintext {
             title: title.clone().unwrap_or_else(|| "Untitled".to_string()),
@@ -217,18 +240,13 @@ pub fn cmd_new(
             body: String::new(),
         };
 
-        let tmpfile = match editor::write_header_file(&config.secure_tmpdir, &initial) {
-            Ok(p) => p,
-            Err(e) => {
-                core.lock();
-                return Err(anyhow::anyhow!("Failed to write temp file: {e}"));
-            }
-        };
+        let tmpfile = editor::write_header_file(&config.secure_tmpdir, &initial)
+            .map_err(|e| anyhow::anyhow!("Failed to write temp file: {e}"))?;
 
         // Inject vim completion for [[title]] links (vim/nvim only).
         let is_vim = !config.vim_options.is_empty();
         let completion_file = if is_vim {
-            let titles = core.all_titles().unwrap_or_default();
+            let titles = guard.all_titles().unwrap_or_default();
             editor::write_completion_file(&config.secure_tmpdir, &titles).ok()
         } else {
             None
@@ -251,17 +269,8 @@ pub fn cmd_new(
             }
         }
 
-        if let Err(e) = edit_result {
-            core.lock();
-            return Err(anyhow::anyhow!("Editor failed: {e}"));
-        }
-        let header = match read_result {
-            Ok(h) => h,
-            Err(e) => {
-                core.lock();
-                return Err(anyhow::anyhow!("Failed to read temp file: {e}"));
-            }
-        };
+        edit_result.map_err(|e| anyhow::anyhow!("Editor failed: {e}"))?;
+        let header = read_result.map_err(|e| anyhow::anyhow!("Failed to read temp file: {e}"))?;
 
         // Prefer header-parsed title/tags over CLI-supplied values.
         let new_title = header.title.or(title);
@@ -275,21 +284,15 @@ pub fn cmd_new(
         .unwrap_or_else(|| "Untitled".to_string());
 
     // Step 4: Create the entry.
-    let uuid_hex = match core.new_entry(&actual_title, &final_body, final_tags) {
-        Ok(h) => h,
-        Err(e) => {
-            core.lock();
-            return Err(anyhow::anyhow!("Failed to create entry: {e}"));
-        }
-    };
+    let uuid_hex = guard
+        .new_entry(&actual_title, &final_body, final_tags)
+        .map_err(|e| anyhow::anyhow!("Failed to create entry: {e}"))?;
 
     // Step 5: Print success message with an 8-character ID prefix.
     let prefix = &uuid_hex[..8];
     println!("Created: {prefix} \"{actual_title}\"");
 
-    // Step 6: Lock the vault.
-    core.lock();
-
+    // guard drops here, automatically calling lock().
     Ok(())
 }
 
@@ -326,22 +329,13 @@ pub fn cmd_list(
         SecretBox::new(Box::from(password_source.secret().expose_secret()));
     core.unlock(secret_password)
         .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+    let guard = VaultGuard::new(&mut core);
 
-    let entries = match core.list_entries(None) {
-        Ok(e) => e,
-        Err(e) => {
-            core.lock();
-            return Err(anyhow::anyhow!("Failed to list entries: {e}"));
-        }
-    };
+    let entries = guard
+        .list_entries(None)
+        .map_err(|e| anyhow::anyhow!("Failed to list entries: {e}"))?;
 
-    let filtered = match filter_and_sort(entries, tag.as_deref(), query.as_deref(), number) {
-        Ok(f) => f,
-        Err(e) => {
-            core.lock();
-            return Err(e);
-        }
-    };
+    let filtered = filter_and_sort(entries, tag.as_deref(), query.as_deref(), number)?;
 
     for meta in &filtered {
         let prefix = meta.id_prefix(8);
@@ -359,7 +353,7 @@ pub fn cmd_list(
         }
     }
 
-    core.lock();
+    // guard drops here, automatically calling lock().
     Ok(())
 }
 
@@ -400,99 +394,81 @@ fn cmd_show_impl(cli: &Cli, id: String, out: &mut dyn std::io::Write) -> anyhow:
         SecretBox::new(Box::from(password_source.secret().expose_secret()));
     core.unlock(secret_password)
         .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+    let guard = VaultGuard::new(&mut core);
 
-    let result = core.get_entry(&id);
+    let (record, plaintext) = guard.get_entry(&id).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    match result {
-        Err(e) => {
-            core.lock();
-            Err(anyhow::anyhow!("{e}"))
-        }
-        Ok((record, plaintext)) => {
-            // Execute all output logic inside a closure so that core.lock()
-            // is guaranteed to run regardless of write/resolve errors.
-            let show_result = (|| -> anyhow::Result<()> {
-                let created = format_timestamp(record.created_at);
-                let updated = format_timestamp(record.updated_at);
+    let created = format_timestamp(record.created_at);
+    let updated = format_timestamp(record.updated_at);
 
-                writeln!(out, "Title:   {}", plaintext.title)
-                    .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-                writeln!(out, "Created: {created}  Updated: {updated}")
-                    .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-                if plaintext.tags.is_empty() {
-                    writeln!(out, "Tags:    (none)")
+    writeln!(out, "Title:   {}", plaintext.title)
+        .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+    writeln!(out, "Created: {created}  Updated: {updated}")
+        .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+    if plaintext.tags.is_empty() {
+        writeln!(out, "Tags:    (none)").map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+    } else {
+        let tags_str = plaintext
+            .tags
+            .iter()
+            .map(|t| format!("#{t}"))
+            .collect::<Vec<_>>()
+            .join("  ");
+        writeln!(out, "Tags:    {tags_str}").map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+    }
+    writeln!(out).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+    write!(out, "{}", plaintext.body).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+
+    // Resolve [[link]] references in the body.
+    let resolved = guard
+        .resolve_links(&plaintext.body)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if !resolved.is_empty() {
+        writeln!(out).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+        writeln!(out, "--- Links ---").map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+        for link in &resolved {
+            match link.matches.len() {
+                0 => writeln!(out, "  [[{}]] (未解決)", link.title)
+                    .map_err(|e| anyhow::anyhow!("Write error: {e}"))?,
+                1 => writeln!(
+                    out,
+                    "  [[{}]] → [{}]",
+                    link.title, link.matches[0].id_prefix
+                )
+                .map_err(|e| anyhow::anyhow!("Write error: {e}"))?,
+                _ => {
+                    writeln!(out, "  [[{}]] → 複数候補:", link.title)
                         .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-                } else {
-                    let tags_str = plaintext
-                        .tags
-                        .iter()
-                        .map(|t| format!("#{t}"))
-                        .collect::<Vec<_>>()
-                        .join("  ");
-                    writeln!(out, "Tags:    {tags_str}")
-                        .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-                }
-                writeln!(out).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-                write!(out, "{}", plaintext.body)
-                    .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-
-                // Resolve [[link]] references in the body.
-                let resolved = core
-                    .resolve_links(&plaintext.body)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-                if !resolved.is_empty() {
-                    writeln!(out).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-                    writeln!(out, "--- Links ---")
-                        .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-                    for link in &resolved {
-                        match link.matches.len() {
-                            0 => writeln!(out, "  [[{}]] (未解決)", link.title)
-                                .map_err(|e| anyhow::anyhow!("Write error: {e}"))?,
-                            1 => writeln!(
-                                out,
-                                "  [[{}]] → [{}]",
-                                link.title, link.matches[0].id_prefix
-                            )
-                            .map_err(|e| anyhow::anyhow!("Write error: {e}"))?,
-                            _ => {
-                                writeln!(out, "  [[{}]] → 複数候補:", link.title)
-                                    .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-                                for m in &link.matches {
-                                    writeln!(out, "    [{}]", m.id_prefix)
-                                        .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Display backlinks (newest first).
-                let mut backlinks = core
-                    .backlinks_for(&plaintext.title)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-                if !backlinks.is_empty() {
-                    backlinks.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-
-                    writeln!(out).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-                    writeln!(out, "--- Backlinks ---")
-                        .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-                    for bl in &backlinks {
-                        let date = format_timestamp(bl.created_at);
-                        let prefix = backlink_uuid_prefix(&bl.source_uuid);
-                        writeln!(out, "  [{prefix}] {date} {}", bl.source_title)
+                    for m in &link.matches {
+                        writeln!(out, "    [{}]", m.id_prefix)
                             .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
                     }
                 }
-
-                Ok(())
-            })();
-
-            core.lock();
-            show_result
+            }
         }
     }
+
+    // Display backlinks (newest first).
+    let mut backlinks = guard
+        .backlinks_for(&plaintext.title)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if !backlinks.is_empty() {
+        backlinks.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+        writeln!(out).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+        writeln!(out, "--- Backlinks ---").map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+        for bl in &backlinks {
+            let date = format_timestamp(bl.created_at);
+            let prefix = backlink_uuid_prefix(&bl.source_uuid);
+            writeln!(out, "  [{prefix}] {date} {}", bl.source_title)
+                .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+        }
+    }
+
+    // guard drops here, automatically calling lock().
+    Ok(())
 }
 
 /// Convert the first 4 bytes of a raw UUID into an 8-character lowercase hex prefix.
@@ -566,15 +542,9 @@ where
         SecretBox::new(Box::from(password_source.secret().expose_secret()));
     core.unlock(secret_password)
         .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+    let guard = VaultGuard::new(&mut core);
 
-    let get_result = core.get_entry(&id);
-    let (_record, original) = match get_result {
-        Ok(r) => r,
-        Err(e) => {
-            core.lock();
-            return Err(anyhow::anyhow!("{e}"));
-        }
-    };
+    let (_record, original) = guard.get_entry(&id).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let flag_mode = title.is_some() || !add_tags.is_empty() || !remove_tags.is_empty();
 
@@ -600,33 +570,22 @@ where
             new_plaintext.tags.retain(|t| t != tag);
         }
 
-        let update_result = core.update_entry(&id, &new_plaintext);
-        core.lock();
-        update_result.map_err(|e| anyhow::anyhow!("Failed to update entry: {e}"))?;
+        guard
+            .update_entry(&id, &new_plaintext)
+            .map_err(|e| anyhow::anyhow!("Failed to update entry: {e}"))?;
         let prefix = &id[..id.len().min(8)];
         println!("Updated: {prefix}");
     } else {
         // Editor mode: write header-comment temp file, launch editor, parse result.
-        let mut config = match EditorConfig::from_env() {
-            Ok(c) => c,
-            Err(e) => {
-                core.lock();
-                return Err(anyhow::anyhow!("{e}"));
-            }
-        };
+        let mut config = EditorConfig::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        let tmpfile = match editor::write_header_file(&config.secure_tmpdir, &original) {
-            Ok(p) => p,
-            Err(e) => {
-                core.lock();
-                return Err(anyhow::anyhow!("Failed to write temp file: {e}"));
-            }
-        };
+        let tmpfile = editor::write_header_file(&config.secure_tmpdir, &original)
+            .map_err(|e| anyhow::anyhow!("Failed to write temp file: {e}"))?;
 
         // Inject vim completion for [[title]] links (vim/nvim only).
         let is_vim = !config.vim_options.is_empty();
         let completion_file = if is_vim {
-            let titles = core.all_titles().unwrap_or_default();
+            let titles = guard.all_titles().unwrap_or_default();
             editor::write_completion_file(&config.secure_tmpdir, &titles).ok()
         } else {
             None
@@ -649,18 +608,8 @@ where
             }
         }
 
-        if let Err(e) = edit_result {
-            core.lock();
-            return Err(anyhow::anyhow!("Editor failed: {e}"));
-        }
-
-        let header = match read_result {
-            Ok(h) => h,
-            Err(e) => {
-                core.lock();
-                return Err(anyhow::anyhow!("Failed to read temp file: {e}"));
-            }
-        };
+        edit_result.map_err(|e| anyhow::anyhow!("Editor failed: {e}"))?;
+        let header = read_result.map_err(|e| anyhow::anyhow!("Failed to read temp file: {e}"))?;
 
         // On header parse error, fall back to the original metadata.
         let (new_title, new_tags) = match (header.title, header.tags) {
@@ -672,8 +621,8 @@ where
         // Change detection: skip update if nothing changed.
         if new_title == original.title && new_tags == original.tags && new_body == original.body {
             println!("変更がありませんでした");
-            core.lock();
             return Ok(());
+            // guard drops here even on early return, calling lock().
         }
 
         let new_plaintext = EntryPlaintext {
@@ -682,13 +631,14 @@ where
             body: new_body,
         };
 
-        let update_result = core.update_entry(&id, &new_plaintext);
-        core.lock();
-        update_result.map_err(|e| anyhow::anyhow!("Failed to update entry: {e}"))?;
+        guard
+            .update_entry(&id, &new_plaintext)
+            .map_err(|e| anyhow::anyhow!("Failed to update entry: {e}"))?;
         let prefix = &id[..id.len().min(8)];
         println!("Updated: {prefix}");
     }
 
+    // guard drops here, automatically calling lock().
     Ok(())
 }
 
@@ -760,15 +710,9 @@ fn cmd_delete_impl(
         SecretBox::new(Box::from(password_source.secret().expose_secret()));
     core.unlock(secret_password)
         .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+    let guard = VaultGuard::new(&mut core);
 
-    let get_result = core.get_entry(&id);
-    let (record, plaintext) = match get_result {
-        Ok(r) => r,
-        Err(e) => {
-            core.lock();
-            return Err(anyhow::anyhow!("{e}"));
-        }
-    };
+    let (record, plaintext) = guard.get_entry(&id).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let title = plaintext.title.clone();
     let date = format_timestamp(record.created_at);
@@ -779,25 +723,19 @@ fn cmd_delete_impl(
     let do_delete = if skip_confirm {
         true
     } else {
-        match confirm_delete(&title, &date, reader) {
-            Ok(v) => v,
-            Err(e) => {
-                core.lock();
-                return Err(e);
-            }
-        }
+        confirm_delete(&title, &date, reader)?
     };
 
     if do_delete {
-        let delete_result = core.delete_entry(&id);
-        core.lock();
-        delete_result.map_err(|e| anyhow::anyhow!("Failed to delete entry: {e}"))?;
+        guard
+            .delete_entry(&id)
+            .map_err(|e| anyhow::anyhow!("Failed to delete entry: {e}"))?;
         println!("Deleted: {prefix} \"{title}\"");
     } else {
-        core.lock();
         println!("キャンセルしました");
     }
 
+    // guard drops here, automatically calling lock().
     Ok(())
 }
 
@@ -871,46 +809,34 @@ where
         SecretBox::new(Box::from(password_source.secret().expose_secret()));
     core.unlock(secret_password)
         .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+    let guard = VaultGuard::new(&mut core);
 
     // Check for an existing template with the same name.
-    let already_exists = core.get_template(&name).is_ok();
+    let already_exists = guard.get_template(&name).is_ok();
     if already_exists && !cli.claude {
         use std::io::Write as _;
         eprint!("Template \"{name}\" already exists. Overwrite? [y/N]: ");
-        if let Err(e) = std::io::stderr().flush() {
-            core.lock();
-            return Err(anyhow::anyhow!("Failed to flush stderr: {e}"));
-        }
+        std::io::stderr()
+            .flush()
+            .map_err(|e| anyhow::anyhow!("Failed to flush stderr: {e}"))?;
         let mut input = String::new();
-        if let Err(e) = reader.read_line(&mut input) {
-            core.lock();
-            return Err(anyhow::anyhow!("Failed to read input: {e}"));
-        }
+        reader
+            .read_line(&mut input)
+            .map_err(|e| anyhow::anyhow!("Failed to read input: {e}"))?;
         let trimmed = input.trim();
         if trimmed != "y" && trimmed != "Y" {
-            core.lock();
             println!("キャンセルしました");
             return Ok(());
+            // guard drops here, calling lock().
         }
     }
 
     // Set up editor config.
-    let config = match editor::EditorConfig::from_env() {
-        Ok(c) => c,
-        Err(e) => {
-            core.lock();
-            return Err(anyhow::anyhow!("{e}"));
-        }
-    };
+    let config = editor::EditorConfig::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // Write a blank temp file and launch editor.
-    let tmpfile = match editor::write_template_file(&config.secure_tmpdir) {
-        Ok(p) => p,
-        Err(e) => {
-            core.lock();
-            return Err(anyhow::anyhow!("Failed to write temp file: {e}"));
-        }
-    };
+    let tmpfile = editor::write_template_file(&config.secure_tmpdir)
+        .map_err(|e| anyhow::anyhow!("Failed to write temp file: {e}"))?;
 
     let edit_result = launch_fn(&tmpfile, &config);
     let read_result = editor::read_template_file(&tmpfile);
@@ -918,35 +844,26 @@ where
         eprintln!("Warning: failed to securely delete temp file: {e}");
     }
 
-    if let Err(e) = edit_result {
-        core.lock();
-        return Err(anyhow::anyhow!("Editor failed: {e}"));
-    }
-
-    let body = match read_result {
-        Ok(b) => b,
-        Err(e) => {
-            core.lock();
-            return Err(anyhow::anyhow!("Failed to read temp file: {e}"));
-        }
-    };
+    edit_result.map_err(|e| anyhow::anyhow!("Editor failed: {e}"))?;
+    let body = read_result.map_err(|e| anyhow::anyhow!("Failed to read temp file: {e}"))?;
 
     // Delete the existing template before creating the replacement.
     if already_exists {
-        if let Err(e) = core.delete_template(&name) {
-            core.lock();
-            return Err(anyhow::anyhow!("Failed to delete old template: {e}"));
-        }
+        guard
+            .delete_template(&name)
+            .map_err(|e| anyhow::anyhow!("Failed to delete old template: {e}"))?;
     }
 
-    let result = core.new_template(&name, &body);
-    core.lock();
-    result.map_err(|e| anyhow::anyhow!("Failed to create template: {e}"))?;
+    guard
+        .new_template(&name, &body)
+        .map_err(|e| anyhow::anyhow!("Failed to create template: {e}"))?;
     if already_exists {
         println!("Template replaced: \"{name}\"");
     } else {
         println!("Template created: \"{name}\"");
     }
+
+    // guard drops here, automatically calling lock().
     Ok(())
 }
 
@@ -975,17 +892,18 @@ pub fn cmd_template_list(cli: &Cli) -> anyhow::Result<()> {
         SecretBox::new(Box::from(password_source.secret().expose_secret()));
     core.unlock(secret_password)
         .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+    let guard = VaultGuard::new(&mut core);
 
-    let result = core.list_templates();
-    core.lock();
-
-    let mut templates = result.map_err(|e| anyhow::anyhow!("Failed to list templates: {e}"))?;
+    let mut templates = guard
+        .list_templates()
+        .map_err(|e| anyhow::anyhow!("Failed to list templates: {e}"))?;
     templates.sort_by(|a, b| a.name.cmp(&b.name));
 
     for meta in &templates {
         println!("{}", meta.name);
     }
 
+    // guard drops here, automatically calling lock().
     Ok(())
 }
 
@@ -1015,19 +933,15 @@ pub fn cmd_template_show(cli: &Cli, name: String) -> anyhow::Result<()> {
         SecretBox::new(Box::from(password_source.secret().expose_secret()));
     core.unlock(secret_password)
         .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+    let guard = VaultGuard::new(&mut core);
 
-    let result = core.get_template(&name);
-    match result {
-        Err(e) => {
-            core.lock();
-            Err(anyhow::anyhow!("{e}"))
-        }
-        Ok(plaintext) => {
-            print!("{}", plaintext.body);
-            core.lock();
-            Ok(())
-        }
-    }
+    let plaintext = guard
+        .get_template(&name)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    print!("{}", plaintext.body);
+
+    // guard drops here, automatically calling lock().
+    Ok(())
 }
 
 /// Execute the `pq-diary template delete` command.
@@ -1072,38 +986,31 @@ fn cmd_template_delete_impl(
         SecretBox::new(Box::from(password_source.secret().expose_secret()));
     core.unlock(secret_password)
         .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+    let guard = VaultGuard::new(&mut core);
 
     // Verify the template exists.
-    let get_result = core.get_template(&name);
-    if let Err(e) = get_result {
-        core.lock();
-        return Err(anyhow::anyhow!("{e}"));
-    }
+    guard
+        .get_template(&name)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // Determine whether to skip confirmation.
     let skip_confirm = force || cli.claude;
     let do_delete = if skip_confirm {
         true
     } else {
-        match confirm_template_delete(&name, reader) {
-            Ok(v) => v,
-            Err(e) => {
-                core.lock();
-                return Err(e);
-            }
-        }
+        confirm_template_delete(&name, reader)?
     };
 
     if do_delete {
-        let delete_result = core.delete_template(&name);
-        core.lock();
-        delete_result.map_err(|e| anyhow::anyhow!("Failed to delete template: {e}"))?;
+        guard
+            .delete_template(&name)
+            .map_err(|e| anyhow::anyhow!("Failed to delete template: {e}"))?;
         println!("Deleted template: \"{name}\"");
     } else {
-        core.lock();
         println!("キャンセルしました");
     }
 
+    // guard drops here, automatically calling lock().
     Ok(())
 }
 
@@ -1156,15 +1063,12 @@ where
         SecretBox::new(Box::from(password_source.secret().expose_secret()));
     core.unlock(secret_password)
         .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+    let guard = VaultGuard::new(&mut core);
 
     // Search for today's entry by exact title match.
-    let entries = match core.list_entries(None) {
-        Ok(e) => e,
-        Err(e) => {
-            core.lock();
-            return Err(anyhow::anyhow!("Failed to list entries: {e}"));
-        }
-    };
+    let entries = guard
+        .list_entries(None)
+        .map_err(|e| anyhow::anyhow!("Failed to list entries: {e}"))?;
     let today_entry = entries.iter().find(|e| e.title == today);
 
     let entry_id = if let Some(meta) = today_entry {
@@ -1172,7 +1076,7 @@ where
         meta.uuid_hex.clone()
     } else {
         // Entry does not exist: determine initial body from template or empty string.
-        let initial_body = match core.get_template("daily") {
+        let initial_body = match guard.get_template("daily") {
             Ok(tmpl) => {
                 let mut vars: HashMap<String, String> = HashMap::new();
                 vars.insert(BUILTIN_DATE.to_string(), today.to_string());
@@ -1183,46 +1087,26 @@ where
         };
 
         // Create the entry.
-        match core.new_entry(today, &initial_body, vec![]) {
-            Ok(uuid_hex) => uuid_hex,
-            Err(e) => {
-                core.lock();
-                return Err(anyhow::anyhow!("Failed to create entry: {e}"));
-            }
-        }
+        guard
+            .new_entry(today, &initial_body, vec![])
+            .map_err(|e| anyhow::anyhow!("Failed to create entry: {e}"))?
     };
 
     // Open the entry in the editor (edit flow).
     let id_prefix = entry_id[..entry_id.len().min(8)].to_string();
-    let get_result = core.get_entry(&id_prefix);
-    let (_record, original) = match get_result {
-        Ok(r) => r,
-        Err(e) => {
-            core.lock();
-            return Err(anyhow::anyhow!("{e}"));
-        }
-    };
+    let (_record, original) = guard
+        .get_entry(&id_prefix)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let mut config = match EditorConfig::from_env() {
-        Ok(c) => c,
-        Err(e) => {
-            core.lock();
-            return Err(anyhow::anyhow!("{e}"));
-        }
-    };
+    let mut config = EditorConfig::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let tmpfile = match editor::write_header_file(&config.secure_tmpdir, &original) {
-        Ok(p) => p,
-        Err(e) => {
-            core.lock();
-            return Err(anyhow::anyhow!("Failed to write temp file: {e}"));
-        }
-    };
+    let tmpfile = editor::write_header_file(&config.secure_tmpdir, &original)
+        .map_err(|e| anyhow::anyhow!("Failed to write temp file: {e}"))?;
 
     // Inject vim completion for [[title]] links (vim/nvim only).
     let is_vim = !config.vim_options.is_empty();
     let completion_file = if is_vim {
-        let titles = core.all_titles().unwrap_or_default();
+        let titles = guard.all_titles().unwrap_or_default();
         editor::write_completion_file(&config.secure_tmpdir, &titles).ok()
     } else {
         None
@@ -1244,18 +1128,8 @@ where
         }
     }
 
-    if let Err(e) = edit_result {
-        core.lock();
-        return Err(anyhow::anyhow!("Editor failed: {e}"));
-    }
-
-    let header = match read_result {
-        Ok(h) => h,
-        Err(e) => {
-            core.lock();
-            return Err(anyhow::anyhow!("Failed to read temp file: {e}"));
-        }
-    };
+    edit_result.map_err(|e| anyhow::anyhow!("Editor failed: {e}"))?;
+    let header = read_result.map_err(|e| anyhow::anyhow!("Failed to read temp file: {e}"))?;
 
     let (new_title, new_tags) = match (header.title, header.tags) {
         (Some(t), Some(tags)) => (t, tags),
@@ -1265,8 +1139,8 @@ where
 
     if new_title == original.title && new_tags == original.tags && new_body == original.body {
         println!("変更がありませんでした");
-        core.lock();
         return Ok(());
+        // guard drops here even on early return, calling lock().
     }
 
     let new_plaintext = EntryPlaintext {
@@ -1275,11 +1149,12 @@ where
         body: new_body,
     };
 
-    let update_result = core.update_entry(&id_prefix, &new_plaintext);
-    core.lock();
-    update_result.map_err(|e| anyhow::anyhow!("Failed to update entry: {e}"))?;
+    guard
+        .update_entry(&id_prefix, &new_plaintext)
+        .map_err(|e| anyhow::anyhow!("Failed to update entry: {e}"))?;
     println!("Updated: {id_prefix}");
 
+    // guard drops here, automatically calling lock().
     Ok(())
 }
 
@@ -3217,6 +3092,69 @@ mod tests {
         assert!(
             !output.contains("--- Links ---"),
             "output must NOT contain '--- Links ---' for an entry with no links, got:\n{output}"
+        );
+    }
+
+    // =========================================================================
+    // TC-A13: VaultGuard drop guard tests (TASK-0056)
+    // =========================================================================
+
+    /// TC-A13-01: VaultGuard drop calls lock() on the underlying DiaryCore.
+    ///
+    /// After the guard goes out of scope, the vault must be locked: any
+    /// attempt to call a vault operation should return `NotUnlocked`.
+    #[test]
+    fn tc_a13_01_vault_guard_drop_calls_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        let vault_pqd = vault_dir.join("vault.pqd");
+        let vault_str = vault_pqd.to_str().expect("utf8");
+
+        let mut core = DiaryCore::new(vault_str).expect("DiaryCore::new");
+        let pw: secrecy::SecretString = secrecy::SecretBox::new(Box::from("password"));
+        core.unlock(pw).expect("unlock");
+
+        {
+            let _guard = VaultGuard::new(&mut core);
+            // guard is alive; vault is unlocked
+        }
+        // guard dropped here — lock() must have been called
+
+        let result = core.list_entries(None);
+        assert!(
+            result.is_err(),
+            "core must be locked after VaultGuard drop; list_entries should fail"
+        );
+    }
+
+    /// TC-A13-02: VaultGuard calls lock() even when an early return (error path) occurs.
+    ///
+    /// Uses a closure that creates a VaultGuard and then returns `Err(...)` via `?`.
+    /// The guard's Drop must run before the closure exits, ensuring lock() is called.
+    #[test]
+    fn tc_a13_02_error_path_calls_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        let vault_pqd = vault_dir.join("vault.pqd");
+        let vault_str = vault_pqd.to_str().expect("utf8");
+
+        let mut core = DiaryCore::new(vault_str).expect("DiaryCore::new");
+        let pw: secrecy::SecretString = secrecy::SecretBox::new(Box::from("password"));
+        core.unlock(pw).expect("unlock");
+
+        // Simulate an error path: guard is created, then ? causes early return.
+        let result: anyhow::Result<()> = (|| {
+            let _guard = VaultGuard::new(&mut core);
+            anyhow::bail!("simulated error to trigger early return");
+        })();
+
+        assert!(result.is_err(), "closure must propagate the error");
+
+        // Even though the closure returned Err, lock() must have been called.
+        let list_result = core.list_entries(None);
+        assert!(
+            list_result.is_err(),
+            "core must be locked after VaultGuard drop on error path"
         );
     }
 }

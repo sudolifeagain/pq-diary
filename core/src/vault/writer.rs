@@ -63,11 +63,15 @@ pub fn write_header<W: Write>(writer: &mut W, header: &VaultHeader) -> Result<()
     writer.write_all(&header.dsa_pk_hash)?;
 
     // --- Variable-length encrypted secret-key blocks ---
-    let kem_len = header.kem_encrypted_sk.len() as u32;
+    let kem_len = u32::try_from(header.kem_encrypted_sk.len()).map_err(|_| {
+        DiaryError::Vault("kem_encrypted_sk length exceeds u32 maximum".to_string())
+    })?;
     writer.write_all(&kem_len.to_le_bytes())?;
     writer.write_all(&header.kem_encrypted_sk)?;
 
-    let dsa_len = header.dsa_encrypted_sk.len() as u32;
+    let dsa_len = u32::try_from(header.dsa_encrypted_sk.len()).map_err(|_| {
+        DiaryError::Vault("dsa_encrypted_sk length exceeds u32 maximum".to_string())
+    })?;
     writer.write_all(&dsa_len.to_le_bytes())?;
     writer.write_all(&header.dsa_encrypted_sk)?;
 
@@ -113,30 +117,37 @@ pub fn write_entries<W: Write>(writer: &mut W, entries: &[EntryRecord]) -> Resul
         payload.extend_from_slice(&entry.updated_at.to_le_bytes());
         payload.extend_from_slice(&entry.iv);
 
-        let ct_len = entry.ciphertext.len() as u32;
+        let ct_len = u32::try_from(entry.ciphertext.len())
+            .map_err(|_| DiaryError::Vault("ciphertext length exceeds u32 maximum".to_string()))?;
         payload.extend_from_slice(&ct_len.to_le_bytes());
         payload.extend_from_slice(&entry.ciphertext);
 
-        let sig_len = entry.signature.len() as u32;
+        let sig_len = u32::try_from(entry.signature.len())
+            .map_err(|_| DiaryError::Vault("signature length exceeds u32 maximum".to_string()))?;
         payload.extend_from_slice(&sig_len.to_le_bytes());
         payload.extend_from_slice(&entry.signature);
 
         payload.extend_from_slice(&entry.content_hmac);
         payload.push(entry.legacy_flag);
 
-        let lkb_len = entry.legacy_key_block.len() as u32;
+        let lkb_len = u32::try_from(entry.legacy_key_block.len()).map_err(|_| {
+            DiaryError::Vault("legacy_key_block length exceeds u32 maximum".to_string())
+        })?;
         payload.extend_from_slice(&lkb_len.to_le_bytes());
         payload.extend_from_slice(&entry.legacy_key_block);
 
         payload.extend_from_slice(&entry.attachment_count.to_le_bytes());
         payload.extend_from_slice(&entry.attachment_offset.to_le_bytes());
 
-        let pad_len = entry.padding.len() as u8;
+        let pad_len = u8::try_from(entry.padding.len()).map_err(|_| {
+            DiaryError::Vault("padding length exceeds 255-byte maximum".to_string())
+        })?;
         payload.push(pad_len);
         payload.extend_from_slice(&entry.padding);
 
         // Write length prefix (LE u32) then the payload.
-        let record_len = payload.len() as u32;
+        let record_len = u32::try_from(payload.len())
+            .map_err(|_| DiaryError::Vault("record length exceeds u32 maximum".to_string()))?;
         writer.write_all(&record_len.to_le_bytes())?;
         writer.write_all(&payload)?;
     }
@@ -165,7 +176,8 @@ pub fn write_vault(
     // Serialise entries first to measure the exact payload size.
     let mut entry_buf: Vec<u8> = Vec::new();
     write_entries(&mut entry_buf, entries)?;
-    header.payload_size = entry_buf.len() as u32;
+    header.payload_size = u32::try_from(entry_buf.len())
+        .map_err(|_| DiaryError::Vault("entry section length exceeds u32 maximum".to_string()))?;
 
     // Generate cryptographically random padding (512–4 096 bytes).
     let mut rng = rand::thread_rng();
@@ -173,11 +185,44 @@ pub fn write_vault(
     let mut padding = vec![0u8; pad_size];
     rng.fill(padding.as_mut_slice());
 
-    // Write header → entries → padding to the target file.
-    let mut file = std::fs::File::create(path)?;
-    write_header(&mut file, &header)?;
-    file.write_all(&entry_buf)?;
-    file.write_all(&padding)?;
+    // Derive the temporary file path (same directory, same name with ".tmp" appended).
+    let mut temp_name = path
+        .file_name()
+        .ok_or_else(|| DiaryError::Vault("vault path has no file name".to_string()))?
+        .to_os_string();
+    temp_name.push(".tmp");
+    let temp_path = path.with_file_name(temp_name);
+
+    // Write header → entries → padding to the temporary file.
+    let write_result = (|| -> Result<(), DiaryError> {
+        let mut file = std::fs::File::create(&temp_path)?;
+        write_header(&mut file, &header)?;
+        file.write_all(&entry_buf)?;
+        file.write_all(&padding)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+
+    if let Err(e) = write_result {
+        // Best-effort cleanup of the temporary file on write failure.
+        if let Err(rm_err) = std::fs::remove_file(&temp_path) {
+            if rm_err.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("Warning: failed to remove temporary vault file: {rm_err}");
+            }
+        }
+        return Err(e);
+    }
+
+    // Atomically replace the target file with the fully written temporary file.
+    if let Err(e) = std::fs::rename(&temp_path, path) {
+        // Best-effort cleanup of the temporary file on rename failure.
+        if let Err(rm_err) = std::fs::remove_file(&temp_path) {
+            if rm_err.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("Warning: failed to remove temporary vault file: {rm_err}");
+            }
+        }
+        return Err(DiaryError::Io(e));
+    }
 
     Ok(())
 }
@@ -290,5 +335,86 @@ mod tests {
             "padding must be <= 4096 bytes, got {}",
             padding
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // TASK-0053 test cases
+    // -----------------------------------------------------------------------
+
+    /// TC-A04-01: writing a normal EntryRecord via write_entries succeeds.
+    ///
+    /// Given a valid EntryRecord with all fields within acceptable limits,
+    /// when write_entries is called, it must return Ok(()).
+    #[test]
+    fn test_tc_a04_01_normal_record_write_succeeds() {
+        let entry = make_test_entry();
+        let mut buf: Vec<u8> = Vec::new();
+        let result = write_entries(&mut buf, &[entry]);
+        assert!(
+            result.is_ok(),
+            "write_entries must succeed for normal record"
+        );
+    }
+
+    /// TC-A04-02: padding field ≥ 256 bytes → DiaryError::Vault.
+    ///
+    /// Given an EntryRecord whose padding Vec has 256 elements (one beyond the
+    /// u8 maximum of 255), when write_entries is called, then DiaryError::Vault
+    /// must be returned.
+    #[test]
+    fn test_tc_a04_02_padding_too_large_returns_vault_error() {
+        let mut entry = make_test_entry();
+        entry.padding = vec![0u8; 256]; // exceeds u8::MAX (255)
+
+        let mut buf: Vec<u8> = Vec::new();
+        let result = write_entries(&mut buf, &[entry]);
+
+        assert!(
+            matches!(result, Err(DiaryError::Vault(_))),
+            "expected DiaryError::Vault for padding >= 256 bytes, got {:?}",
+            result
+        );
+    }
+
+    /// TC-A05-01: no temporary file exists after a successful write_vault call.
+    ///
+    /// Given a valid vault path, when write_vault succeeds, then the temporary
+    /// file (`<name>.tmp`) must not exist in the same directory.
+    #[test]
+    fn test_tc_a05_01_no_temp_file_after_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault.pqd");
+        let temp_path = dir.path().join("vault.pqd.tmp");
+
+        write_vault(&path, VaultHeader::new(), &[]).expect("write_vault must not fail");
+
+        assert!(
+            !temp_path.exists(),
+            "temp file must not exist after write_vault completes"
+        );
+        assert!(path.exists(), "vault.pqd must exist after write_vault");
+    }
+
+    /// TC-A05-02: vault written by write_vault is readable by read_vault.
+    ///
+    /// Given a VaultHeader and one EntryRecord, when write_vault writes them
+    /// to a file and read_vault reads them back, the entry count must be 1.
+    #[test]
+    fn test_tc_a05_02_vault_readable_after_atomic_write() {
+        use crate::vault::reader::read_vault;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault.pqd");
+
+        let entry = make_test_entry();
+        write_vault(&path, VaultHeader::new(), &[entry]).expect("write_vault must not fail");
+
+        let (_, entries) = read_vault(&path).expect("read_vault must not fail");
+        assert_eq!(
+            entries.len(),
+            1,
+            "must read back 1 entry after atomic write"
+        );
+        assert_eq!(entries[0].uuid, [0xABu8; 16]);
     }
 }

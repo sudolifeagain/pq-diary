@@ -91,6 +91,40 @@ fn filter_and_sort(
 }
 
 // ---------------------------------------------------------------------------
+// VaultGuard — RAII drop guard for vault lock/unlock lifecycle
+// ---------------------------------------------------------------------------
+
+/// RAII guard that automatically calls [`DiaryCore::lock`] when dropped.
+///
+/// Create this guard immediately after a successful [`DiaryCore::unlock`] call.
+/// The guard borrows the core mutably, so all vault operations must be
+/// performed through `Deref` coercion (`guard.method()` instead of
+/// `core.method()`).  When the guard goes out of scope — on success, on `?`
+/// early return, or on panic — `lock()` is guaranteed to be called, securely
+/// erasing the master key from memory.
+struct VaultGuard<'a>(&'a mut DiaryCore);
+
+impl<'a> VaultGuard<'a> {
+    /// Wrap an already-unlocked `DiaryCore` in a guard.
+    fn new(core: &'a mut DiaryCore) -> Self {
+        Self(core)
+    }
+}
+
+impl Drop for VaultGuard<'_> {
+    fn drop(&mut self) {
+        self.0.lock();
+    }
+}
+
+impl std::ops::Deref for VaultGuard<'_> {
+    type Target = DiaryCore;
+    fn deref(&self) -> &DiaryCore {
+        self.0
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public command handlers
 // ---------------------------------------------------------------------------
 
@@ -135,6 +169,7 @@ pub fn cmd_new(
         SecretBox::new(Box::from(password_source.secret().expose_secret()));
     core.unlock(secret_password)
         .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+    let guard = VaultGuard::new(&mut core);
 
     // Step 2: Determine body text and potentially update title/tags.
     let (final_body, final_title, final_tags) = if let Some(b) = body {
@@ -147,13 +182,9 @@ pub fn cmd_new(
         };
         use std::collections::{HashMap, HashSet};
 
-        let tmpl = match core.get_template(&tmpl_name) {
-            Ok(t) => t,
-            Err(e) => {
-                core.lock();
-                return Err(anyhow::anyhow!("{e}"));
-            }
-        };
+        let tmpl = guard
+            .get_template(&tmpl_name)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         let var_refs = extract_variables(&tmpl.body);
 
@@ -178,15 +209,14 @@ pub fn cmd_new(
             {
                 use std::io::Write as _;
                 print!("{}: ", var_ref.name);
-                if let Err(e) = std::io::stdout().flush() {
-                    core.lock();
-                    return Err(anyhow::anyhow!("Failed to flush stdout: {e}"));
-                }
+                std::io::stdout()
+                    .flush()
+                    .map_err(|e| anyhow::anyhow!("Failed to flush stdout: {e}"))?;
                 let mut input = String::new();
-                if let Err(e) = std::io::stdin().lock().read_line(&mut input) {
-                    core.lock();
-                    return Err(anyhow::anyhow!("Failed to read variable input: {e}"));
-                }
+                std::io::stdin()
+                    .lock()
+                    .read_line(&mut input)
+                    .map_err(|e| anyhow::anyhow!("Failed to read variable input: {e}"))?;
                 vars.insert(var_ref.name.clone(), input.trim().to_string());
             }
         }
@@ -196,20 +226,13 @@ pub fn cmd_new(
     } else if !std::io::stdin().is_terminal() {
         // Piped stdin: read all content.
         let mut content = String::new();
-        if let Err(e) = std::io::stdin().read_to_string(&mut content) {
-            core.lock();
-            return Err(anyhow::anyhow!("Failed to read stdin: {e}"));
-        }
+        std::io::stdin()
+            .read_to_string(&mut content)
+            .map_err(|e| anyhow::anyhow!("Failed to read stdin: {e}"))?;
         (content, title, tags)
     } else {
         // $EDITOR: write header-comment temp file, launch editor, read back.
-        let mut config = match EditorConfig::from_env() {
-            Ok(c) => c,
-            Err(e) => {
-                core.lock();
-                return Err(anyhow::anyhow!("{e}"));
-            }
-        };
+        let mut config = EditorConfig::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
 
         let initial = EntryPlaintext {
             title: title.clone().unwrap_or_else(|| "Untitled".to_string()),
@@ -217,18 +240,13 @@ pub fn cmd_new(
             body: String::new(),
         };
 
-        let tmpfile = match editor::write_header_file(&config.secure_tmpdir, &initial) {
-            Ok(p) => p,
-            Err(e) => {
-                core.lock();
-                return Err(anyhow::anyhow!("Failed to write temp file: {e}"));
-            }
-        };
+        let tmpfile = editor::write_header_file(&config.secure_tmpdir, &initial)
+            .map_err(|e| anyhow::anyhow!("Failed to write temp file: {e}"))?;
 
         // Inject vim completion for [[title]] links (vim/nvim only).
         let is_vim = !config.vim_options.is_empty();
         let completion_file = if is_vim {
-            let titles = core.all_titles().unwrap_or_default();
+            let titles = guard.all_titles().unwrap_or_default();
             editor::write_completion_file(&config.secure_tmpdir, &titles).ok()
         } else {
             None
@@ -251,17 +269,8 @@ pub fn cmd_new(
             }
         }
 
-        if let Err(e) = edit_result {
-            core.lock();
-            return Err(anyhow::anyhow!("Editor failed: {e}"));
-        }
-        let header = match read_result {
-            Ok(h) => h,
-            Err(e) => {
-                core.lock();
-                return Err(anyhow::anyhow!("Failed to read temp file: {e}"));
-            }
-        };
+        edit_result.map_err(|e| anyhow::anyhow!("Editor failed: {e}"))?;
+        let header = read_result.map_err(|e| anyhow::anyhow!("Failed to read temp file: {e}"))?;
 
         // Prefer header-parsed title/tags over CLI-supplied values.
         let new_title = header.title.or(title);
@@ -275,21 +284,15 @@ pub fn cmd_new(
         .unwrap_or_else(|| "Untitled".to_string());
 
     // Step 4: Create the entry.
-    let uuid_hex = match core.new_entry(&actual_title, &final_body, final_tags) {
-        Ok(h) => h,
-        Err(e) => {
-            core.lock();
-            return Err(anyhow::anyhow!("Failed to create entry: {e}"));
-        }
-    };
+    let uuid_hex = guard
+        .new_entry(&actual_title, &final_body, final_tags)
+        .map_err(|e| anyhow::anyhow!("Failed to create entry: {e}"))?;
 
     // Step 5: Print success message with an 8-character ID prefix.
     let prefix = &uuid_hex[..8];
     println!("Created: {prefix} \"{actual_title}\"");
 
-    // Step 6: Lock the vault.
-    core.lock();
-
+    // guard drops here, automatically calling lock().
     Ok(())
 }
 
@@ -326,22 +329,13 @@ pub fn cmd_list(
         SecretBox::new(Box::from(password_source.secret().expose_secret()));
     core.unlock(secret_password)
         .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+    let guard = VaultGuard::new(&mut core);
 
-    let entries = match core.list_entries(None) {
-        Ok(e) => e,
-        Err(e) => {
-            core.lock();
-            return Err(anyhow::anyhow!("Failed to list entries: {e}"));
-        }
-    };
+    let entries = guard
+        .list_entries(None)
+        .map_err(|e| anyhow::anyhow!("Failed to list entries: {e}"))?;
 
-    let filtered = match filter_and_sort(entries, tag.as_deref(), query.as_deref(), number) {
-        Ok(f) => f,
-        Err(e) => {
-            core.lock();
-            return Err(e);
-        }
-    };
+    let filtered = filter_and_sort(entries, tag.as_deref(), query.as_deref(), number)?;
 
     for meta in &filtered {
         let prefix = meta.id_prefix(8);
@@ -359,7 +353,7 @@ pub fn cmd_list(
         }
     }
 
-    core.lock();
+    // guard drops here, automatically calling lock().
     Ok(())
 }
 
@@ -400,99 +394,81 @@ fn cmd_show_impl(cli: &Cli, id: String, out: &mut dyn std::io::Write) -> anyhow:
         SecretBox::new(Box::from(password_source.secret().expose_secret()));
     core.unlock(secret_password)
         .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+    let guard = VaultGuard::new(&mut core);
 
-    let result = core.get_entry(&id);
+    let (record, plaintext) = guard.get_entry(&id).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    match result {
-        Err(e) => {
-            core.lock();
-            Err(anyhow::anyhow!("{e}"))
-        }
-        Ok((record, plaintext)) => {
-            // Execute all output logic inside a closure so that core.lock()
-            // is guaranteed to run regardless of write/resolve errors.
-            let show_result = (|| -> anyhow::Result<()> {
-                let created = format_timestamp(record.created_at);
-                let updated = format_timestamp(record.updated_at);
+    let created = format_timestamp(record.created_at);
+    let updated = format_timestamp(record.updated_at);
 
-                writeln!(out, "Title:   {}", plaintext.title)
-                    .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-                writeln!(out, "Created: {created}  Updated: {updated}")
-                    .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-                if plaintext.tags.is_empty() {
-                    writeln!(out, "Tags:    (none)")
+    writeln!(out, "Title:   {}", plaintext.title)
+        .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+    writeln!(out, "Created: {created}  Updated: {updated}")
+        .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+    if plaintext.tags.is_empty() {
+        writeln!(out, "Tags:    (none)").map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+    } else {
+        let tags_str = plaintext
+            .tags
+            .iter()
+            .map(|t| format!("#{t}"))
+            .collect::<Vec<_>>()
+            .join("  ");
+        writeln!(out, "Tags:    {tags_str}").map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+    }
+    writeln!(out).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+    write!(out, "{}", plaintext.body).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+
+    // Resolve [[link]] references in the body.
+    let resolved = guard
+        .resolve_links(&plaintext.body)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if !resolved.is_empty() {
+        writeln!(out).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+        writeln!(out, "--- Links ---").map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+        for link in &resolved {
+            match link.matches.len() {
+                0 => writeln!(out, "  [[{}]] (未解決)", link.title)
+                    .map_err(|e| anyhow::anyhow!("Write error: {e}"))?,
+                1 => writeln!(
+                    out,
+                    "  [[{}]] → [{}]",
+                    link.title, link.matches[0].id_prefix
+                )
+                .map_err(|e| anyhow::anyhow!("Write error: {e}"))?,
+                _ => {
+                    writeln!(out, "  [[{}]] → 複数候補:", link.title)
                         .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-                } else {
-                    let tags_str = plaintext
-                        .tags
-                        .iter()
-                        .map(|t| format!("#{t}"))
-                        .collect::<Vec<_>>()
-                        .join("  ");
-                    writeln!(out, "Tags:    {tags_str}")
-                        .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-                }
-                writeln!(out).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-                write!(out, "{}", plaintext.body)
-                    .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-
-                // Resolve [[link]] references in the body.
-                let resolved = core
-                    .resolve_links(&plaintext.body)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-                if !resolved.is_empty() {
-                    writeln!(out).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-                    writeln!(out, "--- Links ---")
-                        .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-                    for link in &resolved {
-                        match link.matches.len() {
-                            0 => writeln!(out, "  [[{}]] (未解決)", link.title)
-                                .map_err(|e| anyhow::anyhow!("Write error: {e}"))?,
-                            1 => writeln!(
-                                out,
-                                "  [[{}]] → [{}]",
-                                link.title, link.matches[0].id_prefix
-                            )
-                            .map_err(|e| anyhow::anyhow!("Write error: {e}"))?,
-                            _ => {
-                                writeln!(out, "  [[{}]] → 複数候補:", link.title)
-                                    .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-                                for m in &link.matches {
-                                    writeln!(out, "    [{}]", m.id_prefix)
-                                        .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Display backlinks (newest first).
-                let mut backlinks = core
-                    .backlinks_for(&plaintext.title)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-                if !backlinks.is_empty() {
-                    backlinks.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-
-                    writeln!(out).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-                    writeln!(out, "--- Backlinks ---")
-                        .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-                    for bl in &backlinks {
-                        let date = format_timestamp(bl.created_at);
-                        let prefix = backlink_uuid_prefix(&bl.source_uuid);
-                        writeln!(out, "  [{prefix}] {date} {}", bl.source_title)
+                    for m in &link.matches {
+                        writeln!(out, "    [{}]", m.id_prefix)
                             .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
                     }
                 }
-
-                Ok(())
-            })();
-
-            core.lock();
-            show_result
+            }
         }
     }
+
+    // Display backlinks (newest first).
+    let mut backlinks = guard
+        .backlinks_for(&plaintext.title)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if !backlinks.is_empty() {
+        backlinks.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+        writeln!(out).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+        writeln!(out, "--- Backlinks ---").map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+        for bl in &backlinks {
+            let date = format_timestamp(bl.created_at);
+            let prefix = backlink_uuid_prefix(&bl.source_uuid);
+            writeln!(out, "  [{prefix}] {date} {}", bl.source_title)
+                .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+        }
+    }
+
+    // guard drops here, automatically calling lock().
+    Ok(())
 }
 
 /// Convert the first 4 bytes of a raw UUID into an 8-character lowercase hex prefix.
@@ -566,15 +542,9 @@ where
         SecretBox::new(Box::from(password_source.secret().expose_secret()));
     core.unlock(secret_password)
         .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+    let guard = VaultGuard::new(&mut core);
 
-    let get_result = core.get_entry(&id);
-    let (_record, original) = match get_result {
-        Ok(r) => r,
-        Err(e) => {
-            core.lock();
-            return Err(anyhow::anyhow!("{e}"));
-        }
-    };
+    let (_record, original) = guard.get_entry(&id).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let flag_mode = title.is_some() || !add_tags.is_empty() || !remove_tags.is_empty();
 
@@ -600,33 +570,22 @@ where
             new_plaintext.tags.retain(|t| t != tag);
         }
 
-        let update_result = core.update_entry(&id, &new_plaintext);
-        core.lock();
-        update_result.map_err(|e| anyhow::anyhow!("Failed to update entry: {e}"))?;
+        guard
+            .update_entry(&id, &new_plaintext)
+            .map_err(|e| anyhow::anyhow!("Failed to update entry: {e}"))?;
         let prefix = &id[..id.len().min(8)];
         println!("Updated: {prefix}");
     } else {
         // Editor mode: write header-comment temp file, launch editor, parse result.
-        let mut config = match EditorConfig::from_env() {
-            Ok(c) => c,
-            Err(e) => {
-                core.lock();
-                return Err(anyhow::anyhow!("{e}"));
-            }
-        };
+        let mut config = EditorConfig::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        let tmpfile = match editor::write_header_file(&config.secure_tmpdir, &original) {
-            Ok(p) => p,
-            Err(e) => {
-                core.lock();
-                return Err(anyhow::anyhow!("Failed to write temp file: {e}"));
-            }
-        };
+        let tmpfile = editor::write_header_file(&config.secure_tmpdir, &original)
+            .map_err(|e| anyhow::anyhow!("Failed to write temp file: {e}"))?;
 
         // Inject vim completion for [[title]] links (vim/nvim only).
         let is_vim = !config.vim_options.is_empty();
         let completion_file = if is_vim {
-            let titles = core.all_titles().unwrap_or_default();
+            let titles = guard.all_titles().unwrap_or_default();
             editor::write_completion_file(&config.secure_tmpdir, &titles).ok()
         } else {
             None
@@ -649,18 +608,8 @@ where
             }
         }
 
-        if let Err(e) = edit_result {
-            core.lock();
-            return Err(anyhow::anyhow!("Editor failed: {e}"));
-        }
-
-        let header = match read_result {
-            Ok(h) => h,
-            Err(e) => {
-                core.lock();
-                return Err(anyhow::anyhow!("Failed to read temp file: {e}"));
-            }
-        };
+        edit_result.map_err(|e| anyhow::anyhow!("Editor failed: {e}"))?;
+        let header = read_result.map_err(|e| anyhow::anyhow!("Failed to read temp file: {e}"))?;
 
         // On header parse error, fall back to the original metadata.
         let (new_title, new_tags) = match (header.title, header.tags) {
@@ -672,8 +621,8 @@ where
         // Change detection: skip update if nothing changed.
         if new_title == original.title && new_tags == original.tags && new_body == original.body {
             println!("変更がありませんでした");
-            core.lock();
             return Ok(());
+            // guard drops here even on early return, calling lock().
         }
 
         let new_plaintext = EntryPlaintext {
@@ -682,13 +631,14 @@ where
             body: new_body,
         };
 
-        let update_result = core.update_entry(&id, &new_plaintext);
-        core.lock();
-        update_result.map_err(|e| anyhow::anyhow!("Failed to update entry: {e}"))?;
+        guard
+            .update_entry(&id, &new_plaintext)
+            .map_err(|e| anyhow::anyhow!("Failed to update entry: {e}"))?;
         let prefix = &id[..id.len().min(8)];
         println!("Updated: {prefix}");
     }
 
+    // guard drops here, automatically calling lock().
     Ok(())
 }
 
@@ -760,15 +710,9 @@ fn cmd_delete_impl(
         SecretBox::new(Box::from(password_source.secret().expose_secret()));
     core.unlock(secret_password)
         .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+    let guard = VaultGuard::new(&mut core);
 
-    let get_result = core.get_entry(&id);
-    let (record, plaintext) = match get_result {
-        Ok(r) => r,
-        Err(e) => {
-            core.lock();
-            return Err(anyhow::anyhow!("{e}"));
-        }
-    };
+    let (record, plaintext) = guard.get_entry(&id).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let title = plaintext.title.clone();
     let date = format_timestamp(record.created_at);
@@ -779,25 +723,19 @@ fn cmd_delete_impl(
     let do_delete = if skip_confirm {
         true
     } else {
-        match confirm_delete(&title, &date, reader) {
-            Ok(v) => v,
-            Err(e) => {
-                core.lock();
-                return Err(e);
-            }
-        }
+        confirm_delete(&title, &date, reader)?
     };
 
     if do_delete {
-        let delete_result = core.delete_entry(&id);
-        core.lock();
-        delete_result.map_err(|e| anyhow::anyhow!("Failed to delete entry: {e}"))?;
+        guard
+            .delete_entry(&id)
+            .map_err(|e| anyhow::anyhow!("Failed to delete entry: {e}"))?;
         println!("Deleted: {prefix} \"{title}\"");
     } else {
-        core.lock();
         println!("キャンセルしました");
     }
 
+    // guard drops here, automatically calling lock().
     Ok(())
 }
 
@@ -871,46 +809,34 @@ where
         SecretBox::new(Box::from(password_source.secret().expose_secret()));
     core.unlock(secret_password)
         .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+    let guard = VaultGuard::new(&mut core);
 
     // Check for an existing template with the same name.
-    let already_exists = core.get_template(&name).is_ok();
+    let already_exists = guard.get_template(&name).is_ok();
     if already_exists && !cli.claude {
         use std::io::Write as _;
         eprint!("Template \"{name}\" already exists. Overwrite? [y/N]: ");
-        if let Err(e) = std::io::stderr().flush() {
-            core.lock();
-            return Err(anyhow::anyhow!("Failed to flush stderr: {e}"));
-        }
+        std::io::stderr()
+            .flush()
+            .map_err(|e| anyhow::anyhow!("Failed to flush stderr: {e}"))?;
         let mut input = String::new();
-        if let Err(e) = reader.read_line(&mut input) {
-            core.lock();
-            return Err(anyhow::anyhow!("Failed to read input: {e}"));
-        }
+        reader
+            .read_line(&mut input)
+            .map_err(|e| anyhow::anyhow!("Failed to read input: {e}"))?;
         let trimmed = input.trim();
         if trimmed != "y" && trimmed != "Y" {
-            core.lock();
             println!("キャンセルしました");
             return Ok(());
+            // guard drops here, calling lock().
         }
     }
 
     // Set up editor config.
-    let config = match editor::EditorConfig::from_env() {
-        Ok(c) => c,
-        Err(e) => {
-            core.lock();
-            return Err(anyhow::anyhow!("{e}"));
-        }
-    };
+    let config = editor::EditorConfig::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // Write a blank temp file and launch editor.
-    let tmpfile = match editor::write_template_file(&config.secure_tmpdir) {
-        Ok(p) => p,
-        Err(e) => {
-            core.lock();
-            return Err(anyhow::anyhow!("Failed to write temp file: {e}"));
-        }
-    };
+    let tmpfile = editor::write_template_file(&config.secure_tmpdir)
+        .map_err(|e| anyhow::anyhow!("Failed to write temp file: {e}"))?;
 
     let edit_result = launch_fn(&tmpfile, &config);
     let read_result = editor::read_template_file(&tmpfile);
@@ -918,35 +844,26 @@ where
         eprintln!("Warning: failed to securely delete temp file: {e}");
     }
 
-    if let Err(e) = edit_result {
-        core.lock();
-        return Err(anyhow::anyhow!("Editor failed: {e}"));
-    }
-
-    let body = match read_result {
-        Ok(b) => b,
-        Err(e) => {
-            core.lock();
-            return Err(anyhow::anyhow!("Failed to read temp file: {e}"));
-        }
-    };
+    edit_result.map_err(|e| anyhow::anyhow!("Editor failed: {e}"))?;
+    let body = read_result.map_err(|e| anyhow::anyhow!("Failed to read temp file: {e}"))?;
 
     // Delete the existing template before creating the replacement.
     if already_exists {
-        if let Err(e) = core.delete_template(&name) {
-            core.lock();
-            return Err(anyhow::anyhow!("Failed to delete old template: {e}"));
-        }
+        guard
+            .delete_template(&name)
+            .map_err(|e| anyhow::anyhow!("Failed to delete old template: {e}"))?;
     }
 
-    let result = core.new_template(&name, &body);
-    core.lock();
-    result.map_err(|e| anyhow::anyhow!("Failed to create template: {e}"))?;
+    guard
+        .new_template(&name, &body)
+        .map_err(|e| anyhow::anyhow!("Failed to create template: {e}"))?;
     if already_exists {
         println!("Template replaced: \"{name}\"");
     } else {
         println!("Template created: \"{name}\"");
     }
+
+    // guard drops here, automatically calling lock().
     Ok(())
 }
 
@@ -975,17 +892,18 @@ pub fn cmd_template_list(cli: &Cli) -> anyhow::Result<()> {
         SecretBox::new(Box::from(password_source.secret().expose_secret()));
     core.unlock(secret_password)
         .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+    let guard = VaultGuard::new(&mut core);
 
-    let result = core.list_templates();
-    core.lock();
-
-    let mut templates = result.map_err(|e| anyhow::anyhow!("Failed to list templates: {e}"))?;
+    let mut templates = guard
+        .list_templates()
+        .map_err(|e| anyhow::anyhow!("Failed to list templates: {e}"))?;
     templates.sort_by(|a, b| a.name.cmp(&b.name));
 
     for meta in &templates {
         println!("{}", meta.name);
     }
 
+    // guard drops here, automatically calling lock().
     Ok(())
 }
 
@@ -1015,19 +933,15 @@ pub fn cmd_template_show(cli: &Cli, name: String) -> anyhow::Result<()> {
         SecretBox::new(Box::from(password_source.secret().expose_secret()));
     core.unlock(secret_password)
         .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+    let guard = VaultGuard::new(&mut core);
 
-    let result = core.get_template(&name);
-    match result {
-        Err(e) => {
-            core.lock();
-            Err(anyhow::anyhow!("{e}"))
-        }
-        Ok(plaintext) => {
-            print!("{}", plaintext.body);
-            core.lock();
-            Ok(())
-        }
-    }
+    let plaintext = guard
+        .get_template(&name)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    print!("{}", plaintext.body);
+
+    // guard drops here, automatically calling lock().
+    Ok(())
 }
 
 /// Execute the `pq-diary template delete` command.
@@ -1072,38 +986,31 @@ fn cmd_template_delete_impl(
         SecretBox::new(Box::from(password_source.secret().expose_secret()));
     core.unlock(secret_password)
         .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+    let guard = VaultGuard::new(&mut core);
 
     // Verify the template exists.
-    let get_result = core.get_template(&name);
-    if let Err(e) = get_result {
-        core.lock();
-        return Err(anyhow::anyhow!("{e}"));
-    }
+    guard
+        .get_template(&name)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // Determine whether to skip confirmation.
     let skip_confirm = force || cli.claude;
     let do_delete = if skip_confirm {
         true
     } else {
-        match confirm_template_delete(&name, reader) {
-            Ok(v) => v,
-            Err(e) => {
-                core.lock();
-                return Err(e);
-            }
-        }
+        confirm_template_delete(&name, reader)?
     };
 
     if do_delete {
-        let delete_result = core.delete_template(&name);
-        core.lock();
-        delete_result.map_err(|e| anyhow::anyhow!("Failed to delete template: {e}"))?;
+        guard
+            .delete_template(&name)
+            .map_err(|e| anyhow::anyhow!("Failed to delete template: {e}"))?;
         println!("Deleted template: \"{name}\"");
     } else {
-        core.lock();
         println!("キャンセルしました");
     }
 
+    // guard drops here, automatically calling lock().
     Ok(())
 }
 
@@ -1156,15 +1063,12 @@ where
         SecretBox::new(Box::from(password_source.secret().expose_secret()));
     core.unlock(secret_password)
         .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+    let guard = VaultGuard::new(&mut core);
 
     // Search for today's entry by exact title match.
-    let entries = match core.list_entries(None) {
-        Ok(e) => e,
-        Err(e) => {
-            core.lock();
-            return Err(anyhow::anyhow!("Failed to list entries: {e}"));
-        }
-    };
+    let entries = guard
+        .list_entries(None)
+        .map_err(|e| anyhow::anyhow!("Failed to list entries: {e}"))?;
     let today_entry = entries.iter().find(|e| e.title == today);
 
     let entry_id = if let Some(meta) = today_entry {
@@ -1172,7 +1076,7 @@ where
         meta.uuid_hex.clone()
     } else {
         // Entry does not exist: determine initial body from template or empty string.
-        let initial_body = match core.get_template("daily") {
+        let initial_body = match guard.get_template("daily") {
             Ok(tmpl) => {
                 let mut vars: HashMap<String, String> = HashMap::new();
                 vars.insert(BUILTIN_DATE.to_string(), today.to_string());
@@ -1183,46 +1087,26 @@ where
         };
 
         // Create the entry.
-        match core.new_entry(today, &initial_body, vec![]) {
-            Ok(uuid_hex) => uuid_hex,
-            Err(e) => {
-                core.lock();
-                return Err(anyhow::anyhow!("Failed to create entry: {e}"));
-            }
-        }
+        guard
+            .new_entry(today, &initial_body, vec![])
+            .map_err(|e| anyhow::anyhow!("Failed to create entry: {e}"))?
     };
 
     // Open the entry in the editor (edit flow).
     let id_prefix = entry_id[..entry_id.len().min(8)].to_string();
-    let get_result = core.get_entry(&id_prefix);
-    let (_record, original) = match get_result {
-        Ok(r) => r,
-        Err(e) => {
-            core.lock();
-            return Err(anyhow::anyhow!("{e}"));
-        }
-    };
+    let (_record, original) = guard
+        .get_entry(&id_prefix)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let mut config = match EditorConfig::from_env() {
-        Ok(c) => c,
-        Err(e) => {
-            core.lock();
-            return Err(anyhow::anyhow!("{e}"));
-        }
-    };
+    let mut config = EditorConfig::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let tmpfile = match editor::write_header_file(&config.secure_tmpdir, &original) {
-        Ok(p) => p,
-        Err(e) => {
-            core.lock();
-            return Err(anyhow::anyhow!("Failed to write temp file: {e}"));
-        }
-    };
+    let tmpfile = editor::write_header_file(&config.secure_tmpdir, &original)
+        .map_err(|e| anyhow::anyhow!("Failed to write temp file: {e}"))?;
 
     // Inject vim completion for [[title]] links (vim/nvim only).
     let is_vim = !config.vim_options.is_empty();
     let completion_file = if is_vim {
-        let titles = core.all_titles().unwrap_or_default();
+        let titles = guard.all_titles().unwrap_or_default();
         editor::write_completion_file(&config.secure_tmpdir, &titles).ok()
     } else {
         None
@@ -1244,18 +1128,8 @@ where
         }
     }
 
-    if let Err(e) = edit_result {
-        core.lock();
-        return Err(anyhow::anyhow!("Editor failed: {e}"));
-    }
-
-    let header = match read_result {
-        Ok(h) => h,
-        Err(e) => {
-            core.lock();
-            return Err(anyhow::anyhow!("Failed to read temp file: {e}"));
-        }
-    };
+    edit_result.map_err(|e| anyhow::anyhow!("Editor failed: {e}"))?;
+    let header = read_result.map_err(|e| anyhow::anyhow!("Failed to read temp file: {e}"))?;
 
     let (new_title, new_tags) = match (header.title, header.tags) {
         (Some(t), Some(tags)) => (t, tags),
@@ -1265,8 +1139,8 @@ where
 
     if new_title == original.title && new_tags == original.tags && new_body == original.body {
         println!("変更がありませんでした");
-        core.lock();
         return Ok(());
+        // guard drops here even on early return, calling lock().
     }
 
     let new_plaintext = EntryPlaintext {
@@ -1275,11 +1149,385 @@ where
         body: new_body,
     };
 
-    let update_result = core.update_entry(&id_prefix, &new_plaintext);
-    core.lock();
-    update_result.map_err(|e| anyhow::anyhow!("Failed to update entry: {e}"))?;
+    guard
+        .update_entry(&id_prefix, &new_plaintext)
+        .map_err(|e| anyhow::anyhow!("Failed to update entry: {e}"))?;
     println!("Updated: {id_prefix}");
 
+    // guard drops here, automatically calling lock().
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Search command
+// ---------------------------------------------------------------------------
+
+/// Execute the `pq-diary search` command, writing output to stdout.
+///
+/// Searches all vault entries for `args.pattern` (a regular expression) and
+/// prints matches in a grep-like format.  The `VaultGuard` pattern ensures
+/// the vault is locked on every exit path.
+///
+/// # Errors
+///
+/// Returns an error if password acquisition, vault unlock, or search fails.
+pub fn cmd_search(cli: &Cli, args: &crate::SearchArgs) -> anyhow::Result<()> {
+    cmd_search_to(cli, args, &mut std::io::stdout())
+}
+
+/// Inner implementation of [`cmd_search`] that writes output to `out`.
+///
+/// Separated from `cmd_search` to enable output capture in tests.
+pub(crate) fn cmd_search_to(
+    cli: &Cli,
+    args: &crate::SearchArgs,
+    out: &mut dyn std::io::Write,
+) -> anyhow::Result<()> {
+    use pq_diary_core::search::SearchQuery;
+    use secrecy::{ExposeSecret as _, SecretBox};
+
+    let password_source =
+        get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let vault_path = resolve_vault_path(cli)?;
+    let vault_str = vault_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Vault path contains non-UTF-8 characters"))?;
+
+    let mut core = DiaryCore::new(vault_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let secret_password: secrecy::SecretString =
+        SecretBox::new(Box::from(password_source.secret().expose_secret()));
+    core.unlock(secret_password)
+        .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+    let guard = VaultGuard::new(&mut core);
+
+    let query = SearchQuery {
+        pattern: args.pattern.clone(),
+        tag_filter: args.tag.clone(),
+        context_lines: args.context,
+        count_only: args.count,
+    };
+
+    let results = guard.search(&query).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if args.count {
+        writeln!(out, "{} entries matched", results.matched_entry_count)?;
+    } else if results.matches.is_empty() {
+        writeln!(out, "No matches found")?;
+    } else {
+        write_search_results(&results, out)?;
+    }
+
+    // guard drops here, automatically calling lock().
+    Ok(())
+}
+
+/// Write search results to `out` in grep-like format.
+///
+/// Each [`SearchMatch`] is printed as a header line followed by context blocks.
+/// Consecutive matches are separated by `--`.
+fn write_search_results(
+    results: &pq_diary_core::search::SearchResults,
+    out: &mut dyn std::io::Write,
+) -> anyhow::Result<()> {
+    let mut first = true;
+    for m in &results.matches {
+        if !first {
+            writeln!(out, "--")?;
+        }
+        first = false;
+
+        let id_prefix = if m.uuid_hex.len() >= 8 {
+            &m.uuid_hex[..8]
+        } else {
+            m.uuid_hex.as_str()
+        };
+        let date = format_timestamp(m.updated_at);
+        writeln!(out, "{id_prefix} {date} {}", m.title)?;
+
+        for block in &m.context_blocks {
+            for (line_num, content, is_match) in &block.lines {
+                if *is_match {
+                    writeln!(out, "> {line_num}: {content}")?;
+                } else {
+                    writeln!(out, "  {line_num}: {content}")?;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Stats command
+// ---------------------------------------------------------------------------
+
+/// Execute the `pq-diary stats` command, writing output to stdout.
+///
+/// Collects vault-wide statistics and prints them in text, JSON, or heatmap
+/// format depending on the flags in `args`.  The `VaultGuard` pattern ensures
+/// the vault is locked on every exit path.
+///
+/// # Errors
+///
+/// Returns an error if password acquisition, vault unlock, or statistics
+/// collection fails.
+pub fn cmd_stats(cli: &Cli, args: &crate::StatsArgs) -> anyhow::Result<()> {
+    cmd_stats_to(cli, args, &mut std::io::stdout())
+}
+
+/// Inner implementation of [`cmd_stats`] that writes output to `out`.
+///
+/// Separated from `cmd_stats` to enable output capture in tests.
+pub(crate) fn cmd_stats_to(
+    cli: &Cli,
+    args: &crate::StatsArgs,
+    out: &mut dyn std::io::Write,
+) -> anyhow::Result<()> {
+    use secrecy::{ExposeSecret as _, SecretBox};
+
+    let password_source =
+        get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let vault_path = resolve_vault_path(cli)?;
+    let vault_str = vault_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Vault path contains non-UTF-8 characters"))?;
+
+    let mut core = DiaryCore::new(vault_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let secret_password: secrecy::SecretString =
+        SecretBox::new(Box::from(password_source.secret().expose_secret()));
+    core.unlock(secret_password)
+        .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+    let guard = VaultGuard::new(&mut core);
+
+    let stats = guard.stats().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if args.json {
+        let json = serde_json::to_string_pretty(&stats)
+            .map_err(|e| anyhow::anyhow!("JSON serialization failed: {e}"))?;
+        writeln!(out, "{json}")?;
+    } else if args.heatmap {
+        let heatmap = render_heatmap(&stats.daily_activity);
+        writeln!(out, "{heatmap}")?;
+    } else {
+        let first_date = stats
+            .first_entry_date
+            .map(format_timestamp)
+            .unwrap_or_else(|| "N/A".to_string());
+        let last_date = stats
+            .last_entry_date
+            .map(format_timestamp)
+            .unwrap_or_else(|| "N/A".to_string());
+
+        writeln!(out, "=== Vault Statistics ===")?;
+        writeln!(out)?;
+        writeln!(out, "Entries:        {}", stats.entry_count)?;
+        writeln!(out, "Tags:           {}", stats.tag_count)?;
+        writeln!(out, "First entry:    {first_date}")?;
+        writeln!(out, "Last entry:     {last_date}")?;
+        writeln!(out, "Active days (30d): {}", stats.active_days_30d)?;
+        writeln!(out)?;
+        writeln!(out, "Characters:")?;
+        writeln!(out, "  Total:        {}", stats.char_stats.total)?;
+        writeln!(out, "  Average:      {}", stats.char_stats.average)?;
+        writeln!(out, "  Maximum:      {}", stats.char_stats.max)?;
+        writeln!(out)?;
+        if stats.tag_distribution.is_empty() {
+            writeln!(out, "Top Tags: N/A")?;
+        } else {
+            writeln!(out, "Top Tags:")?;
+            for (i, tc) in stats.tag_distribution.iter().enumerate() {
+                writeln!(out, "  {}. {} ({})", i + 1, tc.tag, tc.count)?;
+            }
+        }
+    }
+
+    // guard drops here, automatically calling lock().
+    Ok(())
+}
+
+/// Render a 7-row × 52-column ASCII heatmap of daily writing activity.
+///
+/// Each cell maps an entry count to a Unicode block character:
+/// - `░` — 0 entries
+/// - `▒` — 1 entry
+/// - `▓` — 2–3 entries
+/// - `█` — 4 or more entries
+///
+/// The grid covers the last 52 weeks (364 days) ending today.  Rows are
+/// weekdays (Mon–Sun) and columns are calendar weeks (oldest left, newest
+/// right).  A month-abbreviation header and a legend line are appended.
+fn render_heatmap(daily_activity: &[pq_diary_core::stats::DailyActivity]) -> String {
+    use chrono::{Datelike as _, Duration, Utc};
+    use std::collections::HashMap;
+
+    let activity_map: HashMap<String, usize> = daily_activity
+        .iter()
+        .map(|a| (a.date.clone(), a.count))
+        .collect();
+
+    let today = Utc::now().date_naive();
+    let start_date = today - Duration::days(363);
+
+    const WEEKS: usize = 52;
+    // grid[weekday][week]: weekday 0 = Mon … 6 = Sun
+    let mut grid = [[0usize; WEEKS]; 7];
+
+    // Align grid to calendar week boundaries: Monday is always row 0.
+    let start_weekday = start_date.weekday().num_days_from_monday() as usize; // 0=Mon
+    for day_offset in 0..364i64 {
+        let date = start_date + Duration::days(day_offset);
+        let adjusted_offset = day_offset as usize + start_weekday;
+        let week = adjusted_offset / 7;
+        let weekday = adjusted_offset % 7;
+        let date_str = date.format("%Y-%m-%d").to_string();
+        let count = activity_map.get(&date_str).copied().unwrap_or(0);
+        if week < WEEKS {
+            grid[weekday][week] = count;
+        }
+    }
+
+    let count_to_char = |c: usize| -> char {
+        match c {
+            0 => '░',
+            1 => '▒',
+            2 | 3 => '▓',
+            _ => '█',
+        }
+    };
+
+    const MONTH_NAMES: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+
+    // Build the month header: 5-char indent ("     ") followed by 52 chars.
+    // Month abbreviations (3 chars) are written left-aligned at the column
+    // where the month first appears; they may overlap with the next label.
+    let mut header_chars: Vec<char> = std::iter::repeat_n(' ', 5 + WEEKS).collect();
+    let mut last_month: u32 = 0;
+    for week in 0..WEEKS {
+        // The Monday (row 0) of each grid column: offset back by start_weekday.
+        let date = start_date + Duration::days((week * 7) as i64 - start_weekday as i64);
+        let month = date.month();
+        if month != last_month {
+            let m_str = MONTH_NAMES[(month - 1) as usize];
+            let pos = 5 + week;
+            for (i, ch) in m_str.chars().enumerate() {
+                if pos + i < header_chars.len() {
+                    header_chars[pos + i] = ch;
+                }
+            }
+            last_month = month;
+        }
+    }
+    let header: String = header_chars.into_iter().collect();
+
+    let day_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    let mut lines = vec![header];
+    for (weekday, week_counts) in grid.iter().enumerate() {
+        let mut row = format!("{} ", day_labels[weekday]);
+        for &count in week_counts.iter() {
+            row.push(count_to_char(count));
+        }
+        lines.push(row);
+    }
+    lines.push("Legend: ░ 0  ▒ 1  ▓ 2-3  █ 4+".to_string());
+    lines.join("\n")
+}
+
+// ---------------------------------------------------------------------------
+// Import command
+// ---------------------------------------------------------------------------
+
+/// Execute the `pq-diary import` command, writing output to stdout.
+///
+/// Recursively imports all `.md` files from `args.dir` into the vault.
+/// When `args.dry_run` is `true`, no entries are written; a preview summary
+/// is printed instead.  The `VaultGuard` pattern ensures the vault is locked
+/// on every exit path.
+///
+/// # Errors
+///
+/// Returns an error if the directory does not exist, is not a directory,
+/// password acquisition fails, vault unlock fails, or import fails.
+pub fn cmd_import(cli: &Cli, args: &crate::ImportArgs) -> anyhow::Result<()> {
+    cmd_import_to(cli, args, &mut std::io::stdout())
+}
+
+/// Inner implementation of [`cmd_import`] that writes output to `out`.
+///
+/// Separated from `cmd_import` to enable output capture in tests.
+pub(crate) fn cmd_import_to(
+    cli: &Cli,
+    args: &crate::ImportArgs,
+    out: &mut dyn std::io::Write,
+) -> anyhow::Result<()> {
+    use secrecy::{ExposeSecret as _, SecretBox};
+
+    // 1. Validate source directory before touching the vault.
+    if !args.dir.exists() {
+        return Err(anyhow::anyhow!(
+            "Error: Directory '{}' does not exist",
+            args.dir.display()
+        ));
+    }
+    if !args.dir.is_dir() {
+        return Err(anyhow::anyhow!(
+            "Error: '{}' is not a directory",
+            args.dir.display()
+        ));
+    }
+
+    // 2. Acquire password.
+    let password_source =
+        get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // 3. Open and unlock vault.
+    let vault_path = resolve_vault_path(cli)?;
+    let vault_str = vault_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Vault path contains non-UTF-8 characters"))?;
+
+    let mut core = DiaryCore::new(vault_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let secret_password: secrecy::SecretString =
+        SecretBox::new(Box::from(password_source.secret().expose_secret()));
+    core.unlock(secret_password)
+        .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+    let guard = VaultGuard::new(&mut core);
+
+    // 4. Run import (dry_run flag is forwarded to core).
+    let result = guard
+        .import(&args.dir, args.dry_run)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // 5. Display results.
+    if args.dry_run {
+        writeln!(
+            out,
+            "[DRY RUN] Would import {} files from '{}'",
+            result.would_import,
+            args.dir.display()
+        )?;
+        writeln!(out, "  Links to convert: {}", result.links_converted)?;
+        writeln!(out, "  Tags to extract: {}", result.tags_converted)?;
+        writeln!(out, "  Files to skip: {}", result.skipped)?;
+        for detail in &result.skip_details {
+            writeln!(out, "    - {} ({})", detail.path, detail.reason)?;
+        }
+    } else {
+        writeln!(
+            out,
+            "Imported: {}, Skipped: {}, Links converted: {}, Tags converted: {}",
+            result.imported, result.skipped, result.links_converted, result.tags_converted
+        )?;
+    }
+
+    // guard drops here, automatically calling lock().
     Ok(())
 }
 
@@ -3217,6 +3465,734 @@ mod tests {
         assert!(
             !output.contains("--- Links ---"),
             "output must NOT contain '--- Links ---' for an entry with no links, got:\n{output}"
+        );
+    }
+
+    // =========================================================================
+    // TC-A13: VaultGuard drop guard tests (TASK-0056)
+    // =========================================================================
+
+    /// TC-A13-01: VaultGuard drop calls lock() on the underlying DiaryCore.
+    ///
+    /// After the guard goes out of scope, the vault must be locked: any
+    /// attempt to call a vault operation should return `NotUnlocked`.
+    #[test]
+    fn tc_a13_01_vault_guard_drop_calls_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        let vault_pqd = vault_dir.join("vault.pqd");
+        let vault_str = vault_pqd.to_str().expect("utf8");
+
+        let mut core = DiaryCore::new(vault_str).expect("DiaryCore::new");
+        let pw: secrecy::SecretString = secrecy::SecretBox::new(Box::from("password"));
+        core.unlock(pw).expect("unlock");
+
+        {
+            let _guard = VaultGuard::new(&mut core);
+            // guard is alive; vault is unlocked
+        }
+        // guard dropped here — lock() must have been called
+
+        let result = core.list_entries(None);
+        assert!(
+            result.is_err(),
+            "core must be locked after VaultGuard drop; list_entries should fail"
+        );
+    }
+
+    /// TC-A13-02: VaultGuard calls lock() even when an early return (error path) occurs.
+    ///
+    /// Uses a closure that creates a VaultGuard and then returns `Err(...)` via `?`.
+    /// The guard's Drop must run before the closure exits, ensuring lock() is called.
+    #[test]
+    fn tc_a13_02_error_path_calls_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        let vault_pqd = vault_dir.join("vault.pqd");
+        let vault_str = vault_pqd.to_str().expect("utf8");
+
+        let mut core = DiaryCore::new(vault_str).expect("DiaryCore::new");
+        let pw: secrecy::SecretString = secrecy::SecretBox::new(Box::from("password"));
+        core.unlock(pw).expect("unlock");
+
+        // Simulate an error path: guard is created, then ? causes early return.
+        let result: anyhow::Result<()> = (|| {
+            let _guard = VaultGuard::new(&mut core);
+            anyhow::bail!("simulated error to trigger early return");
+        })();
+
+        assert!(result.is_err(), "closure must propagate the error");
+
+        // Even though the closure returned Err, lock() must have been called.
+        let list_result = core.list_entries(None);
+        assert!(
+            list_result.is_err(),
+            "core must be locked after VaultGuard drop on error path"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TASK-0059: cmd_search tests
+    // -------------------------------------------------------------------------
+
+    /// Set up a fresh vault for search tests and return its directory path.
+    fn setup_search_vault(dir: &tempfile::TempDir) -> PathBuf {
+        use pq_diary_core::vault::init::VaultManager;
+        let mgr = VaultManager::new(dir.path().to_path_buf())
+            .expect("VaultManager::new")
+            .with_kdf_params(fast_params());
+        mgr.init_vault("sv", b"password").expect("init_vault");
+        dir.path().join("sv")
+    }
+
+    /// Add an entry to the vault at `vault_dir` with password "password".
+    fn add_entry(vault_dir: &PathBuf, title: &str, body: &str, tags: Vec<String>) {
+        let vault_pqd = vault_dir.join("vault.pqd");
+        let mut core = DiaryCore::new(vault_pqd.to_str().expect("utf8")).expect("DiaryCore::new");
+        let pw: secrecy::SecretString = secrecy::SecretBox::new(Box::from("password"));
+        core.unlock(pw).expect("unlock");
+        core.new_entry(title, body, tags).expect("new_entry");
+        core.lock();
+    }
+
+    /// Parse a `Cli` with the `search` subcommand targeting `vault_dir`.
+    fn parse_search_cli(vault_dir_str: &str, extra: &[&str]) -> crate::Cli {
+        let mut args = vec![
+            "pq-diary",
+            "-v",
+            vault_dir_str,
+            "--password",
+            "password",
+            "search",
+        ];
+        args.extend_from_slice(extra);
+        crate::Cli::try_parse_from(&args).expect("parse test CLI")
+    }
+
+    /// Extract `SearchArgs` from a parsed `Cli`.
+    fn extract_search_args(cli: &crate::Cli) -> &crate::SearchArgs {
+        match &cli.command {
+            crate::Commands::Search(a) => a,
+            _ => panic!("Expected Commands::Search"),
+        }
+    }
+
+    /// TC-B04-01: Output header format is `{8-char hex} {YYYY-MM-DD} {title}`.
+    #[test]
+    fn tc_b04_01_output_id_prefix_date_title() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_search_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        add_entry(&vault_dir, "テスト記事", "今日は晴れ", vec![]);
+
+        let cli = parse_search_cli(vault_dir_str, &["晴れ"]);
+        let args = extract_search_args(&cli);
+
+        let mut out = Vec::new();
+        cmd_search_to(&cli, args, &mut out).expect("cmd_search_to");
+        let output = String::from_utf8(out).expect("utf8");
+
+        let first_line = output.lines().next().expect("output must have lines");
+        let parts: Vec<&str> = first_line.splitn(3, ' ').collect();
+        assert_eq!(parts.len(), 3, "header must have 3 space-separated parts");
+        assert_eq!(parts[0].len(), 8, "id prefix must be 8 chars");
+        assert!(
+            parts[0].chars().all(|c| c.is_ascii_hexdigit()),
+            "id prefix must be hex digits: {:?}",
+            parts[0]
+        );
+        // Date format YYYY-MM-DD
+        assert!(
+            parts[1].len() == 10 && parts[1].chars().nth(4) == Some('-'),
+            "date must be YYYY-MM-DD: {:?}",
+            parts[1]
+        );
+        assert_eq!(parts[2], "テスト記事");
+    }
+
+    /// TC-B05-03: `--context 0` shows only the match line, no surrounding lines.
+    #[test]
+    fn tc_b05_03_context_0_shows_only_match_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_search_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        add_entry(&vault_dir, "テスト", "前の行\nTARGET行\n後の行", vec![]);
+
+        let cli = parse_search_cli(vault_dir_str, &["--context", "0", "TARGET"]);
+        let args = extract_search_args(&cli);
+
+        let mut out = Vec::new();
+        cmd_search_to(&cli, args, &mut out).expect("cmd_search_to");
+        let output = String::from_utf8(out).expect("utf8");
+
+        assert!(!output.contains("前の行"), "pre-context must not appear");
+        assert!(!output.contains("後の行"), "post-context must not appear");
+        assert!(output.contains("TARGET行"), "match line must appear");
+    }
+
+    /// TC-B06-01: `--tag "日記"` returns only entries tagged "日記".
+    #[test]
+    fn tc_b06_01_tag_filter_restricts_results() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_search_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        add_entry(
+            &vault_dir,
+            "日記記事",
+            "検索対象テキスト",
+            vec!["日記".to_string()],
+        );
+        add_entry(
+            &vault_dir,
+            "技術記事",
+            "検索対象テキスト",
+            vec!["技術".to_string()],
+        );
+
+        let cli = parse_search_cli(vault_dir_str, &["--tag", "日記", "検索対象テキスト"]);
+        let args = extract_search_args(&cli);
+
+        let mut out = Vec::new();
+        cmd_search_to(&cli, args, &mut out).expect("cmd_search_to");
+        let output = String::from_utf8(out).expect("utf8");
+
+        assert!(output.contains("日記記事"), "must include 日記 entry");
+        assert!(!output.contains("技術記事"), "must not include 技術 entry");
+    }
+
+    /// TC-B07-01: `--count` outputs "{n} entries matched" for n > 0.
+    #[test]
+    fn tc_b07_01_count_mode_two_matches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_search_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        add_entry(&vault_dir, "一致1", "MATCH_WORD ここにある", vec![]);
+        add_entry(&vault_dir, "一致2", "MATCH_WORD ここにも", vec![]);
+        add_entry(&vault_dir, "不一致", "no match here", vec![]);
+
+        let cli = parse_search_cli(vault_dir_str, &["--count", "MATCH_WORD"]);
+        let args = extract_search_args(&cli);
+
+        let mut out = Vec::new();
+        cmd_search_to(&cli, args, &mut out).expect("cmd_search_to");
+        let output = String::from_utf8(out).expect("utf8").trim().to_string();
+
+        assert_eq!(output, "2 entries matched");
+    }
+
+    /// TC-B07-02: `--count` outputs "0 entries matched" when nothing matches.
+    #[test]
+    fn tc_b07_02_count_zero_when_no_match() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_search_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        add_entry(&vault_dir, "記事", "内容", vec![]);
+
+        let cli = parse_search_cli(vault_dir_str, &["--count", "NOMATCH_ZZZZZ"]);
+        let args = extract_search_args(&cli);
+
+        let mut out = Vec::new();
+        cmd_search_to(&cli, args, &mut out).expect("cmd_search_to");
+        let output = String::from_utf8(out).expect("utf8").trim().to_string();
+
+        assert_eq!(output, "0 entries matched");
+    }
+
+    /// TC-EDGE-01: Invalid regex pattern returns an error containing "regex" or "pattern".
+    #[test]
+    fn tc_edge_01_invalid_regex_returns_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_search_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let cli = parse_search_cli(vault_dir_str, &["[invalid"]);
+        let args = extract_search_args(&cli);
+
+        let mut out = Vec::new();
+        let result = cmd_search_to(&cli, args, &mut out);
+
+        assert!(result.is_err(), "invalid regex must return Err");
+        let msg = result.unwrap_err().to_string().to_lowercase();
+        assert!(
+            msg.contains("regex") || msg.contains("pattern"),
+            "error must mention regex/pattern: {msg}"
+        );
+    }
+
+    /// TC-EDGE-02: Empty vault produces "No matches found".
+    #[test]
+    fn tc_edge_02_empty_vault_no_matches_found() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_search_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        // No entries added — vault is empty.
+
+        let cli = parse_search_cli(vault_dir_str, &["anything"]);
+        let args = extract_search_args(&cli);
+
+        let mut out = Vec::new();
+        cmd_search_to(&cli, args, &mut out).expect("cmd_search_to");
+        let output = String::from_utf8(out).expect("utf8").trim().to_string();
+
+        assert_eq!(output, "No matches found");
+    }
+
+    // -------------------------------------------------------------------------
+    // TASK-0061: cmd_stats tests
+    // -------------------------------------------------------------------------
+
+    /// Set up a fresh vault for stats tests and return its directory path.
+    fn setup_stats_vault(dir: &tempfile::TempDir) -> PathBuf {
+        use pq_diary_core::vault::init::VaultManager;
+        let mgr = VaultManager::new(dir.path().to_path_buf())
+            .expect("VaultManager::new")
+            .with_kdf_params(fast_params());
+        mgr.init_vault("stv", b"password").expect("init_vault");
+        dir.path().join("stv")
+    }
+
+    /// Parse a `Cli` targeting `vault_dir` with the `stats` subcommand.
+    fn parse_stats_cli(vault_dir_str: &str, extra: &[&str]) -> crate::Cli {
+        use clap::Parser as _;
+        let mut args = vec![
+            "pq-diary",
+            "-v",
+            vault_dir_str,
+            "--password",
+            "password",
+            "stats",
+        ];
+        args.extend_from_slice(extra);
+        crate::Cli::try_parse_from(&args).expect("parse test CLI")
+    }
+
+    /// Extract `StatsArgs` from a parsed `Cli`.
+    fn extract_stats_args(cli: &crate::Cli) -> &crate::StatsArgs {
+        match &cli.command {
+            crate::Commands::Stats(a) => a,
+            _ => panic!("Expected Commands::Stats"),
+        }
+    }
+
+    /// TC-C03-01: Default output contains "Vault Statistics" header and "Entries:" label.
+    #[test]
+    fn tc_c03_01_default_output_text_format() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_stats_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        add_entry(&vault_dir, "テスト", "本文", vec![]);
+
+        let cli = parse_stats_cli(vault_dir_str, &[]);
+        let args = extract_stats_args(&cli);
+
+        let mut out = Vec::new();
+        cmd_stats_to(&cli, args, &mut out).expect("cmd_stats_to");
+        let output = String::from_utf8(out).expect("utf8");
+
+        assert!(
+            output.contains("Vault Statistics"),
+            "output must contain 'Vault Statistics': {output}"
+        );
+        assert!(
+            output.contains("Entries:"),
+            "output must contain 'Entries:': {output}"
+        );
+    }
+
+    /// TC-C03-02: Text output contains all expected statistics fields.
+    #[test]
+    fn tc_c03_02_text_output_all_fields() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_stats_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        add_entry(
+            &vault_dir,
+            "記事A",
+            "本文テキスト",
+            vec!["日記".to_string()],
+        );
+
+        let cli = parse_stats_cli(vault_dir_str, &[]);
+        let args = extract_stats_args(&cli);
+
+        let mut out = Vec::new();
+        cmd_stats_to(&cli, args, &mut out).expect("cmd_stats_to");
+        let output = String::from_utf8(out).expect("utf8");
+
+        for label in &[
+            "Entries:",
+            "Tags:",
+            "First entry:",
+            "Last entry:",
+            "Active days (30d):",
+            "Characters:",
+            "Total:",
+            "Average:",
+            "Maximum:",
+            "Top Tags:",
+        ] {
+            assert!(
+                output.contains(label),
+                "output must contain '{label}': {output}"
+            );
+        }
+    }
+
+    /// TC-C04-01: --json outputs valid JSON.
+    #[test]
+    fn tc_c04_01_json_output_is_valid() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_stats_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        add_entry(&vault_dir, "記事", "本文", vec![]);
+
+        let cli = parse_stats_cli(vault_dir_str, &["--json"]);
+        let args = extract_stats_args(&cli);
+
+        let mut out = Vec::new();
+        cmd_stats_to(&cli, args, &mut out).expect("cmd_stats_to");
+        let output = String::from_utf8(out).expect("utf8");
+
+        let parsed: serde_json::Result<serde_json::Value> = serde_json::from_str(&output);
+        assert!(parsed.is_ok(), "--json output must be valid JSON: {output}");
+    }
+
+    /// TC-C04-02: --json output contains all VaultStats fields.
+    #[test]
+    fn tc_c04_02_json_output_all_fields() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_stats_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        add_entry(&vault_dir, "記事", "本文", vec!["tech".to_string()]);
+
+        let cli = parse_stats_cli(vault_dir_str, &["--json"]);
+        let args = extract_stats_args(&cli);
+
+        let mut out = Vec::new();
+        cmd_stats_to(&cli, args, &mut out).expect("cmd_stats_to");
+        let output = String::from_utf8(out).expect("utf8");
+
+        let value: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+        for key in &[
+            "entry_count",
+            "tag_count",
+            "char_stats",
+            "tag_distribution",
+            "daily_activity",
+        ] {
+            assert!(
+                value.get(key).is_some(),
+                "JSON must contain key '{key}': {output}"
+            );
+        }
+    }
+
+    /// TC-C05-01: --heatmap output contains at least one heatmap character.
+    #[test]
+    fn tc_c05_01_heatmap_contains_block_chars() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_stats_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        add_entry(&vault_dir, "記事", "本文", vec![]);
+
+        let cli = parse_stats_cli(vault_dir_str, &["--heatmap"]);
+        let args = extract_stats_args(&cli);
+
+        let mut out = Vec::new();
+        cmd_stats_to(&cli, args, &mut out).expect("cmd_stats_to");
+        let output = String::from_utf8(out).expect("utf8");
+
+        let has_block = output.contains('░')
+            || output.contains('▒')
+            || output.contains('▓')
+            || output.contains('█');
+        assert!(
+            has_block,
+            "--heatmap output must contain block characters: {output}"
+        );
+    }
+
+    /// TC-C05-02: --heatmap output ends with a "Legend:" line.
+    #[test]
+    fn tc_c05_02_heatmap_has_legend() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_stats_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let cli = parse_stats_cli(vault_dir_str, &["--heatmap"]);
+        let args = extract_stats_args(&cli);
+
+        let mut out = Vec::new();
+        cmd_stats_to(&cli, args, &mut out).expect("cmd_stats_to");
+        let output = String::from_utf8(out).expect("utf8");
+
+        assert!(
+            output.contains("Legend:"),
+            "--heatmap output must contain 'Legend:': {output}"
+        );
+    }
+
+    /// TC-EDGE-01: Empty vault does not error and shows "Entries:" with "0".
+    #[test]
+    fn tc_c_edge_01_empty_vault_shows_zero_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_stats_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        // No entries added.
+        let cli = parse_stats_cli(vault_dir_str, &[]);
+        let args = extract_stats_args(&cli);
+
+        let mut out = Vec::new();
+        let result = cmd_stats_to(&cli, args, &mut out);
+        assert!(
+            result.is_ok(),
+            "empty vault must not error: {:?}",
+            result.err()
+        );
+
+        let output = String::from_utf8(out).expect("utf8");
+        assert!(
+            output.contains("Entries:"),
+            "output must contain 'Entries:': {output}"
+        );
+        assert!(
+            output.contains("Entries:        0"),
+            "output must show 0 entries: {output}"
+        );
+    }
+
+    // =========================================================================
+    // TASK-0064: cmd_import tests
+    // =========================================================================
+
+    /// Build a `Cli` targeting `vault_dir_str` for the `import` subcommand.
+    fn parse_import_cli(
+        vault_dir_str: &str,
+        import_dir_str: &str,
+        extra_args: &[&str],
+    ) -> crate::Cli {
+        let mut args: Vec<&str> = vec![
+            "pq-diary",
+            "-v",
+            vault_dir_str,
+            "--password",
+            "password",
+            "import",
+            import_dir_str,
+        ];
+        args.extend_from_slice(extra_args);
+        crate::Cli::try_parse_from(&args).expect("parse test CLI")
+    }
+
+    /// Extract `ImportArgs` from a parsed CLI.
+    fn extract_import_args(cli: &crate::Cli) -> &crate::ImportArgs {
+        match &cli.command {
+            crate::Commands::Import(args) => args,
+            _ => panic!("Expected Commands::Import"),
+        }
+    }
+
+    /// TC-D01-06: `import <DIR>` imports `.md` files and shows "Imported: 1".
+    #[test]
+    fn tc_d01_06_import_md_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let src_dir = tempfile::tempdir().expect("src tempdir");
+        std::fs::write(
+            src_dir.path().join("note.md"),
+            "# Test Note\n\nHello world.",
+        )
+        .expect("write md");
+
+        let cli = parse_import_cli(vault_dir_str, src_dir.path().to_str().expect("utf8"), &[]);
+        let import_args = extract_import_args(&cli);
+
+        let mut out = Vec::new();
+        cmd_import_to(&cli, import_args, &mut out).expect("cmd_import_to");
+        let output = String::from_utf8(out).expect("utf8");
+
+        assert!(
+            output.contains("Imported: 1"),
+            "output must contain 'Imported: 1': {output}"
+        );
+    }
+
+    /// TC-D07-02: `--dry-run` shows `[DRY RUN]` and `Would import` preview.
+    #[test]
+    fn tc_d07_02_dry_run_preview() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let src_dir = tempfile::tempdir().expect("src tempdir");
+        std::fs::write(
+            src_dir.path().join("note.md"),
+            "# Test Note\n\nHello world.",
+        )
+        .expect("write md");
+
+        let cli = parse_import_cli(
+            vault_dir_str,
+            src_dir.path().to_str().expect("utf8"),
+            &["--dry-run"],
+        );
+        let import_args = extract_import_args(&cli);
+
+        let mut out = Vec::new();
+        cmd_import_to(&cli, import_args, &mut out).expect("cmd_import_to");
+        let output = String::from_utf8(out).expect("utf8");
+
+        assert!(
+            output.contains("[DRY RUN]"),
+            "output must contain '[DRY RUN]': {output}"
+        );
+        assert!(
+            output.contains("Would import"),
+            "output must contain 'Would import': {output}"
+        );
+    }
+
+    /// TC-D07-03: `--dry-run` does not change vault file size.
+    #[test]
+    fn tc_d07_03_dry_run_no_vault_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        let vault_pqd = vault_dir.join("vault.pqd");
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let src_dir = tempfile::tempdir().expect("src tempdir");
+        std::fs::write(
+            src_dir.path().join("note.md"),
+            "# Test Note\n\nHello world.",
+        )
+        .expect("write md");
+
+        let size_before = std::fs::metadata(&vault_pqd)
+            .expect("metadata before")
+            .len();
+
+        let cli = parse_import_cli(
+            vault_dir_str,
+            src_dir.path().to_str().expect("utf8"),
+            &["--dry-run"],
+        );
+        let import_args = extract_import_args(&cli);
+
+        let mut out = Vec::new();
+        cmd_import_to(&cli, import_args, &mut out).expect("cmd_import_to");
+
+        let size_after = std::fs::metadata(&vault_pqd).expect("metadata after").len();
+        assert_eq!(
+            size_before, size_after,
+            "vault size must not change in dry-run mode"
+        );
+    }
+
+    /// TC-D09-01: Summary output contains all four items (imported/skipped/links/tags).
+    #[test]
+    fn tc_d09_01_summary_all_four_items() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let src_dir = tempfile::tempdir().expect("src tempdir");
+        // File with a wiki-link and an inline tag so links/tags counts are non-zero.
+        std::fs::write(
+            src_dir.path().join("note.md"),
+            "# Test\n\nSee [[other note]] and #work/project.\n",
+        )
+        .expect("write md");
+
+        let cli = parse_import_cli(vault_dir_str, src_dir.path().to_str().expect("utf8"), &[]);
+        let import_args = extract_import_args(&cli);
+
+        let mut out = Vec::new();
+        cmd_import_to(&cli, import_args, &mut out).expect("cmd_import_to");
+        let output = String::from_utf8(out).expect("utf8");
+
+        assert!(
+            output.contains("Imported:"),
+            "output must contain 'Imported:': {output}"
+        );
+        assert!(
+            output.contains("Skipped:"),
+            "output must contain 'Skipped:': {output}"
+        );
+        assert!(
+            output.contains("Links converted:"),
+            "output must contain 'Links converted:': {output}"
+        );
+        assert!(
+            output.contains("Tags converted:"),
+            "output must contain 'Tags converted:': {output}"
+        );
+    }
+
+    /// TC-EDGE-01: Nonexistent directory returns error containing "does not exist".
+    #[test]
+    fn tc_d_edge_01_nonexistent_directory() {
+        // Directory check happens before vault operations, so no real vault is needed.
+        let cli = crate::Cli::try_parse_from([
+            "pq-diary",
+            "-v",
+            "nonexistent.pqd",
+            "--password",
+            "pw",
+            "import",
+            "/tmp/nonexistent_dir_task0064_xxxxx",
+        ])
+        .expect("parse cli");
+        let import_args = extract_import_args(&cli);
+
+        let mut out = Vec::new();
+        let result = cmd_import_to(&cli, import_args, &mut out);
+
+        assert!(
+            result.is_err(),
+            "must return error for nonexistent directory"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("does not exist"),
+            "error must mention 'does not exist': {err_msg}"
+        );
+    }
+
+    /// TC-EDGE-02: Empty directory returns error containing "No Markdown files found".
+    #[test]
+    fn tc_d_edge_02_empty_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        // Source directory exists but contains no .md files.
+        let src_dir = tempfile::tempdir().expect("src tempdir");
+
+        let cli = parse_import_cli(vault_dir_str, src_dir.path().to_str().expect("utf8"), &[]);
+        let import_args = extract_import_args(&cli);
+
+        let mut out = Vec::new();
+        let result = cmd_import_to(&cli, import_args, &mut out);
+
+        assert!(result.is_err(), "must return error for empty directory");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("No Markdown files found"),
+            "error must mention 'No Markdown files found': {err_msg}"
         );
     }
 }

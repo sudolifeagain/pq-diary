@@ -60,6 +60,9 @@ pub fn get_password(flag_value: Option<&str>) -> Result<PasswordSource, DiaryErr
 
     // Stage 2: PQ_DIARY_PASSWORD environment variable
     if let Ok(env_pass) = std::env::var("PQ_DIARY_PASSWORD") {
+        // Remove the variable immediately to prevent child processes or memory
+        // dumps from leaking the password via the environment.
+        std::env::remove_var("PQ_DIARY_PASSWORD");
         return Ok(PasswordSource::Env(SecretBox::new(
             env_pass.into_boxed_str(),
         )));
@@ -119,11 +122,13 @@ fn read_password_tty() -> Result<SecretString, DiaryError> {
     }
     impl Drop for TtyGuard {
         fn drop(&mut self) {
-            let _ = nix::sys::termios::tcsetattr(
+            if let Err(e) = nix::sys::termios::tcsetattr(
                 &self.file,
                 nix::sys::termios::SetArg::TCSANOW,
                 &self.old,
-            );
+            ) {
+                eprintln!("Warning: Failed to restore terminal attributes: {e}");
+            }
         }
     }
     let mut guard = TtyGuard {
@@ -183,12 +188,21 @@ fn read_password_tty() -> Result<SecretString, DiaryError> {
     };
     use zeroize::Zeroizing;
 
-    // SAFETY: This block calls Win32 console APIs which require `unsafe` as
-    // they are raw FFI functions from windows-sys.  The pattern (save mode →
-    // modify → use → restore) is the standard Windows approach for disabling
-    // console echo, directly analogous to the Unix termios pattern above.
-    // All handles and buffers used here are valid for the lifetime of this
-    // function.
+    // SAFETY: This block calls Win32 Console APIs (GetConsoleMode,
+    // SetConsoleMode, ReadConsoleW) via windows-sys FFI, which requires
+    // `unsafe`.  Four invariants are maintained per ADR-0007:
+    //
+    // 1. Handle validity: GetStdHandle return value is checked against both
+    //    null (0) and INVALID_HANDLE_VALUE (-1 as isize) before use.
+    // 2. Console mode restoration: SetConsoleMode(handle, old_mode) is called
+    //    unconditionally after ReadConsoleW, before any early return, ensuring
+    //    the original mode is always restored even on error.
+    // 3. Buffer boundary: ReadConsoleW is given `buf.len() as u32` (= 256) as
+    //    the character limit, so the API guarantees chars_read ≤ 256.  The
+    //    subsequent slice `&buf[..chars_read as usize]` is therefore always
+    //    within bounds.
+    // 4. Lifetime: the handle, old_mode, and buf are all valid for the entire
+    //    duration of this unsafe block.
     unsafe {
         let handle = GetStdHandle(STD_INPUT_HANDLE);
         // INVALID_HANDLE_VALUE = -1 as pointer; null = 0 pointer (both invalid)
@@ -228,7 +242,9 @@ fn read_password_tty() -> Result<SecretString, DiaryError> {
         );
 
         // Restore console mode before any early return.
-        let _ = SetConsoleMode(handle, old_mode);
+        if SetConsoleMode(handle, old_mode) == 0 {
+            eprintln!("Warning: Failed to restore console mode");
+        }
         eprintln!(); // newline after the hidden input
 
         if ok == 0 {
@@ -390,11 +406,28 @@ mod tests {
 
         std::env::set_var("PQ_DIARY_PASSWORD", "");
         let result = get_password(None);
+        // Note: get_password removes the var; the remove_var below is a no-op.
         std::env::remove_var("PQ_DIARY_PASSWORD");
 
         assert!(result.is_ok(), "Empty password via env var must not panic");
         let source = result.unwrap();
         assert!(matches!(source, PasswordSource::Env(_)));
         assert_eq!(source.secret().expose_secret(), "");
+    }
+
+    /// TC-A07-01: `PQ_DIARY_PASSWORD` is removed from the environment immediately
+    /// after `get_password` reads it, so child processes cannot inherit it.
+    #[test]
+    fn tc_a07_01_env_var_removed_after_read() {
+        let _lock = ENV_LOCK.lock().unwrap();
+
+        std::env::set_var("PQ_DIARY_PASSWORD", "secret_a07_01");
+        let result = get_password(None);
+        assert!(result.is_ok(), "Expected Ok, got: {:?}", result.err());
+
+        assert!(
+            std::env::var("PQ_DIARY_PASSWORD").is_err(),
+            "PQ_DIARY_PASSWORD must be absent from the environment after get_password returns"
+        );
     }
 }

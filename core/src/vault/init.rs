@@ -102,6 +102,13 @@ impl VaultManager {
     /// Returns [`DiaryError::Io`] on filesystem failures.
     /// Returns [`DiaryError::Crypto`] on key derivation or encryption failures.
     pub fn init_vault(&self, name: &str, password: &[u8]) -> Result<(), DiaryError> {
+        // Guard: refuse empty password.
+        if password.is_empty() {
+            return Err(DiaryError::Password(
+                "password must not be empty".to_string(),
+            ));
+        }
+
         let vault_dir = self.base_dir.join(name);
 
         // Guard: refuse to clobber an existing vault directory.
@@ -368,6 +375,55 @@ mod tests {
             matches!(result, Err(DiaryError::Vault(_))),
             "expected DiaryError::Vault for duplicate vault name, got {:?}",
             result
+        );
+    }
+
+    /// TC-A03-01: init_vault with empty password returns DiaryError::Password.
+    ///
+    /// Given an empty password byte slice, when `init_vault` is called, it must
+    /// return `Err(DiaryError::Password(_))` without creating any files.
+    #[test]
+    fn tc_a03_01_empty_password_returns_password_error() {
+        let dir = tempdir().expect("tempdir");
+        let mgr = VaultManager::new(dir.path().to_path_buf())
+            .expect("VaultManager::new")
+            .with_kdf_params(fast_params());
+
+        let result = mgr.init_vault("test", b"");
+
+        assert!(
+            matches!(result, Err(DiaryError::Password(_))),
+            "expected DiaryError::Password for empty password, got {:?}",
+            result
+        );
+        // Vault directory must not have been created.
+        assert!(
+            !dir.path().join("test").exists(),
+            "vault directory must not be created for empty password"
+        );
+    }
+
+    /// TC-A03-02: init_vault with non-empty password succeeds.
+    ///
+    /// Given a non-empty password, when `init_vault` is called, it must return
+    /// `Ok(())` and create the vault on disk.
+    #[test]
+    fn tc_a03_02_nonempty_password_creates_vault() {
+        let dir = tempdir().expect("tempdir");
+        let mgr = VaultManager::new(dir.path().to_path_buf())
+            .expect("VaultManager::new")
+            .with_kdf_params(fast_params());
+
+        let result = mgr.init_vault("test", b"secure-password-123");
+
+        assert!(
+            result.is_ok(),
+            "expected Ok for non-empty password, got {:?}",
+            result
+        );
+        assert!(
+            dir.path().join("test").join("vault.pqd").exists(),
+            "vault.pqd must exist after successful init"
         );
     }
 

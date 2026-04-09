@@ -16,6 +16,22 @@ use crate::vault::format::{EntryRecord, VaultHeader, MAGIC, SCHEMA_VERSION};
 /// Fixed size of the on-disk verification-token ciphertext field (bytes 92–140).
 const VERIFICATION_CT_LEN: usize = 48;
 
+/// Maximum allowed byte length for any variable-length field.
+///
+/// Fields whose stored length prefix exceeds this value are rejected as
+/// malicious or corrupt to prevent large-allocation denial-of-service.
+const MAX_FIELD_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
+
+/// Return `DiaryError::Vault` if `len` exceeds [`MAX_FIELD_SIZE`].
+fn check_field_size(len: usize) -> Result<(), DiaryError> {
+    if len > MAX_FIELD_SIZE {
+        return Err(DiaryError::Vault(format!(
+            "field size {len} exceeds 16MiB maximum"
+        )));
+    }
+    Ok(())
+}
+
 /// Parse a [`VaultHeader`] from `reader`.
 ///
 /// Reads the fixed 204-byte section then the variable-length encrypted
@@ -89,6 +105,7 @@ pub fn read_header(reader: &mut impl Read) -> Result<VaultHeader, DiaryError> {
     let mut kem_sk_len_bytes = [0u8; 4];
     reader.read_exact(&mut kem_sk_len_bytes)?;
     let kem_sk_len = u32::from_le_bytes(kem_sk_len_bytes) as usize;
+    check_field_size(kem_sk_len)?;
     let mut kem_encrypted_sk = vec![0u8; kem_sk_len];
     if kem_sk_len > 0 {
         reader.read_exact(&mut kem_encrypted_sk)?;
@@ -98,6 +115,7 @@ pub fn read_header(reader: &mut impl Read) -> Result<VaultHeader, DiaryError> {
     let mut dsa_sk_len_bytes = [0u8; 4];
     reader.read_exact(&mut dsa_sk_len_bytes)?;
     let dsa_sk_len = u32::from_le_bytes(dsa_sk_len_bytes) as usize;
+    check_field_size(dsa_sk_len)?;
     let mut dsa_encrypted_sk = vec![0u8; dsa_sk_len];
     if dsa_sk_len > 0 {
         reader.read_exact(&mut dsa_encrypted_sk)?;
@@ -141,6 +159,9 @@ pub fn read_entries(reader: &mut impl Read) -> Result<Vec<EntryRecord>, DiaryErr
             break;
         }
 
+        // Guard against oversized records before allocating.
+        check_field_size(record_len)?;
+
         // Read the record payload into a bounded buffer then parse it.
         let mut payload = vec![0u8; record_len];
         reader.read_exact(&mut payload)?;
@@ -182,6 +203,7 @@ fn parse_entry_payload(payload: &[u8]) -> Result<EntryRecord, DiaryError> {
     let mut u32_buf = [0u8; 4];
     cursor.read_exact(&mut u32_buf)?;
     let ct_len = u32::from_le_bytes(u32_buf) as usize;
+    check_field_size(ct_len)?;
     let mut ciphertext = vec![0u8; ct_len];
     if ct_len > 0 {
         cursor.read_exact(&mut ciphertext)?;
@@ -190,6 +212,7 @@ fn parse_entry_payload(payload: &[u8]) -> Result<EntryRecord, DiaryError> {
     // Signature length (LE u32) + signature
     cursor.read_exact(&mut u32_buf)?;
     let sig_len = u32::from_le_bytes(u32_buf) as usize;
+    check_field_size(sig_len)?;
     let mut signature = vec![0u8; sig_len];
     if sig_len > 0 {
         cursor.read_exact(&mut signature)?;
@@ -207,6 +230,7 @@ fn parse_entry_payload(payload: &[u8]) -> Result<EntryRecord, DiaryError> {
     // Legacy key block length (LE u32) + legacy key block
     cursor.read_exact(&mut u32_buf)?;
     let lkb_len = u32::from_le_bytes(u32_buf) as usize;
+    check_field_size(lkb_len)?;
     let mut legacy_key_block = vec![0u8; lkb_len];
     if lkb_len > 0 {
         cursor.read_exact(&mut legacy_key_block)?;
@@ -700,5 +724,80 @@ mod tests {
         for (i, e) in read_back.iter().enumerate() {
             assert_eq!(e.uuid, [i as u8; 16], "uuid mismatch at index {}", i);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // TASK-0053 test cases
+    // -----------------------------------------------------------------------
+
+    /// TC-A01-01: kem_encrypted_sk field with size 16MiB+1 → DiaryError::Vault.
+    ///
+    /// Given a header byte stream whose kem_encrypted_sk length field is set to
+    /// 16MiB+1, when read_header is called, then DiaryError::Vault must be
+    /// returned before any large allocation is attempted.
+    #[test]
+    fn test_tc_a01_01_kem_sk_oversized_returns_vault_error() {
+        // Build a valid header, then overwrite the kem_sk_len field (bytes 204..208)
+        // with an oversized value.
+        let mut buf: Vec<u8> = Vec::new();
+        write_header(&mut buf, &VaultHeader::new()).expect("write_header must not fail");
+
+        // kem_encrypted_sk_len is written at offset 204 (after the 204-byte fixed section).
+        let oversized: u32 = 16 * 1024 * 1024 + 1;
+        buf[204..208].copy_from_slice(&oversized.to_le_bytes());
+
+        let mut cursor = io::Cursor::new(&buf);
+        let result = read_header(&mut cursor);
+
+        assert!(
+            matches!(result, Err(DiaryError::Vault(_))),
+            "expected DiaryError::Vault for oversized kem_encrypted_sk, got {:?}",
+            result
+        );
+    }
+
+    /// TC-A01-02: record_len field with value 16MiB+1 → DiaryError::Vault.
+    ///
+    /// Given a byte stream whose first record-length prefix is 16MiB+1 (non-zero
+    /// sentinel), when read_entries is called, then DiaryError::Vault must be
+    /// returned before any large allocation is attempted.
+    #[test]
+    fn test_tc_a01_02_record_len_oversized_returns_vault_error() {
+        let oversized: u32 = 16 * 1024 * 1024 + 1;
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&oversized.to_le_bytes());
+        // No payload bytes — the size check must fire before read_exact.
+
+        let mut cursor = io::Cursor::new(&buf);
+        let result = read_entries(&mut cursor);
+
+        assert!(
+            matches!(result, Err(DiaryError::Vault(_))),
+            "expected DiaryError::Vault for oversized record_len, got {:?}",
+            result
+        );
+    }
+
+    /// TC-A01-03: normal-sized fields parse successfully (regression guard).
+    ///
+    /// Given a valid vault written with small-sized fields (a few KiB each),
+    /// when read_vault is called, it must succeed without error.
+    #[test]
+    fn test_tc_a01_03_normal_size_fields_parse_ok() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault.pqd");
+
+        let mut header = make_test_header();
+        // Use a few-KiB sized kem/dsa keys (still well within 16 MiB).
+        header.kem_encrypted_sk = vec![0xAAu8; 1024];
+        header.dsa_encrypted_sk = vec![0xBBu8; 512];
+
+        let entries = vec![make_test_entry()];
+        write_vault(&path, header, &entries).expect("write_vault must not fail");
+
+        let (parsed_header, parsed_entries) = read_vault(&path).expect("read_vault must not fail");
+        assert_eq!(parsed_header.kem_encrypted_sk, vec![0xAAu8; 1024]);
+        assert_eq!(parsed_header.dsa_encrypted_sk, vec![0xBBu8; 512]);
+        assert_eq!(parsed_entries.len(), 1);
     }
 }

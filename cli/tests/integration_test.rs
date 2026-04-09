@@ -5,6 +5,7 @@
 //! link resolution + backlinks, and template variable expansion.
 
 use pq_diary_core::{
+    search::SearchQuery,
     template_engine::{expand, extract_variables, VariableKind, BUILTIN_DATE, BUILTIN_TITLE},
     vault::init::VaultManager,
     DiaryCore, DiaryError, EntryPlaintext, IdPrefix, Tag,
@@ -700,6 +701,334 @@ fn tc_s5_06_template_variable_expansion() {
 
     // Step 3: verify result
     assert_eq!(result, "## 2026-04-05 - Alpha");
+}
+
+// =============================================================================
+// TC-0041-06: Multiple entries — sort and filter
+// =============================================================================
+
+// =============================================================================
+// TC-S6-01: search → list → search で結果一致
+// =============================================================================
+
+/// TC-S6-01: search → list → search returns consistent results (idempotency).
+///
+/// Creates 2 entries containing the keyword and 1 without. Verifies that search
+/// finds 2, list finds 3, and a second search still finds 2.
+#[test]
+fn tc_s6_01_search_list_search_idempotent() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let vault_path = setup_vault(&dir, "s6_01_vault", b"password");
+
+    let mut core = DiaryCore::new(vault_path.to_str().expect("utf8")).expect("DiaryCore::new");
+    core.unlock(secret("password")).expect("unlock");
+
+    // 2 entries with keyword, 1 without
+    core.new_entry("Entry with keyword 1", "unique_keyword_2026 body", vec![])
+        .expect("new_entry 1");
+    core.new_entry("Entry with keyword 2", "unique_keyword_2026 body", vec![])
+        .expect("new_entry 2");
+    core.new_entry("Entry without keyword", "other content", vec![])
+        .expect("new_entry 3");
+
+    let query = SearchQuery {
+        pattern: "unique_keyword_2026".to_string(),
+        tag_filter: None,
+        context_lines: 2,
+        count_only: false,
+    };
+
+    // First search: 2 entries match
+    let results1 = core.search(&query).expect("first search");
+    assert_eq!(
+        results1.matched_entry_count, 2,
+        "first search must find 2 matching entries"
+    );
+
+    // List: all 3 entries present
+    let entries = core.list_entries(None).expect("list_entries");
+    assert_eq!(entries.len(), 3, "list must show all 3 entries");
+
+    // Second search: still 2 (idempotent)
+    let results2 = core.search(&query).expect("second search");
+    assert_eq!(
+        results2.matched_entry_count, 2,
+        "second search must still find 2 entries"
+    );
+
+    core.lock();
+}
+
+// =============================================================================
+// TC-S6-02: stats 基本統計 (空vault + エントリ追加後)
+// =============================================================================
+
+/// TC-S6-02: stats reports 0 for an empty vault and correct values after adding entries.
+#[test]
+fn tc_s6_02_stats_empty_then_with_entries() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let vault_path = setup_vault(&dir, "s6_02_vault", b"password");
+
+    let mut core = DiaryCore::new(vault_path.to_str().expect("utf8")).expect("DiaryCore::new");
+    core.unlock(secret("password")).expect("unlock");
+
+    // Empty vault: entry_count = 0
+    let stats0 = core.stats().expect("stats on empty vault");
+    assert_eq!(stats0.entry_count, 0, "empty vault must have 0 entries");
+
+    // Add 3 entries with different tags and bodies
+    core.new_entry("エントリ1", "本文その一", vec!["日記".to_string()])
+        .expect("new_entry 1");
+    core.new_entry("エントリ2", "本文その二 長め", vec!["技術".to_string()])
+        .expect("new_entry 2");
+    core.new_entry(
+        "エントリ3",
+        "本文その三 もっと長め",
+        vec!["旅行".to_string()],
+    )
+    .expect("new_entry 3");
+
+    // Stats after 3 entries
+    let stats3 = core.stats().expect("stats after 3 entries");
+    assert_eq!(stats3.entry_count, 3, "entry_count must be 3");
+    assert_eq!(
+        stats3.tag_count, 3,
+        "tag_count must be 3 (日記, 技術, 旅行)"
+    );
+    assert!(stats3.char_stats.total > 0, "total chars must be > 0");
+    assert!(stats3.char_stats.max > 0, "max chars must be > 0");
+    assert!(
+        !stats3.tag_distribution.is_empty(),
+        "tag_distribution must not be empty"
+    );
+
+    core.lock();
+}
+
+// =============================================================================
+// TC-S6-03: import → list でインポート件数一致
+// =============================================================================
+
+/// TC-S6-03: After importing 5 Markdown files, list returns exactly 5 entries
+/// with titles matching the file name stems.
+#[test]
+fn tc_s6_03_import_then_list() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let vault_path = setup_vault(&dir, "s6_03_vault", b"password");
+
+    let source_dir = tempfile::tempdir().expect("source tempdir");
+
+    // Create 5 .md files
+    for i in 1..=5u32 {
+        let filename = format!("note_{i:02}.md");
+        std::fs::write(
+            source_dir.path().join(&filename),
+            format!("Content of note {i}"),
+        )
+        .expect("write note");
+    }
+
+    let mut core = DiaryCore::new(vault_path.to_str().expect("utf8")).expect("DiaryCore::new");
+    core.unlock(secret("password")).expect("unlock");
+
+    // Import
+    let result = core.import(source_dir.path(), false).expect("import");
+    assert_eq!(result.imported, 5, "import must report 5 imported entries");
+
+    // List: 5 entries
+    let entries = core.list_entries(None).expect("list_entries");
+    assert_eq!(entries.len(), 5, "list must show all 5 imported entries");
+
+    // Titles match filename stems
+    for i in 1..=5u32 {
+        let expected_title = format!("note_{i:02}");
+        assert!(
+            entries.iter().any(|e| e.title == expected_title),
+            "entry with title '{expected_title}' must exist"
+        );
+    }
+
+    core.lock();
+}
+
+// =============================================================================
+// TC-S6-04: import --dry-run で vault 未変更
+// =============================================================================
+
+/// TC-S6-04: `import --dry-run` leaves vault bytes unchanged and reports imported=0.
+#[test]
+fn tc_s6_04_import_dry_run_vault_unchanged() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let vault_path = setup_vault(&dir, "s6_04_vault", b"password");
+
+    let mut core = DiaryCore::new(vault_path.to_str().expect("utf8")).expect("DiaryCore::new");
+    core.unlock(secret("password")).expect("unlock");
+
+    // Create 1 existing entry
+    core.new_entry("Existing Entry", "existing body", vec![])
+        .expect("new_entry");
+    core.lock();
+
+    // Capture vault bytes after the 1 real entry is written
+    let vault_bytes_before = std::fs::read(&vault_path).expect("read vault before dry-run");
+
+    // Create 3 .md files in source dir
+    let source_dir = tempfile::tempdir().expect("source tempdir");
+    for i in 1..=3u32 {
+        std::fs::write(
+            source_dir.path().join(format!("doc{i}.md")),
+            format!("doc {i} content"),
+        )
+        .expect("write doc");
+    }
+
+    // Dry-run import
+    core.unlock(secret("password")).expect("unlock for dry-run");
+    let result = core
+        .import(source_dir.path(), true)
+        .expect("dry-run import");
+    assert_eq!(result.imported, 0, "dry_run must report imported=0");
+    core.lock();
+
+    // Vault bytes must be unchanged
+    let vault_bytes_after = std::fs::read(&vault_path).expect("read vault after dry-run");
+    assert_eq!(
+        vault_bytes_before, vault_bytes_after,
+        "vault bytes must be unchanged after dry-run"
+    );
+
+    // list still shows only 1 entry
+    core.unlock(secret("password"))
+        .expect("unlock for final list");
+    let entries = core.list_entries(None).expect("list after dry-run");
+    assert_eq!(
+        entries.len(),
+        1,
+        "vault must still have only 1 entry after dry-run"
+    );
+    core.lock();
+}
+
+// =============================================================================
+// TC-S6-05: import wiki-link 変換 + tag 抽出
+// =============================================================================
+
+/// TC-S6-05: import converts `[[link|alias]]` to `[[link]]` and extracts `#tags`.
+///
+/// Imports a Markdown file with a YAML frontmatter tag, an aliased wiki-link,
+/// and an inline `#tag`.  Verifies that:
+/// - body contains `[[Other Note]]` (alias removed)
+/// - body does not contain `[[Other Note|alias]]`
+/// - tags contain "diary" (frontmatter) and "work/project" (inline `#tag`)
+#[test]
+fn tc_s6_05_import_wiki_link_and_tag_extraction() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let vault_path = setup_vault(&dir, "s6_05_vault", b"password");
+
+    let source_dir = tempfile::tempdir().expect("source tempdir");
+
+    let content = "---\ntitle: Test Note\ntags: [diary]\n---\n\
+                   See [[Other Note|alias]] for details.\n\
+                   Working on #work/project today.\n";
+    std::fs::write(source_dir.path().join("test_note.md"), content).expect("write test_note.md");
+
+    let mut core = DiaryCore::new(vault_path.to_str().expect("utf8")).expect("DiaryCore::new");
+    core.unlock(secret("password")).expect("unlock");
+
+    core.import(source_dir.path(), false).expect("import");
+
+    // Find the imported entry
+    let entries = core.list_entries(None).expect("list_entries");
+    assert_eq!(entries.len(), 1, "must have exactly 1 imported entry");
+    assert_eq!(
+        entries[0].title, "Test Note",
+        "title must come from frontmatter"
+    );
+
+    // Retrieve full plaintext
+    let (_, plaintext) = core
+        .get_entry(&entries[0].uuid_hex[..8])
+        .expect("get_entry");
+
+    // body: alias removed → [[Other Note]] present, [[Other Note|alias]] absent
+    assert!(
+        plaintext.body.contains("[[Other Note]]"),
+        "body must contain [[Other Note]] after alias removal"
+    );
+    assert!(
+        !plaintext.body.contains("[[Other Note|alias]]"),
+        "body must not contain [[Other Note|alias]] after conversion"
+    );
+
+    // tags: "diary" from frontmatter, "work/project" extracted from #work/project
+    assert!(
+        plaintext.tags.contains(&"diary".to_string()),
+        "tags must contain 'diary' from frontmatter"
+    );
+    assert!(
+        plaintext.tags.contains(&"work/project".to_string()),
+        "tags must contain 'work/project' from inline #tag"
+    );
+
+    core.lock();
+}
+
+// =============================================================================
+// TC-S6-06: stats --json が valid JSON
+// =============================================================================
+
+/// TC-S6-06: `stats` output serialises to valid JSON with all required keys.
+///
+/// Serialises `VaultStats` to JSON via `serde_json` and verifies that the
+/// resulting string is parseable and contains the mandatory top-level keys.
+#[test]
+fn tc_s6_06_stats_json_valid() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let vault_path = setup_vault(&dir, "s6_06_vault", b"password");
+
+    let mut core = DiaryCore::new(vault_path.to_str().expect("utf8")).expect("DiaryCore::new");
+    core.unlock(secret("password")).expect("unlock");
+
+    // Add several entries with different tags
+    core.new_entry("Entry A", "Body A", vec!["tag1".to_string()])
+        .expect("new_entry A");
+    core.new_entry("Entry B", "Body B longer", vec!["tag2".to_string()])
+        .expect("new_entry B");
+    core.new_entry(
+        "Entry C",
+        "Body C even longer text",
+        vec!["tag1".to_string(), "tag2".to_string()],
+    )
+    .expect("new_entry C");
+
+    let stats = core.stats().expect("stats");
+
+    // Serialize to JSON — this is what `pq-diary stats --json` outputs
+    let json_str = serde_json::to_string(&stats).expect("serialize to JSON");
+
+    // Must parse back as valid JSON
+    let json_val: serde_json::Value =
+        serde_json::from_str(&json_str).expect("output must be valid JSON");
+
+    // Required top-level keys must exist
+    assert!(
+        json_val["entry_count"].is_number(),
+        "entry_count must be present and numeric"
+    );
+    assert!(
+        json_val["tag_count"].is_number(),
+        "tag_count must be present and numeric"
+    );
+    assert!(
+        json_val["char_stats"].is_object(),
+        "char_stats must be present and an object"
+    );
+    assert!(
+        json_val["tag_distribution"].is_array(),
+        "tag_distribution must be present and an array"
+    );
+
+    core.lock();
 }
 
 // =============================================================================

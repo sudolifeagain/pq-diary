@@ -8,44 +8,50 @@ set -euo pipefail
 # =============================================================================
 
 # === 設定 ===
-SPRINT_NAME="daily-note-template-link"
-SPRINT_TAG="s5"
+SPRINT_NAME="search-stats-import"
+SPRINT_TAG="s6"
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TASKS_DIR="${PROJECT_ROOT}/docs/tasks/${SPRINT_NAME}"
 PROMPTS_DIR="$(dirname "$0")/prompts"
 LOG_DIR="${PROJECT_ROOT}/logs/sprint-${SPRINT_NAME}"
 
 # タスク一覧 (依存順)
-TASKS=(TASK-0042 TASK-0043 TASK-0044 TASK-0045 TASK-0046 TASK-0047 TASK-0048 TASK-0049 TASK-0050 TASK-0051 TASK-0052)
+TASKS=(TASK-0053 TASK-0054 TASK-0055 TASK-0056 TASK-0057 TASK-0058 TASK-0059 TASK-0060 TASK-0061 TASK-0062 TASK-0063 TASK-0064 TASK-0065 TASK-0066)
 
 # タスクタイプ
 declare -A TASK_TYPES=(
-    [TASK-0042]="TDD"
-    [TASK-0043]="TDD"
-    [TASK-0044]="TDD"
-    [TASK-0045]="TDD"
-    [TASK-0046]="TDD"
-    [TASK-0047]="TDD"
-    [TASK-0048]="TDD"
-    [TASK-0049]="TDD"
-    [TASK-0050]="TDD"
-    [TASK-0051]="TDD"
-    [TASK-0052]="TDD"
+    [TASK-0053]="TDD"
+    [TASK-0054]="TDD"
+    [TASK-0055]="TDD"
+    [TASK-0056]="TDD"
+    [TASK-0057]="TDD"
+    [TASK-0058]="TDD"
+    [TASK-0059]="TDD"
+    [TASK-0060]="TDD"
+    [TASK-0061]="TDD"
+    [TASK-0062]="TDD"
+    [TASK-0063]="TDD"
+    [TASK-0064]="TDD"
+    [TASK-0065]="TDD"
+    [TASK-0066]="DIRECT"
 )
 
 # タスク名 (コミットメッセージ用)
 declare -A TASK_NAMES=(
-    [TASK-0042]="TemplatePlaintext type and template CRUD"
-    [TASK-0043]="template engine variable expansion"
-    [TASK-0044]="LinkParser for wiki-link syntax"
-    [TASK-0045]="LinkIndex backlink index"
-    [TASK-0046]="DiaryCore facade extension for template and link"
-    [TASK-0047]="template add list show delete CLI commands"
-    [TASK-0048]="new --template flag and variable prompt"
-    [TASK-0049]="today command"
-    [TASK-0050]="show command link resolution and backlinks"
-    [TASK-0051]="vim completion function"
-    [TASK-0052]="integration tests and doc comments"
+    [TASK-0053]="vault reader/writer hardening"
+    [TASK-0054]="password guard and hmac error handling"
+    [TASK-0055]="EntryPlaintext zeroize and editor security"
+    [TASK-0056]="VaultGuard drop guard pattern"
+    [TASK-0057]="Win32 console unsafe ADR"
+    [TASK-0058]="search core module"
+    [TASK-0059]="search CLI command"
+    [TASK-0060]="stats core module"
+    [TASK-0061]="stats CLI and heatmap"
+    [TASK-0062]="import core markdown parser"
+    [TASK-0063]="import batch write and directory walk"
+    [TASK-0064]="import CLI command"
+    [TASK-0065]="integration tests and doc comments"
+    [TASK-0066]="run-sprint.sh S6 config update"
 )
 
 # モデル設定

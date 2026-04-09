@@ -2,7 +2,7 @@ mod commands;
 mod editor;
 mod password;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 /// Post-quantum cryptography CLI journal.
 #[derive(Debug, Parser)]
@@ -30,6 +30,48 @@ pub struct Cli {
 
     #[command(subcommand)]
     pub command: Commands,
+}
+
+/// Arguments for the `stats` subcommand.
+#[derive(Debug, Args)]
+pub struct StatsArgs {
+    /// Output statistics as JSON.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Show ASCII heatmap of writing activity (last 52 weeks).
+    #[arg(long)]
+    pub heatmap: bool,
+}
+
+/// Arguments for the `import` subcommand.
+#[derive(Debug, Args)]
+pub struct ImportArgs {
+    /// Source directory containing .md files.
+    pub dir: std::path::PathBuf,
+
+    /// Preview import without writing to vault.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+/// Arguments for the `search` subcommand.
+#[derive(Debug, Args)]
+pub struct SearchArgs {
+    /// Regex pattern to search for.
+    pub pattern: String,
+
+    /// Filter by tag (prefix match).
+    #[arg(long)]
+    pub tag: Option<String>,
+
+    /// Number of context lines around matches (default: 2).
+    #[arg(long, default_value = "2")]
+    pub context: usize,
+
+    /// Show match count only.
+    #[arg(long)]
+    pub count: bool,
 }
 
 /// Top-level subcommands for pq-diary.
@@ -156,20 +198,14 @@ pub enum Commands {
     /// Open or create today's diary entry
     Today,
 
-    /// Search diary entries by keyword
-    Search {
-        /// Search query string
-        query: String,
-    },
+    /// Search entries by regex pattern.
+    Search(SearchArgs),
 
-    /// Show diary statistics
-    Stats,
+    /// Show vault statistics.
+    Stats(StatsArgs),
 
-    /// Import entries from an external source
-    Import {
-        /// Source file or directory path
-        source: String,
-    },
+    /// Import Markdown files from a directory.
+    Import(ImportArgs),
 
     /// Manage entry templates
     Template {
@@ -321,9 +357,9 @@ fn dispatch(cli: &Cli) -> anyhow::Result<()> {
             DaemonCommands::Lock => not_implemented("daemon lock", "Sprint 10"),
         },
         Commands::Today => commands::cmd_today(cli),
-        Commands::Search { .. } => not_implemented("search", "Sprint 5"),
-        Commands::Stats => not_implemented("stats", "Sprint 5"),
-        Commands::Import { .. } => not_implemented("import", "Sprint 6"),
+        Commands::Search(args) => commands::cmd_search(cli, args),
+        Commands::Stats(args) => commands::cmd_stats(cli, args),
+        Commands::Import(args) => commands::cmd_import(cli, args),
         Commands::Template { subcommand } => match subcommand {
             TemplateCommands::Add { name } => commands::cmd_template_add(cli, name.clone()),
             TemplateCommands::List => commands::cmd_template_list(cli),
@@ -651,6 +687,95 @@ mod tests {
                 assert_eq!(tag, vec!["work".to_string()]);
             }
             _ => panic!("Expected Commands::New"),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Commands::Search parsing tests (TASK-0059)
+    // -------------------------------------------------------------------------
+
+    /// TC-0059-P01: `search "hello"` parses pattern with default options.
+    #[test]
+    fn tc_0059_p01_search_basic_pattern() {
+        let result = Cli::try_parse_from(["pq-diary", "search", "hello"]);
+        assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
+        let cli = result.unwrap();
+        match cli.command {
+            Commands::Search(args) => {
+                assert_eq!(args.pattern, "hello");
+                assert_eq!(args.tag, None);
+                assert_eq!(args.context, 2);
+                assert!(!args.count);
+            }
+            _ => panic!("Expected Commands::Search"),
+        }
+    }
+
+    /// TC-0059-P02: `search --tag "日記" "pattern"` parses tag flag.
+    #[test]
+    fn tc_0059_p02_search_with_tag() {
+        let result = Cli::try_parse_from(["pq-diary", "search", "--tag", "日記", "hello"]);
+        assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
+        let cli = result.unwrap();
+        match cli.command {
+            Commands::Search(args) => {
+                assert_eq!(args.tag, Some("日記".to_string()));
+            }
+            _ => panic!("Expected Commands::Search"),
+        }
+    }
+
+    /// TC-0059-P03: `search --context 0 "pattern"` parses context=0.
+    #[test]
+    fn tc_0059_p03_search_with_context_0() {
+        let result = Cli::try_parse_from(["pq-diary", "search", "--context", "0", "hello"]);
+        assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
+        let cli = result.unwrap();
+        match cli.command {
+            Commands::Search(args) => {
+                assert_eq!(args.context, 0);
+            }
+            _ => panic!("Expected Commands::Search"),
+        }
+    }
+
+    /// TC-0059-P04: `search --count "pattern"` parses count flag.
+    #[test]
+    fn tc_0059_p04_search_with_count() {
+        let result = Cli::try_parse_from(["pq-diary", "search", "--count", "hello"]);
+        assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
+        let cli = result.unwrap();
+        match cli.command {
+            Commands::Search(args) => {
+                assert!(args.count);
+            }
+            _ => panic!("Expected Commands::Search"),
+        }
+    }
+
+    /// TC-0059-P05: Combined --tag, --context, --count parse correctly together.
+    #[test]
+    fn tc_0059_p05_search_combined_flags() {
+        let result = Cli::try_parse_from([
+            "pq-diary",
+            "search",
+            "--tag",
+            "tech",
+            "--context",
+            "5",
+            "--count",
+            r"\d+",
+        ]);
+        assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
+        let cli = result.unwrap();
+        match cli.command {
+            Commands::Search(args) => {
+                assert_eq!(args.pattern, r"\d+");
+                assert_eq!(args.tag, Some("tech".to_string()));
+                assert_eq!(args.context, 5);
+                assert!(args.count);
+            }
+            _ => panic!("Expected Commands::Search"),
         }
     }
 }

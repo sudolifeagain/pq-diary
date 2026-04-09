@@ -19,12 +19,18 @@ pub mod entry;
 pub mod error;
 /// Git synchronisation operations (implemented in Sprint 8).
 pub mod git;
+/// Obsidian-compatible Markdown file importer (implemented in Sprint 6).
+pub mod importer;
 /// Digital-legacy operations (implemented in Phase 2).
 pub mod legacy;
 /// `[[title]]` wiki-link parser (implemented in Sprint 5).
 pub mod link;
 /// Access-policy evaluation (implemented in Sprint 7).
 pub mod policy;
+/// Full-text regex search across vault entries (implemented in Sprint 6).
+pub mod search;
+/// Vault-wide statistics collection (implemented in Sprint 6).
+pub mod stats;
 /// Template CRUD operations (implemented in Sprint 5).
 pub mod template;
 /// Template variable extraction and expansion engine (implemented in Sprint 5).
@@ -133,10 +139,17 @@ impl DiaryCore {
         self.engine = Some(engine);
 
         // Build the link index from all current entries.
-        let entries_with_body = {
+        // list_entries_with_body returns Zeroizing<String> bodies; convert to
+        // plain Strings for LinkIndex::build.  The intermediate Vec is dropped
+        // immediately after index construction.
+        let zeroizing_entries = {
             let e = self.require_engine()?;
             entry::list_entries_with_body(&self.vault_path, e)?
         };
+        let entries_with_body: Vec<(entry::EntryMeta, String)> = zeroizing_entries
+            .into_iter()
+            .map(|(meta, body)| (meta, body.as_str().to_owned()))
+            .collect();
         self.link_index = Some(link::LinkIndex::build(&entries_with_body));
 
         Ok(())
@@ -392,6 +405,80 @@ impl DiaryCore {
     pub fn all_titles(&self) -> Result<Vec<String>, DiaryError> {
         let index = self.link_index.as_ref().ok_or(DiaryError::NotUnlocked)?;
         Ok(index.all_titles())
+    }
+
+    // =========================================================================
+    // Stats operations
+    // =========================================================================
+
+    /// Collect vault-wide statistics.
+    ///
+    /// Iterates over all journal entry records, decrypts each one, and
+    /// aggregates entry count, character statistics, tag distribution, and
+    /// daily activity into a [`stats::VaultStats`] value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DiaryError::NotUnlocked`] if the vault is locked.
+    /// Returns [`DiaryError::Entry`] if JSON deserialisation fails.
+    /// Returns [`DiaryError::Crypto`] on decryption failure.
+    /// Returns [`DiaryError::Io`] on vault I/O failure.
+    pub fn stats(&self) -> Result<stats::VaultStats, DiaryError> {
+        let engine = self.require_engine()?;
+        stats::collect_stats(&self.vault_path, engine)
+    }
+
+    // =========================================================================
+    // Import operations
+    // =========================================================================
+
+    /// Import all Markdown files from `source_dir` into the vault.
+    ///
+    /// Recursively walks `source_dir`, skipping `.obsidian/` directories and
+    /// non-`.md` files.  Each `.md` file is parsed and imported as a journal
+    /// entry.  All entries are written with a single `write_vault` call.
+    ///
+    /// When `dry_run` is `true` the vault is not modified; the returned
+    /// [`importer::ImportResult`] has `imported: 0` and the other fields
+    /// reflect what *would* have happened.
+    ///
+    /// Source files are **never** deleted or modified.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DiaryError::NotUnlocked`] if the vault is locked.
+    /// Returns [`DiaryError::Import`] if `source_dir` does not exist or contains
+    ///   no `.md` files.
+    /// Returns [`DiaryError::Io`] on file-read or vault I/O failure.
+    /// Returns [`DiaryError::Crypto`] on encryption or signing failure.
+    pub fn import(
+        &self,
+        source_dir: &std::path::Path,
+        dry_run: bool,
+    ) -> Result<importer::ImportResult, DiaryError> {
+        let engine = self.require_engine()?;
+        importer::import_directory(&self.vault_path, engine, source_dir, dry_run)
+    }
+
+    // =========================================================================
+    // Search operations
+    // =========================================================================
+
+    /// Search all journal entries and templates for `query.pattern`.
+    ///
+    /// Uses a streaming strategy: each record is decrypted, searched, and its
+    /// plaintext is zeroed via [`zeroize::ZeroizeOnDrop`] before the next
+    /// record is processed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DiaryError::NotUnlocked`] if the vault is locked.
+    /// Returns [`DiaryError::Search`] if `query.pattern` is not a valid regex.
+    /// Returns [`DiaryError::Io`] on vault I/O failure.
+    /// Returns [`DiaryError::Crypto`] on decryption failure.
+    pub fn search(&self, query: &search::SearchQuery) -> Result<search::SearchResults, DiaryError> {
+        let engine = self.require_engine()?;
+        search::search_entries(&self.vault_path, engine, query)
     }
 }
 

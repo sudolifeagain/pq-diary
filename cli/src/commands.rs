@@ -1159,6 +1159,108 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Search command
+// ---------------------------------------------------------------------------
+
+/// Execute the `pq-diary search` command, writing output to stdout.
+///
+/// Searches all vault entries for `args.pattern` (a regular expression) and
+/// prints matches in a grep-like format.  The `VaultGuard` pattern ensures
+/// the vault is locked on every exit path.
+///
+/// # Errors
+///
+/// Returns an error if password acquisition, vault unlock, or search fails.
+pub fn cmd_search(cli: &Cli, args: &crate::SearchArgs) -> anyhow::Result<()> {
+    cmd_search_to(cli, args, &mut std::io::stdout())
+}
+
+/// Inner implementation of [`cmd_search`] that writes output to `out`.
+///
+/// Separated from `cmd_search` to enable output capture in tests.
+pub(crate) fn cmd_search_to(
+    cli: &Cli,
+    args: &crate::SearchArgs,
+    out: &mut dyn std::io::Write,
+) -> anyhow::Result<()> {
+    use pq_diary_core::search::SearchQuery;
+    use secrecy::{ExposeSecret as _, SecretBox};
+
+    let password_source =
+        get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let vault_path = resolve_vault_path(cli)?;
+    let vault_str = vault_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Vault path contains non-UTF-8 characters"))?;
+
+    let mut core = DiaryCore::new(vault_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let secret_password: secrecy::SecretString =
+        SecretBox::new(Box::from(password_source.secret().expose_secret()));
+    core.unlock(secret_password)
+        .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+    let guard = VaultGuard::new(&mut core);
+
+    let query = SearchQuery {
+        pattern: args.pattern.clone(),
+        tag_filter: args.tag.clone(),
+        context_lines: args.context,
+        count_only: args.count,
+    };
+
+    let results = guard.search(&query).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if args.count {
+        writeln!(out, "{} entries matched", results.matched_entry_count)?;
+    } else if results.matches.is_empty() {
+        writeln!(out, "No matches found")?;
+    } else {
+        write_search_results(&results, out)?;
+    }
+
+    // guard drops here, automatically calling lock().
+    Ok(())
+}
+
+/// Write search results to `out` in grep-like format.
+///
+/// Each [`SearchMatch`] is printed as a header line followed by context blocks.
+/// Consecutive matches are separated by `--`.
+fn write_search_results(
+    results: &pq_diary_core::search::SearchResults,
+    out: &mut dyn std::io::Write,
+) -> anyhow::Result<()> {
+    let mut first = true;
+    for m in &results.matches {
+        if !first {
+            writeln!(out, "--")?;
+        }
+        first = false;
+
+        let id_prefix = if m.uuid_hex.len() >= 8 {
+            &m.uuid_hex[..8]
+        } else {
+            m.uuid_hex.as_str()
+        };
+        let date = format_timestamp(m.updated_at);
+        writeln!(out, "{id_prefix} {date} {}", m.title)?;
+
+        for block in &m.context_blocks {
+            for (line_num, content, is_match) in &block.lines {
+                if *is_match {
+                    writeln!(out, "> {line_num}: {content}")?;
+                } else {
+                    writeln!(out, "  {line_num}: {content}")?;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -3156,5 +3258,217 @@ mod tests {
             list_result.is_err(),
             "core must be locked after VaultGuard drop on error path"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // TASK-0059: cmd_search tests
+    // -------------------------------------------------------------------------
+
+    /// Set up a fresh vault for search tests and return its directory path.
+    fn setup_search_vault(dir: &tempfile::TempDir) -> PathBuf {
+        use pq_diary_core::vault::init::VaultManager;
+        let mgr = VaultManager::new(dir.path().to_path_buf())
+            .expect("VaultManager::new")
+            .with_kdf_params(fast_params());
+        mgr.init_vault("sv", b"password").expect("init_vault");
+        dir.path().join("sv")
+    }
+
+    /// Add an entry to the vault at `vault_dir` with password "password".
+    fn add_entry(vault_dir: &PathBuf, title: &str, body: &str, tags: Vec<String>) {
+        let vault_pqd = vault_dir.join("vault.pqd");
+        let mut core = DiaryCore::new(vault_pqd.to_str().expect("utf8")).expect("DiaryCore::new");
+        let pw: secrecy::SecretString = secrecy::SecretBox::new(Box::from("password"));
+        core.unlock(pw).expect("unlock");
+        core.new_entry(title, body, tags).expect("new_entry");
+        core.lock();
+    }
+
+    /// Parse a `Cli` with the `search` subcommand targeting `vault_dir`.
+    fn parse_search_cli(vault_dir_str: &str, extra: &[&str]) -> crate::Cli {
+        let mut args = vec![
+            "pq-diary",
+            "-v",
+            vault_dir_str,
+            "--password",
+            "password",
+            "search",
+        ];
+        args.extend_from_slice(extra);
+        crate::Cli::try_parse_from(&args).expect("parse test CLI")
+    }
+
+    /// Extract `SearchArgs` from a parsed `Cli`.
+    fn extract_search_args(cli: &crate::Cli) -> &crate::SearchArgs {
+        match &cli.command {
+            crate::Commands::Search(a) => a,
+            _ => panic!("Expected Commands::Search"),
+        }
+    }
+
+    /// TC-B04-01: Output header format is `{8-char hex} {YYYY-MM-DD} {title}`.
+    #[test]
+    fn tc_b04_01_output_id_prefix_date_title() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_search_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        add_entry(&vault_dir, "テスト記事", "今日は晴れ", vec![]);
+
+        let cli = parse_search_cli(vault_dir_str, &["晴れ"]);
+        let args = extract_search_args(&cli);
+
+        let mut out = Vec::new();
+        cmd_search_to(&cli, args, &mut out).expect("cmd_search_to");
+        let output = String::from_utf8(out).expect("utf8");
+
+        let first_line = output.lines().next().expect("output must have lines");
+        let parts: Vec<&str> = first_line.splitn(3, ' ').collect();
+        assert_eq!(parts.len(), 3, "header must have 3 space-separated parts");
+        assert_eq!(parts[0].len(), 8, "id prefix must be 8 chars");
+        assert!(
+            parts[0].chars().all(|c| c.is_ascii_hexdigit()),
+            "id prefix must be hex digits: {:?}",
+            parts[0]
+        );
+        // Date format YYYY-MM-DD
+        assert!(
+            parts[1].len() == 10 && parts[1].chars().nth(4) == Some('-'),
+            "date must be YYYY-MM-DD: {:?}",
+            parts[1]
+        );
+        assert_eq!(parts[2], "テスト記事");
+    }
+
+    /// TC-B05-03: `--context 0` shows only the match line, no surrounding lines.
+    #[test]
+    fn tc_b05_03_context_0_shows_only_match_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_search_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        add_entry(&vault_dir, "テスト", "前の行\nTARGET行\n後の行", vec![]);
+
+        let cli = parse_search_cli(vault_dir_str, &["--context", "0", "TARGET"]);
+        let args = extract_search_args(&cli);
+
+        let mut out = Vec::new();
+        cmd_search_to(&cli, args, &mut out).expect("cmd_search_to");
+        let output = String::from_utf8(out).expect("utf8");
+
+        assert!(!output.contains("前の行"), "pre-context must not appear");
+        assert!(!output.contains("後の行"), "post-context must not appear");
+        assert!(output.contains("TARGET行"), "match line must appear");
+    }
+
+    /// TC-B06-01: `--tag "日記"` returns only entries tagged "日記".
+    #[test]
+    fn tc_b06_01_tag_filter_restricts_results() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_search_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        add_entry(
+            &vault_dir,
+            "日記記事",
+            "検索対象テキスト",
+            vec!["日記".to_string()],
+        );
+        add_entry(
+            &vault_dir,
+            "技術記事",
+            "検索対象テキスト",
+            vec!["技術".to_string()],
+        );
+
+        let cli = parse_search_cli(vault_dir_str, &["--tag", "日記", "検索対象テキスト"]);
+        let args = extract_search_args(&cli);
+
+        let mut out = Vec::new();
+        cmd_search_to(&cli, args, &mut out).expect("cmd_search_to");
+        let output = String::from_utf8(out).expect("utf8");
+
+        assert!(output.contains("日記記事"), "must include 日記 entry");
+        assert!(!output.contains("技術記事"), "must not include 技術 entry");
+    }
+
+    /// TC-B07-01: `--count` outputs "{n} entries matched" for n > 0.
+    #[test]
+    fn tc_b07_01_count_mode_two_matches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_search_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        add_entry(&vault_dir, "一致1", "MATCH_WORD ここにある", vec![]);
+        add_entry(&vault_dir, "一致2", "MATCH_WORD ここにも", vec![]);
+        add_entry(&vault_dir, "不一致", "no match here", vec![]);
+
+        let cli = parse_search_cli(vault_dir_str, &["--count", "MATCH_WORD"]);
+        let args = extract_search_args(&cli);
+
+        let mut out = Vec::new();
+        cmd_search_to(&cli, args, &mut out).expect("cmd_search_to");
+        let output = String::from_utf8(out).expect("utf8").trim().to_string();
+
+        assert_eq!(output, "2 entries matched");
+    }
+
+    /// TC-B07-02: `--count` outputs "0 entries matched" when nothing matches.
+    #[test]
+    fn tc_b07_02_count_zero_when_no_match() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_search_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        add_entry(&vault_dir, "記事", "内容", vec![]);
+
+        let cli = parse_search_cli(vault_dir_str, &["--count", "NOMATCH_ZZZZZ"]);
+        let args = extract_search_args(&cli);
+
+        let mut out = Vec::new();
+        cmd_search_to(&cli, args, &mut out).expect("cmd_search_to");
+        let output = String::from_utf8(out).expect("utf8").trim().to_string();
+
+        assert_eq!(output, "0 entries matched");
+    }
+
+    /// TC-EDGE-01: Invalid regex pattern returns an error containing "regex" or "pattern".
+    #[test]
+    fn tc_edge_01_invalid_regex_returns_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_search_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let cli = parse_search_cli(vault_dir_str, &["[invalid"]);
+        let args = extract_search_args(&cli);
+
+        let mut out = Vec::new();
+        let result = cmd_search_to(&cli, args, &mut out);
+
+        assert!(result.is_err(), "invalid regex must return Err");
+        let msg = result.unwrap_err().to_string().to_lowercase();
+        assert!(
+            msg.contains("regex") || msg.contains("pattern"),
+            "error must mention regex/pattern: {msg}"
+        );
+    }
+
+    /// TC-EDGE-02: Empty vault produces "No matches found".
+    #[test]
+    fn tc_edge_02_empty_vault_no_matches_found() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_search_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        // No entries added — vault is empty.
+
+        let cli = parse_search_cli(vault_dir_str, &["anything"]);
+        let args = extract_search_args(&cli);
+
+        let mut out = Vec::new();
+        cmd_search_to(&cli, args, &mut out).expect("cmd_search_to");
+        let output = String::from_utf8(out).expect("utf8").trim().to_string();
+
+        assert_eq!(output, "No matches found");
     }
 }

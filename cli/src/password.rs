@@ -60,6 +60,9 @@ pub fn get_password(flag_value: Option<&str>) -> Result<PasswordSource, DiaryErr
 
     // Stage 2: PQ_DIARY_PASSWORD environment variable
     if let Ok(env_pass) = std::env::var("PQ_DIARY_PASSWORD") {
+        // Remove the variable immediately to prevent child processes or memory
+        // dumps from leaking the password via the environment.
+        std::env::remove_var("PQ_DIARY_PASSWORD");
         return Ok(PasswordSource::Env(SecretBox::new(
             env_pass.into_boxed_str(),
         )));
@@ -390,11 +393,28 @@ mod tests {
 
         std::env::set_var("PQ_DIARY_PASSWORD", "");
         let result = get_password(None);
+        // Note: get_password removes the var; the remove_var below is a no-op.
         std::env::remove_var("PQ_DIARY_PASSWORD");
 
         assert!(result.is_ok(), "Empty password via env var must not panic");
         let source = result.unwrap();
         assert!(matches!(source, PasswordSource::Env(_)));
         assert_eq!(source.secret().expose_secret(), "");
+    }
+
+    /// TC-A07-01: `PQ_DIARY_PASSWORD` is removed from the environment immediately
+    /// after `get_password` reads it, so child processes cannot inherit it.
+    #[test]
+    fn tc_a07_01_env_var_removed_after_read() {
+        let _lock = ENV_LOCK.lock().unwrap();
+
+        std::env::set_var("PQ_DIARY_PASSWORD", "secret_a07_01");
+        let result = get_password(None);
+        assert!(result.is_ok(), "Expected Ok, got: {:?}", result.err());
+
+        assert!(
+            std::env::var("PQ_DIARY_PASSWORD").is_err(),
+            "PQ_DIARY_PASSWORD must be absent from the environment after get_password returns"
+        );
     }
 }

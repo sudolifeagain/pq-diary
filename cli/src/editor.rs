@@ -169,7 +169,7 @@ pub fn write_header_file(tmpdir: &Path, plaintext: &EntryPlaintext) -> Result<Pa
         plaintext.title, tags_str, plaintext.body
     );
 
-    let mut file = std::fs::File::create(&path)?;
+    let mut file = create_tmpfile(&path)?;
     file.write_all(content.as_bytes())?;
 
     Ok(path)
@@ -250,7 +250,7 @@ pub fn read_header_file(path: &Path) -> Result<HeaderComment, DiaryError> {
 pub fn write_template_file(tmpdir: &Path) -> Result<PathBuf, DiaryError> {
     let filename = format!("{}.md", uuid::Uuid::new_v4().as_simple());
     let path = tmpdir.join(&filename);
-    std::fs::File::create(&path)?;
+    create_tmpfile(&path)?;
     Ok(path)
 }
 
@@ -276,10 +276,12 @@ pub fn read_template_file(path: &Path) -> Result<String, DiaryError> {
 ///
 /// Returns [`DiaryError::Io`] on file creation or write failure.
 pub fn write_completion_file(tmpdir: &Path, titles: &[String]) -> Result<PathBuf, DiaryError> {
+    use std::io::Write as _;
     let filename = format!("{}.completion", uuid::Uuid::new_v4().as_simple());
     let path = tmpdir.join(&filename);
     let content = titles.join("\n");
-    std::fs::write(&path, content.as_bytes())?;
+    let mut file = create_tmpfile(&path)?;
+    file.write_all(content.as_bytes())?;
     Ok(path)
 }
 
@@ -402,9 +404,10 @@ fn vim_completion_options_for(command: &str, completion_file: &Path) -> Vec<Stri
 
 /// Returns the vim/neovim security options for the given editor command.
 ///
-/// Returns `["-c", "set noswapfile nobackup noundofile"]` when the basename
-/// of `command` is `"vim"` or `"nvim"` (`.exe` suffix is stripped on Windows).
-/// Returns an empty vector for all other editors.
+/// - For `vim`: returns `["-c", "set noswapfile nobackup noundofile nowritebackup viminfo=''"]`.
+/// - For `nvim`: returns `["-c", "set noswapfile nobackup noundofile nowritebackup shada=''"]`.
+/// - `.exe` suffix is stripped on Windows before the basename comparison.
+/// - Returns an empty vector for all other editors.
 fn vim_options_for(command: &str) -> Vec<String> {
     let basename = Path::new(command)
         .file_name()
@@ -413,13 +416,42 @@ fn vim_options_for(command: &str) -> Vec<String> {
 
     let basename = basename.strip_suffix(".exe").unwrap_or(basename);
 
-    if basename == "vim" || basename == "nvim" {
-        vec![
+    match basename {
+        "vim" => vec![
             "-c".to_string(),
-            "set noswapfile nobackup noundofile".to_string(),
-        ]
-    } else {
-        vec![]
+            "set noswapfile nobackup noundofile nowritebackup viminfo=''".to_string(),
+        ],
+        "nvim" => vec![
+            "-c".to_string(),
+            "set noswapfile nobackup noundofile nowritebackup shada=''".to_string(),
+        ],
+        _ => vec![],
+    }
+}
+
+/// Creates a file at `path` with owner-only permissions.
+///
+/// On Unix, the file is created with `0o600` mode so that other users on the
+/// same system cannot read the temporary plaintext content.
+/// On non-Unix platforms, falls back to `std::fs::File::create`.
+///
+/// # Errors
+///
+/// Returns [`DiaryError::Io`] if the file cannot be created.
+fn create_tmpfile(path: &Path) -> Result<std::fs::File, DiaryError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(DiaryError::from)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::File::create(path).map_err(DiaryError::from)
     }
 }
 
@@ -813,7 +845,7 @@ mod tests {
     // vim option detection tests (TASK-0036)
     // -------------------------------------------------------------------------
 
-    /// TC-0036-08: "vim" command → security options are added.
+    /// TC-0036-08: "vim" command → security options include nowritebackup and viminfo=''.
     #[test]
     fn tc_0036_08_vim_options_for_vim() {
         let opts = vim_options_for("vim");
@@ -821,12 +853,12 @@ mod tests {
             opts,
             vec![
                 "-c".to_string(),
-                "set noswapfile nobackup noundofile".to_string()
+                "set noswapfile nobackup noundofile nowritebackup viminfo=''".to_string()
             ]
         );
     }
 
-    /// TC-0036-09: "nvim" command → security options are added.
+    /// TC-0036-09: "nvim" command → security options include nowritebackup and shada=''.
     #[test]
     fn tc_0036_09_vim_options_for_nvim() {
         let opts = vim_options_for("nvim");
@@ -834,7 +866,7 @@ mod tests {
             opts,
             vec![
                 "-c".to_string(),
-                "set noswapfile nobackup noundofile".to_string()
+                "set noswapfile nobackup noundofile nowritebackup shada=''".to_string()
             ]
         );
     }
@@ -848,7 +880,7 @@ mod tests {
             opts,
             vec![
                 "-c".to_string(),
-                "set noswapfile nobackup noundofile".to_string()
+                "set noswapfile nobackup noundofile nowritebackup viminfo=''".to_string()
             ]
         );
     }
@@ -878,7 +910,7 @@ mod tests {
         }
     }
 
-    /// TC-0036-14: vim.exe on Windows path → security options are added.
+    /// TC-0036-14: vim.exe on Windows path → security options include nowritebackup and viminfo=''.
     #[test]
     fn tc_0036_14_vim_exe_windows() {
         let opts = vim_options_for("vim.exe");
@@ -886,7 +918,7 @@ mod tests {
             opts,
             vec![
                 "-c".to_string(),
-                "set noswapfile nobackup noundofile".to_string()
+                "set noswapfile nobackup noundofile nowritebackup viminfo=''".to_string()
             ]
         );
     }
@@ -1052,6 +1084,59 @@ mod tests {
             dir.path(),
             "File must be inside the given tmpdir"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // TASK-0055: vim security options and tmpfile permissions
+    // -------------------------------------------------------------------------
+
+    /// TC-A06-01: vim and nvim options both contain "nowritebackup".
+    #[test]
+    fn tc_a06_01_vim_options_include_nowritebackup() {
+        let vim_opts = vim_options_for("vim");
+        assert!(
+            vim_opts.iter().any(|s| s.contains("nowritebackup")),
+            "vim options must contain nowritebackup: {vim_opts:?}"
+        );
+
+        let nvim_opts = vim_options_for("nvim");
+        assert!(
+            nvim_opts.iter().any(|s| s.contains("nowritebackup")),
+            "nvim options must contain nowritebackup: {nvim_opts:?}"
+        );
+    }
+
+    /// TC-A06-02: vim options contain `viminfo=''`; nvim options contain `shada=''`.
+    #[test]
+    fn tc_a06_02_vim_options_include_viminfo_shada() {
+        let vim_opts = vim_options_for("vim");
+        assert!(
+            vim_opts.iter().any(|s| s.contains("viminfo=''")),
+            "vim options must contain viminfo='': {vim_opts:?}"
+        );
+
+        let nvim_opts = vim_options_for("nvim");
+        assert!(
+            nvim_opts.iter().any(|s| s.contains("shada=''")),
+            "nvim options must contain shada='': {nvim_opts:?}"
+        );
+    }
+
+    /// TC-A08-01 (Unix): write_header_file creates the tmpfile with 0o600 permissions.
+    #[cfg(unix)]
+    #[test]
+    fn tc_a08_01_tmpfile_permissions_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plaintext = make_plaintext("Perm Test", vec![], "body");
+        let path = write_header_file(dir.path(), &plaintext).expect("write_header_file");
+
+        let perms = std::fs::metadata(&path)
+            .expect("metadata failed")
+            .permissions();
+        let mode = perms.mode() & 0o777;
+        assert_eq!(mode, 0o600, "Expected 0o600, got 0o{mode:o}");
     }
 
     /// vim_completion_options_for includes the completion file path in the script.

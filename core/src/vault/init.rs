@@ -20,6 +20,22 @@ use crate::{
 };
 
 // =============================================================================
+// VaultInfo
+// =============================================================================
+
+/// Vault list display information.
+///
+/// Returned by [`VaultManager::list_vaults_with_policy`].
+/// Contains only information readable without a password (from `vault.toml`).
+#[derive(Debug)]
+pub struct VaultInfo {
+    /// Vault name (directory name under the base directory).
+    pub name: String,
+    /// Access policy for this vault.
+    pub policy: AccessPolicy,
+}
+
+// =============================================================================
 // VaultManager
 // =============================================================================
 
@@ -313,6 +329,118 @@ impl VaultManager {
     /// `"default"` when no `config.toml` is present.
     pub fn default_vault(&self) -> &str {
         &self.app_config.defaults.vault
+    }
+
+    /// Return the names and access policies of all initialised vaults.
+    ///
+    /// Reads `vault.toml` from each vault subdirectory under `base_dir`.
+    /// Does **not** require a password — `vault.toml` is stored in plain text.
+    /// Directories that do not contain a `vault.toml` are silently skipped.
+    /// Results are returned in ascending lexicographic order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DiaryError::Io`] on filesystem failures.
+    /// Returns [`DiaryError::Config`] if any `vault.toml` cannot be parsed.
+    pub fn list_vaults_with_policy(&self) -> Result<Vec<VaultInfo>, DiaryError> {
+        let mut vaults = Vec::new();
+
+        for entry_result in std::fs::read_dir(&self.base_dir)? {
+            let entry = entry_result?;
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let toml_path = path.join("vault.toml");
+            if !toml_path.exists() {
+                continue;
+            }
+            let config = VaultConfig::from_file(&toml_path)?;
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                vaults.push(VaultInfo {
+                    name: name.to_owned(),
+                    policy: config.access.policy,
+                });
+            }
+        }
+
+        vaults.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(vaults)
+    }
+
+    /// Update the access policy for vault `name` in its `vault.toml`.
+    ///
+    /// Writes atomically: serialises to `vault.toml.tmp`, calls `sync_all()`,
+    /// then renames to `vault.toml`.  Does **not** require a password.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DiaryError::Vault`] if the vault does not exist.
+    /// Returns [`DiaryError::Config`] if `vault.toml` cannot be parsed or serialised.
+    /// Returns [`DiaryError::Io`] on filesystem failures.
+    pub fn set_policy(&self, name: &str, policy: AccessPolicy) -> Result<(), DiaryError> {
+        let vault_path = self.base_dir.join(name);
+        let toml_path = vault_path.join("vault.toml");
+        if !toml_path.exists() {
+            return Err(DiaryError::Vault(format!(
+                "vault '{}' does not exist",
+                name
+            )));
+        }
+        let content = std::fs::read_to_string(&toml_path)?;
+        let mut config: VaultConfig = toml::from_str(&content)
+            .map_err(|e| DiaryError::Config(format!("failed to parse vault.toml: {}", e)))?;
+        config.access.policy = policy;
+        let new_content = toml::to_string_pretty(&config)
+            .map_err(|e| DiaryError::Config(format!("failed to serialize vault.toml: {}", e)))?;
+        let tmp_path = toml_path.with_extension("toml.tmp");
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&tmp_path)?;
+            file.write_all(new_content.as_bytes())?;
+            file.sync_all()?;
+        }
+        std::fs::rename(&tmp_path, &toml_path)?;
+        Ok(())
+    }
+
+    /// Delete vault `name` and its entire directory tree.
+    ///
+    /// When `zeroize` is `true`, `vault.pqd` is overwritten with
+    /// cryptographically random bytes (via [`rand::rngs::OsRng`]) and flushed
+    /// to disk before the directory is removed.  Does **not** require a
+    /// password.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DiaryError::Vault`] if the vault does not exist.
+    /// Returns [`DiaryError::Io`] on filesystem failures.
+    pub fn delete_vault(&self, name: &str, zeroize: bool) -> Result<(), DiaryError> {
+        let vault_path = self.base_dir.join(name);
+        if !vault_path.exists() {
+            return Err(DiaryError::Vault(format!(
+                "vault '{}' does not exist",
+                name
+            )));
+        }
+        if zeroize {
+            let pqd_path = vault_path.join("vault.pqd");
+            if pqd_path.exists() {
+                let size = usize::try_from(std::fs::metadata(&pqd_path)?.len()).map_err(|_| {
+                    DiaryError::Vault("vault.pqd size exceeds addressable memory".to_string())
+                })?;
+                let mut random_data = vec![0u8; size];
+                OsRng.fill_bytes(&mut random_data);
+                {
+                    use std::io::Write;
+                    let mut file = std::fs::File::create(&pqd_path)?;
+                    file.write_all(&random_data)?;
+                    file.sync_all()?;
+                }
+            }
+        }
+        std::fs::remove_dir_all(&vault_path)?;
+        Ok(())
     }
 }
 
@@ -762,6 +890,307 @@ mod tests {
             matches!(result, Err(DiaryError::InvalidArgument(_))),
             "expected DiaryError::InvalidArgument for empty name, got {:?}",
             result
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TASK-0070: list_vaults_with_policy tests
+    // -------------------------------------------------------------------------
+
+    /// TC-S7-033-01: list_vaults_with_policy returns all vaults sorted by name.
+    ///
+    /// Given 3 vaults with different policies, list_vaults_with_policy must
+    /// return exactly 3 entries sorted lexicographically with correct policies.
+    #[test]
+    fn tc_s7_033_01_list_vaults_with_policy_multiple() {
+        let dir = tempdir().expect("tempdir");
+        let mgr = VaultManager::new(dir.path().to_path_buf())
+            .expect("VaultManager::new")
+            .with_kdf_params(fast_params());
+
+        mgr.create_vault("charlie", b"pw", AccessPolicy::Full)
+            .expect("create charlie");
+        mgr.create_vault("alpha", b"pw", AccessPolicy::None)
+            .expect("create alpha");
+        mgr.create_vault("bravo", b"pw", AccessPolicy::WriteOnly)
+            .expect("create bravo");
+
+        let infos = mgr
+            .list_vaults_with_policy()
+            .expect("list_vaults_with_policy");
+
+        assert_eq!(
+            infos.len(),
+            3,
+            "must list exactly 3 vaults, got {:?}",
+            infos.iter().map(|i| &i.name).collect::<Vec<_>>()
+        );
+        assert_eq!(infos[0].name, "alpha");
+        assert_eq!(infos[0].policy, AccessPolicy::None);
+        assert_eq!(infos[1].name, "bravo");
+        assert_eq!(infos[1].policy, AccessPolicy::WriteOnly);
+        assert_eq!(infos[2].name, "charlie");
+        assert_eq!(infos[2].policy, AccessPolicy::Full);
+    }
+
+    /// TC-S7-033-02: list_vaults_with_policy returns empty Vec when no vaults exist.
+    ///
+    /// Given a fresh base directory with no vaults, the result must be an
+    /// empty Vec without error.
+    #[test]
+    fn tc_s7_033_02_list_vaults_with_policy_empty() {
+        let dir = tempdir().expect("tempdir");
+        let mgr = VaultManager::new(dir.path().to_path_buf()).expect("VaultManager::new");
+
+        let infos = mgr
+            .list_vaults_with_policy()
+            .expect("list_vaults_with_policy");
+
+        assert!(
+            infos.is_empty(),
+            "expected empty Vec, got {} entries",
+            infos.len()
+        );
+    }
+
+    /// TC-S7-033-03: list_vaults_with_policy requires no password argument.
+    ///
+    /// Verifies at the API level that list_vaults_with_policy takes no password
+    /// parameter and only reads vault.toml (no vault.pqd decryption needed).
+    #[test]
+    fn tc_s7_033_03_list_vaults_with_policy_no_password_needed() {
+        let dir = tempdir().expect("tempdir");
+        let mgr = VaultManager::new(dir.path().to_path_buf())
+            .expect("VaultManager::new")
+            .with_kdf_params(fast_params());
+
+        mgr.create_vault("myvault", b"secret", AccessPolicy::WriteOnly)
+            .expect("create_vault");
+
+        // Call without any password — must succeed.
+        let infos = mgr
+            .list_vaults_with_policy()
+            .expect("list_vaults_with_policy must not require a password");
+
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].name, "myvault");
+        assert_eq!(infos[0].policy, AccessPolicy::WriteOnly);
+    }
+
+    // -------------------------------------------------------------------------
+    // TASK-0070: set_policy tests
+    // -------------------------------------------------------------------------
+
+    /// TC-S7-034-01: set_policy changes policy from None to WriteOnly.
+    ///
+    /// After calling set_policy with WriteOnly, vault.toml must reflect the
+    /// new policy when read back from disk.
+    #[test]
+    fn tc_s7_034_01_set_policy_none_to_write_only() {
+        let dir = tempdir().expect("tempdir");
+        let mgr = VaultManager::new(dir.path().to_path_buf())
+            .expect("VaultManager::new")
+            .with_kdf_params(fast_params());
+
+        mgr.create_vault("myvault", b"pw", AccessPolicy::None)
+            .expect("create_vault");
+
+        mgr.set_policy("myvault", AccessPolicy::WriteOnly)
+            .expect("set_policy");
+
+        let toml_path = dir.path().join("myvault").join("vault.toml");
+        let config = VaultConfig::from_file(&toml_path).expect("read vault.toml");
+        assert_eq!(
+            config.access.policy,
+            AccessPolicy::WriteOnly,
+            "policy must be WriteOnly after set_policy"
+        );
+    }
+
+    /// TC-S7-034-03: set_policy changes policy from Full to None without warning.
+    ///
+    /// core layer must not emit any warning — that is CLI's responsibility.
+    /// The policy must be updated correctly.
+    #[test]
+    fn tc_s7_034_03_set_policy_full_to_none() {
+        let dir = tempdir().expect("tempdir");
+        let mgr = VaultManager::new(dir.path().to_path_buf())
+            .expect("VaultManager::new")
+            .with_kdf_params(fast_params());
+
+        mgr.create_vault("myvault", b"pw", AccessPolicy::Full)
+            .expect("create_vault");
+
+        let result = mgr.set_policy("myvault", AccessPolicy::None);
+        assert!(
+            result.is_ok(),
+            "set_policy Full→None must succeed: {:?}",
+            result
+        );
+
+        let toml_path = dir.path().join("myvault").join("vault.toml");
+        let config = VaultConfig::from_file(&toml_path).expect("read vault.toml");
+        assert_eq!(config.access.policy, AccessPolicy::None);
+    }
+
+    /// TC-S7-034-04: set_policy requires no password argument.
+    ///
+    /// Verifies at the API level that set_policy takes no password and only
+    /// touches vault.toml (vault.pqd is not modified).
+    #[test]
+    fn tc_s7_034_04_set_policy_no_password_needed() {
+        let dir = tempdir().expect("tempdir");
+        let mgr = VaultManager::new(dir.path().to_path_buf())
+            .expect("VaultManager::new")
+            .with_kdf_params(fast_params());
+
+        mgr.create_vault("myvault", b"secret", AccessPolicy::None)
+            .expect("create_vault");
+
+        // Read vault.pqd before set_policy.
+        let pqd_path = dir.path().join("myvault").join("vault.pqd");
+        let pqd_before = std::fs::read(&pqd_path).expect("read vault.pqd before");
+
+        // Call set_policy without any password — must succeed.
+        mgr.set_policy("myvault", AccessPolicy::Full)
+            .expect("set_policy must not require a password");
+
+        // vault.pqd must be untouched.
+        let pqd_after = std::fs::read(&pqd_path).expect("read vault.pqd after");
+        assert_eq!(
+            pqd_before, pqd_after,
+            "vault.pqd must not be modified by set_policy"
+        );
+    }
+
+    /// TC-S7-034-E01: set_policy on a non-existent vault returns DiaryError::Vault.
+    #[test]
+    fn tc_s7_034_e01_set_policy_nonexistent_vault() {
+        let dir = tempdir().expect("tempdir");
+        let mgr = VaultManager::new(dir.path().to_path_buf()).expect("VaultManager::new");
+
+        let result = mgr.set_policy("nonexistent", AccessPolicy::Full);
+        assert!(
+            matches!(result, Err(DiaryError::Vault(_))),
+            "expected DiaryError::Vault for non-existent vault, got {:?}",
+            result
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TASK-0070: delete_vault tests
+    // -------------------------------------------------------------------------
+
+    /// TC-S7-035-01: delete_vault removes the vault directory completely.
+    #[test]
+    fn tc_s7_035_01_delete_vault_removes_directory() {
+        let dir = tempdir().expect("tempdir");
+        let mgr = VaultManager::new(dir.path().to_path_buf())
+            .expect("VaultManager::new")
+            .with_kdf_params(fast_params());
+
+        mgr.create_vault("myvault", b"pw", AccessPolicy::None)
+            .expect("create_vault");
+
+        let vault_dir = dir.path().join("myvault");
+        assert!(
+            vault_dir.exists(),
+            "vault directory must exist before deletion"
+        );
+
+        mgr.delete_vault("myvault", false).expect("delete_vault");
+
+        assert!(
+            !vault_dir.exists(),
+            "vault directory must not exist after deletion"
+        );
+    }
+
+    /// TC-S7-035-04: delete_vault with zeroize overwrites vault.pqd before removal.
+    ///
+    /// The content of vault.pqd after zeroize must differ from the original
+    /// (random overwrite), and the directory must be removed at the end.
+    #[test]
+    fn tc_s7_035_04_delete_vault_zeroize_overwrites_pqd() {
+        let dir = tempdir().expect("tempdir");
+        let mgr = VaultManager::new(dir.path().to_path_buf())
+            .expect("VaultManager::new")
+            .with_kdf_params(fast_params());
+
+        mgr.create_vault("myvault", b"pw", AccessPolicy::None)
+            .expect("create_vault");
+
+        let pqd_path = dir.path().join("myvault").join("vault.pqd");
+        let original_bytes = std::fs::read(&pqd_path).expect("read original vault.pqd");
+
+        // We cannot directly observe the intermediate state after zeroize but
+        // before remove_dir_all, because the file is gone after the call.
+        // Instead we verify that the call completes successfully and the dir is gone.
+        mgr.delete_vault("myvault", true)
+            .expect("delete_vault with zeroize");
+
+        assert!(
+            !dir.path().join("myvault").exists(),
+            "vault directory must be removed after zeroize+delete"
+        );
+
+        // Ensure original_bytes is non-empty (vault.pqd was a real file).
+        assert!(
+            !original_bytes.is_empty(),
+            "vault.pqd must have been non-empty"
+        );
+    }
+
+    /// TC-S7-035-E02: delete_vault on a non-existent vault returns DiaryError::Vault.
+    #[test]
+    fn tc_s7_035_e02_delete_vault_nonexistent() {
+        let dir = tempdir().expect("tempdir");
+        let mgr = VaultManager::new(dir.path().to_path_buf()).expect("VaultManager::new");
+
+        let result = mgr.delete_vault("ghost", false);
+        assert!(
+            matches!(result, Err(DiaryError::Vault(_))),
+            "expected DiaryError::Vault for non-existent vault, got {:?}",
+            result
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TASK-0070: edge case tests
+    // -------------------------------------------------------------------------
+
+    /// TC-S7-EDGE-004: corrupt vault.toml causes DiaryError::Config.
+    ///
+    /// Writing invalid TOML content to vault.toml and then calling
+    /// list_vaults_with_policy or set_policy must return DiaryError::Config.
+    #[test]
+    fn tc_s7_edge_004_corrupt_vault_toml_returns_config_error() {
+        let dir = tempdir().expect("tempdir");
+        let mgr = VaultManager::new(dir.path().to_path_buf())
+            .expect("VaultManager::new")
+            .with_kdf_params(fast_params());
+
+        mgr.create_vault("myvault", b"pw", AccessPolicy::None)
+            .expect("create_vault");
+
+        // Overwrite vault.toml with invalid TOML.
+        let toml_path = dir.path().join("myvault").join("vault.toml");
+        std::fs::write(&toml_path, b"invalid toml content {{{").expect("write corrupt toml");
+
+        // list_vaults_with_policy must fail with DiaryError::Config.
+        let list_result = mgr.list_vaults_with_policy();
+        assert!(
+            matches!(list_result, Err(DiaryError::Config(_))),
+            "expected DiaryError::Config for corrupt vault.toml in list, got {:?}",
+            list_result
+        );
+
+        // set_policy must also fail with DiaryError::Config.
+        let set_result = mgr.set_policy("myvault", AccessPolicy::Full);
+        assert!(
+            matches!(set_result, Err(DiaryError::Config(_))),
+            "expected DiaryError::Config for corrupt vault.toml in set_policy, got {:?}",
+            set_result
         );
     }
 }

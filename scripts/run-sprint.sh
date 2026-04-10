@@ -8,36 +8,34 @@ set -euo pipefail
 # =============================================================================
 
 # === 設定 ===
-SPRINT_NAME="s7-access-control-claude"
-SPRINT_TAG="s7"
+SPRINT_NAME="s8-git-sync"
+SPRINT_TAG="s8"
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TASKS_DIR="${PROJECT_ROOT}/docs/tasks/${SPRINT_NAME}"
 PROMPTS_DIR="$(dirname "$0")/prompts"
 LOG_DIR="${PROJECT_ROOT}/logs/sprint-${SPRINT_NAME}"
 
 # タスク一覧 (依存順)
-TASKS=(TASK-0067 TASK-0068 TASK-0069 TASK-0070 TASK-0071 TASK-0072 TASK-0073)
+TASKS=(TASK-0074 TASK-0075 TASK-0076 TASK-0077 TASK-0078 TASK-0079)
 
 # タスクタイプ
 declare -A TASK_TYPES=(
-    [TASK-0067]="TDD"
-    [TASK-0068]="TDD"
-    [TASK-0069]="TDD"
-    [TASK-0070]="TDD"
-    [TASK-0071]="TDD"
-    [TASK-0072]="TDD"
-    [TASK-0073]="TDD"
+    [TASK-0074]="TDD"
+    [TASK-0075]="TDD"
+    [TASK-0076]="TDD"
+    [TASK-0077]="TDD"
+    [TASK-0078]="TDD"
+    [TASK-0079]="TDD"
 )
 
 # タスク名 (コミットメッセージ用)
 declare -A TASK_NAMES=(
-    [TASK-0067]="AccessPolicy enum and policy evaluation logic"
-    [TASK-0068]="AccessSection enum migration and DiaryCore accessors"
-    [TASK-0069]="VaultManager create_vault and validate_vault_name"
-    [TASK-0070]="VaultManager list set_policy delete"
-    [TASK-0071]="CLI vault subcommands"
-    [TASK-0072]="policy check integration into existing commands"
-    [TASK-0073]="integration tests and doc comments"
+    [TASK-0074]="git foundation check_git_available and git-init"
+    [TASK-0075]="privacy helpers author timestamp fuzzing padding"
+    [TASK-0076]="git-push with privacy pipeline"
+    [TASK-0077]="git-pull and 3-way merge by UUID HMAC"
+    [TASK-0078]="CLI git subcommand handlers"
+    [TASK-0079]="integration tests doc comments and run-sprint update"
 )
 
 # モデル設定

@@ -81,15 +81,15 @@
 - [x] vault delete [--zeroize]
 
 ### S8: Git連携
-- [ ] git-init [--remote URL]
-- [ ] git-push / git-pull / git-sync / git-status
-- [ ] .gitignore生成 (entries/*.md除外)
-- [ ] author匿名化 (ランダムID@localhost)
-- [ ] コミットメッセージ定型化 ("update")
-- [ ] 末尾ランダムパディング (0-4096B)
-- [ ] タイムスタンプファジング (単調増加保証)
-- [ ] 3-wayマージ (UUID + content_hmac)
-- [ ] コンフリクト対話式解決
+- [x] git-init [--remote URL]
+- [x] git-push / git-pull / git-sync / git-status
+- [x] .gitignore生成 (entries/*.md除外)
+- [x] author匿名化 (ランダムID@localhost)
+- [x] コミットメッセージ定型化 ("update")
+- [x] 末尾ランダムパディング (0-4096B)
+- [x] タイムスタンプファジング (単調増加保証)
+- [x] 3-wayマージ (UUID + content_hmac, last-write-wins)
+- [x] コンフリクト対話式解決 (--claude時ローカル優先自動解決)
 
 ### S9: セキュリティ硬化 + 統合テスト + S1-S2技術的負債
 - [ ] mlock (unix) / VirtualLock (windows)

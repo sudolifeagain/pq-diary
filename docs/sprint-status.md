@@ -1,6 +1,6 @@
 # Sprint Status
 
-## Current: Sprint 7 — アクセス制御 + Claude連携 (completed)
+## Current: Sprint 8 — Git連携 (completed)
 
 ## Progress
 
@@ -13,7 +13,7 @@
 | S5 | デイリーノート + テンプレート + リンク | completed (s5-done) | 5 |
 | S6 | 検索 + 統計 + インポート + 技術的負債 | completed (s6-done) | 6 |
 | S7 | アクセス制御 + Claude連携 | completed (s7-done) | 7 |
-| S8 | Git連携 | ready | 8 |
+| S8 | Git連携 | completed (s8-done) | 8 |
 | S9 | セキュリティ硬化 + 統合テスト + S1-S2負債 | blocked by S6-S8 | 9 |
 
 ## Sprint Scope

@@ -23,21 +23,15 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 // Static regexes (compiled once via LazyLock)
 // =========================================================================
 
-static WIKI_LINK_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]").unwrap()
-});
+static WIKI_LINK_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]").unwrap());
 
-static TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"#([\w/]+)").unwrap()
-});
+static TAG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"#([\w/]+)").unwrap());
 
-static FENCED_CODE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?s)```[^\n]*\n.*?```").unwrap()
-});
+static FENCED_CODE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?s)```[^\n]*\n.*?```").unwrap());
 
-static INLINE_CODE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"`[^`]+`").unwrap()
-});
+static INLINE_CODE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`[^`]+`").unwrap());
 
 use crate::{
     crypto::CryptoEngine,

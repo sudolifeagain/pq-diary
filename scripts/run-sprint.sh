@@ -8,50 +8,36 @@ set -euo pipefail
 # =============================================================================
 
 # === 設定 ===
-SPRINT_NAME="search-stats-import"
-SPRINT_TAG="s6"
+SPRINT_NAME="s7-access-control-claude"
+SPRINT_TAG="s7"
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TASKS_DIR="${PROJECT_ROOT}/docs/tasks/${SPRINT_NAME}"
 PROMPTS_DIR="$(dirname "$0")/prompts"
 LOG_DIR="${PROJECT_ROOT}/logs/sprint-${SPRINT_NAME}"
 
 # タスク一覧 (依存順)
-TASKS=(TASK-0053 TASK-0054 TASK-0055 TASK-0056 TASK-0057 TASK-0058 TASK-0059 TASK-0060 TASK-0061 TASK-0062 TASK-0063 TASK-0064 TASK-0065 TASK-0066)
+TASKS=(TASK-0067 TASK-0068 TASK-0069 TASK-0070 TASK-0071 TASK-0072 TASK-0073)
 
 # タスクタイプ
 declare -A TASK_TYPES=(
-    [TASK-0053]="TDD"
-    [TASK-0054]="TDD"
-    [TASK-0055]="TDD"
-    [TASK-0056]="TDD"
-    [TASK-0057]="TDD"
-    [TASK-0058]="TDD"
-    [TASK-0059]="TDD"
-    [TASK-0060]="TDD"
-    [TASK-0061]="TDD"
-    [TASK-0062]="TDD"
-    [TASK-0063]="TDD"
-    [TASK-0064]="TDD"
-    [TASK-0065]="TDD"
-    [TASK-0066]="DIRECT"
+    [TASK-0067]="TDD"
+    [TASK-0068]="TDD"
+    [TASK-0069]="TDD"
+    [TASK-0070]="TDD"
+    [TASK-0071]="TDD"
+    [TASK-0072]="TDD"
+    [TASK-0073]="TDD"
 )
 
 # タスク名 (コミットメッセージ用)
 declare -A TASK_NAMES=(
-    [TASK-0053]="vault reader/writer hardening"
-    [TASK-0054]="password guard and hmac error handling"
-    [TASK-0055]="EntryPlaintext zeroize and editor security"
-    [TASK-0056]="VaultGuard drop guard pattern"
-    [TASK-0057]="Win32 console unsafe ADR"
-    [TASK-0058]="search core module"
-    [TASK-0059]="search CLI command"
-    [TASK-0060]="stats core module"
-    [TASK-0061]="stats CLI and heatmap"
-    [TASK-0062]="import core markdown parser"
-    [TASK-0063]="import batch write and directory walk"
-    [TASK-0064]="import CLI command"
-    [TASK-0065]="integration tests and doc comments"
-    [TASK-0066]="run-sprint.sh S6 config update"
+    [TASK-0067]="AccessPolicy enum and policy evaluation logic"
+    [TASK-0068]="AccessSection enum migration and DiaryCore accessors"
+    [TASK-0069]="VaultManager create_vault and validate_vault_name"
+    [TASK-0070]="VaultManager list set_policy delete"
+    [TASK-0071]="CLI vault subcommands"
+    [TASK-0072]="policy check integration into existing commands"
+    [TASK-0073]="integration tests and doc comments"
 )
 
 # モデル設定

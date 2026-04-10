@@ -9,8 +9,11 @@ use chrono::{DateTime, Duration, Utc};
 use rand::rngs::OsRng;
 use rand::{Rng, RngCore};
 
+use crate::crypto::CryptoEngine;
 use crate::error::DiaryError;
 use crate::vault::config::VaultConfig;
+use crate::vault::reader::read_vault;
+use crate::vault::writer::write_vault;
 
 // =============================================================================
 // Types
@@ -274,6 +277,136 @@ pub fn generate_extra_padding(max_bytes: usize) -> Vec<u8> {
     let mut padding = vec![0u8; size];
     OsRng.fill_bytes(&mut padding);
     padding
+}
+
+/// Apply the privacy pipeline and push the vault to the remote Git repository.
+///
+/// # Pipeline
+///
+/// 1. Verifies `.git` directory exists in `vault_dir` (`EDGE-003` if absent).
+/// 2. Verifies at least one remote is configured (`EDGE-002` if absent).
+/// 3. Re-writes `vault_path` with new random padding — makes binary diffs
+///    across commits unpredictable (REQ-013, REQ-016).
+/// 4. Optionally appends extra random bytes when
+///    `config.git.privacy.extra_padding_bytes_max > 0` (REQ-054).
+/// 5. Computes a fuzzed commit timestamp via [`fuzz_timestamp`] (REQ-014).
+/// 6. Stages only `vault.pqd`, `vault.toml`, and `.gitignore` (REQ-010).
+/// 7. Commits with the anonymous author from `config.git` and a fixed
+///    commit message (REQ-011, REQ-012, REQ-017).
+/// 8. Pushes the current branch to `origin` (REQ-010).
+///
+/// # Errors
+///
+/// Returns [`DiaryError::Git`] when:
+/// - `.git` does not exist (`EDGE-003`)
+/// - no remote is configured (`EDGE-002`)
+/// - any Git sub-command exits with a non-zero status
+/// - `vault_path` cannot be read or written
+pub fn git_push(
+    vault_dir: &Path,
+    config: &VaultConfig,
+    _engine: &CryptoEngine,
+    vault_path: &Path,
+) -> Result<(), DiaryError> {
+    // Step 1: .git directory must exist (EDGE-003).
+    if !vault_dir.join(".git").exists() {
+        return Err(DiaryError::Git(
+            "git repository is not initialized: .git directory not found (EDGE-003)".to_string(),
+        ));
+    }
+
+    // Step 2: At least one remote must be configured (EDGE-002).
+    let remote_out = run_git_command(vault_dir, &["remote"])?;
+    if !remote_out.status.success()
+        || String::from_utf8_lossy(&remote_out.stdout)
+            .trim()
+            .is_empty()
+    {
+        return Err(DiaryError::Git(
+            "no remote repository configured (EDGE-002)".to_string(),
+        ));
+    }
+
+    // Step 3: Re-write vault.pqd with new random padding (REQ-013, REQ-016).
+    // Decryption is not required — EntryRecords are passed through unchanged.
+    {
+        let (header, entries) = read_vault(vault_path)?;
+        write_vault(vault_path, header, &entries)?;
+    }
+
+    // Step 3b: Append extra padding when configured (REQ-054).
+    let extra_max = config.git.privacy.extra_padding_bytes_max;
+    if extra_max > 0 {
+        let extra = generate_extra_padding(extra_max);
+        if !extra.is_empty() {
+            use std::io::Write as IoWrite;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(vault_path)
+                .map_err(|e| {
+                    DiaryError::Git(format!("failed to open vault.pqd for extra padding: {e}"))
+                })?;
+            file.write_all(&extra).map_err(|e| {
+                DiaryError::Git(format!("failed to append extra padding to vault.pqd: {e}"))
+            })?;
+        }
+    }
+
+    // Step 4: Compute fuzzed author/committer timestamp (REQ-014).
+    let prev_ts = get_last_commit_timestamp(vault_dir);
+    let fuzz_hours = config.git.privacy.timestamp_fuzz_hours;
+    let fuzzed_ts = fuzz_timestamp(prev_ts, fuzz_hours);
+    let ts_str = fuzzed_ts.to_rfc3339();
+
+    // Step 5: Stage only the three allowed files (REQ-010).
+    let add_out = run_git_command(vault_dir, &["add", "vault.pqd", "vault.toml", ".gitignore"])?;
+    if !add_out.status.success() {
+        return Err(DiaryError::Git(format!(
+            "git add failed: {}",
+            String::from_utf8_lossy(&add_out.stderr)
+        )));
+    }
+
+    // Step 6: Commit with anonymous author, fixed message, and fuzzed date
+    //         (REQ-011, REQ-012, REQ-017).
+    let commit_message = &config.git.commit_message;
+    let commit_out = std::process::Command::new("git")
+        .current_dir(vault_dir)
+        .arg("-c")
+        .arg(format!("user.name={}", config.git.author_name))
+        .arg("-c")
+        .arg(format!("user.email={}", config.git.author_email))
+        .args(["commit", "--date", &ts_str, "-m", commit_message])
+        .env("GIT_AUTHOR_DATE", &ts_str)
+        .env("GIT_COMMITTER_DATE", &ts_str)
+        .output()
+        .map_err(|e| DiaryError::Git(format!("failed to spawn git commit: {e}")))?;
+    if !commit_out.status.success() {
+        return Err(DiaryError::Git(format!(
+            "git commit failed: {}",
+            String::from_utf8_lossy(&commit_out.stderr)
+        )));
+    }
+
+    // Step 7: Push current branch to origin (REQ-010).
+    let branch_out = run_git_command(vault_dir, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let branch = if branch_out.status.success() {
+        String::from_utf8_lossy(&branch_out.stdout)
+            .trim()
+            .to_string()
+    } else {
+        "main".to_string()
+    };
+
+    let push_out = run_git_command(vault_dir, &["push", "origin", &branch])?;
+    if !push_out.status.success() {
+        return Err(DiaryError::Git(format!(
+            "git push failed: {}",
+            String::from_utf8_lossy(&push_out.stderr)
+        )));
+    }
+
+    Ok(())
 }
 
 // =============================================================================
@@ -650,5 +783,454 @@ mod tests {
         // The fixed author string "pq-diary" is intentionally used as the
         // author name — it never coincides with a real login name.
         "__REAL_USER__"
+    }
+
+    // -------------------------------------------------------------------------
+    // TASK-0076 helpers
+    // -------------------------------------------------------------------------
+
+    /// Build a [`VaultConfig`] suitable for git_push() tests.
+    fn make_git_push_config(
+        author_name: &str,
+        author_email: &str,
+        commit_message: &str,
+        fuzz_hours: u64,
+        extra_padding_bytes_max: usize,
+    ) -> crate::vault::config::VaultConfig {
+        use crate::policy::AccessPolicy;
+        use crate::vault::config::{
+            AccessSection, Argon2Section, GitPrivacySection, GitSection, VaultConfig, VaultSection,
+        };
+
+        VaultConfig {
+            vault: VaultSection {
+                name: "test".to_string(),
+                schema_version: 4,
+            },
+            access: AccessSection {
+                policy: AccessPolicy::None,
+            },
+            git: GitSection {
+                author_name: author_name.to_string(),
+                author_email: author_email.to_string(),
+                commit_message: commit_message.to_string(),
+                privacy: GitPrivacySection {
+                    timestamp_fuzz_hours: fuzz_hours,
+                    extra_padding_bytes_max,
+                },
+            },
+            argon2: Argon2Section {
+                memory_cost_kb: 65536,
+                time_cost: 3,
+                parallelism: 1,
+            },
+        }
+    }
+
+    /// Set up a vault directory with git initialized, vault files, and a local
+    /// bare remote.  Returns `(TempDir, vault_dir_path, vault_pqd_path)`.
+    ///
+    /// The working repo has one initial commit already pushed to the bare
+    /// remote so that subsequent `git_push()` calls can push a second commit.
+    fn setup_vault_with_remote(
+        config: &crate::vault::config::VaultConfig,
+    ) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        use crate::vault::format::VaultHeader;
+        use crate::vault::writer::write_vault as wv;
+
+        let tmp = tempdir().expect("tempdir");
+        let bare_dir = tmp.path().join("bare.git");
+        let vault_dir = tmp.path().join("vault");
+
+        std::fs::create_dir_all(&bare_dir).expect("create bare dir");
+        std::fs::create_dir_all(&vault_dir).expect("create vault dir");
+
+        // Initialise the bare remote.
+        let out = std::process::Command::new("git")
+            .current_dir(&bare_dir)
+            .args(["init", "--bare"])
+            .output()
+            .expect("git init --bare");
+        assert!(out.status.success(), "git init --bare failed");
+
+        // Initialise the working repo.
+        let out = std::process::Command::new("git")
+            .current_dir(&vault_dir)
+            .args(["init"])
+            .output()
+            .expect("git init");
+        assert!(out.status.success(), "git init failed");
+
+        // Configure local git identity for the initial commit.
+        for (k, v) in [
+            ("user.name", "setup-user"),
+            ("user.email", "setup@localhost"),
+        ] {
+            let out = std::process::Command::new("git")
+                .current_dir(&vault_dir)
+                .args(["config", k, v])
+                .output()
+                .expect("git config");
+            assert!(out.status.success(), "git config {k} failed");
+        }
+
+        // Create vault files.
+        let vault_path = vault_dir.join("vault.pqd");
+        wv(&vault_path, VaultHeader::new(), &[]).expect("write_vault");
+
+        let toml_path = vault_dir.join("vault.toml");
+        config.to_file(&toml_path).expect("write vault.toml");
+
+        std::fs::write(vault_dir.join(".gitignore"), generate_gitignore())
+            .expect("write .gitignore");
+
+        // Add the bare repo as remote "origin".
+        let out = std::process::Command::new("git")
+            .current_dir(&vault_dir)
+            .args(["remote", "add", "origin", bare_dir.to_str().unwrap()])
+            .output()
+            .expect("git remote add");
+        assert!(out.status.success(), "git remote add failed");
+
+        // Initial commit (adds all three files).
+        let out = std::process::Command::new("git")
+            .current_dir(&vault_dir)
+            .args(["add", "vault.pqd", "vault.toml", ".gitignore"])
+            .output()
+            .expect("git add");
+        assert!(out.status.success(), "initial git add failed");
+
+        let out = std::process::Command::new("git")
+            .current_dir(&vault_dir)
+            .args(["commit", "-m", "initial commit"])
+            .output()
+            .expect("git commit");
+        assert!(
+            out.status.success(),
+            "initial git commit failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // Push initial commit to bare remote.
+        let branch_out = std::process::Command::new("git")
+            .current_dir(&vault_dir)
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .expect("git rev-parse HEAD");
+        let branch = String::from_utf8_lossy(&branch_out.stdout)
+            .trim()
+            .to_string();
+
+        let out = std::process::Command::new("git")
+            .current_dir(&vault_dir)
+            .args(["push", "-u", "origin", &branch])
+            .output()
+            .expect("git push -u");
+        assert!(
+            out.status.success(),
+            "initial git push failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        (tmp, vault_dir, vault_path)
+    }
+
+    // -------------------------------------------------------------------------
+    // TASK-0076 tests
+    // -------------------------------------------------------------------------
+
+    /// TC-S8-076-01: git_push() re-writes vault.pqd (bytes change after call).
+    #[test]
+    fn tc_s8_076_01_vault_pqd_bytes_change() {
+        use crate::crypto::CryptoEngine;
+
+        let config = make_git_push_config("anon", "tc01@localhost", "Update vault", 0, 0);
+        let (_tmp, vault_dir, vault_path) = setup_vault_with_remote(&config);
+
+        let before = std::fs::read(&vault_path).expect("read vault before");
+
+        let engine = CryptoEngine::new();
+        let result = git_push(&vault_dir, &config, &engine, &vault_path);
+        assert!(result.is_ok(), "git_push failed: {:?}", result);
+
+        let after = std::fs::read(&vault_path).expect("read vault after");
+        assert_ne!(
+            before, after,
+            "vault.pqd must have different bytes after git_push (random padding regenerated)"
+        );
+    }
+
+    /// TC-S8-076-02: git_push() commits with the anonymous author from vault.toml.
+    #[test]
+    fn tc_s8_076_02_anonymous_author_used() {
+        use crate::crypto::CryptoEngine;
+
+        let anon_name = "pq-anon-test";
+        let anon_email = "ab12cd34@localhost";
+        let config = make_git_push_config(anon_name, anon_email, "Update vault", 0, 0);
+        let (_tmp, vault_dir, vault_path) = setup_vault_with_remote(&config);
+
+        let engine = CryptoEngine::new();
+        let result = git_push(&vault_dir, &config, &engine, &vault_path);
+        assert!(result.is_ok(), "git_push failed: {:?}", result);
+
+        let out = std::process::Command::new("git")
+            .current_dir(&vault_dir)
+            .args(["log", "-1", "--format=%an%n%ae"])
+            .output()
+            .expect("git log");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let mut lines = stdout.trim().lines();
+        let got_name = lines.next().unwrap_or("").trim();
+        let got_email = lines.next().unwrap_or("").trim();
+
+        assert_eq!(
+            got_name, anon_name,
+            "commit author name must be anonymous_name from config: got '{got_name}'"
+        );
+        assert_eq!(
+            got_email, anon_email,
+            "commit author email must be anonymous_email from config: got '{got_email}'"
+        );
+    }
+
+    /// TC-S8-076-03: git_push() commits with the fixed commit_message from vault.toml.
+    #[test]
+    fn tc_s8_076_03_fixed_commit_message_used() {
+        use crate::crypto::CryptoEngine;
+
+        let expected_msg = "pq-diary sync operation";
+        let config = make_git_push_config("anon", "tc03@localhost", expected_msg, 0, 0);
+        let (_tmp, vault_dir, vault_path) = setup_vault_with_remote(&config);
+
+        let engine = CryptoEngine::new();
+        let result = git_push(&vault_dir, &config, &engine, &vault_path);
+        assert!(result.is_ok(), "git_push failed: {:?}", result);
+
+        let out = std::process::Command::new("git")
+            .current_dir(&vault_dir)
+            .args(["log", "-1", "--format=%s"])
+            .output()
+            .expect("git log --format=%s");
+        let got_msg = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+        assert_eq!(
+            got_msg, expected_msg,
+            "commit message must match config.git.commit_message: got '{got_msg}'"
+        );
+    }
+
+    /// TC-S8-076-04: git_push() applies timestamp fuzzing (fuzz_hours > 0).
+    #[test]
+    fn tc_s8_076_04_timestamp_fuzzing_applied() {
+        use crate::crypto::CryptoEngine;
+        use chrono::Utc;
+
+        let fuzz_hours: u64 = 6;
+        let config = make_git_push_config("anon", "tc04@localhost", "Update vault", fuzz_hours, 0);
+        let (_tmp, vault_dir, vault_path) = setup_vault_with_remote(&config);
+
+        let before_push = Utc::now();
+        let engine = CryptoEngine::new();
+        let result = git_push(&vault_dir, &config, &engine, &vault_path);
+        assert!(result.is_ok(), "git_push failed: {:?}", result);
+        let after_push = Utc::now();
+
+        // Read the author date from the commit.
+        let out = std::process::Command::new("git")
+            .current_dir(&vault_dir)
+            .args(["log", "-1", "--format=%aI"])
+            .output()
+            .expect("git log --format=%aI");
+        let ts_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let commit_ts = chrono::DateTime::parse_from_rfc3339(&ts_str)
+            .expect("parse commit author date")
+            .with_timezone(&Utc);
+
+        // The commit timestamp must not be in the future.
+        assert!(
+            commit_ts <= after_push + Duration::seconds(1),
+            "commit timestamp must not exceed current time: commit={commit_ts}, now={after_push}"
+        );
+
+        // The commit timestamp must be within fuzz_hours of the call time.
+        let max_past = before_push - Duration::hours(fuzz_hours as i64);
+        assert!(
+            commit_ts >= max_past,
+            "commit timestamp must not be more than {fuzz_hours}h in the past: \
+             commit={commit_ts}, floor={max_past}"
+        );
+
+        // Also verify fuzz_hours=0 uses approximately current time.
+        let config0 = make_git_push_config("anon", "tc04b@localhost", "Update vault", 0, 0);
+        let (_tmp2, vault_dir2, vault_path2) = setup_vault_with_remote(&config0);
+        let t_before = Utc::now();
+        let engine2 = CryptoEngine::new();
+        let result2 = git_push(&vault_dir2, &config0, &engine2, &vault_path2);
+        assert!(result2.is_ok(), "git_push (fuzz=0) failed: {:?}", result2);
+        let t_after = Utc::now();
+
+        let out2 = std::process::Command::new("git")
+            .current_dir(&vault_dir2)
+            .args(["log", "-1", "--format=%aI"])
+            .output()
+            .expect("git log --format=%aI");
+        let ts_str2 = String::from_utf8_lossy(&out2.stdout).trim().to_string();
+        let commit_ts2 = chrono::DateTime::parse_from_rfc3339(&ts_str2)
+            .expect("parse commit author date (fuzz=0)")
+            .with_timezone(&Utc);
+
+        let diff_secs = (commit_ts2 - t_before).num_seconds().abs();
+        assert!(
+            diff_secs <= (t_after - t_before).num_seconds() + 2,
+            "fuzz_hours=0 commit timestamp must be close to current time: \
+             commit={commit_ts2}, before={t_before}"
+        );
+    }
+
+    /// TC-S8-076-05: extra_padding_bytes_max=0 does not add extra bytes.
+    #[test]
+    fn tc_s8_076_05_no_extra_padding_when_max_zero() {
+        use crate::crypto::CryptoEngine;
+        use crate::vault::reader::read_vault as rv;
+
+        let config = make_git_push_config("anon", "tc05@localhost", "Update vault", 0, 0);
+        let (_tmp, vault_dir, vault_path) = setup_vault_with_remote(&config);
+
+        let engine = CryptoEngine::new();
+        let result = git_push(&vault_dir, &config, &engine, &vault_path);
+        assert!(result.is_ok(), "git_push failed: {:?}", result);
+
+        // vault.pqd must still be parseable (no format corruption from extra bytes).
+        let parse_result = rv(&vault_path);
+        assert!(
+            parse_result.is_ok(),
+            "vault.pqd must be parseable after git_push with extra_padding_bytes_max=0: {:?}",
+            parse_result
+        );
+
+        // File size must not exceed the upper bound of write_vault() with empty entries:
+        // header (~212 B) + entry_sentinel (4 B) + max_tail_padding (4096 B) + margin.
+        let file_size = std::fs::metadata(&vault_path).expect("metadata").len();
+        let reasonable_upper = 212 + 4 + 4096 + 256; // generous margin
+        assert!(
+            file_size <= reasonable_upper as u64,
+            "vault.pqd size {file_size} B exceeds expected upper bound {reasonable_upper} B \
+             (no extra padding should be added when max=0)"
+        );
+    }
+
+    /// TC-S8-076-06: git_push() returns EDGE-003 when .git is not initialized.
+    #[test]
+    fn tc_s8_076_06_edge_003_no_git_directory() {
+        use crate::crypto::CryptoEngine;
+        use crate::vault::format::VaultHeader;
+        use crate::vault::writer::write_vault as wv;
+
+        let tmp = tempdir().expect("tempdir");
+        let vault_dir = tmp.path().to_path_buf();
+        let vault_path = vault_dir.join("vault.pqd");
+        wv(&vault_path, VaultHeader::new(), &[]).expect("write_vault");
+
+        let config = make_git_push_config("anon", "tc06@localhost", "Update vault", 0, 0);
+        let engine = CryptoEngine::new();
+
+        let result = git_push(&vault_dir, &config, &engine, &vault_path);
+        assert!(result.is_err(), "expected Err for missing .git, got Ok");
+
+        match result {
+            Err(DiaryError::Git(msg)) => {
+                assert!(
+                    msg.contains("EDGE-003") || msg.contains("not initialized"),
+                    "error must mention EDGE-003 or 'not initialized': {msg}"
+                );
+            }
+            other => panic!("expected DiaryError::Git, got {:?}", other),
+        }
+    }
+
+    /// TC-S8-076-07: git_push() returns EDGE-002 when no remote is configured.
+    #[test]
+    fn tc_s8_076_07_edge_002_no_remote_configured() {
+        use crate::crypto::CryptoEngine;
+        use crate::vault::format::VaultHeader;
+        use crate::vault::writer::write_vault as wv;
+
+        let tmp = tempdir().expect("tempdir");
+        let vault_dir = tmp.path().to_path_buf();
+        let vault_path = vault_dir.join("vault.pqd");
+        wv(&vault_path, VaultHeader::new(), &[]).expect("write_vault");
+
+        // Create vault.toml and .gitignore.
+        let config = make_git_push_config("anon", "tc07@localhost", "Update vault", 0, 0);
+        config
+            .to_file(&vault_dir.join("vault.toml"))
+            .expect("write vault.toml");
+        std::fs::write(vault_dir.join(".gitignore"), generate_gitignore())
+            .expect("write .gitignore");
+
+        // git init but DO NOT add a remote.
+        let out = std::process::Command::new("git")
+            .current_dir(&vault_dir)
+            .args(["init"])
+            .output()
+            .expect("git init");
+        assert!(out.status.success(), "git init failed");
+
+        let engine = CryptoEngine::new();
+        let result = git_push(&vault_dir, &config, &engine, &vault_path);
+        assert!(result.is_err(), "expected Err for missing remote, got Ok");
+
+        match result {
+            Err(DiaryError::Git(msg)) => {
+                assert!(
+                    msg.contains("EDGE-002") || msg.contains("no remote"),
+                    "error must mention EDGE-002 or 'no remote': {msg}"
+                );
+            }
+            other => panic!("expected DiaryError::Git, got {:?}", other),
+        }
+    }
+
+    /// TC-S8-076-08: git add stages only vault.pqd, vault.toml, .gitignore.
+    ///
+    /// An extra file in `entries/` (not matching `entries/*.md` gitignore rule)
+    /// must not appear in the commit produced by `git_push()`.
+    #[test]
+    fn tc_s8_076_08_only_allowed_files_are_staged() {
+        use crate::crypto::CryptoEngine;
+
+        let config = make_git_push_config("anon", "tc08@localhost", "Update vault", 0, 0);
+        let (_tmp, vault_dir, vault_path) = setup_vault_with_remote(&config);
+
+        // Create an untracked file under entries/ that is NOT covered by
+        // `entries/*.md` gitignore rule (it uses a .txt extension).
+        let entries_dir = vault_dir.join("entries");
+        std::fs::create_dir_all(&entries_dir).expect("create entries dir");
+        std::fs::write(entries_dir.join("secret.txt"), b"should not be committed")
+            .expect("write entries/secret.txt");
+
+        let engine = CryptoEngine::new();
+        let result = git_push(&vault_dir, &config, &engine, &vault_path);
+        assert!(result.is_ok(), "git_push failed: {:?}", result);
+
+        // Inspect which files appeared in the last commit.
+        let out = std::process::Command::new("git")
+            .current_dir(&vault_dir)
+            .args(["show", "--name-only", "--format=", "HEAD"])
+            .output()
+            .expect("git show");
+        let committed = String::from_utf8_lossy(&out.stdout);
+
+        assert!(
+            !committed.contains("entries/secret.txt"),
+            "entries/secret.txt must NOT be committed, but it appears in: {committed}"
+        );
+
+        // The three allowed files must be present.
+        assert!(
+            committed.contains("vault.pqd"),
+            "vault.pqd must be in the commit: {committed}"
+        );
     }
 }

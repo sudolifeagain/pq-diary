@@ -3,9 +3,9 @@
 //! Provides three public functions for serialising vault data to little-endian
 //! binary format:
 //!
-//! - [`write_header`]: serialise a [`VaultHeader`] into any [`Write`] sink
-//! - [`write_entries`]: serialise a slice of [`EntryRecord`]s into any [`Write`] sink
-//! - [`write_vault`]: write a complete vault file to a [`Path`] with random tail padding
+//! - `write_header`: serialise a `VaultHeader` into any `Write` sink
+//! - `write_entries`: serialise a slice of `EntryRecord`s into any `Write` sink
+//! - `write_vault`: write a complete vault file to a `Path` with random tail padding
 
 use std::io::Write;
 use std::path::Path;

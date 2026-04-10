@@ -1,6 +1,6 @@
 //! Vault initialisation and `VaultManager` (directory creation, key generation).
 //!
-//! Provides [`VaultManager`], which manages the on-disk directory tree for all
+//! Provides `VaultManager`, which manages the on-disk directory tree for all
 //! pq-diary vaults under a single base directory (typically `~/.pq-diary/`).
 
 use std::path::PathBuf;

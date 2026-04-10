@@ -1,8 +1,8 @@
 //! Vault-wide statistics collection.
 //!
-//! Provides [`collect_stats`] which iterates over all `ENTRY` records in the
-//! vault, decrypts each one, and accumulates statistics into a [`VaultStats`]
-//! value.  Each [`EntryPlaintext`] is dropped (zeroed via
+//! Provides `collect_stats` which iterates over all `ENTRY` records in the
+//! vault, decrypts each one, and accumulates statistics into a `VaultStats`
+//! value.  Each `EntryPlaintext` is dropped (zeroed via
 //! [`zeroize::ZeroizeOnDrop`]) immediately after aggregation, so only one
 //! entry's plaintext occupies memory at a time.
 

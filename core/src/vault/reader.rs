@@ -3,9 +3,9 @@
 //! Provides three public functions for deserialising vault data from
 //! little-endian binary format:
 //!
-//! - [`read_header`]: parse a [`VaultHeader`] from any [`Read`] source
-//! - [`read_entries`]: parse a sequence of [`EntryRecord`]s from any [`Read`] source
-//! - [`read_vault`]: read a complete vault file from a [`Path`]
+//! - `read_header`: parse a `VaultHeader` from any `Read` source
+//! - `read_entries`: parse a sequence of `EntryRecord`s from any `Read` source
+//! - `read_vault`: read a complete vault file from a `Path`
 
 use std::io::{self, Read};
 use std::path::Path;

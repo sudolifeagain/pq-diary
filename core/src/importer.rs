@@ -6,9 +6,9 @@
 //!
 //! # Batch import
 //!
-//! [`import_directory`] walks a source directory recursively, parses each `.md`
-//! file via [`parse_markdown`], and writes all resulting entries to the vault
-//! with a single [`batch_create_entries`] call (i.e., one `write_vault`
+//! `import_directory` walks a source directory recursively, parses each `.md`
+//! file via `parse_markdown`, and writes all resulting entries to the vault
+//! with a single `batch_create_entries` call (i.e., one `write_vault`
 //! invocation regardless of the number of files).
 
 use std::path::{Path, PathBuf};

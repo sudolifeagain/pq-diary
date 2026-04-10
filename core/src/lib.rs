@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use secrecy::ExposeSecret;
 
-/// Secure memory types: [`SecureBuffer`], [`ZeroizingKey`], [`MasterKey`], [`CryptoEngine`].
+/// Secure memory types: `SecureBuffer`, `ZeroizingKey`, `MasterKey`, `CryptoEngine`.
 pub mod crypto;
 /// Entry CRUD operations (implemented in Sprint 4).
 pub mod entry;

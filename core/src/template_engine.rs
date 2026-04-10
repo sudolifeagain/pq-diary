@@ -1,8 +1,8 @@
 //! Template variable extraction and expansion engine.
 //!
 //! Parses `{{var_name}}` patterns from template bodies, classifies each variable
-//! as [`VariableKind::Builtin`] (`date`, `datetime`, `title`) or
-//! [`VariableKind::Custom`], and substitutes them with caller-supplied values.
+//! as `VariableKind::Builtin` (`date`, `datetime`, `title`) or
+//! `VariableKind::Custom`, and substitutes them with caller-supplied values.
 
 use regex::Regex;
 use std::collections::HashMap;

@@ -1,7 +1,7 @@
 //! vault.pqd v4 binary format constants and structures.
 //!
 //! Defines the magic bytes, schema version, fixed-header size,
-//! record-type constants, and the [`VaultHeader`] / [`EntryRecord`] structs
+//! record-type constants, and the `VaultHeader` / `EntryRecord` structs
 //! used for the custom binary serialisation of vault files.
 //!
 //! All multi-byte integer fields use little-endian byte order.

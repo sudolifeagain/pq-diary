@@ -1,17 +1,17 @@
 //! Vault format read/write operations.
 //!
 //! Sub-modules:
-//! - [`config`]: TOML configuration types for `vault.toml` and `config.toml`
-//! - [`format`]: vault.pqd v4 binary format constants and structures
-//! - [`init`]: vault initialisation and [`VaultManager`](init::VaultManager) directory management
-//! - [`reader`]: vault.pqd deserialisation (header and entry-record parsing)
-//! - [`writer`]: vault.pqd serialisation (header and entry-record writing)
+//! - `config`: TOML configuration types for `vault.toml` and `config.toml`
+//! - `format`: vault.pqd v4 binary format constants and structures
+//! - `init`: vault initialisation and `VaultManager` directory management
+//! - `reader`: vault.pqd deserialisation (header and entry-record parsing)
+//! - `writer`: vault.pqd serialisation (header and entry-record writing)
 
 /// Per-vault and application-wide TOML configuration (`vault.toml`, `config.toml`).
 pub mod config;
 /// vault.pqd v4 binary format constants and structures.
 pub mod format;
-/// Vault initialisation and [`VaultManager`](init::VaultManager) directory management.
+/// Vault initialisation and `VaultManager` directory management.
 pub mod init;
 /// vault.pqd deserialisation: header and entry-record parsing.
 pub mod reader;

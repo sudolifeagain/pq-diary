@@ -6,11 +6,11 @@
 //!
 //! # Evaluation order
 //!
-//! 1. `claude == false` → [`PolicyDecision::Allow`] (non-Claude environment)
-//! 2. `policy == None` → [`PolicyDecision::DenyNoDecrypt`] (vault never decrypted)
-//! 3. `policy == WriteOnly && op == Read` → [`PolicyDecision::DenyOperation`]
-//! 4. `policy == WriteOnly && op == Write` → [`PolicyDecision::Allow`]
-//! 5. `policy == Full` → [`PolicyDecision::Allow`]
+//! 1. `claude == false` → `PolicyDecision::Allow` (non-Claude environment)
+//! 2. `policy == None` → `PolicyDecision::DenyNoDecrypt` (vault never decrypted)
+//! 3. `policy == WriteOnly && op == Read` → `PolicyDecision::DenyOperation`
+//! 4. `policy == WriteOnly && op == Write` → `PolicyDecision::Allow`
+//! 5. `policy == Full` → `PolicyDecision::Allow`
 
 use serde::{Deserialize, Serialize};
 

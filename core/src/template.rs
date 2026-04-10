@@ -1,10 +1,10 @@
 //! Template CRUD operations.
 //!
 //! Provides [`TemplatePlaintext`], [`TemplateMeta`], and [`TemplateName`] types,
-//! along with [`create_template`], [`list_templates`], [`get_template`], and
-//! [`delete_template`] functions implemented in Sprint 5.
+//! along with `create_template`, `list_templates`, `get_template`, and
+//! `delete_template` functions implemented in Sprint 5.
 //!
-//! Templates are stored as [`RECORD_TYPE_TEMPLATE`] (0x02) records in `vault.pqd`,
+//! Templates are stored as `RECORD_TYPE_TEMPLATE` (0x02) records in `vault.pqd`,
 //! using the same encryption pipeline as journal entries.
 
 use crate::{

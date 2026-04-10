@@ -1,7 +1,7 @@
 //! vault.toml and config.toml serde structs.
 //!
-//! Provides [`VaultConfig`] (per-vault settings stored in `vault.toml`) and
-//! [`AppConfig`] (application-wide settings stored in `config.toml`) with
+//! Provides `VaultConfig` (per-vault settings stored in `vault.toml`) and
+//! `AppConfig` (application-wide settings stored in `config.toml`) with
 //! TOML serialisation/deserialisation and file I/O helpers.
 
 use serde::{Deserialize, Serialize};

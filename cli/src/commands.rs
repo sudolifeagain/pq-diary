@@ -91,6 +91,40 @@ fn filter_and_sort(
 }
 
 // ---------------------------------------------------------------------------
+// check_claude_policy — pre-unlock policy gatekeeper
+// ---------------------------------------------------------------------------
+
+/// Evaluate Claude access policy before any vault operation.
+///
+/// Reads `vault.toml` from the vault directory and checks whether the
+/// configured policy permits `operation` when running with `--claude`.
+///
+/// Returns `Ok(())` immediately when `--claude` is not set (non-Claude
+/// environment).  This ensures the check adds zero overhead for normal usage.
+///
+/// # Errors
+///
+/// Returns an error if the vault directory cannot be determined, `vault.toml`
+/// cannot be read or parsed, or the policy denies the requested operation.
+fn check_claude_policy(
+    cli: &Cli,
+    operation: pq_diary_core::policy::OperationType,
+) -> anyhow::Result<()> {
+    use pq_diary_core::{policy, vault::config::VaultConfig};
+    if !cli.claude {
+        return Ok(());
+    }
+    let vault_path = resolve_vault_path(cli)?;
+    let toml_path = vault_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("vault path has no parent directory"))?
+        .join("vault.toml");
+    let config = VaultConfig::from_file(&toml_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let decision = policy::check_access(true, config.access.policy, operation, &config.vault.name);
+    decision.into_result().map_err(|e| anyhow::anyhow!("{}", e))
+}
+
+// ---------------------------------------------------------------------------
 // VaultGuard — RAII drop guard for vault lock/unlock lifecycle
 // ---------------------------------------------------------------------------
 
@@ -151,8 +185,12 @@ pub fn cmd_new(
     tags: Vec<String>,
     template: Option<String>,
 ) -> anyhow::Result<()> {
+    use pq_diary_core::policy::OperationType;
     use secrecy::{ExposeSecret as _, SecretBox};
     use std::io::{BufRead as _, IsTerminal as _, Read as _};
+
+    // Step 0: Policy check (before any password prompt or vault decryption).
+    check_claude_policy(cli, OperationType::Write)?;
 
     // Step 1: Obtain password and unlock the vault.
     let password_source =
@@ -313,7 +351,11 @@ pub fn cmd_list(
     query: Option<String>,
     number: usize,
 ) -> anyhow::Result<()> {
+    use pq_diary_core::policy::OperationType;
     use secrecy::{ExposeSecret as _, SecretBox};
+
+    // Policy check before any password prompt or vault decryption.
+    check_claude_policy(cli, OperationType::Read)?;
 
     let password_source =
         get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -378,7 +420,11 @@ pub fn cmd_show(cli: &Cli, id: String) -> anyhow::Result<()> {
 /// Separating the writer allows tests to capture the output without spawning a
 /// subprocess or redirecting `stdout`.
 fn cmd_show_impl(cli: &Cli, id: String, out: &mut dyn std::io::Write) -> anyhow::Result<()> {
+    use pq_diary_core::policy::OperationType;
     use secrecy::{ExposeSecret as _, SecretBox};
+
+    // Policy check before any password prompt or vault decryption.
+    check_claude_policy(cli, OperationType::Read)?;
 
     let password_source =
         get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -526,7 +572,11 @@ fn cmd_edit_impl<F>(
 where
     F: FnOnce(&std::path::Path, &EditorConfig) -> Result<(), pq_diary_core::DiaryError>,
 {
+    use pq_diary_core::policy::OperationType;
     use secrecy::{ExposeSecret as _, SecretBox};
+
+    // Policy check before any password prompt or vault decryption.
+    check_claude_policy(cli, OperationType::Write)?;
 
     let password_source =
         get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -694,7 +744,11 @@ fn cmd_delete_impl(
     force: bool,
     reader: &mut impl std::io::BufRead,
 ) -> anyhow::Result<()> {
+    use pq_diary_core::policy::OperationType;
     use secrecy::{ExposeSecret as _, SecretBox};
+
+    // Policy check before any password prompt or vault decryption.
+    check_claude_policy(cli, OperationType::Write)?;
 
     let password_source =
         get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -793,7 +847,11 @@ fn cmd_template_add_impl<F>(
 where
     F: FnOnce(&std::path::Path, &EditorConfig) -> Result<(), pq_diary_core::DiaryError>,
 {
+    use pq_diary_core::policy::OperationType;
     use secrecy::{ExposeSecret as _, SecretBox};
+
+    // Policy check before any password prompt or vault decryption.
+    check_claude_policy(cli, OperationType::Write)?;
 
     let password_source =
         get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -876,7 +934,11 @@ where
 ///
 /// Returns an error if password acquisition, vault unlock, or template listing fails.
 pub fn cmd_template_list(cli: &Cli) -> anyhow::Result<()> {
+    use pq_diary_core::policy::OperationType;
     use secrecy::{ExposeSecret as _, SecretBox};
+
+    // Policy check before any password prompt or vault decryption.
+    check_claude_policy(cli, OperationType::Read)?;
 
     let password_source =
         get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -917,7 +979,11 @@ pub fn cmd_template_list(cli: &Cli) -> anyhow::Result<()> {
 /// Returns `DiaryError::TemplateNotFound` (wrapped in anyhow) when no template
 /// with the given name exists.
 pub fn cmd_template_show(cli: &Cli, name: String) -> anyhow::Result<()> {
+    use pq_diary_core::policy::OperationType;
     use secrecy::{ExposeSecret as _, SecretBox};
+
+    // Policy check before any password prompt or vault decryption.
+    check_claude_policy(cli, OperationType::Read)?;
 
     let password_source =
         get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -970,7 +1036,11 @@ fn cmd_template_delete_impl(
     force: bool,
     reader: &mut impl std::io::BufRead,
 ) -> anyhow::Result<()> {
+    use pq_diary_core::policy::OperationType;
     use secrecy::{ExposeSecret as _, SecretBox};
+
+    // Policy check before any password prompt or vault decryption.
+    check_claude_policy(cli, OperationType::Write)?;
 
     let password_source =
         get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1045,9 +1115,13 @@ fn cmd_today_impl<F>(cli: &Cli, today: &str, launch_fn: F) -> anyhow::Result<()>
 where
     F: FnOnce(&std::path::Path, &EditorConfig) -> Result<(), pq_diary_core::DiaryError>,
 {
+    use pq_diary_core::policy::OperationType;
     use pq_diary_core::template_engine::{expand, BUILTIN_DATE, BUILTIN_TITLE};
     use secrecy::{ExposeSecret as _, SecretBox};
     use std::collections::HashMap;
+
+    // Policy check before any password prompt or vault decryption.
+    check_claude_policy(cli, OperationType::Write)?;
 
     let password_source =
         get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1183,8 +1257,12 @@ pub(crate) fn cmd_search_to(
     args: &crate::SearchArgs,
     out: &mut dyn std::io::Write,
 ) -> anyhow::Result<()> {
+    use pq_diary_core::policy::OperationType;
     use pq_diary_core::search::SearchQuery;
     use secrecy::{ExposeSecret as _, SecretBox};
+
+    // Policy check before any password prompt or vault decryption.
+    check_claude_policy(cli, OperationType::Read)?;
 
     let password_source =
         get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1225,7 +1303,7 @@ pub(crate) fn cmd_search_to(
 
 /// Write search results to `out` in grep-like format.
 ///
-/// Each [`SearchMatch`] is printed as a header line followed by context blocks.
+/// Each `SearchMatch` is printed as a header line followed by context blocks.
 /// Consecutive matches are separated by `--`.
 fn write_search_results(
     results: &pq_diary_core::search::SearchResults,
@@ -1286,7 +1364,11 @@ pub(crate) fn cmd_stats_to(
     args: &crate::StatsArgs,
     out: &mut dyn std::io::Write,
 ) -> anyhow::Result<()> {
+    use pq_diary_core::policy::OperationType;
     use secrecy::{ExposeSecret as _, SecretBox};
+
+    // Policy check before any password prompt or vault decryption.
+    check_claude_policy(cli, OperationType::Read)?;
 
     let password_source =
         get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1482,11 +1564,17 @@ pub(crate) fn cmd_import_to(
         ));
     }
 
-    // 2. Acquire password.
+    // 2. Policy check before any password prompt or vault decryption.
+    {
+        use pq_diary_core::policy::OperationType;
+        check_claude_policy(cli, OperationType::Write)?;
+    }
+
+    // 3. Acquire password.
     let password_source =
         get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // 3. Open and unlock vault.
+    // 4. Open and unlock vault.
     let vault_path = resolve_vault_path(cli)?;
     let vault_str = vault_path
         .to_str()
@@ -1500,12 +1588,12 @@ pub(crate) fn cmd_import_to(
         .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
     let guard = VaultGuard::new(&mut core);
 
-    // 4. Run import (dry_run flag is forwarded to core).
+    // 5. Run import (dry_run flag is forwarded to core).
     let result = guard
         .import(&args.dir, args.dry_run)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // 5. Display results.
+    // 6. Display results.
     if args.dry_run {
         writeln!(
             out,
@@ -1528,6 +1616,267 @@ pub(crate) fn cmd_import_to(
     }
 
     // guard drops here, automatically calling lock().
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Vault command handlers
+// ---------------------------------------------------------------------------
+
+/// Resolve the base directory for vault management commands.
+///
+/// - `--vault <dir>` → used as-is
+/// - No `--vault`   → current working directory
+fn resolve_vaults_base_dir(cli: &Cli) -> anyhow::Result<PathBuf> {
+    match &cli.vault {
+        Some(v) => Ok(PathBuf::from(v)),
+        None => std::env::current_dir()
+            .map_err(|e| anyhow::anyhow!("Cannot determine current directory: {e}")),
+    }
+}
+
+/// Show the Full-policy security warning and read a [y/N] confirmation.
+///
+/// Prints the warning to stderr and reads one line from `reader`.
+/// Returns `true` only when the user responds with `y` or `Y`.
+fn confirm_full_policy(reader: &mut impl std::io::BufRead) -> anyhow::Result<bool> {
+    use std::io::Write as _;
+    eprintln!("警告: \"full\"を設定すると日記内容がAnthropicのAPIサーバーを通過します。");
+    eprintln!("      間接プロンプトインジェクション等のリスクがあります。");
+    eprint!("      本当に許可しますか？ [y/N]: ");
+    std::io::stderr()
+        .flush()
+        .map_err(|e| anyhow::anyhow!("Failed to flush stderr: {e}"))?;
+    let mut input = String::new();
+    reader
+        .read_line(&mut input)
+        .map_err(|e| anyhow::anyhow!("Failed to read input: {e}"))?;
+    let trimmed = input.trim();
+    Ok(trimmed == "y" || trimmed == "Y")
+}
+
+/// Show the vault deletion [y/N] confirmation prompt.
+///
+/// Returns `true` only when the user responds with `y` or `Y`.
+fn confirm_vault_delete(name: &str, reader: &mut impl std::io::BufRead) -> anyhow::Result<bool> {
+    use std::io::Write as _;
+    eprint!("Delete vault '{name}'? [y/N]: ");
+    std::io::stderr()
+        .flush()
+        .map_err(|e| anyhow::anyhow!("Failed to flush stderr: {e}"))?;
+    let mut input = String::new();
+    reader
+        .read_line(&mut input)
+        .map_err(|e| anyhow::anyhow!("Failed to read input: {e}"))?;
+    let trimmed = input.trim();
+    Ok(trimmed == "y" || trimmed == "Y")
+}
+
+/// Execute the `pq-diary vault create` command.
+///
+/// Parses `policy_str` to an `AccessPolicy` (default: `None`), shows a
+/// security warning for `Full` policy, prompts for the vault password, and
+/// creates the vault via `VaultManager::create_vault`.
+///
+/// # Errors
+///
+/// Returns an error if the policy string is invalid, the user cancels the
+/// `Full` policy confirmation, password acquisition fails, or vault creation
+/// fails.
+pub fn cmd_vault_create(cli: &Cli, name: &str, policy_str: Option<&str>) -> anyhow::Result<()> {
+    use pq_diary_core::vault::init::VaultManager;
+    cmd_vault_create_impl(
+        cli,
+        name,
+        policy_str,
+        &mut std::io::BufReader::new(std::io::stdin()),
+        |base_dir| VaultManager::new(base_dir).map_err(|e| anyhow::anyhow!("{e}")),
+    )
+}
+
+/// Internal implementation of `cmd_vault_create` with injectable stdin reader
+/// and `VaultManager` factory.
+fn cmd_vault_create_impl(
+    cli: &Cli,
+    name: &str,
+    policy_str: Option<&str>,
+    reader: &mut impl std::io::BufRead,
+    mgr_factory: impl FnOnce(PathBuf) -> anyhow::Result<pq_diary_core::vault::init::VaultManager>,
+) -> anyhow::Result<()> {
+    use pq_diary_core::policy::AccessPolicy;
+    use secrecy::ExposeSecret as _;
+    use std::str::FromStr as _;
+
+    // Step 1: Parse policy string.
+    let policy = match policy_str {
+        Some(s) => AccessPolicy::from_str(s).map_err(|e| anyhow::anyhow!("{e}"))?,
+        None => AccessPolicy::None,
+    };
+
+    // Step 2: Full policy warning.
+    if policy == AccessPolicy::Full && !confirm_full_policy(reader)? {
+        println!("キャンセルしました");
+        return Ok(());
+    }
+
+    // Step 3: Get password.
+    let password_source =
+        get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Step 4: Create vault.
+    let base_dir = resolve_vaults_base_dir(cli)?;
+    let mgr = mgr_factory(base_dir.clone())?;
+    let pw_bytes = password_source.secret().expose_secret().as_bytes();
+    mgr.create_vault(name, pw_bytes, policy)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Step 5: Success message.
+    let vault_dir = base_dir.join(name);
+    println!(
+        "Created vault '{name}' at {} (policy: {policy})",
+        vault_dir.display()
+    );
+    Ok(())
+}
+
+/// Execute the `pq-diary vault list` command.
+///
+/// Lists all vaults under the base directory with their access policies.
+/// Prints a `NAME` / `POLICY` table.  Does not require a password.
+///
+/// # Errors
+///
+/// Returns an error if the base directory cannot be determined or vault
+/// enumeration fails.
+pub fn cmd_vault_list(cli: &Cli) -> anyhow::Result<()> {
+    use pq_diary_core::vault::init::VaultManager;
+
+    let base_dir = resolve_vaults_base_dir(cli)?;
+    let mgr = VaultManager::new(base_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let vaults = mgr
+        .list_vaults_with_policy()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    println!("{:<20} POLICY", "NAME");
+    println!("{}", "-".repeat(31));
+    for v in &vaults {
+        println!("{:<20} {}", v.name, v.policy);
+    }
+
+    Ok(())
+}
+
+/// Execute the `pq-diary vault policy` command.
+///
+/// Parses `policy_str` to an `AccessPolicy`, shows a security warning for
+/// `Full` policy, then updates the vault's policy via
+/// `VaultManager::set_policy`.  Does not require a password.
+///
+/// # Errors
+///
+/// Returns an error if the policy string is invalid, the user cancels the
+/// `Full` policy confirmation, or the update fails.
+pub fn cmd_vault_policy(cli: &Cli, name: &str, policy_str: &str) -> anyhow::Result<()> {
+    cmd_vault_policy_impl(
+        cli,
+        name,
+        policy_str,
+        &mut std::io::BufReader::new(std::io::stdin()),
+    )
+}
+
+/// Internal implementation of `cmd_vault_policy` with an injectable stdin reader.
+fn cmd_vault_policy_impl(
+    cli: &Cli,
+    name: &str,
+    policy_str: &str,
+    reader: &mut impl std::io::BufRead,
+) -> anyhow::Result<()> {
+    use pq_diary_core::policy::AccessPolicy;
+    use pq_diary_core::vault::init::VaultManager;
+    use std::str::FromStr as _;
+
+    // Step 1: Parse policy string.
+    let policy = AccessPolicy::from_str(policy_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Step 2: Full policy warning.
+    if policy == AccessPolicy::Full && !confirm_full_policy(reader)? {
+        println!("キャンセルしました");
+        return Ok(());
+    }
+
+    // Step 3: Set policy.
+    let base_dir = resolve_vaults_base_dir(cli)?;
+    let mgr = VaultManager::new(base_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
+    mgr.set_policy(name, policy)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Step 4: Success message.
+    println!("Policy updated: {name} → {policy}");
+    Ok(())
+}
+
+/// Execute the `pq-diary vault delete` command.
+///
+/// Verifies the vault exists, shows an additional warning when deleting the
+/// default vault, and prompts for confirmation unless `--claude` is set.
+/// Calls `VaultManager::delete_vault` with the `zeroize` flag.  Does not
+/// require a password.
+///
+/// # Errors
+///
+/// Returns an error if the vault does not exist or deletion fails.
+pub fn cmd_vault_delete(cli: &Cli, name: &str, zeroize: bool) -> anyhow::Result<()> {
+    cmd_vault_delete_impl(
+        cli,
+        name,
+        zeroize,
+        &mut std::io::BufReader::new(std::io::stdin()),
+    )
+}
+
+/// Internal implementation of `cmd_vault_delete` with an injectable stdin reader.
+fn cmd_vault_delete_impl(
+    cli: &Cli,
+    name: &str,
+    zeroize: bool,
+    reader: &mut impl std::io::BufRead,
+) -> anyhow::Result<()> {
+    use pq_diary_core::vault::init::VaultManager;
+
+    let base_dir = resolve_vaults_base_dir(cli)?;
+    let mgr = VaultManager::new(base_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Step 1: Check if vault exists.
+    let vault_path = mgr.vault_path(name);
+    if !vault_path.exists() {
+        return Err(anyhow::anyhow!("vault '{}' does not exist", name));
+    }
+
+    // Step 2: Show additional warning for the default vault (always, before any prompt).
+    let is_default = mgr.default_vault() == name;
+    if is_default {
+        eprintln!(
+            "警告: '{name}' はデフォルト vault です。削除すると他の操作に影響する可能性があります。"
+        );
+    }
+
+    // Step 3: Confirmation (skip with --claude).
+    let do_delete = if cli.claude {
+        true
+    } else {
+        confirm_vault_delete(name, reader)?
+    };
+
+    if do_delete {
+        // Step 4: Delete vault.
+        mgr.delete_vault(name, zeroize)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        println!("Deleted vault '{name}'");
+    } else {
+        println!("キャンセルしました");
+    }
+
     Ok(())
 }
 
@@ -2674,12 +3023,31 @@ mod tests {
     }
 
     /// TC-0040-09: --claude global flag skips confirmation and deletes.
+    /// Uses WriteOnly policy so the policy check permits the write operation.
     #[test]
     fn tc_0040_09_claude_flag_skips_confirmation() {
+        use pq_diary_core::policy::AccessPolicy;
         let dir = tempfile::tempdir().expect("tempdir");
-        let (vault_dir, prefix) = setup_vault_with_entry(&dir, "Claude Test", "body", vec![]);
+
+        // Create vault with WriteOnly policy so --claude delete is allowed.
+        let vault_dir = setup_vault_with_policy(&dir, AccessPolicy::WriteOnly);
         let vault_dir_str = vault_dir.to_str().expect("utf8");
 
+        // Add an entry via non-Claude path (no policy check for non-Claude).
+        let setup_cli = make_cli(vault_dir_str, Some("password"));
+        cmd_new(
+            &setup_cli,
+            Some("Claude Test".to_string()),
+            Some("body".to_string()),
+            vec![],
+            None,
+        )
+        .expect("setup cmd_new");
+        let entries = read_vault_entries(&vault_dir);
+        assert_eq!(entries.len(), 1, "setup: expected 1 entry");
+        let prefix = entries[0].uuid_hex[..8].to_string();
+
+        // Delete with --claude: confirmation should be skipped.
         let delete_cli = make_delete_cli_claude(vault_dir_str, Some("password"), &prefix);
         let mut reader = std::io::BufReader::new("".as_bytes());
         let result = cmd_delete_impl(&delete_cli, prefix.clone(), false, &mut reader);
@@ -4193,6 +4561,1286 @@ mod tests {
         assert!(
             err_msg.contains("No Markdown files found"),
             "error must mention 'No Markdown files found': {err_msg}"
+        );
+    }
+
+    // =========================================================================
+    // TASK-0071: vault command tests
+    // =========================================================================
+
+    /// Create a VaultManager with fast Argon2 params rooted at a temp dir.
+    fn make_vault_mgr(dir: &tempfile::TempDir) -> pq_diary_core::vault::init::VaultManager {
+        pq_diary_core::vault::init::VaultManager::new(dir.path().to_path_buf())
+            .expect("VaultManager::new")
+            .with_kdf_params(fast_params())
+    }
+
+    /// Build a `Cli` for vault management commands.
+    ///
+    /// `base_dir_str` is set as `--vault`.  `password` (if `Some`) is set as
+    /// `--password`.  `subcmd` is appended after `vault`.
+    fn make_vault_mgmt_cli(
+        base_dir_str: &str,
+        password: Option<&str>,
+        subcmd: &[&str],
+    ) -> crate::Cli {
+        use clap::Parser as _;
+        let mut args = vec!["pq-diary", "-v", base_dir_str];
+        if let Some(pw) = password {
+            args.extend_from_slice(&["--password", pw]);
+        }
+        args.push("vault");
+        args.extend_from_slice(subcmd);
+        crate::Cli::try_parse_from(&args).expect("parse test CLI")
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-S7-030-03: Full policy create with "y" → success
+    // -------------------------------------------------------------------------
+
+    /// TC-S7-030-03: Full policy vault creation with "y" confirmation completes.
+    #[test]
+    fn tc_s7_030_03_full_policy_create_with_y_succeeds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base_dir_str = dir.path().to_str().expect("utf8");
+
+        let cli = make_vault_mgmt_cli(base_dir_str, Some("testpass"), &["create", "v030"]);
+        let mut reader = std::io::Cursor::new("y\n");
+
+        let result = cmd_vault_create_impl(&cli, "v030", Some("full"), &mut reader, |base_dir| {
+            pq_diary_core::vault::init::VaultManager::new(base_dir)
+                .map(|m| m.with_kdf_params(fast_params()))
+                .map_err(|e| anyhow::anyhow!("{e}"))
+        });
+
+        assert!(
+            result.is_ok(),
+            "create with Full policy and 'y' must succeed: {:?}",
+            result.err()
+        );
+        assert!(
+            dir.path().join("v030").join("vault.pqd").exists(),
+            "vault.pqd must exist after creation"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-S7-030-E04: Invalid policy string → error
+    // -------------------------------------------------------------------------
+
+    /// TC-S7-030-E04: An invalid policy string returns an error.
+    #[test]
+    fn tc_s7_030_e04_invalid_policy_string_returns_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base_dir_str = dir.path().to_str().expect("utf8");
+
+        let cli = make_vault_mgmt_cli(base_dir_str, Some("testpass"), &["create", "v_e04"]);
+        let mut reader = std::io::Cursor::new("");
+
+        let result =
+            cmd_vault_create_impl(&cli, "v_e04", Some("invalid"), &mut reader, |base_dir| {
+                pq_diary_core::vault::init::VaultManager::new(base_dir)
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+            });
+
+        assert!(result.is_err(), "invalid policy must return an error");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("invalid policy"),
+            "error message must mention 'invalid policy': {err_msg}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-S7-030-E05: Full policy warning declined → abort
+    // -------------------------------------------------------------------------
+
+    /// TC-S7-030-E05: Full policy warning with "n" response aborts creation.
+    #[test]
+    fn tc_s7_030_e05_full_policy_declined_aborts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base_dir_str = dir.path().to_str().expect("utf8");
+
+        let cli = make_vault_mgmt_cli(base_dir_str, Some("testpass"), &["create", "v_e05"]);
+        let mut reader = std::io::Cursor::new("n\n");
+
+        let result = cmd_vault_create_impl(&cli, "v_e05", Some("full"), &mut reader, |base_dir| {
+            pq_diary_core::vault::init::VaultManager::new(base_dir)
+                .map_err(|e| anyhow::anyhow!("{e}"))
+        });
+
+        assert!(
+            result.is_ok(),
+            "declined abort must return Ok: {:?}",
+            result.err()
+        );
+        assert!(
+            !dir.path().join("v_e05").exists(),
+            "vault must not be created after declining Full policy warning"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-S7-034-02: write_only → full policy change with "y" → success
+    // -------------------------------------------------------------------------
+
+    /// TC-S7-034-02: Changing policy from write_only to full with "y" succeeds.
+    #[test]
+    fn tc_s7_034_02_policy_change_to_full_with_y_succeeds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mgr = make_vault_mgr(&dir);
+        mgr.create_vault(
+            "v034",
+            b"testpass",
+            pq_diary_core::policy::AccessPolicy::WriteOnly,
+        )
+        .expect("create_vault");
+
+        let base_dir_str = dir.path().to_str().expect("utf8");
+        let cli = make_vault_mgmt_cli(base_dir_str, None, &["policy", "v034", "full"]);
+        let mut reader = std::io::Cursor::new("y\n");
+
+        let result = cmd_vault_policy_impl(&cli, "v034", "full", &mut reader);
+
+        assert!(
+            result.is_ok(),
+            "policy change to full with 'y' must succeed: {:?}",
+            result.err()
+        );
+        // Verify policy is now Full.
+        let vaults = mgr.list_vaults_with_policy().expect("list");
+        let v = vaults.iter().find(|v| v.name == "v034").expect("vault");
+        assert_eq!(
+            v.policy,
+            pq_diary_core::policy::AccessPolicy::Full,
+            "policy must be Full after change"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-S7-034-E02: Full policy warning declined during policy change → abort
+    // -------------------------------------------------------------------------
+
+    /// TC-S7-034-E02: Full policy change declined with "n" leaves policy unchanged.
+    #[test]
+    fn tc_s7_034_e02_policy_change_to_full_declined_aborts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mgr = make_vault_mgr(&dir);
+        mgr.create_vault(
+            "v_e02",
+            b"testpass",
+            pq_diary_core::policy::AccessPolicy::WriteOnly,
+        )
+        .expect("create_vault");
+
+        let base_dir_str = dir.path().to_str().expect("utf8");
+        let cli = make_vault_mgmt_cli(base_dir_str, None, &["policy", "v_e02", "full"]);
+        let mut reader = std::io::Cursor::new("n\n");
+
+        let result = cmd_vault_policy_impl(&cli, "v_e02", "full", &mut reader);
+
+        assert!(
+            result.is_ok(),
+            "declined abort must return Ok: {:?}",
+            result.err()
+        );
+        // Verify policy is still WriteOnly.
+        let vaults = mgr.list_vaults_with_policy().expect("list");
+        let v = vaults.iter().find(|v| v.name == "v_e02").expect("vault");
+        assert_eq!(
+            v.policy,
+            pq_diary_core::policy::AccessPolicy::WriteOnly,
+            "policy must remain write_only after declining"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-S7-035-02: Delete confirmation declined → abort
+    // -------------------------------------------------------------------------
+
+    /// TC-S7-035-02: Delete confirmation with "n" aborts deletion.
+    #[test]
+    fn tc_s7_035_02_delete_declined_aborts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mgr = make_vault_mgr(&dir);
+        mgr.create_vault(
+            "v035",
+            b"testpass",
+            pq_diary_core::policy::AccessPolicy::None,
+        )
+        .expect("create_vault");
+
+        let base_dir_str = dir.path().to_str().expect("utf8");
+        let cli = make_vault_mgmt_cli(base_dir_str, None, &["delete", "v035"]);
+        let mut reader = std::io::Cursor::new("n\n");
+
+        let result = cmd_vault_delete_impl(&cli, "v035", false, &mut reader);
+
+        assert!(
+            result.is_ok(),
+            "declined abort must return Ok: {:?}",
+            result.err()
+        );
+        assert!(
+            dir.path().join("v035").exists(),
+            "vault must not be deleted after declining"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-S7-035-03: --claude flag skips confirmation and deletes directly
+    // -------------------------------------------------------------------------
+
+    /// TC-S7-035-03: `--claude` skips the confirmation prompt and deletes the vault.
+    #[test]
+    fn tc_s7_035_03_delete_with_claude_skips_confirmation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mgr = make_vault_mgr(&dir);
+        mgr.create_vault(
+            "v035c",
+            b"testpass",
+            pq_diary_core::policy::AccessPolicy::None,
+        )
+        .expect("create_vault");
+
+        let base_dir_str = dir.path().to_str().expect("utf8");
+        let cli = crate::Cli::try_parse_from([
+            "pq-diary",
+            "--claude",
+            "-v",
+            base_dir_str,
+            "vault",
+            "delete",
+            "v035c",
+        ])
+        .expect("parse cli");
+
+        let result = cmd_vault_delete(&cli, "v035c", false);
+
+        assert!(
+            result.is_ok(),
+            "delete with --claude must succeed: {:?}",
+            result.err()
+        );
+        assert!(
+            !dir.path().join("v035c").exists(),
+            "vault must be deleted when --claude is set"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-S7-035-E01: Default vault deletion shows additional warning
+    // -------------------------------------------------------------------------
+
+    /// TC-S7-035-E01: Deleting the default vault shows an extra warning and still prompts.
+    #[test]
+    fn tc_s7_035_e01_default_vault_deletion_shows_warning() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mgr = make_vault_mgr(&dir);
+        // "default" matches AppConfig::default().defaults.vault
+        mgr.create_vault(
+            "default",
+            b"testpass",
+            pq_diary_core::policy::AccessPolicy::None,
+        )
+        .expect("create_vault");
+
+        let base_dir_str = dir.path().to_str().expect("utf8");
+        let cli = make_vault_mgmt_cli(base_dir_str, None, &["delete", "default"]);
+        let mut reader = std::io::Cursor::new("n\n");
+
+        // "n" → abort; verifies that the confirmation prompt was still issued
+        // (the vault is not deleted), and the additional warning was shown.
+        let result = cmd_vault_delete_impl(&cli, "default", false, &mut reader);
+
+        assert!(result.is_ok(), "abort must return Ok: {:?}", result.err());
+        assert!(
+            dir.path().join("default").exists(),
+            "default vault must not be deleted after declining"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-S7-040-01: None policy create — no warning, vault is created
+    // -------------------------------------------------------------------------
+
+    /// TC-S7-040-01: Creating with None policy does not trigger the Full warning.
+    #[test]
+    fn tc_s7_040_01_none_policy_create_no_warning() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base_dir_str = dir.path().to_str().expect("utf8");
+
+        let cli = make_vault_mgmt_cli(base_dir_str, Some("testpass"), &["create", "v040a"]);
+        // "n" as reader: if Full warning were shown, this would abort creation.
+        let mut reader = std::io::Cursor::new("n\n");
+
+        let result = cmd_vault_create_impl(
+            &cli,
+            "v040a",
+            None, // None policy
+            &mut reader,
+            |base_dir| {
+                pq_diary_core::vault::init::VaultManager::new(base_dir)
+                    .map(|m| m.with_kdf_params(fast_params()))
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+            },
+        );
+
+        assert!(
+            result.is_ok(),
+            "None policy create must succeed without warning: {:?}",
+            result.err()
+        );
+        assert!(
+            dir.path().join("v040a").exists(),
+            "vault v040a must be created (no warning was shown)"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-S7-040-02: WriteOnly policy create — no warning, vault is created
+    // -------------------------------------------------------------------------
+
+    /// TC-S7-040-02: Creating with WriteOnly policy does not trigger the Full warning.
+    #[test]
+    fn tc_s7_040_02_write_only_policy_create_no_warning() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base_dir_str = dir.path().to_str().expect("utf8");
+
+        let cli = make_vault_mgmt_cli(base_dir_str, Some("testpass"), &["create", "v040b"]);
+        // "n" as reader: if Full warning were shown, this would abort creation.
+        let mut reader = std::io::Cursor::new("n\n");
+
+        let result =
+            cmd_vault_create_impl(&cli, "v040b", Some("write_only"), &mut reader, |base_dir| {
+                pq_diary_core::vault::init::VaultManager::new(base_dir)
+                    .map(|m| m.with_kdf_params(fast_params()))
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+            });
+
+        assert!(
+            result.is_ok(),
+            "WriteOnly policy create must succeed without warning: {:?}",
+            result.err()
+        );
+        assert!(
+            dir.path().join("v040b").exists(),
+            "vault v040b must be created (no warning was shown)"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-S7-040-03: Full policy create — warning is shown (reader consulted)
+    // -------------------------------------------------------------------------
+
+    /// TC-S7-040-03: Creating with Full policy shows the warning and reads confirmation.
+    #[test]
+    fn tc_s7_040_03_full_policy_create_shows_warning() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base_dir_str = dir.path().to_str().expect("utf8");
+
+        let cli = make_vault_mgmt_cli(base_dir_str, Some("testpass"), &["create", "v040c"]);
+        // "n" — the warning IS shown, reader IS consulted, creation is aborted.
+        let mut reader = std::io::Cursor::new("n\n");
+
+        let result = cmd_vault_create_impl(&cli, "v040c", Some("full"), &mut reader, |base_dir| {
+            pq_diary_core::vault::init::VaultManager::new(base_dir)
+                .map_err(|e| anyhow::anyhow!("{e}"))
+        });
+
+        assert!(
+            result.is_ok(),
+            "declined abort must return Ok: {:?}",
+            result.err()
+        );
+        assert!(
+            !dir.path().join("v040c").exists(),
+            "vault v040c must not exist — warning was shown and 'n' was read"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-S7-040-04: Full policy change — warning is shown (reader consulted)
+    // -------------------------------------------------------------------------
+
+    /// TC-S7-040-04: Changing policy to Full shows the warning and reads confirmation.
+    #[test]
+    fn tc_s7_040_04_full_policy_change_shows_warning() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mgr = make_vault_mgr(&dir);
+        mgr.create_vault(
+            "v040d",
+            b"testpass",
+            pq_diary_core::policy::AccessPolicy::None,
+        )
+        .expect("create_vault");
+
+        let base_dir_str = dir.path().to_str().expect("utf8");
+        let cli = make_vault_mgmt_cli(base_dir_str, None, &["policy", "v040d", "full"]);
+        // "n" — the warning IS shown, reader IS consulted, change is aborted.
+        let mut reader = std::io::Cursor::new("n\n");
+
+        let result = cmd_vault_policy_impl(&cli, "v040d", "full", &mut reader);
+
+        assert!(
+            result.is_ok(),
+            "declined abort must return Ok: {:?}",
+            result.err()
+        );
+        // Policy must remain None.
+        let vaults = mgr.list_vaults_with_policy().expect("list");
+        let v = vaults.iter().find(|v| v.name == "v040d").expect("vault");
+        assert_eq!(
+            v.policy,
+            pq_diary_core::policy::AccessPolicy::None,
+            "policy must remain none — warning was shown and 'n' was read"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-S7-NFR-003-01: vault create completes within 3 seconds
+    // -------------------------------------------------------------------------
+
+    /// TC-S7-NFR-003-01: `vault create` with default Argon2 params completes within 3s.
+    #[test]
+    fn tc_s7_nfr_003_01_vault_create_within_3_seconds() {
+        use std::time::Instant;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base_dir_str = dir.path().to_str().expect("utf8");
+
+        let cli = make_vault_mgmt_cli(base_dir_str, Some("testpass"), &["create", "v_nfr"]);
+        let mut reader = std::io::Cursor::new("");
+
+        let start = Instant::now();
+        let result = cmd_vault_create_impl(
+            &cli,
+            "v_nfr",
+            None, // None policy — no confirmation, no extra latency
+            &mut reader,
+            |base_dir| {
+                // Use real (default) Argon2 params for the NFR measurement.
+                pq_diary_core::vault::init::VaultManager::new(base_dir)
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+            },
+        );
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_ok(),
+            "vault create must succeed: {:?}",
+            result.err()
+        );
+        assert!(
+            elapsed.as_secs() < 3,
+            "vault create must complete within 3 seconds; took {elapsed:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // vault list — smoke test
+    // -------------------------------------------------------------------------
+
+    /// cmd_vault_list lists vaults without error.
+    #[test]
+    fn tc_s7_vault_list_no_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mgr = make_vault_mgr(&dir);
+        mgr.create_vault("alpha", b"pw", pq_diary_core::policy::AccessPolicy::None)
+            .expect("create alpha");
+        mgr.create_vault(
+            "beta",
+            b"pw",
+            pq_diary_core::policy::AccessPolicy::WriteOnly,
+        )
+        .expect("create beta");
+
+        let base_dir_str = dir.path().to_str().expect("utf8");
+        let cli = make_vault_mgmt_cli(base_dir_str, None, &["list"]);
+
+        let result = cmd_vault_list(&cli);
+        assert!(
+            result.is_ok(),
+            "vault list must not error: {:?}",
+            result.err()
+        );
+    }
+
+    // =========================================================================
+    // TASK-0072: check_claude_policy integration tests
+    // =========================================================================
+
+    /// Create a vault with a specific access policy for policy-check tests.
+    fn setup_vault_with_policy(
+        dir: &tempfile::TempDir,
+        policy: pq_diary_core::policy::AccessPolicy,
+    ) -> PathBuf {
+        use pq_diary_core::vault::init::VaultManager;
+        let mgr = VaultManager::new(dir.path().to_path_buf())
+            .expect("VaultManager::new")
+            .with_kdf_params(fast_params());
+        mgr.create_vault("v", b"password", policy)
+            .expect("create_vault");
+        dir.path().join("v")
+    }
+
+    /// Build a `Cli` with `--claude` flag targeting `vault_dir`.
+    fn make_cli_claude(vault_dir_str: &str, password: Option<&str>) -> crate::Cli {
+        let mut args: Vec<&str> = vec!["pq-diary", "--claude", "-v", vault_dir_str];
+        if let Some(pw) = password {
+            args.extend_from_slice(&["--password", pw]);
+        }
+        args.push("list");
+        crate::Cli::try_parse_from(&args).expect("parse test CLI with --claude")
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-S7-020-01: --claude 未指定で None vault に正常アクセス
+    // -------------------------------------------------------------------------
+
+    /// TC-S7-020-01: Without --claude the policy check is skipped; None policy
+    /// vault is accessible as usual.
+    #[test]
+    fn tc_s7_020_01_no_claude_flag_none_policy_allows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir); // default policy = None
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let cli = make_cli(vault_dir_str, Some("password"));
+        let result = cmd_list(&cli, None, None, 20);
+        assert!(
+            result.is_ok(),
+            "cmd_list without --claude must succeed on None policy vault: {:?}",
+            result.err()
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-S7-020-02: --claude + Full + read で許可
+    // -------------------------------------------------------------------------
+
+    /// TC-S7-020-02: --claude + Full policy allows all read operations.
+    #[test]
+    fn tc_s7_020_02_claude_full_read_allows() {
+        use pq_diary_core::policy::AccessPolicy;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault_with_policy(&dir, AccessPolicy::Full);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let cli = make_cli_claude(vault_dir_str, Some("password"));
+        let result = cmd_list(&cli, None, None, 20);
+        assert!(
+            result.is_ok(),
+            "--claude + Full + Read (list) must be allowed: {:?}",
+            result.err()
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-S7-020-03: --claude + Full + write で許可
+    // -------------------------------------------------------------------------
+
+    /// TC-S7-020-03: --claude + Full policy allows all write operations.
+    #[test]
+    fn tc_s7_020_03_claude_full_write_allows() {
+        use pq_diary_core::policy::AccessPolicy;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault_with_policy(&dir, AccessPolicy::Full);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let cli = make_cli_claude(vault_dir_str, Some("password"));
+        let result = cmd_new(
+            &cli,
+            Some("Test".to_string()),
+            Some("body".to_string()),
+            vec![],
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "--claude + Full + Write (new) must be allowed: {:?}",
+            result.err()
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-S7-020-04: --claude + WriteOnly + write で許可
+    // -------------------------------------------------------------------------
+
+    /// TC-S7-020-04: --claude + WriteOnly policy allows write operations.
+    #[test]
+    fn tc_s7_020_04_claude_write_only_write_allows() {
+        use pq_diary_core::policy::AccessPolicy;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault_with_policy(&dir, AccessPolicy::WriteOnly);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let cli = make_cli_claude(vault_dir_str, Some("password"));
+        let result = cmd_new(
+            &cli,
+            Some("Test".to_string()),
+            Some("body".to_string()),
+            vec![],
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "--claude + WriteOnly + Write (new) must be allowed: {:?}",
+            result.err()
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-S7-020-E01: --claude + None + write で拒否（復号なし）
+    // -------------------------------------------------------------------------
+
+    /// TC-S7-020-E01: --claude + None policy denies write operations before any
+    /// vault decryption takes place.
+    #[test]
+    fn tc_s7_020_e01_claude_none_write_denied_no_decrypt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir); // default policy = None
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let cli = make_cli_claude(vault_dir_str, Some("password"));
+        let result = cmd_new(
+            &cli,
+            Some("Test".to_string()),
+            Some("body".to_string()),
+            vec![],
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "--claude + None + Write must be denied before decryption"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("Access denied"),
+            "error must contain 'Access denied': {msg}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-S7-020-E02: --claude + WriteOnly + show で拒否
+    // -------------------------------------------------------------------------
+
+    /// TC-S7-020-E02: --claude + WriteOnly policy denies show (read) operations.
+    #[test]
+    fn tc_s7_020_e02_claude_write_only_show_denied() {
+        use pq_diary_core::policy::AccessPolicy;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault_with_policy(&dir, AccessPolicy::WriteOnly);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let cli = make_cli_claude(vault_dir_str, Some("password"));
+        let mut out = Vec::new();
+        // Policy check fires before any vault access; entry-not-found is irrelevant.
+        let result = cmd_show_impl(&cli, "00000000".to_string(), &mut out);
+        assert!(
+            result.is_err(),
+            "--claude + WriteOnly + show must be denied"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("Access denied"),
+            "error must contain 'Access denied': {msg}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-S7-020-E03: --claude + WriteOnly + list で拒否
+    // -------------------------------------------------------------------------
+
+    /// TC-S7-020-E03: --claude + WriteOnly policy denies list (read) operations.
+    #[test]
+    fn tc_s7_020_e03_claude_write_only_list_denied() {
+        use pq_diary_core::policy::AccessPolicy;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault_with_policy(&dir, AccessPolicy::WriteOnly);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let cli = make_cli_claude(vault_dir_str, Some("password"));
+        let result = cmd_list(&cli, None, None, 20);
+        assert!(
+            result.is_err(),
+            "--claude + WriteOnly + list must be denied"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("Access denied"),
+            "error must contain 'Access denied': {msg}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-S7-020-E04: --claude + WriteOnly + search で拒否
+    // -------------------------------------------------------------------------
+
+    /// TC-S7-020-E04: --claude + WriteOnly policy denies search (read) operations.
+    #[test]
+    fn tc_s7_020_e04_claude_write_only_search_denied() {
+        use pq_diary_core::policy::AccessPolicy;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault_with_policy(&dir, AccessPolicy::WriteOnly);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let cli = make_cli_claude(vault_dir_str, Some("password"));
+        let args = crate::SearchArgs {
+            pattern: "test".to_string(),
+            tag: None,
+            context: 2,
+            count: false,
+        };
+        let mut out = Vec::new();
+        let result = cmd_search_to(&cli, &args, &mut out);
+        assert!(
+            result.is_err(),
+            "--claude + WriteOnly + search must be denied"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("Access denied"),
+            "error must contain 'Access denied': {msg}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-S7-020-E05: --claude + WriteOnly + stats で拒否
+    // -------------------------------------------------------------------------
+
+    /// TC-S7-020-E05: --claude + WriteOnly policy denies stats (read) operations.
+    #[test]
+    fn tc_s7_020_e05_claude_write_only_stats_denied() {
+        use pq_diary_core::policy::AccessPolicy;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault_with_policy(&dir, AccessPolicy::WriteOnly);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let cli = make_cli_claude(vault_dir_str, Some("password"));
+        let args = crate::StatsArgs {
+            json: false,
+            heatmap: false,
+        };
+        let mut out = Vec::new();
+        let result = cmd_stats_to(&cli, &args, &mut out);
+        assert!(
+            result.is_err(),
+            "--claude + WriteOnly + stats must be denied"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("Access denied"),
+            "error must contain 'Access denied': {msg}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-S7-020-E06: --claude + None + パスワード提供済でも拒否（復号なし）
+    // -------------------------------------------------------------------------
+
+    /// TC-S7-020-E06: --claude + None policy denies operations even when a
+    /// password is already provided; the vault is never decrypted.
+    #[test]
+    fn tc_s7_020_e06_claude_none_with_password_still_denied() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir); // default policy = None
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        // Password supplied via --password, but policy check fires first.
+        let cli = make_cli_claude(vault_dir_str, Some("password"));
+        let result = cmd_list(&cli, None, None, 20);
+        assert!(
+            result.is_err(),
+            "--claude + None must be denied even when password is provided"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("Access denied"),
+            "error must contain 'Access denied': {msg}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-S7-050-01: None 拒否エラーメッセージ形式
+    // -------------------------------------------------------------------------
+
+    /// TC-S7-050-01: None policy denial error message matches REQ-050 format.
+    #[test]
+    fn tc_s7_050_01_none_deny_error_message_format() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir); // default policy = None
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let cli = make_cli_claude(vault_dir_str, Some("password"));
+        let result = cmd_list(&cli, None, None, 20);
+        assert!(result.is_err(), "must be denied");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("Access denied"),
+            "must contain 'Access denied': {msg}"
+        );
+        assert!(msg.contains("none"), "must contain policy 'none': {msg}");
+        assert!(msg.contains("'--claude'"), "must mention '--claude': {msg}");
+        assert!(
+            msg.contains("'write_only' or 'full'"),
+            "must mention required policies: {msg}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-S7-050-02: WriteOnly 拒否エラーメッセージ形式
+    // -------------------------------------------------------------------------
+
+    /// TC-S7-050-02: WriteOnly policy denial (read op) error message matches
+    /// REQ-050 format.
+    #[test]
+    fn tc_s7_050_02_write_only_deny_error_message_format() {
+        use pq_diary_core::policy::AccessPolicy;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault_with_policy(&dir, AccessPolicy::WriteOnly);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let cli = make_cli_claude(vault_dir_str, Some("password"));
+        let result = cmd_list(&cli, None, None, 20);
+        assert!(result.is_err(), "must be denied");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("Access denied"),
+            "must contain 'Access denied': {msg}"
+        );
+        assert!(
+            msg.contains("write_only"),
+            "must contain 'write_only': {msg}"
+        );
+        assert!(
+            msg.contains("Read operations require 'full'"),
+            "must mention read ops requirement: {msg}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-S7-040-03 (TASK-0072 variant): --claude + Full 時に警告が表示されない
+    // -------------------------------------------------------------------------
+
+    /// TC-S7-040-03: Running operations with --claude + Full policy does not
+    /// produce the Full-policy security warning (warning only appears at
+    /// policy-set time via vault commands).
+    #[test]
+    fn tc_s7_020_claude_full_operation_no_security_warning() {
+        use pq_diary_core::policy::AccessPolicy;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault_with_policy(&dir, AccessPolicy::Full);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        // Operations on a Full vault with --claude succeed without any error.
+        let cli = make_cli_claude(vault_dir_str, Some("password"));
+        let result = cmd_list(&cli, None, None, 20);
+        assert!(
+            result.is_ok(),
+            "--claude + Full + list must succeed without warning: {:?}",
+            result.err()
+        );
+    }
+
+    // =========================================================================
+    // TASK-0073: Integration tests + NFR performance checks
+    // =========================================================================
+
+    // -------------------------------------------------------------------------
+    // TC-S7-INT-01: vault CRUD cycle (create → list → policy → delete)
+    // -------------------------------------------------------------------------
+
+    /// TC-S7-INT-01: Complete vault CRUD cycle — create → list → policy → delete.
+    ///
+    /// Verifies REQ-030~037: each vault management command works end-to-end
+    /// and the state transitions are correct after each operation.
+    #[test]
+    fn tc_s7_int_01_vault_crud_cycle() {
+        use pq_diary_core::policy::AccessPolicy;
+        use pq_diary_core::vault::init::VaultManager;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base_dir_str = dir.path().to_str().expect("utf8");
+
+        // Step 1: create vault with write_only policy
+        let cli = make_vault_mgmt_cli(base_dir_str, Some("testpass"), &["create", "int01vault"]);
+        let mut reader = std::io::Cursor::new("");
+        cmd_vault_create_impl(
+            &cli,
+            "int01vault",
+            Some("write_only"),
+            &mut reader,
+            |base_dir| {
+                VaultManager::new(base_dir)
+                    .map(|m| m.with_kdf_params(fast_params()))
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+            },
+        )
+        .expect("create vault");
+
+        // Step 2: verify vault appears in list with write_only policy
+        let mgr = VaultManager::new(dir.path().to_path_buf()).expect("VaultManager");
+        let vaults = mgr.list_vaults_with_policy().expect("list");
+        assert!(
+            vaults.iter().any(|v| v.name == "int01vault"),
+            "vault must appear in list after creation"
+        );
+        let v = vaults.iter().find(|v| v.name == "int01vault").unwrap();
+        assert_eq!(
+            v.policy,
+            AccessPolicy::WriteOnly,
+            "policy must be write_only after creation"
+        );
+
+        // Also verify cmd_vault_list succeeds without error
+        let cli = make_vault_mgmt_cli(base_dir_str, None, &["list"]);
+        cmd_vault_list(&cli).expect("vault list");
+
+        // Step 3: change policy to none via cmd_vault_policy
+        let cli = make_vault_mgmt_cli(base_dir_str, None, &["policy", "int01vault", "none"]);
+        let mut reader = std::io::Cursor::new("");
+        cmd_vault_policy_impl(&cli, "int01vault", "none", &mut reader).expect("vault policy");
+
+        let vaults = mgr
+            .list_vaults_with_policy()
+            .expect("list after policy change");
+        let v = vaults.iter().find(|v| v.name == "int01vault").unwrap();
+        assert_eq!(
+            v.policy,
+            AccessPolicy::None,
+            "policy must be updated to none after vault policy command"
+        );
+
+        // Step 4: delete vault with confirmation "y"
+        let cli = make_vault_mgmt_cli(base_dir_str, None, &["delete", "int01vault"]);
+        let mut reader = std::io::Cursor::new("y\n");
+        cmd_vault_delete_impl(&cli, "int01vault", false, &mut reader).expect("vault delete");
+
+        // Verify vault is gone
+        assert!(
+            !dir.path().join("int01vault").exists(),
+            "vault directory must not exist after deletion"
+        );
+        let vaults = mgr.list_vaults_with_policy().expect("list after delete");
+        assert!(
+            !vaults.iter().any(|v| v.name == "int01vault"),
+            "vault must not appear in list after deletion"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-S7-INT-02: --claude + None vault の即座拒否
+    // -------------------------------------------------------------------------
+
+    /// TC-S7-INT-02: --claude + None vault is denied immediately without
+    /// vault decryption — cmd_new is rejected before password is used.
+    ///
+    /// Verifies REQ-101, NFR-101: the policy check fires before any vault.pqd
+    /// read.
+    #[test]
+    fn tc_s7_int_02_claude_none_vault_immediate_denial() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir); // default policy = None
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let cli = make_cli_claude(vault_dir_str, Some("password"));
+        let result = cmd_new(
+            &cli,
+            Some("Title".to_string()),
+            Some("body".to_string()),
+            vec![],
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "--claude + None must deny cmd_new immediately"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("Access denied"),
+            "error must contain 'Access denied': {msg}"
+        );
+        assert!(
+            msg.contains("none"),
+            "error must contain policy 'none': {msg}"
+        );
+        assert!(
+            msg.contains("'--claude'"),
+            "error must mention '--claude': {msg}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-S7-INT-03: --claude + WriteOnly vault の操作制御
+    // -------------------------------------------------------------------------
+
+    /// TC-S7-INT-03: --claude + WriteOnly vault — write ops are permitted,
+    /// read ops are denied.
+    ///
+    /// Verifies REQ-020~025: `new` (Write) succeeds and `list` (Read) fails.
+    #[test]
+    fn tc_s7_int_03_claude_write_only_operation_control() {
+        use pq_diary_core::policy::AccessPolicy;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault_with_policy(&dir, AccessPolicy::WriteOnly);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        // Write op (new) must be allowed
+        let cli = make_cli_claude(vault_dir_str, Some("password"));
+        let result = cmd_new(
+            &cli,
+            Some("Test Entry".to_string()),
+            Some("body text".to_string()),
+            vec![],
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "--claude + WriteOnly + Write (new) must be allowed: {:?}",
+            result.err()
+        );
+
+        // Read op (list) must be denied
+        let cli = make_cli_claude(vault_dir_str, Some("password"));
+        let result = cmd_list(&cli, None, None, 20);
+        assert!(
+            result.is_err(),
+            "--claude + WriteOnly + Read (list) must be denied"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("Access denied"),
+            "error must contain 'Access denied': {msg}"
+        );
+        assert!(
+            msg.contains("write_only"),
+            "error must mention policy 'write_only': {msg}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-S7-INT-04: --claude + Full vault の全操作許可
+    // -------------------------------------------------------------------------
+
+    /// TC-S7-INT-04: --claude + Full vault permits all operations (reads and
+    /// writes).
+    ///
+    /// Verifies REQ-020~025: both `new` (Write) and `list` (Read) succeed.
+    #[test]
+    fn tc_s7_int_04_claude_full_all_operations_permitted() {
+        use pq_diary_core::policy::AccessPolicy;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault_with_policy(&dir, AccessPolicy::Full);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        // Write op (new) must be allowed
+        let cli = make_cli_claude(vault_dir_str, Some("password"));
+        let result = cmd_new(
+            &cli,
+            Some("Test Entry".to_string()),
+            Some("body text".to_string()),
+            vec![],
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "--claude + Full + Write (new) must be allowed: {:?}",
+            result.err()
+        );
+
+        // Read op (list) must be allowed
+        let cli = make_cli_claude(vault_dir_str, Some("password"));
+        let result = cmd_list(&cli, None, None, 20);
+        assert!(
+            result.is_ok(),
+            "--claude + Full + Read (list) must be allowed: {:?}",
+            result.err()
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-S7-INT-05: vault delete --zeroize
+    // -------------------------------------------------------------------------
+
+    /// TC-S7-INT-05: `vault delete --zeroize` overwrites vault.pqd with random
+    /// bytes and removes the vault directory.
+    ///
+    /// Verifies REQ-037: after deletion the vault directory does not exist.
+    #[test]
+    fn tc_s7_int_05_vault_delete_zeroize() {
+        use pq_diary_core::vault::init::VaultManager;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base_dir_str = dir.path().to_str().expect("utf8");
+
+        // Create vault with fast params
+        let mgr = VaultManager::new(dir.path().to_path_buf())
+            .expect("VaultManager")
+            .with_kdf_params(fast_params());
+        mgr.create_vault(
+            "zvault",
+            b"password",
+            pq_diary_core::policy::AccessPolicy::None,
+        )
+        .expect("create vault");
+
+        // Verify vault.pqd exists before deletion
+        assert!(
+            dir.path().join("zvault").join("vault.pqd").exists(),
+            "vault.pqd must exist before deletion"
+        );
+
+        // Delete with zeroize=true using confirmation "y"
+        let cli = make_vault_mgmt_cli(base_dir_str, None, &["delete", "zvault"]);
+        let mut reader = std::io::Cursor::new("y\n");
+        cmd_vault_delete_impl(&cli, "zvault", true, &mut reader).expect("vault delete --zeroize");
+
+        // Verify vault directory is completely removed
+        assert!(
+            !dir.path().join("zvault").exists(),
+            "vault directory must not exist after --zeroize deletion"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-S7-INT-06: 後方互換性 (policy = "none" 文字列)
+    // -------------------------------------------------------------------------
+
+    /// TC-S7-INT-06: Pre-S7 `vault.toml` with `policy = "none"` string is
+    /// correctly parsed as [`AccessPolicy::None`].
+    ///
+    /// Verifies EDGE-001 backward compatibility: existing vault.toml files that
+    /// store the policy as a plain snake_case string are parsed without error.
+    #[test]
+    fn tc_s7_int_06_backward_compat_policy_none_string() {
+        use pq_diary_core::policy::AccessPolicy;
+        use pq_diary_core::vault::config::VaultConfig;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let toml_path = dir.path().join("vault.toml");
+
+        // Write a vault.toml in the S6-era format (policy stored as a string)
+        let legacy_toml = r#"
+[vault]
+name = "legacy"
+schema_version = 4
+
+[access]
+policy = "none"
+
+[git]
+author_name = ""
+author_email = ""
+commit_message = "Update vault"
+
+[git.privacy]
+timestamp_fuzz_hours = 0
+extra_padding_bytes_max = 0
+
+[argon2]
+memory_cost_kb = 65536
+time_cost = 3
+parallelism = 1
+"#;
+        std::fs::write(&toml_path, legacy_toml).expect("write legacy vault.toml");
+
+        let config = VaultConfig::from_file(&toml_path).expect("from_file on legacy format");
+        assert_eq!(
+            config.access.policy,
+            AccessPolicy::None,
+            "policy = \"none\" string must deserialise to AccessPolicy::None"
+        );
+        assert_eq!(config.vault.name, "legacy");
+
+        // Also verify write_only and full strings round-trip
+        let wo_toml = legacy_toml.replace(r#"policy = "none""#, r#"policy = "write_only""#);
+        std::fs::write(&toml_path, &wo_toml).expect("write write_only toml");
+        let config_wo = VaultConfig::from_file(&toml_path).expect("from_file write_only");
+        assert_eq!(config_wo.access.policy, AccessPolicy::WriteOnly);
+
+        let full_toml = legacy_toml.replace(r#"policy = "none""#, r#"policy = "full""#);
+        std::fs::write(&toml_path, &full_toml).expect("write full toml");
+        let config_full = VaultConfig::from_file(&toml_path).expect("from_file full");
+        assert_eq!(config_full.access.policy, AccessPolicy::Full);
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-S7-NFR-001-01: None ポリシー拒否 < 10ms
+    // -------------------------------------------------------------------------
+
+    /// TC-S7-NFR-001-01: None policy denial completes in under 10 ms.
+    ///
+    /// Verifies NFR-101: only vault.toml is read (no vault.pqd decryption),
+    /// so the check must be nearly instantaneous.
+    #[test]
+    fn tc_s7_nfr_001_01_none_policy_denial_under_10ms() {
+        use std::time::Instant;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir); // default policy = None
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let cli = make_cli_claude(vault_dir_str, Some("password"));
+
+        let start = Instant::now();
+        let result = cmd_list(&cli, None, None, 20);
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "--claude + None must be denied");
+        assert!(
+            elapsed.as_millis() < 10,
+            "None policy denial must complete in < 10 ms; took {elapsed:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-S7-NFR-103-01: vault.toml 改ざん検出
+    // -------------------------------------------------------------------------
+
+    /// TC-S7-NFR-103-01: A tampered `vault.toml` with an unknown policy value
+    /// causes [`VaultConfig::from_file`] to return [`DiaryError::Config`].
+    ///
+    /// Verifies NFR-103: there is no silent fallback for unrecognised policy
+    /// strings — serde returns an error that propagates as DiaryError::Config.
+    #[test]
+    fn tc_s7_nfr_103_01_tampered_vault_toml_returns_config_error() {
+        use pq_diary_core::vault::config::VaultConfig;
+        use pq_diary_core::DiaryError;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let toml_path = dir.path().join("vault.toml");
+
+        // Write a vault.toml with a tampered / invalid policy value
+        let tampered = r#"
+[vault]
+name = "test"
+schema_version = 4
+
+[access]
+policy = "hacked"
+
+[git]
+author_name = ""
+author_email = ""
+commit_message = "Update vault"
+
+[git.privacy]
+timestamp_fuzz_hours = 0
+extra_padding_bytes_max = 0
+
+[argon2]
+memory_cost_kb = 65536
+time_cost = 3
+parallelism = 1
+"#;
+        std::fs::write(&toml_path, tampered).expect("write tampered vault.toml");
+
+        let result = VaultConfig::from_file(&toml_path);
+        assert!(
+            matches!(result, Err(DiaryError::Config(_))),
+            "tampered policy value must return DiaryError::Config, got: {:?}",
+            result
         );
     }
 }

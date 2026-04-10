@@ -6,9 +6,9 @@
 //!
 //! # Batch import
 //!
-//! [`import_directory`] walks a source directory recursively, parses each `.md`
-//! file via [`parse_markdown`], and writes all resulting entries to the vault
-//! with a single [`batch_create_entries`] call (i.e., one `write_vault`
+//! `import_directory` walks a source directory recursively, parses each `.md`
+//! file via `parse_markdown`, and writes all resulting entries to the vault
+//! with a single `batch_create_entries` call (i.e., one `write_vault`
 //! invocation regardless of the number of files).
 
 use std::path::{Path, PathBuf};
@@ -23,21 +23,15 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 // Static regexes (compiled once via LazyLock)
 // =========================================================================
 
-static WIKI_LINK_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]").unwrap()
-});
+static WIKI_LINK_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]").unwrap());
 
-static TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"#([\w/]+)").unwrap()
-});
+static TAG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"#([\w/]+)").unwrap());
 
-static FENCED_CODE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?s)```[^\n]*\n.*?```").unwrap()
-});
+static FENCED_CODE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?s)```[^\n]*\n.*?```").unwrap());
 
-static INLINE_CODE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"`[^`]+`").unwrap()
-});
+static INLINE_CODE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`[^`]+`").unwrap());
 
 use crate::{
     crypto::CryptoEngine,

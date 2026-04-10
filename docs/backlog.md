@@ -70,13 +70,15 @@
 - [ ] CLI vault操作のボイラープレート抽出 (S5 L-2、drop guard パターン)
 
 ### S7: アクセス制御 + Claude連携
-- [ ] vault.toml access.policy (none/write_only/full)
-- [ ] vault create --policy <POLICY>
-- [ ] vault policy <name> <POLICY> (変更)
-- [ ] fullポリシー選択時の警告・承認フロー
-- [ ] --claude フラグ
-- [ ] 4層ポリシーチェック
-- [ ] --claude new / list / show / sync
+- [x] vault.toml access.policy (none/write_only/full)
+- [x] vault create --policy <POLICY>
+- [x] vault policy <name> <POLICY> (変更)
+- [x] fullポリシー選択時の警告・承認フロー
+- [x] --claude フラグ
+- [x] 4層ポリシーチェック
+- [x] --claude 全コマンド対応 (PRDの4コマンドから拡張)
+- [x] vault list (名前+ポリシー表示)
+- [x] vault delete [--zeroize]
 
 ### S8: Git連携
 - [ ] git-init [--remote URL]

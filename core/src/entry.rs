@@ -1,7 +1,7 @@
 //! Entry CRUD foundational types and operations.
 //!
 //! Provides [`EntryPlaintext`], [`EntryMeta`], [`Tag`], and [`IdPrefix`] types,
-//! along with [`create_entry`] and other CRUD functions implemented in Sprint 4.
+//! along with `create_entry` and other CRUD functions implemented in Sprint 4.
 
 use crate::{
     crypto::CryptoEngine,
@@ -233,7 +233,7 @@ pub fn list_entries(
 
 /// List all entries in the vault returning metadata paired with the decrypted body text.
 ///
-/// Used internally by [`DiaryCore::unlock`] to build the [`crate::link::LinkIndex`]
+/// Used internally by `DiaryCore::unlock` to build the [`crate::link::LinkIndex`]
 /// in a single vault read.
 ///
 /// # Errors

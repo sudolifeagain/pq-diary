@@ -1,12 +1,12 @@
 //! Cryptographic types and operations for pq-diary.
 //!
 //! Sub-modules:
-//! - [`secure_mem`]: secure memory types (SecureBuffer, ZeroizingKey, MasterKey, CryptoEngine)
-//! - [`kdf`]: Argon2id key derivation
-//! - [`aead`]: AES-256-GCM authenticated encryption
-//! - [`kem`]: ML-KEM-768 key encapsulation
-//! - [`dsa`]: ML-DSA-65 digital signatures
-//! - [`hmac_util`]: HMAC-SHA256 message authentication
+//! - `secure_mem`: secure memory types (SecureBuffer, ZeroizingKey, MasterKey, CryptoEngine)
+//! - `kdf`: Argon2id key derivation
+//! - `aead`: AES-256-GCM authenticated encryption
+//! - `kem`: ML-KEM-768 key encapsulation
+//! - `dsa`: ML-DSA-65 digital signatures
+//! - `hmac_util`: HMAC-SHA256 message authentication
 
 /// AES-256-GCM authenticated encryption and decryption.
 pub mod aead;
@@ -18,7 +18,7 @@ pub mod hmac_util;
 pub mod kdf;
 /// ML-KEM-768 key encapsulation mechanism (FIPS 203).
 pub mod kem;
-/// Secure memory types: [`SecureBuffer`], [`ZeroizingKey`], [`MasterKey`], [`CryptoEngine`].
+/// Secure memory types: `SecureBuffer`, `ZeroizingKey`, `MasterKey`, `CryptoEngine`.
 pub mod secure_mem;
 
 pub use secure_mem::{CryptoEngine, MasterKey, SecureBuffer, ZeroizingKey};

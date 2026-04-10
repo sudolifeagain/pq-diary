@@ -1,7 +1,7 @@
 //! `[[title]]` wiki-link parser and backlink index.
 //!
 //! Extracts Obsidian-style `[[title]]` link references from journal entry
-//! bodies and returns them as [`ParsedLink`] values with byte-offset positions.
+//! bodies and returns them as `ParsedLink` values with byte-offset positions.
 //!
 //! The [`LinkIndex`] type builds forward and reverse link maps from a set of
 //! decrypted entries, enabling link resolution and backlink queries.

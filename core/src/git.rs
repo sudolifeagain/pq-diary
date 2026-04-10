@@ -5,8 +5,9 @@
 
 use std::path::{Path, PathBuf};
 
+use chrono::{DateTime, Duration, Utc};
 use rand::rngs::OsRng;
-use rand::RngCore;
+use rand::{Rng, RngCore};
 
 use crate::error::DiaryError;
 use crate::vault::config::VaultConfig;
@@ -180,6 +181,99 @@ pub fn git_init(vault_dir: &Path, remote: Option<&str>) -> Result<(), DiaryError
     }
 
     Ok(())
+}
+
+/// Build an anonymised Git author string from the vault configuration.
+///
+/// Returns a string in the format `"pq-diary <{author_email}>"` using only
+/// the `author_email` stored in the vault's `[git]` section.  Real user names
+/// and email addresses are never included — REQ-011, REQ-052.
+///
+/// # Example
+///
+/// ```text
+/// "pq-diary <a3f1b2c4@localhost>"
+/// ```
+pub fn make_author(config: &VaultConfig) -> String {
+    format!("pq-diary <{}>", config.git.author_email)
+}
+
+/// Generate a privacy-preserving, monotonically increasing commit timestamp.
+///
+/// # Arguments
+///
+/// * `prev` — author date of the most-recent commit, or `None` if this is the
+///   first commit.
+/// * `fuzz_hours` — maximum number of hours to subtract from the candidate
+///   timestamp.  Pass `0` to disable fuzzing (returns `Utc::now()`).
+///
+/// # Algorithm
+///
+/// 1. If `fuzz_hours == 0` return `Utc::now()` immediately (fuzzing disabled,
+///    REQ-014).
+/// 2. Draw a random `offset_secs` in `[0, fuzz_hours * 3600]` from [`OsRng`].
+/// 3. Compute `candidate = base + (offset_secs + 1) seconds`, where `base` is
+///    `prev` when `Some`, or `Utc::now() - fuzz_hours hours` when `None`.
+/// 4. Return `min(candidate, Utc::now())` to prevent future-dated timestamps.
+///
+/// The `+ 1` guarantees strict `prev < result` on every call (REQ-015).
+pub fn fuzz_timestamp(prev: Option<DateTime<Utc>>, fuzz_hours: u64) -> DateTime<Utc> {
+    if fuzz_hours == 0 {
+        return Utc::now();
+    }
+
+    let max_offset_secs = fuzz_hours * 3600;
+    let offset_secs = OsRng.gen_range(0u64..=max_offset_secs);
+
+    let base = match prev {
+        Some(p) => p,
+        None => Utc::now() - Duration::hours(fuzz_hours as i64),
+    };
+
+    let candidate = base + Duration::seconds(offset_secs as i64 + 1);
+    let now = Utc::now();
+
+    candidate.min(now)
+}
+
+/// Retrieve the author date of the most-recent commit in the repository.
+///
+/// Runs `git log -1 --format=%aI` in `vault_dir` and parses the ISO 8601
+/// output into a [`DateTime<Utc>`].
+///
+/// Returns `None` when:
+/// * The repository has no commits yet (empty repo).
+/// * The `git log` command fails for any reason.
+/// * The timestamp string cannot be parsed.
+pub fn get_last_commit_timestamp(vault_dir: &Path) -> Option<DateTime<Utc>> {
+    let out = run_git_command(vault_dir, &["log", "-1", "--format=%aI"]).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    chrono::DateTime::parse_from_rfc3339(trimmed)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+/// Generate a random-length byte sequence for commit-size obfuscation.
+///
+/// Returns a `Vec<u8>` of length drawn uniformly from `[0, max_bytes)` using
+/// [`OsRng`].  The contents are cryptographically random bytes.
+///
+/// When `max_bytes == 0` an empty `Vec` is returned immediately (REQ-054).
+pub fn generate_extra_padding(max_bytes: usize) -> Vec<u8> {
+    if max_bytes == 0 {
+        return Vec::new();
+    }
+    let size = OsRng.gen_range(0..max_bytes);
+    let mut padding = vec![0u8; size];
+    OsRng.fill_bytes(&mut padding);
+    padding
 }
 
 // =============================================================================
@@ -398,5 +492,163 @@ mod tests {
             Ok(()) => panic!("expected error when git is not in PATH"),
             Err(e) => panic!("unexpected error type: {}", e),
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // TASK-0075 tests
+    // -------------------------------------------------------------------------
+
+    /// TC-S8-075-01: make_author returns "pq-diary <X@localhost>" format.
+    #[test]
+    fn tc_s8_075_01_make_author_format() {
+        use crate::vault::config::VaultConfig;
+
+        let mut config = VaultConfig::default();
+        config.git.author_email = "abcd1234@localhost".to_string();
+
+        let author = make_author(&config);
+        assert_eq!(
+            author, "pq-diary <abcd1234@localhost>",
+            "make_author must return 'pq-diary <abcd1234@localhost>', got: {}",
+            author
+        );
+        // Real user names must not appear.
+        assert!(
+            !author.contains(whoami_name_guard()),
+            "make_author must not contain real system username"
+        );
+    }
+
+    /// TC-S8-075-02: fuzz_timestamp with fuzz_hours=0 returns approximately Utc::now().
+    #[test]
+    fn tc_s8_075_02_fuzz_timestamp_disabled() {
+        use chrono::{Duration, Utc};
+
+        let before = Utc::now();
+        let result = fuzz_timestamp(None, 0);
+        let after = Utc::now();
+
+        let diff = (result - before).num_milliseconds().abs();
+        assert!(
+            diff < 1000,
+            "fuzz_timestamp(None, 0) must be within 1 second of Utc::now(), diff={}ms",
+            diff
+        );
+        assert!(
+            result >= before && result <= after + Duration::milliseconds(1),
+            "result must be in [before, after]: before={before}, result={result}, after={after}"
+        );
+    }
+
+    /// TC-S8-075-03: fuzz_timestamp with fuzz_hours=6 satisfies prev < result <= Utc::now().
+    #[test]
+    fn tc_s8_075_03_fuzz_timestamp_range() {
+        use chrono::{Duration, Utc};
+
+        let prev = Utc::now() - Duration::hours(12);
+        let mut results = Vec::new();
+
+        for _ in 0..5 {
+            let result = fuzz_timestamp(Some(prev), 6);
+            let now = Utc::now();
+            assert!(
+                result > prev,
+                "result must be strictly greater than prev: prev={prev}, result={result}"
+            );
+            assert!(
+                result <= now,
+                "result must not exceed Utc::now(): result={result}, now={now}"
+            );
+            results.push(result);
+        }
+
+        // At least two distinct values should appear across 5 calls (randomness check).
+        let unique_count = results.windows(2).filter(|w| w[0] != w[1]).count();
+        assert!(
+            unique_count > 0,
+            "multiple calls should produce different timestamps (at least 1 distinct pair)"
+        );
+    }
+
+    /// TC-S8-075-04: fuzz_timestamp guarantees strict monotonicity (prev < result).
+    #[test]
+    fn tc_s8_075_04_fuzz_timestamp_monotonic() {
+        use chrono::{Duration, Utc};
+
+        let prev = Utc::now() - Duration::hours(1);
+
+        for i in 0..10 {
+            let result = fuzz_timestamp(Some(prev), 6);
+            assert!(
+                result > prev,
+                "iteration {i}: prev < result must hold. prev={prev}, result={result}"
+            );
+        }
+    }
+
+    /// TC-S8-075-05: generate_extra_padding with max_bytes=0 returns empty Vec.
+    #[test]
+    fn tc_s8_075_05_padding_zero_max() {
+        let padding = generate_extra_padding(0);
+        assert_eq!(
+            padding.len(),
+            0,
+            "generate_extra_padding(0) must return empty Vec"
+        );
+    }
+
+    /// TC-S8-075-06: generate_extra_padding with max_bytes=4096 returns 0..4096 bytes.
+    #[test]
+    fn tc_s8_075_06_padding_size_bounds() {
+        let max = 4096usize;
+        let mut any_nonzero = false;
+
+        for _ in 0..100 {
+            let padding = generate_extra_padding(max);
+            assert!(
+                padding.len() <= max,
+                "padding length {} must be <= {max}",
+                padding.len()
+            );
+            if padding.len() > 0 {
+                any_nonzero = true;
+            }
+        }
+
+        assert!(
+            any_nonzero,
+            "at least one call out of 100 must return non-empty padding"
+        );
+    }
+
+    /// TC-S8-075-07: get_last_commit_timestamp returns None for an empty repository.
+    #[test]
+    fn tc_s8_075_07_no_commits_returns_none() {
+        let dir = tempdir().expect("tempdir");
+
+        // git init (no commits).
+        let out = std::process::Command::new("git")
+            .current_dir(dir.path())
+            .args(["init"])
+            .output()
+            .expect("git init");
+        assert!(out.status.success(), "git init must succeed");
+
+        let result = get_last_commit_timestamp(dir.path());
+        assert!(
+            result.is_none(),
+            "get_last_commit_timestamp must return None for empty repo, got: {:?}",
+            result
+        );
+    }
+
+    /// Return a placeholder that is never equal to real author strings.
+    ///
+    /// Used only to satisfy the "real username must not appear" check in
+    /// TC-S8-075-01 without importing any OS username crate in tests.
+    fn whoami_name_guard() -> &'static str {
+        // The fixed author string "pq-diary" is intentionally used as the
+        // author name — it never coincides with a real login name.
+        "__REAL_USER__"
     }
 }

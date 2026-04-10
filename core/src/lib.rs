@@ -461,6 +461,26 @@ impl DiaryCore {
     }
 
     // =========================================================================
+    // Access-control accessors
+    // =========================================================================
+
+    /// Return the access policy configured in this vault's `vault.toml`.
+    ///
+    /// This is a pure read of the in-memory [`vault::config::VaultConfig`]
+    /// loaded at construction time; the vault does not need to be unlocked.
+    pub fn access_policy(&self) -> policy::AccessPolicy {
+        self.config.access.policy
+    }
+
+    /// Return the vault name as configured in `vault.toml`.
+    ///
+    /// This is a pure read of the in-memory [`vault::config::VaultConfig`]
+    /// loaded at construction time; the vault does not need to be unlocked.
+    pub fn vault_name(&self) -> &str {
+        &self.config.vault.name
+    }
+
+    // =========================================================================
     // Search operations
     // =========================================================================
 
@@ -760,6 +780,47 @@ mod tests {
         assert_eq!(
             resolved[0].matches[0].uuid_hex, id_a,
             "UUID must match entry A"
+        );
+    }
+
+    // =========================================================================
+    // TC-S7-068-01: DiaryCore::access_policy()
+    // =========================================================================
+
+    /// TC-S7-068-01: access_policy() returns the default AccessPolicy::None.
+    ///
+    /// A freshly initialised vault uses AccessPolicy::None by default.
+    /// The accessor must be available without unlocking.
+    #[test]
+    fn tc_s7_068_01_access_policy_default_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_pqd = setup_test_vault(&dir);
+
+        let core = DiaryCore::new(vault_pqd.to_str().expect("utf8")).expect("DiaryCore::new");
+        assert_eq!(
+            core.access_policy(),
+            policy::AccessPolicy::None,
+            "default policy must be AccessPolicy::None"
+        );
+    }
+
+    // =========================================================================
+    // TC-S7-068-02: DiaryCore::vault_name()
+    // =========================================================================
+
+    /// TC-S7-068-02: vault_name() returns the name used during init_vault.
+    ///
+    /// The accessor must be available without unlocking.
+    #[test]
+    fn tc_s7_068_02_vault_name_matches_init() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_pqd = setup_test_vault(&dir);
+
+        let core = DiaryCore::new(vault_pqd.to_str().expect("utf8")).expect("DiaryCore::new");
+        assert_eq!(
+            core.vault_name(),
+            "test",
+            "vault_name must match the name passed to init_vault"
         );
     }
 

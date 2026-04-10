@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 use crate::error::DiaryError;
+use crate::policy::AccessPolicy;
 
 // =============================================================================
 // VaultConfig — vault.toml
@@ -41,8 +42,8 @@ pub struct VaultSection {
 /// `[access]` section of `vault.toml`.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct AccessSection {
-    /// Access policy: `"none"` | `"write_only"` | `"full"`.
-    pub policy: String,
+    /// Access policy controlling what Claude is permitted to do with this vault.
+    pub policy: AccessPolicy,
 }
 
 /// `[git]` section of `vault.toml`.
@@ -86,7 +87,7 @@ impl Default for VaultConfig {
                 schema_version: 4,
             },
             access: AccessSection {
-                policy: "none".to_owned(),
+                policy: AccessPolicy::None,
             },
             git: GitSection {
                 author_name: String::new(),
@@ -210,6 +211,7 @@ impl AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::AccessPolicy;
 
     /// TC-004-01: VaultConfig serialise → deserialise roundtrip.
     ///
@@ -232,7 +234,7 @@ mod tests {
         let config = VaultConfig::default();
         assert_eq!(config.vault.name, "default");
         assert_eq!(config.vault.schema_version, 4);
-        assert_eq!(config.access.policy, "none");
+        assert_eq!(config.access.policy, AccessPolicy::None);
         assert!(config.git.commit_message.len() > 0);
         assert_eq!(config.argon2.memory_cost_kb, 65536);
         assert_eq!(config.argon2.time_cost, 3);
@@ -249,6 +251,50 @@ mod tests {
         let toml_str = toml::to_string_pretty(&config).expect("serialise");
         let restored: AppConfig = toml::from_str(&toml_str).expect("deserialise");
         assert_eq!(config, restored);
+    }
+
+    /// TC-S7-001-07: S6-era vault.toml strings deserialise to the correct AccessPolicy variants.
+    ///
+    /// Verifies backward compatibility: pre-S7 vault.toml files that store the
+    /// policy as a plain string ("none", "write_only", "full") are correctly
+    /// deserialised by serde's rename_all = "snake_case" mapping.
+    #[test]
+    fn tc_s7_001_07_backward_compat_string_to_access_policy() {
+        // "none" → AccessPolicy::None
+        let toml_none = r#"
+[vault]
+name = "old-vault"
+schema_version = 4
+
+[access]
+policy = "none"
+
+[git]
+author_name = ""
+author_email = ""
+commit_message = "Update vault"
+
+[git.privacy]
+timestamp_fuzz_hours = 0
+extra_padding_bytes_max = 0
+
+[argon2]
+memory_cost_kb = 65536
+time_cost = 3
+parallelism = 1
+"#;
+        let config: VaultConfig = toml::from_str(toml_none).expect("parse none");
+        assert_eq!(config.access.policy, AccessPolicy::None);
+
+        // "write_only" → AccessPolicy::WriteOnly
+        let toml_wo = toml_none.replace(r#"policy = "none""#, r#"policy = "write_only""#);
+        let config_wo: VaultConfig = toml::from_str(&toml_wo).expect("parse write_only");
+        assert_eq!(config_wo.access.policy, AccessPolicy::WriteOnly);
+
+        // "full" → AccessPolicy::Full
+        let toml_full = toml_none.replace(r#"policy = "none""#, r#"policy = "full""#);
+        let config_full: VaultConfig = toml::from_str(&toml_full).expect("parse full");
+        assert_eq!(config_full.access.policy, AccessPolicy::Full);
     }
 
     /// TC-004-E01: from_file with invalid TOML returns DiaryError::Config.

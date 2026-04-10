@@ -3,6 +3,7 @@
 //! Provides Git repository initialisation and related utilities for pq-diary vaults.
 //! Full push/pull/merge support is planned for later Sprint 8 tasks.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Duration, Utc};
@@ -12,6 +13,7 @@ use rand::{Rng, RngCore};
 use crate::crypto::CryptoEngine;
 use crate::error::DiaryError;
 use crate::vault::config::VaultConfig;
+use crate::vault::format::EntryRecord;
 use crate::vault::reader::read_vault;
 use crate::vault::writer::write_vault;
 
@@ -38,6 +40,47 @@ impl GitOperations {
     pub fn vault_dir(&self) -> &Path {
         &self.vault_dir
     }
+}
+
+/// Result returned by [`git_pull_merge`].
+///
+/// Summarises how many entries were added, updated, or left unchanged, and
+/// lists any unresolved conflicts (same UUID, same `updated_at`, different
+/// `content_hmac`) that the caller must resolve.
+#[derive(Debug, Clone)]
+pub struct MergeResult {
+    /// Number of entries present in the remote but not in the local vault (added).
+    pub added: usize,
+    /// Number of entries updated via last-write-wins (`updated_at` comparison).
+    pub updated: usize,
+    /// Number of entries deleted (reserved; always 0 in Phase 1).
+    pub deleted: usize,
+    /// Unresolved conflicts: same UUID, same `updated_at`, different `content_hmac`.
+    pub conflicts: Vec<MergeConflict>,
+}
+
+/// A merge conflict: same UUID appeared in both local and remote with different
+/// `content_hmac` values and identical `updated_at` timestamps.
+///
+/// The caller (CLI layer) must choose [`ConflictResolution::KeepLocal`] or
+/// [`ConflictResolution::KeepRemote`] for each conflict before re-writing the vault.
+#[derive(Debug, Clone)]
+pub struct MergeConflict {
+    /// UUID of the conflicting entry (16-byte raw bytes).
+    pub uuid: [u8; 16],
+    /// Local version of the entry.
+    pub local: EntryRecord,
+    /// Remote version of the entry.
+    pub remote: EntryRecord,
+}
+
+/// Strategy for resolving a [`MergeConflict`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictResolution {
+    /// Keep the local version (default when `--claude` flag is set, REQ-026).
+    KeepLocal,
+    /// Adopt the remote version.
+    KeepRemote,
 }
 
 // =============================================================================
@@ -409,9 +452,285 @@ pub fn git_push(
     Ok(())
 }
 
+/// Fetch from origin and merge remote vault.pqd into the local vault using a
+/// 3-way, entry-level merge strategy.
+///
+/// # Algorithm
+///
+/// 1. Backup `vault_path` → `vault_path.bak`.
+/// 2. Run `git fetch origin`.
+/// 3. Count commits ahead on the remote tracking branch.
+///    * If count == 0: delete backup and return a no-op [`MergeResult`].
+/// 4. `git checkout <tracking_ref> -- vault.pqd` to get the remote version.
+/// 5. Parse remote [`EntryRecord`]s from the overwritten `vault_path`.
+/// 6. Restore `vault_path` from backup (local version).
+/// 7. Parse local [`EntryRecord`]s.
+/// 8. Merge by UUID:
+///    - Local-only UUID → keep.
+///    - Remote-only UUID → add (`MergeResult.added++`).
+///    - Both sides, same `content_hmac` → keep local unchanged.
+///    - Both sides, different `content_hmac`, different `updated_at`
+///      → adopt the record with the larger (newer) `updated_at`
+///      (`MergeResult.updated++`).
+///    - Both sides, different `content_hmac`, same `updated_at`
+///      → true conflict.  When `claude_mode` is `true`, local wins silently.
+///      Otherwise the conflict is recorded in [`MergeResult.conflicts`] and
+///      local is used as the provisional resolution.
+/// 9. Write merged records atomically via [`write_vault`].
+/// 10. `git add vault.pqd` + `git commit` with the privacy pipeline from
+///     `config.git`.
+/// 11. Delete backup on success; restore backup on error.
+///
+/// # Errors
+///
+/// Returns [`DiaryError::Git`] on any Git command failure or I/O problem.
+pub fn git_pull_merge(
+    vault_dir: &Path,
+    config: &VaultConfig,
+    _engine: &CryptoEngine,
+    vault_path: &Path,
+    claude_mode: bool,
+) -> Result<MergeResult, DiaryError> {
+    if !vault_path.exists() {
+        return Err(DiaryError::Git("vault.pqd does not exist".to_string()));
+    }
+
+    // Create backup: vault.pqd → vault.pqd.bak
+    let bak_name = format!(
+        "{}.bak",
+        vault_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+    );
+    let bak_path = vault_path.with_file_name(bak_name);
+    std::fs::copy(vault_path, &bak_path)
+        .map_err(|e| DiaryError::Git(format!("failed to create vault backup: {e}")))?;
+
+    let result = git_pull_merge_inner(vault_dir, config, vault_path, &bak_path, claude_mode);
+
+    match &result {
+        Ok(_) => {
+            // Clean up backup after successful merge.
+            if let Err(e) = std::fs::remove_file(&bak_path) {
+                eprintln!("Warning: failed to remove vault backup file: {e}");
+            }
+        }
+        Err(_) => {
+            // Restore local vault.pqd from backup; keep backup for manual recovery.
+            if let Err(e) = std::fs::copy(&bak_path, vault_path) {
+                eprintln!("Warning: failed to restore vault from backup: {e}");
+            }
+        }
+    }
+
+    result
+}
+
 // =============================================================================
 // Private helpers
 // =============================================================================
+
+/// Inner logic for [`git_pull_merge`].  All errors propagate back to the outer
+/// function which handles backup cleanup/restore.
+fn git_pull_merge_inner(
+    vault_dir: &Path,
+    config: &VaultConfig,
+    vault_path: &Path,
+    bak_path: &Path,
+    claude_mode: bool,
+) -> Result<MergeResult, DiaryError> {
+    // 1. Fetch from origin.
+    let fetch_out = run_git_command(vault_dir, &["fetch", "origin"])?;
+    if !fetch_out.status.success() {
+        return Err(DiaryError::Git(format!(
+            "git fetch origin failed: {}",
+            String::from_utf8_lossy(&fetch_out.stderr)
+        )));
+    }
+
+    // 2. Resolve the remote tracking branch (e.g. "origin/main").
+    let tracking_ref = get_tracking_ref(vault_dir)?;
+
+    // 3. Count commits on remote that are not in local HEAD.
+    let count_arg = format!("HEAD..{tracking_ref}");
+    let count_out = run_git_command(vault_dir, &["rev-list", &count_arg, "--count"])?;
+    let count: u64 = if count_out.status.success() {
+        String::from_utf8_lossy(&count_out.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    // No-op when remote has no new commits.
+    if count == 0 {
+        return Ok(MergeResult {
+            added: 0,
+            updated: 0,
+            deleted: 0,
+            conflicts: Vec::new(),
+        });
+    }
+
+    // 4. Overwrite vault.pqd with the remote version.
+    let checkout_out =
+        run_git_command(vault_dir, &["checkout", &tracking_ref, "--", "vault.pqd"])?;
+    if !checkout_out.status.success() {
+        return Err(DiaryError::Git(format!(
+            "git checkout {tracking_ref} -- vault.pqd failed: {}",
+            String::from_utf8_lossy(&checkout_out.stderr)
+        )));
+    }
+
+    // 5. Read remote entries.
+    let (_remote_header, remote_entries) = read_vault(vault_path)
+        .map_err(|e| DiaryError::Git(format!("failed to read remote vault.pqd: {e}")))?;
+
+    // 6. Restore the local vault.pqd from backup.
+    std::fs::copy(bak_path, vault_path).map_err(DiaryError::Io)?;
+
+    // 7. Read local entries.
+    let (local_header, local_entries) = read_vault(vault_path)
+        .map_err(|e| DiaryError::Git(format!("failed to read local vault.pqd: {e}")))?;
+
+    // 8. Build UUID → EntryRecord maps and run the 3-way merge.
+    let local_map: HashMap<[u8; 16], EntryRecord> =
+        local_entries.into_iter().map(|e| (e.uuid, e)).collect();
+    let remote_map: HashMap<[u8; 16], EntryRecord> =
+        remote_entries.into_iter().map(|e| (e.uuid, e)).collect();
+
+    let all_uuids: HashSet<[u8; 16]> = local_map
+        .keys()
+        .chain(remote_map.keys())
+        .cloned()
+        .collect();
+
+    let mut merged: Vec<EntryRecord> = Vec::with_capacity(all_uuids.len());
+    let mut added = 0usize;
+    let mut updated = 0usize;
+    let mut conflicts: Vec<MergeConflict> = Vec::new();
+
+    for uuid in all_uuids {
+        match (local_map.get(&uuid), remote_map.get(&uuid)) {
+            (Some(local), None) => {
+                // Local-only: keep as-is.
+                merged.push(local.clone());
+            }
+            (None, Some(remote)) => {
+                // Remote-only: adopt.
+                merged.push(remote.clone());
+                added += 1;
+            }
+            (Some(local), Some(remote)) => {
+                if local.content_hmac == remote.content_hmac {
+                    // Identical content: keep local (no change).
+                    merged.push(local.clone());
+                } else if local.updated_at > remote.updated_at {
+                    // Local is newer: last-write-wins → keep local.
+                    merged.push(local.clone());
+                    updated += 1;
+                } else if remote.updated_at > local.updated_at {
+                    // Remote is newer: last-write-wins → adopt remote.
+                    merged.push(remote.clone());
+                    updated += 1;
+                } else {
+                    // True conflict: same updated_at, different content_hmac.
+                    if claude_mode {
+                        // Auto-resolve: local wins silently (REQ-026).
+                        merged.push(local.clone());
+                    } else {
+                        // Record conflict; use local as provisional fallback.
+                        conflicts.push(MergeConflict {
+                            uuid,
+                            local: local.clone(),
+                            remote: remote.clone(),
+                        });
+                        merged.push(local.clone());
+                    }
+                }
+            }
+            (None, None) => unreachable!("UUID must appear in at least one map"),
+        }
+    }
+
+    // 9. Atomically write merged entries (REQ-028).
+    write_vault(vault_path, local_header, &merged)?;
+
+    // 10. Stage and commit with the privacy pipeline.
+    let add_out = run_git_command(vault_dir, &["add", "vault.pqd"])?;
+    if !add_out.status.success() {
+        return Err(DiaryError::Git(format!(
+            "git add failed after merge: {}",
+            String::from_utf8_lossy(&add_out.stderr)
+        )));
+    }
+
+    let prev_ts = get_last_commit_timestamp(vault_dir);
+    let fuzz_hours = config.git.privacy.timestamp_fuzz_hours;
+    let fuzzed_ts = fuzz_timestamp(prev_ts, fuzz_hours);
+    let ts_str = fuzzed_ts.to_rfc3339();
+
+    let commit_out = std::process::Command::new("git")
+        .current_dir(vault_dir)
+        .arg("-c")
+        .arg(format!("user.name={}", config.git.author_name))
+        .arg("-c")
+        .arg(format!("user.email={}", config.git.author_email))
+        .args(["commit", "--date", &ts_str, "-m", &config.git.commit_message])
+        .env("GIT_AUTHOR_DATE", &ts_str)
+        .env("GIT_COMMITTER_DATE", &ts_str)
+        .output()
+        .map_err(|e| DiaryError::Git(format!("failed to spawn git commit: {e}")))?;
+
+    if !commit_out.status.success() {
+        let stderr = String::from_utf8_lossy(&commit_out.stderr);
+        let stdout = String::from_utf8_lossy(&commit_out.stdout);
+        // "nothing to commit" is acceptable (merged result identical to HEAD).
+        if !stderr.contains("nothing to commit") && !stdout.contains("nothing to commit") {
+            return Err(DiaryError::Git(format!(
+                "git commit failed after merge: {stderr}"
+            )));
+        }
+    }
+
+    Ok(MergeResult {
+        added,
+        updated,
+        deleted: 0,
+        conflicts,
+    })
+}
+
+/// Resolve the remote tracking branch ref for HEAD.
+///
+/// Tries `@{upstream}` first; falls back to `origin/<local_branch>` when the
+/// upstream is not configured (e.g. repo created with `git init` + `git push -u`).
+fn get_tracking_ref(vault_dir: &Path) -> Result<String, DiaryError> {
+    // Prefer the configured upstream ref (e.g. "origin/main").
+    if let Ok(out) = run_git_command(vault_dir, &["rev-parse", "--abbrev-ref", "@{upstream}"]) {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !s.is_empty() {
+                return Ok(s);
+            }
+        }
+    }
+    // Fallback: construct "origin/<current branch>".
+    let branch_out = run_git_command(vault_dir, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let branch = if branch_out.status.success() {
+        let s = String::from_utf8_lossy(&branch_out.stdout).trim().to_string();
+        if s.is_empty() {
+            "main".to_string()
+        } else {
+            s
+        }
+    } else {
+        "main".to_string()
+    };
+    Ok(format!("origin/{branch}"))
+}
 
 /// Run a Git command in `vault_dir` with the specified `args`.
 ///
@@ -1231,6 +1550,420 @@ mod tests {
         assert!(
             committed.contains("vault.pqd"),
             "vault.pqd must be in the commit: {committed}"
+        );
+    }
+
+    // =========================================================================
+    // TASK-0077 helpers
+    // =========================================================================
+
+    /// Build a minimal [`EntryRecord`] for merge tests.
+    ///
+    /// `uuid_byte` is used as the first byte of the UUID (remaining bytes are 0).
+    /// `hmac_byte` fills all 32 bytes of `content_hmac`.
+    /// `updated_at` is the Unix timestamp stored in the record.
+    fn make_entry(uuid_byte: u8, hmac_byte: u8, updated_at: u64) -> EntryRecord {
+        use crate::vault::format::RECORD_TYPE_ENTRY;
+        let mut uuid = [0u8; 16];
+        uuid[0] = uuid_byte;
+        EntryRecord {
+            record_type: RECORD_TYPE_ENTRY,
+            uuid,
+            created_at: 1000,
+            updated_at,
+            iv: [0u8; 12],
+            ciphertext: vec![0xAB; 32],
+            signature: vec![],
+            content_hmac: [hmac_byte; 32],
+            legacy_flag: 0,
+            legacy_key_block: vec![],
+            attachment_count: 0,
+            attachment_offset: 0,
+            padding: vec![],
+        }
+    }
+
+    /// Set up a pair of git repos for git_pull_merge tests.
+    ///
+    /// Uses the existing `setup_vault_with_remote` fixture (initial empty vault
+    /// committed and pushed to a bare remote). A "contributor" clone then pushes
+    /// `remote_entries` as a second commit so that `local` is one commit behind.
+    /// Finally, `vault_path` on the local side is overwritten with `local_entries`
+    /// (not committed) — this is the content that git_pull_merge will treat as the
+    /// local state.
+    ///
+    /// Returns `(TempDir, vault_dir, vault_path, config)`.
+    /// Caller MUST keep `TempDir` alive for the duration of the test.
+    fn setup_pull_test(
+        remote_entries: &[EntryRecord],
+        local_entries: &[EntryRecord],
+    ) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf, crate::vault::config::VaultConfig) {
+        use crate::vault::format::VaultHeader;
+        use crate::vault::writer::write_vault as wv;
+
+        let config = make_git_push_config(
+            "pq-diary",
+            "test@localhost",
+            "Update vault",
+            0, // disable timestamp fuzz for deterministic tests
+            0,
+        );
+
+        // Create base: bare remote + local working repo with initial empty vault.
+        let (tmp, vault_dir, vault_path) = setup_vault_with_remote(&config);
+
+        let bare_dir = tmp.path().join("bare.git");
+        let contributor_dir = tmp.path().join("contributor");
+        std::fs::create_dir_all(&contributor_dir).expect("create contributor dir");
+
+        // Clone the bare remote to a contributor directory.
+        let out = std::process::Command::new("git")
+            .args(["clone", bare_dir.to_str().unwrap(), contributor_dir.to_str().unwrap()])
+            .output()
+            .expect("git clone contributor");
+        assert!(
+            out.status.success(),
+            "contributor git clone failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        for (k, v) in [("user.name", "contributor"), ("user.email", "contrib@localhost")] {
+            std::process::Command::new("git")
+                .current_dir(&contributor_dir)
+                .args(["config", k, v])
+                .output()
+                .expect("git config contributor");
+        }
+
+        // Write remote_entries to contributor's vault.pqd and push.
+        let contrib_vault = contributor_dir.join("vault.pqd");
+        wv(&contrib_vault, VaultHeader::new(), remote_entries).expect("write contributor vault");
+
+        let out = std::process::Command::new("git")
+            .current_dir(&contributor_dir)
+            .args(["add", "vault.pqd"])
+            .output()
+            .expect("contributor git add");
+        assert!(out.status.success(), "contributor git add failed");
+
+        let out = std::process::Command::new("git")
+            .current_dir(&contributor_dir)
+            .args(["commit", "-m", "remote update"])
+            .output()
+            .expect("contributor git commit");
+        assert!(
+            out.status.success(),
+            "contributor git commit failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // Detect and push using whatever branch was created.
+        let branch_out = std::process::Command::new("git")
+            .current_dir(&contributor_dir)
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .expect("contributor git rev-parse");
+        let branch = String::from_utf8_lossy(&branch_out.stdout).trim().to_string();
+
+        let out = std::process::Command::new("git")
+            .current_dir(&contributor_dir)
+            .args(["push", "origin", &branch])
+            .output()
+            .expect("contributor git push");
+        assert!(
+            out.status.success(),
+            "contributor git push failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // Overwrite local vault.pqd with the desired local state (not committed).
+        wv(&vault_path, VaultHeader::new(), local_entries).expect("write local vault");
+
+        (tmp, vault_dir, vault_path, config)
+    }
+
+    // =========================================================================
+    // TASK-0077 tests
+    // =========================================================================
+
+    /// TC-S8-077-01: git_pull_merge returns no-op when remote has no new commits (EDGE-004).
+    #[test]
+    fn tc_s8_077_01_no_op_when_no_remote_changes() {
+        use crate::crypto::CryptoEngine;
+
+        // Set up: local and remote at the same commit — no contributor push.
+        let config = make_git_push_config("pq-diary", "test@localhost", "Update vault", 0, 0);
+        let (_tmp, vault_dir, vault_path) = setup_vault_with_remote(&config);
+
+        let before = std::fs::read(&vault_path).expect("read vault before");
+
+        let engine = CryptoEngine::new();
+        let result = git_pull_merge(&vault_dir, &config, &engine, &vault_path, false);
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+
+        let mr = result.unwrap();
+        assert_eq!(mr.added, 0, "no-op: added must be 0");
+        assert_eq!(mr.updated, 0, "no-op: updated must be 0");
+        assert_eq!(mr.deleted, 0, "no-op: deleted must be 0");
+        assert!(mr.conflicts.is_empty(), "no-op: conflicts must be empty");
+
+        // vault.pqd must be unchanged.
+        let after = std::fs::read(&vault_path).expect("read vault after");
+        assert_eq!(before, after, "vault.pqd must not be modified in no-op case");
+
+        // Backup file must be cleaned up.
+        let bak_path = vault_path.with_file_name("vault.pqd.bak");
+        assert!(
+            !bak_path.exists(),
+            "vault.pqd.bak must not exist after no-op merge"
+        );
+    }
+
+    /// TC-S8-077-02: local is empty; all remote entries are adopted (EDGE-005).
+    #[test]
+    fn tc_s8_077_02_empty_local_accepts_all_remote_entries() {
+        use crate::crypto::CryptoEngine;
+        use crate::vault::reader::read_vault as rv;
+
+        let uuid_a = make_entry(0xA0, 0x01, 100);
+        let uuid_b = make_entry(0xB0, 0x02, 100);
+        let remote_entries = vec![uuid_a, uuid_b];
+
+        let (_tmp, vault_dir, vault_path, config) =
+            setup_pull_test(&remote_entries, &[] /* local: empty */);
+
+        let engine = CryptoEngine::new();
+        let result = git_pull_merge(&vault_dir, &config, &engine, &vault_path, false);
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+
+        let mr = result.unwrap();
+        assert_eq!(mr.added, 2, "all 2 remote entries must be added");
+        assert_eq!(mr.updated, 0);
+        assert!(mr.conflicts.is_empty());
+
+        // Verify merged vault contains both entries.
+        let (_, entries) = rv(&vault_path).expect("read merged vault");
+        assert_eq!(entries.len(), 2, "merged vault must have 2 entries");
+    }
+
+    /// TC-S8-077-03: local-only entries are preserved after merge.
+    #[test]
+    fn tc_s8_077_03_local_only_entries_preserved() {
+        use crate::crypto::CryptoEngine;
+        use crate::vault::reader::read_vault as rv;
+
+        let uuid_a = make_entry(0xA0, 0x01, 100);
+        let local_entries = vec![uuid_a.clone()];
+
+        // Remote: just re-writes an empty vault (count > 0 due to random padding).
+        let (_tmp, vault_dir, vault_path, config) =
+            setup_pull_test(&[] /* remote: empty */, &local_entries);
+
+        let engine = CryptoEngine::new();
+        let result = git_pull_merge(&vault_dir, &config, &engine, &vault_path, false);
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+
+        let mr = result.unwrap();
+        assert_eq!(mr.added, 0);
+        assert_eq!(mr.updated, 0);
+        assert!(mr.conflicts.is_empty());
+
+        // UUID-A must still be present in merged vault.
+        let (_, entries) = rv(&vault_path).expect("read merged vault");
+        let found = entries.iter().any(|e| e.uuid == uuid_a.uuid);
+        assert!(found, "UUID-A must be preserved in merged vault");
+    }
+
+    /// TC-S8-077-04: remote-only entries are added to the merged vault.
+    #[test]
+    fn tc_s8_077_04_remote_only_entries_added() {
+        use crate::crypto::CryptoEngine;
+        use crate::vault::reader::read_vault as rv;
+
+        let uuid_b = make_entry(0xB0, 0x02, 100);
+        let remote_entries = vec![uuid_b.clone()];
+
+        let (_tmp, vault_dir, vault_path, config) =
+            setup_pull_test(&remote_entries, &[] /* local: empty */);
+
+        let engine = CryptoEngine::new();
+        let result = git_pull_merge(&vault_dir, &config, &engine, &vault_path, false);
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+
+        let mr = result.unwrap();
+        assert_eq!(mr.added, 1, "MergeResult.added must be 1");
+        assert_eq!(mr.updated, 0);
+        assert!(mr.conflicts.is_empty());
+
+        // UUID-B must appear in merged vault.
+        let (_, entries) = rv(&vault_path).expect("read merged vault");
+        let found = entries.iter().any(|e| e.uuid == uuid_b.uuid);
+        assert!(found, "UUID-B must be present in merged vault");
+    }
+
+    /// TC-S8-077-05: same UUID + same content_hmac → no update, local preserved.
+    #[test]
+    fn tc_s8_077_05_same_hmac_no_update() {
+        use crate::crypto::CryptoEngine;
+        use crate::vault::reader::read_vault as rv;
+
+        let uuid_c = make_entry(0xC0, 0x03, 100);
+        // Both local and remote have the same entry (same HMAC).
+        let (_tmp, vault_dir, vault_path, config) =
+            setup_pull_test(&[uuid_c.clone()], &[uuid_c.clone()]);
+
+        let engine = CryptoEngine::new();
+        let result = git_pull_merge(&vault_dir, &config, &engine, &vault_path, false);
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+
+        let mr = result.unwrap();
+        assert_eq!(mr.updated, 0, "no update when content_hmac is identical");
+        assert!(mr.conflicts.is_empty());
+
+        // UUID-C must still be in the merged vault.
+        let (_, entries) = rv(&vault_path).expect("read merged vault");
+        let found = entries.iter().any(|e| e.uuid == uuid_c.uuid);
+        assert!(found, "UUID-C must be in merged vault");
+    }
+
+    /// TC-S8-077-06: same UUID + different HMAC → last-write-wins (updated_at).
+    #[test]
+    fn tc_s8_077_06_last_write_wins_updated_at() {
+        use crate::crypto::CryptoEngine;
+        use crate::vault::reader::read_vault as rv;
+
+        // --- subcase A: remote is newer ---
+        let uuid_d_local = make_entry(0xD0, 0x10, 100); // local updated_at=100
+        let uuid_d_remote = make_entry(0xD0, 0x20, 200); // remote updated_at=200 (newer)
+
+        let (_tmp_a, vault_dir_a, vault_path_a, config_a) =
+            setup_pull_test(&[uuid_d_remote.clone()], &[uuid_d_local.clone()]);
+
+        let engine_a = CryptoEngine::new();
+        let result_a = git_pull_merge(&vault_dir_a, &config_a, &engine_a, &vault_path_a, false);
+        assert!(result_a.is_ok(), "subcase A failed: {:?}", result_a);
+        let mr_a = result_a.unwrap();
+        assert_eq!(mr_a.updated, 1, "subcase A: updated must be 1");
+        assert!(mr_a.conflicts.is_empty());
+
+        let (_, entries_a) = rv(&vault_path_a).expect("read merged vault A");
+        let entry_a = entries_a
+            .iter()
+            .find(|e| e.uuid == uuid_d_remote.uuid)
+            .expect("UUID-D not found in merged vault A");
+        assert_eq!(
+            entry_a.content_hmac, uuid_d_remote.content_hmac,
+            "subcase A: remote (newer) entry must win"
+        );
+
+        // --- subcase B: local is newer ---
+        let uuid_d_local2 = make_entry(0xD0, 0x10, 200); // local updated_at=200 (newer)
+        let uuid_d_remote2 = make_entry(0xD0, 0x20, 100); // remote updated_at=100
+
+        let (_tmp_b, vault_dir_b, vault_path_b, config_b) =
+            setup_pull_test(&[uuid_d_remote2.clone()], &[uuid_d_local2.clone()]);
+
+        let engine_b = CryptoEngine::new();
+        let result_b = git_pull_merge(&vault_dir_b, &config_b, &engine_b, &vault_path_b, false);
+        assert!(result_b.is_ok(), "subcase B failed: {:?}", result_b);
+        let mr_b = result_b.unwrap();
+        assert_eq!(mr_b.updated, 1, "subcase B: updated must be 1");
+
+        let (_, entries_b) = rv(&vault_path_b).expect("read merged vault B");
+        let entry_b = entries_b
+            .iter()
+            .find(|e| e.uuid == uuid_d_local2.uuid)
+            .expect("UUID-D not found in merged vault B");
+        assert_eq!(
+            entry_b.content_hmac, uuid_d_local2.content_hmac,
+            "subcase B: local (newer) entry must win"
+        );
+    }
+
+    /// TC-S8-077-07: claude_mode=true auto-resolves true conflicts with local-wins (REQ-026).
+    #[test]
+    fn tc_s8_077_07_claude_mode_auto_resolves_conflict() {
+        use crate::crypto::CryptoEngine;
+        use crate::vault::reader::read_vault as rv;
+
+        // Same UUID, same updated_at, different HMAC → true conflict.
+        let uuid_e_local = make_entry(0xE0, 0x10, 100); // local version
+        let uuid_e_remote = make_entry(0xE0, 0x20, 100); // remote version (same updated_at)
+
+        let (_tmp, vault_dir, vault_path, config) =
+            setup_pull_test(&[uuid_e_remote.clone()], &[uuid_e_local.clone()]);
+
+        let engine = CryptoEngine::new();
+        // claude_mode = true → auto-resolve with local-wins.
+        let result = git_pull_merge(&vault_dir, &config, &engine, &vault_path, true);
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+
+        let mr = result.unwrap();
+        assert!(
+            mr.conflicts.is_empty(),
+            "claude_mode=true must produce no conflicts, got: {:?}",
+            mr.conflicts
+        );
+
+        // Local version must be in merged vault.
+        let (_, entries) = rv(&vault_path).expect("read merged vault");
+        let entry = entries
+            .iter()
+            .find(|e| e.uuid == uuid_e_local.uuid)
+            .expect("UUID-E not found in merged vault");
+        assert_eq!(
+            entry.content_hmac, uuid_e_local.content_hmac,
+            "claude_mode: local entry must be adopted"
+        );
+    }
+
+    /// TC-S8-077-08: merged vault.pqd is readable and valid after merge (REQ-028).
+    #[test]
+    fn tc_s8_077_08_merged_vault_is_readable() {
+        use crate::crypto::CryptoEngine;
+        use crate::vault::reader::read_vault as rv;
+
+        let uuid_a = make_entry(0xA0, 0x01, 100);
+        let uuid_b = make_entry(0xB0, 0x02, 200);
+
+        // Remote has UUID-B (remote-only → added); local has UUID-A (local-only → kept).
+        let (_tmp, vault_dir, vault_path, config) =
+            setup_pull_test(&[uuid_b.clone()], &[uuid_a.clone()]);
+
+        let engine = CryptoEngine::new();
+        let result = git_pull_merge(&vault_dir, &config, &engine, &vault_path, false);
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+
+        // vault.pqd must parse without errors (write_vault produced a valid file).
+        let parse_result = rv(&vault_path);
+        assert!(
+            parse_result.is_ok(),
+            "merged vault.pqd must be readable by read_vault: {:?}",
+            parse_result
+        );
+
+        let (_, entries) = parse_result.unwrap();
+        assert_eq!(entries.len(), 2, "merged vault must have 2 entries");
+    }
+
+    /// TC-S8-077-09: vault.pqd.bak is deleted after a successful merge.
+    #[test]
+    fn tc_s8_077_09_backup_deleted_after_successful_merge() {
+        use crate::crypto::CryptoEngine;
+
+        let uuid_b = make_entry(0xB0, 0x02, 100);
+
+        let (_tmp, vault_dir, vault_path, config) =
+            setup_pull_test(&[uuid_b], &[]);
+
+        let engine = CryptoEngine::new();
+        let result = git_pull_merge(&vault_dir, &config, &engine, &vault_path, false);
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+
+        let bak_path = vault_path.with_file_name("vault.pqd.bak");
+        assert!(
+            !bak_path.exists(),
+            "vault.pqd.bak must be deleted after a successful merge"
         );
     }
 }

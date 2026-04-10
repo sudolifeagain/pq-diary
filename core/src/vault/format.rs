@@ -132,7 +132,7 @@ impl Default for VaultHeader {
 ///
 /// The `record_type` byte is serialised as the first byte of each record's
 /// payload and must be either [`RECORD_TYPE_ENTRY`] or [`RECORD_TYPE_TEMPLATE`].
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct EntryRecord {
     /// Record type: [`RECORD_TYPE_ENTRY`] (0x01) or [`RECORD_TYPE_TEMPLATE`] (0x02).
     pub record_type: u8,

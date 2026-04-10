@@ -390,13 +390,13 @@ fn dispatch(cli: &Cli) -> anyhow::Result<()> {
     }
 }
 
-/// Print a "not yet implemented" message and exit with code 1.
+/// Return an error for a command that has not been implemented yet.
 ///
-/// Returns the never type `!` which coerces to any `Result` type, allowing
-/// it to be used directly in match arms that return `anyhow::Result<()>`.
+/// Uses [`anyhow::bail!`] to return `Err` with a message containing the command
+/// name and the planned sprint, allowing normal stack unwinding so that all
+/// `Drop` implementations (including `zeroize`) run correctly.
 fn not_implemented(cmd_name: &str, sprint: &str) -> anyhow::Result<()> {
-    eprintln!("Command '{cmd_name}' is not yet implemented. Planned for {sprint}.");
-    std::process::exit(1);
+    anyhow::bail!("Command '{cmd_name}' is not yet implemented. Planned for {sprint}.")
 }
 
 fn main() -> anyhow::Result<()> {
@@ -408,6 +408,42 @@ fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    // -------------------------------------------------------------------------
+    // TASK-0080 tests: M-1 not_implemented() → bail!
+    // -------------------------------------------------------------------------
+
+    /// TC-S9-080-01: not_implemented() returns Err (does not call process::exit).
+    #[test]
+    fn tc_s9_080_01_not_implemented_returns_err() {
+        let result = not_implemented("test-cmd", "S99");
+        assert!(
+            result.is_err(),
+            "not_implemented must return Err, not exit the process"
+        );
+    }
+
+    /// TC-S9-080-02: not_implemented() error message contains the command name.
+    #[test]
+    fn tc_s9_080_02_error_message_contains_command_name() {
+        let result = not_implemented("test-cmd", "S99");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("test-cmd"),
+            "error message must contain command name 'test-cmd', got: {err_msg}"
+        );
+    }
+
+    /// TC-S9-080-03: not_implemented() error message contains the planned sprint.
+    #[test]
+    fn tc_s9_080_03_error_message_contains_sprint() {
+        let result = not_implemented("test-cmd", "S99");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("S99"),
+            "error message must contain planned sprint 'S99', got: {err_msg}"
+        );
+    }
 
     #[test]
     fn test_help_contains_all_subcommands() {

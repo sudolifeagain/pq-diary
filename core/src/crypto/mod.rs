@@ -240,7 +240,7 @@ impl CryptoEngine {
     /// Returns [`DiaryError::NotUnlocked`] if the engine has not been unlocked.
     pub fn hmac_verify(&self, data: &[u8], expected: &[u8; 32]) -> Result<bool, DiaryError> {
         let mk = self.expose_master_key()?;
-        Ok(hmac_util::verify_hmac(&mk.sym_key, data, expected))
+        hmac_util::verify_hmac(&mk.sym_key, data, expected)
     }
 
     /// Expose the master key for internal use, returning [`DiaryError::NotUnlocked`] if locked.

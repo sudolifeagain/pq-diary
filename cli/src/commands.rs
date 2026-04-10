@@ -2053,9 +2053,7 @@ pub fn cmd_git_init(cli: &Cli, remote: Option<&str>) -> anyhow::Result<()> {
 /// Returns an error if policy check fails, password acquisition fails,
 /// vault unlock fails, or any step of the push pipeline fails.
 pub fn cmd_git_push(cli: &Cli) -> anyhow::Result<()> {
-    use pq_diary_core::{
-        git, policy::OperationType, vault::config::VaultConfig,
-    };
+    use pq_diary_core::{git, policy::OperationType, vault::config::VaultConfig};
     use secrecy::{ExposeSecret as _, SecretBox};
 
     check_claude_policy(cli, OperationType::Write)?;
@@ -2082,7 +2080,6 @@ pub fn cmd_git_push(cli: &Cli) -> anyhow::Result<()> {
     core.unlock(secret_password)
         .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
     let _guard = VaultGuard::new(&mut core);
-
 
     git::git_push(&vault_dir, &config, &vault_path).map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -2110,9 +2107,7 @@ pub fn cmd_git_pull(cli: &Cli) -> anyhow::Result<()> {
 /// Separating the reader allows unit tests to supply pre-programmed conflict
 /// resolutions without touching the real stdin.
 fn cmd_git_pull_impl(cli: &Cli, reader: &mut impl std::io::BufRead) -> anyhow::Result<()> {
-    use pq_diary_core::{
-        git, policy::OperationType, vault::config::VaultConfig,
-    };
+    use pq_diary_core::{git, policy::OperationType, vault::config::VaultConfig};
     use secrecy::{ExposeSecret as _, SecretBox};
 
     check_claude_policy(cli, OperationType::Write)?;
@@ -2139,7 +2134,6 @@ fn cmd_git_pull_impl(cli: &Cli, reader: &mut impl std::io::BufRead) -> anyhow::R
     core.unlock(secret_password)
         .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
     let _guard = VaultGuard::new(&mut core);
-
 
     let result = git::git_pull_merge(&vault_dir, &config, &vault_path, cli.claude)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -2175,9 +2169,7 @@ pub fn cmd_git_sync(cli: &Cli) -> anyhow::Result<()> {
 
 /// Internal implementation of `cmd_git_sync` with an injectable stdin reader.
 fn cmd_git_sync_impl(cli: &Cli, reader: &mut impl std::io::BufRead) -> anyhow::Result<()> {
-    use pq_diary_core::{
-        git, policy::OperationType, vault::config::VaultConfig,
-    };
+    use pq_diary_core::{git, policy::OperationType, vault::config::VaultConfig};
     use secrecy::{ExposeSecret as _, SecretBox};
 
     check_claude_policy(cli, OperationType::Write)?;
@@ -2205,8 +2197,6 @@ fn cmd_git_sync_impl(cli: &Cli, reader: &mut impl std::io::BufRead) -> anyhow::R
     core.unlock(secret_password)
         .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
     let _guard = VaultGuard::new(&mut core);
-
-
 
     // Phase 1: Pull + merge.
     let pull_result = git::git_pull_merge(&vault_dir, &config, &vault_path, cli.claude)

@@ -11,8 +11,8 @@ zeroize = { version = "1", features = ["derive"] }
 secrecy = "0.10"
 argon2 = "0.5"
 aes-gcm = "0.10"
-ml-kem = { git = "https://github.com/sudolifeagain/ml-kem", branch = "pq-diary", features = ["getrandom", "zeroize"] }
-ml-dsa = { git = "https://github.com/sudolifeagain/ml-dsa", branch = "pq-diary", features = ["zeroize"] }
+ml-kem = { git = "https://github.com/sudolifeagain/ml-kem", rev = "4338a86958d9b9435d558c51c79952e9408fe65b", features = ["getrandom", "zeroize"] }
+ml-dsa = { git = "https://github.com/sudolifeagain/ml-dsa", rev = "fc61a1e6ecd286650f47b59eff3acf3e961edf90", features = ["zeroize"] }
 hmac = "0.12"
 sha2 = "0.10"
 rand = "0.8"

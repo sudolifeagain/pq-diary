@@ -48,26 +48,26 @@
 - [x] 補完用一時ファイル (/dev/shm, zeroize削除)
 
 ### S6: 検索 + 統計 + インポート + S1-S5技術的負債
-- [ ] search コマンド (復号後インメモリ正規表現grep)
-- [ ] 検索結果のコンテキスト表示 (前後N行)
-- [ ] stats コマンド (執筆頻度, 文字数推移, タグ分布)
-- [ ] import <dir> (プレーンMD一括取り込み)
-- [ ] [[wiki-link]] → [[タイトル]] 自動変換
-- [ ] #ネスト/タグ 自動変換
-- [ ] インポート結果サマリー表示
-- [ ] **[C-1/C-2]** vault reader にフィールドサイズ上限チェック追加 (S3, OOM攻撃ベクタ)
-- [ ] **[H-3]** init_vault に空パスワードガード追加 (S3)
-- [ ] **[H-4]** writer の as u32/u8 を try_from に変換 (S3, サイレント切り捨て防止)
-- [ ] **[M-6]** write_vault をアトミック write (temp + rename) に変更 (S3, クラッシュ耐性)
-- [ ] **[M-7]** vim に nowritebackup / viminfo=NONE 追加 (S4, 残留データ防止)
-- [ ] **[M-8]** PQ_DIARY_PASSWORD 読み取り後に env::remove_var (S4)
-- [ ] **[M-9]** tmp ファイルパーミッションを 0600 に (S4)
-- [ ] **[M-5]** HMAC エラー時にゼロMAC返却でなくResult返却 (S2)
-- [ ] EntryPlaintext に Zeroize/ZeroizeOnDrop 追加 (S4/S5技術的負債 H-1)
-- [ ] list_entries_with_body の中間 Vec<String> zeroize 対応 (S5 H-2)
-- [ ] 読み取り時の署名/HMAC 検証 (S4技術的負債 H-3、S9で対応も可)
-- [ ] Win32コンソールAPI unsafe の ADR 作成 (S5 M-7)
-- [ ] CLI vault操作のボイラープレート抽出 (S5 L-2、drop guard パターン)
+- [x] search コマンド (復号後インメモリ正規表現grep)
+- [x] 検索結果のコンテキスト表示 (前後N行)
+- [x] stats コマンド (執筆頻度, 文字数推移, タグ分布)
+- [x] import <dir> (プレーンMD一括取り込み)
+- [x] [[wiki-link]] → [[タイトル]] 自動変換
+- [x] #ネスト/タグ 自動変換
+- [x] インポート結果サマリー表示
+- [x] **[C-1/C-2]** vault reader にフィールドサイズ上限チェック追加 (S3) — reader.rs MAX_FIELD_SIZE=16MiB
+- [x] **[H-3]** init_vault に空パスワードガード追加 (S3) — init.rs password.is_empty()
+- [x] **[H-4]** writer の as u32/u8 を try_from に変換 (S3) — writer.rs 全箇所 u32::try_from
+- [x] **[M-6]** write_vault をアトミック write (temp + rename) に変更 (S3) — writer.rs .tmp + rename
+- [x] **[M-7]** vim に nowritebackup / viminfo=NONE 追加 (S4) — editor.rs viminfo=''/shada=''
+- [x] **[M-8]** PQ_DIARY_PASSWORD 読み取り後に env::remove_var (S4) — password.rs
+- [x] **[M-9]** tmp ファイルパーミッションを 0600 に (S4) — editor.rs mode(0o600)
+- [ ] **[M-5]** HMAC エラー時にゼロMAC返却でなくResult返却 (S2) → S9で対応
+- [x] EntryPlaintext に Zeroize/ZeroizeOnDrop 追加 (S4/S5技術的負債 H-1)
+- [x] list_entries_with_body の中間 Vec<String> zeroize 対応 (S5 H-2) — Zeroizing<String>
+- [ ] 読み取り時の署名/HMAC 検証 (S4技術的負債 H-3) → S9で対応
+- [x] Win32コンソールAPI unsafe の ADR 作成 (S5 M-7) — docs/adr/0007
+- [x] CLI vault操作のボイラープレート抽出 (S5 L-2) — VaultGuard パターン
 
 ### S7: アクセス制御 + Claude連携
 - [x] vault.toml access.policy (none/write_only/full)
@@ -91,7 +91,7 @@
 - [x] 3-wayマージ (UUID + content_hmac, last-write-wins)
 - [x] コンフリクト対話式解決 (--claude時ローカル優先自動解決)
 
-### S9: セキュリティ硬化 + 統合テスト + S1-S2技術的負債
+### S9: セキュリティ硬化 + 統合テスト + S1-S6技術的負債残り
 - [ ] mlock (unix) / VirtualLock (windows)
 - [ ] PR_SET_DUMPABLE=0
 - [ ] setrlimit(RLIMIT_CORE, 0, 0)
@@ -99,12 +99,14 @@
 - [ ] クロスプラットフォームビルド (Linux x86_64/aarch64, macOS aarch64, Windows x86_64)
 - [ ] 統合テスト (全コマンドのE2Eテスト)
 - [ ] パフォーマンス検証 (init<3s, unlock 1-3s, new/edit<200ms, list<500ms, lock<50ms)
-- [ ] **[H-1]** Cli.password を SecretString 化 (S1, zeroize対応)
-- [ ] **[H-2]** tc_015_05 テストの UB 修正 (ManuallyDrop パターン適用) (S1/S2)
+- [ ] **[H-1]** Cli.password を SecretString 化 (S1, zeroize対応) — 現在 Option<String>
+- [x] **[H-2]** tc_015_05 テストの UB 修正 (ManuallyDrop パターン適用) (S1/S2) — dsa.rs/kem.rs ManuallyDrop済
 - [ ] **[M-2]** MasterKey.sym_key コピー時の zeroize 対応 (S1)
 - [ ] **[M-4]** unlock_with_vault の中間 Vec<u8> を Zeroizing でラップ (S2)
-- [ ] **[M-3]** PQC 依存 (ml-kem/ml-dsa) を commit hash で pin (S1/S2)
-- [ ] **[M-1]** not_implemented() を process::exit から anyhow::bail! に変更 (S1)
+- [ ] **[M-3]** PQC 依存 (ml-kem/ml-dsa) を commit hash で pin (S1/S2) — 現在 branch指定
+- [ ] **[M-1]** not_implemented() を process::exit から anyhow::bail! に変更 (S1) — 4箇所残存
+- [ ] **[M-5]** verify_hmac をbool返却からResult返却に変更 (S2/S6繰越)
+- [ ] 読み取り時の署名/HMAC 検証 (S4/S6繰越)
 
 ---
 

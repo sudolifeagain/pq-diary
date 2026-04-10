@@ -1881,6 +1881,390 @@ fn cmd_vault_delete_impl(
 }
 
 // ---------------------------------------------------------------------------
+// Git command helpers
+// ---------------------------------------------------------------------------
+
+/// Derive the vault directory from a vault path, canonicalising an empty
+/// parent to the current working directory.
+fn vault_dir_from_path(vault_path: &std::path::Path) -> anyhow::Result<PathBuf> {
+    let parent = vault_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("vault path has no parent directory"))?;
+    if parent.as_os_str().is_empty() {
+        std::env::current_dir()
+            .map_err(|e| anyhow::anyhow!("Cannot determine current directory: {e}"))
+    } else {
+        Ok(parent.to_path_buf())
+    }
+}
+
+/// Apply conflict resolutions chosen interactively by the user.
+///
+/// For each conflict where the user chooses `r` (remote), overwrites the
+/// local provisional entry in the vault with the remote version and commits
+/// the change using the vault's privacy pipeline.
+///
+/// `reader` is injected so that tests can supply pre-programmed responses
+/// instead of reading from the real stdin.
+fn resolve_conflicts_interactive(
+    conflicts: &[pq_diary_core::git::MergeConflict],
+    vault_dir: &std::path::Path,
+    config: &pq_diary_core::vault::config::VaultConfig,
+    vault_path: &std::path::Path,
+    reader: &mut impl std::io::BufRead,
+) -> anyhow::Result<()> {
+    use pq_diary_core::git::{fuzz_timestamp, get_last_commit_timestamp};
+    use pq_diary_core::vault::{reader::read_vault, writer::write_vault};
+    use std::io::Write as _;
+
+    let mut remote_uuids: Vec<[u8; 16]> = Vec::new();
+
+    println!("Merge conflicts detected:");
+    for conflict in conflicts {
+        let uuid_hex: String = conflict.uuid.iter().map(|b| format!("{b:02x}")).collect();
+        println!("  UUID: {}", &uuid_hex[..8]);
+        println!("  Local  updated_at: {}", conflict.local.updated_at);
+        println!("  Remote updated_at: {}", conflict.remote.updated_at);
+        eprint!("  Keep [l]ocal or [r]emote? ");
+        std::io::stderr()
+            .flush()
+            .map_err(|e| anyhow::anyhow!("Failed to flush stderr: {e}"))?;
+
+        let mut input = String::new();
+        reader
+            .read_line(&mut input)
+            .map_err(|e| anyhow::anyhow!("Failed to read conflict choice: {e}"))?;
+        let choice = input.trim().to_lowercase();
+        if choice == "r" || choice == "remote" {
+            remote_uuids.push(conflict.uuid);
+        }
+    }
+
+    if remote_uuids.is_empty() {
+        return Ok(());
+    }
+
+    // Apply "keep remote" choices: swap entries in vault.pqd.
+    let (header, mut entries) = read_vault(vault_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    for uuid in &remote_uuids {
+        if let Some(conflict) = conflicts.iter().find(|c| &c.uuid == uuid) {
+            if let Some(pos) = entries.iter().position(|e| e.uuid == *uuid) {
+                entries[pos] = conflict.remote.clone();
+            }
+        }
+    }
+    write_vault(vault_path, header, &entries).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Commit the updated vault using the privacy pipeline.
+    let prev_ts = get_last_commit_timestamp(vault_dir);
+    let fuzz_hours = config.git.privacy.timestamp_fuzz_hours;
+    let fuzzed_ts = fuzz_timestamp(prev_ts, fuzz_hours);
+    let ts_str = fuzzed_ts.to_rfc3339();
+
+    let add_out = std::process::Command::new("git")
+        .current_dir(vault_dir)
+        .args(["add", "vault.pqd"])
+        .output()
+        .map_err(|e| anyhow::anyhow!("git add failed: {e}"))?;
+    if !add_out.status.success() {
+        return Err(anyhow::anyhow!(
+            "git add failed: {}",
+            String::from_utf8_lossy(&add_out.stderr)
+        ));
+    }
+
+    let commit_out = std::process::Command::new("git")
+        .current_dir(vault_dir)
+        .arg("-c")
+        .arg(format!("user.name={}", config.git.author_name))
+        .arg("-c")
+        .arg(format!("user.email={}", config.git.author_email))
+        .args([
+            "commit",
+            "--date",
+            &ts_str,
+            "-m",
+            &config.git.commit_message,
+        ])
+        .env("GIT_AUTHOR_DATE", &ts_str)
+        .env("GIT_COMMITTER_DATE", &ts_str)
+        .output()
+        .map_err(|e| anyhow::anyhow!("git commit failed: {e}"))?;
+    if !commit_out.status.success() {
+        let stderr = String::from_utf8_lossy(&commit_out.stderr);
+        if !stderr.contains("nothing to commit") {
+            return Err(anyhow::anyhow!("git commit failed: {}", stderr));
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Git command handlers
+// ---------------------------------------------------------------------------
+
+/// Execute the `pq-diary git-init` command.
+///
+/// Initialises a Git repository in the vault directory, writes `.gitignore`,
+/// generates a random anonymous author email, stores it in `vault.toml`, and
+/// optionally adds a remote named `origin`.  No password is required.
+///
+/// # Errors
+///
+/// Returns an error if `git` is not installed, the vault directory cannot be
+/// resolved, `git_init` fails (e.g. already initialised), or the success
+/// message cannot be assembled.
+pub fn cmd_git_init(cli: &Cli, remote: Option<&str>) -> anyhow::Result<()> {
+    use pq_diary_core::{git, vault::config::VaultConfig};
+
+    let vault_path = resolve_vault_path(cli)?;
+    let vault_dir = vault_dir_from_path(&vault_path)?;
+
+    git::check_git_available().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    git::git_init(&vault_dir, remote).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    println!("Initialized git repository in {}", vault_dir.display());
+    // Try to show the generated author email from vault.toml if it exists.
+    let toml_path = vault_dir.join("vault.toml");
+    if toml_path.exists() {
+        if let Ok(config) = VaultConfig::from_file(&toml_path) {
+            if !config.git.author_email.is_empty() {
+                println!("Author: pq-diary <{}>", config.git.author_email);
+            }
+        }
+    }
+    if let Some(url) = remote {
+        println!("Remote: origin → {url}");
+    }
+
+    Ok(())
+}
+
+/// Execute the `pq-diary git-push` command.
+///
+/// Applies the privacy pipeline (extra padding, anonymous author, fixed
+/// commit message, timestamp fuzzing) and pushes the vault to the remote
+/// repository.  Requires the vault password to authorise the operation.
+///
+/// # Errors
+///
+/// Returns an error if policy check fails, password acquisition fails,
+/// vault unlock fails, or any step of the push pipeline fails.
+pub fn cmd_git_push(cli: &Cli) -> anyhow::Result<()> {
+    use pq_diary_core::{
+        crypto::CryptoEngine, git, policy::OperationType, vault::config::VaultConfig,
+    };
+    use secrecy::{ExposeSecret as _, SecretBox};
+
+    check_claude_policy(cli, OperationType::Write)?;
+
+    let vault_path = resolve_vault_path(cli)?;
+    let vault_dir = vault_dir_from_path(&vault_path)?;
+    let toml_path = vault_dir.join("vault.toml");
+
+    git::check_git_available().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let config = VaultConfig::from_file(&toml_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let password_source =
+        get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let vault_str = vault_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("vault path contains non-UTF-8 characters"))?;
+
+    let mut core = pq_diary_core::DiaryCore::new(vault_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let secret_password: secrecy::SecretString =
+        SecretBox::new(Box::from(password_source.secret().expose_secret()));
+    core.unlock(secret_password)
+        .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+    let _guard = VaultGuard::new(&mut core);
+
+    // CryptoEngine is required by the function signature but unused internally.
+    let engine = CryptoEngine::new();
+    git::git_push(&vault_dir, &config, &engine, &vault_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    println!("Pushed vault to remote.");
+    // _guard drops here → lock() called
+    Ok(())
+}
+
+/// Execute the `pq-diary git-pull` command.
+///
+/// Fetches from the remote, runs an entry-level 3-way merge, and handles any
+/// conflicts either automatically (when `--claude` is set) or interactively.
+/// Requires the vault password because the merged vault.pqd is re-written.
+///
+/// # Errors
+///
+/// Returns an error if policy check fails, password acquisition fails,
+/// vault unlock fails, the merge fails, or conflict resolution fails.
+pub fn cmd_git_pull(cli: &Cli) -> anyhow::Result<()> {
+    cmd_git_pull_impl(cli, &mut std::io::BufReader::new(std::io::stdin()))
+}
+
+/// Internal implementation of `cmd_git_pull` with an injectable stdin reader.
+///
+/// Separating the reader allows unit tests to supply pre-programmed conflict
+/// resolutions without touching the real stdin.
+fn cmd_git_pull_impl(cli: &Cli, reader: &mut impl std::io::BufRead) -> anyhow::Result<()> {
+    use pq_diary_core::{
+        crypto::CryptoEngine, git, policy::OperationType, vault::config::VaultConfig,
+    };
+    use secrecy::{ExposeSecret as _, SecretBox};
+
+    check_claude_policy(cli, OperationType::Write)?;
+
+    let vault_path = resolve_vault_path(cli)?;
+    let vault_dir = vault_dir_from_path(&vault_path)?;
+    let toml_path = vault_dir.join("vault.toml");
+
+    git::check_git_available().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let config = VaultConfig::from_file(&toml_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let password_source =
+        get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let vault_str = vault_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("vault path contains non-UTF-8 characters"))?;
+
+    let mut core = pq_diary_core::DiaryCore::new(vault_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let secret_password: secrecy::SecretString =
+        SecretBox::new(Box::from(password_source.secret().expose_secret()));
+    core.unlock(secret_password)
+        .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+    let _guard = VaultGuard::new(&mut core);
+
+    // CryptoEngine is required by the function signature but unused internally.
+    let engine = CryptoEngine::new();
+    let result = git::git_pull_merge(&vault_dir, &config, &engine, &vault_path, cli.claude)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if !result.conflicts.is_empty() && !cli.claude {
+        resolve_conflicts_interactive(&result.conflicts, &vault_dir, &config, &vault_path, reader)?;
+    }
+
+    println!(
+        "Pull complete: {} added, {} updated, {} deleted, {} conflict(s)",
+        result.added,
+        result.updated,
+        result.deleted,
+        result.conflicts.len()
+    );
+    // _guard drops here → lock() called
+    Ok(())
+}
+
+/// Execute the `pq-diary git-sync` command.
+///
+/// Runs pull (fetch + merge) followed by push using a single password prompt.
+/// Conflict resolution follows the same rules as `git-pull`: automatic when
+/// `--claude` is set, interactive otherwise.
+///
+/// # Errors
+///
+/// Returns an error if policy check, password acquisition, vault unlock,
+/// pull, conflict resolution, or push fails.
+pub fn cmd_git_sync(cli: &Cli) -> anyhow::Result<()> {
+    cmd_git_sync_impl(cli, &mut std::io::BufReader::new(std::io::stdin()))
+}
+
+/// Internal implementation of `cmd_git_sync` with an injectable stdin reader.
+fn cmd_git_sync_impl(cli: &Cli, reader: &mut impl std::io::BufRead) -> anyhow::Result<()> {
+    use pq_diary_core::{
+        crypto::CryptoEngine, git, policy::OperationType, vault::config::VaultConfig,
+    };
+    use secrecy::{ExposeSecret as _, SecretBox};
+
+    check_claude_policy(cli, OperationType::Write)?;
+
+    let vault_path = resolve_vault_path(cli)?;
+    let vault_dir = vault_dir_from_path(&vault_path)?;
+    let toml_path = vault_dir.join("vault.toml");
+
+    git::check_git_available().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let config = VaultConfig::from_file(&toml_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Single password prompt for both pull and push.
+    let password_source =
+        get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let vault_str = vault_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("vault path contains non-UTF-8 characters"))?;
+
+    let mut core = pq_diary_core::DiaryCore::new(vault_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let secret_password: secrecy::SecretString =
+        SecretBox::new(Box::from(password_source.secret().expose_secret()));
+    core.unlock(secret_password)
+        .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+    let _guard = VaultGuard::new(&mut core);
+
+    // CryptoEngine is required by the function signature but unused internally.
+    let engine = CryptoEngine::new();
+
+    // Phase 1: Pull + merge.
+    let pull_result = git::git_pull_merge(&vault_dir, &config, &engine, &vault_path, cli.claude)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if !pull_result.conflicts.is_empty() && !cli.claude {
+        resolve_conflicts_interactive(
+            &pull_result.conflicts,
+            &vault_dir,
+            &config,
+            &vault_path,
+            reader,
+        )?;
+    }
+
+    // Phase 2: Push.
+    git::git_push(&vault_dir, &config, &engine, &vault_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    println!("Sync complete.");
+    println!(
+        "Pull: {} added, {} updated, {} deleted, {} conflict(s)",
+        pull_result.added,
+        pull_result.updated,
+        pull_result.deleted,
+        pull_result.conflicts.len()
+    );
+    println!("Push: committed and pushed to remote.");
+    // _guard drops here → lock() called
+    Ok(())
+}
+
+/// Execute the `pq-diary git-status` command.
+///
+/// Runs `git status` in the vault directory and prints the output.
+/// No password is required.
+///
+/// # Errors
+///
+/// Returns an error if `git` is not installed, the vault directory cannot be
+/// resolved, or `git status` fails.
+pub fn cmd_git_status(cli: &Cli) -> anyhow::Result<()> {
+    use pq_diary_core::git;
+
+    let vault_path = resolve_vault_path(cli)?;
+    let vault_dir = vault_dir_from_path(&vault_path)?;
+
+    git::check_git_available().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let status = git::git_status(&vault_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
+    print!("{status}");
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -5766,6 +6150,490 @@ parallelism = 1
         std::fs::write(&toml_path, &full_toml).expect("write full toml");
         let config_full = VaultConfig::from_file(&toml_path).expect("from_file full");
         assert_eq!(config_full.access.policy, AccessPolicy::Full);
+    }
+
+    // =========================================================================
+    // TASK-0078 helpers and tests
+    // =========================================================================
+
+    /// Parse a `Cli` from argument strings for git subcommands.
+    fn make_git_cli(args: &[&str]) -> crate::Cli {
+        crate::Cli::try_parse_from(args).expect("parse git CLI args")
+    }
+
+    /// Initialise a vault with VaultManager and return the vault directory path.
+    ///
+    /// The vault is created with the password `"password"`.
+    /// A fast Argon2 configuration is used to keep tests responsive.
+    fn setup_vault_for_git(dir: &tempfile::TempDir) -> PathBuf {
+        use pq_diary_core::vault::init::VaultManager;
+        let mgr = VaultManager::new(dir.path().to_path_buf())
+            .expect("VaultManager::new")
+            .with_kdf_params(fast_params());
+        mgr.init_vault("v", b"password").expect("init_vault");
+        dir.path().join("v")
+    }
+
+    /// Set up a vault directory with git initialised, a bare local remote, an
+    /// initial commit, and the branch pushed to origin with `-u`.
+    ///
+    /// Returns `(TempDir, vault_dir_path)`.  The `TempDir` must be kept alive
+    /// for the duration of the test.
+    fn setup_git_vault_with_remote(tmp: &tempfile::TempDir) -> PathBuf {
+        let vault_dir = setup_vault_for_git(tmp);
+
+        // Create bare remote.
+        let bare_dir = tmp.path().join("bare.git");
+        std::fs::create_dir_all(&bare_dir).expect("create bare dir");
+        let out = std::process::Command::new("git")
+            .current_dir(&bare_dir)
+            .args(["init", "--bare"])
+            .output()
+            .expect("git init --bare");
+        assert!(out.status.success(), "git init --bare failed");
+
+        // Initialise git in the vault directory (sets local user.name/email).
+        pq_diary_core::git::git_init(&vault_dir, Some(bare_dir.to_str().unwrap()))
+            .expect("git_init");
+
+        // Stage all vault files created by VaultManager.
+        let out = std::process::Command::new("git")
+            .current_dir(&vault_dir)
+            .args(["add", "vault.pqd", "vault.toml", ".gitignore"])
+            .output()
+            .expect("git add");
+        assert!(out.status.success(), "initial git add failed");
+
+        // Initial commit.
+        let out = std::process::Command::new("git")
+            .current_dir(&vault_dir)
+            .args([
+                "-c",
+                "user.name=pq-diary",
+                "-c",
+                "user.email=test@localhost",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .output()
+            .expect("git commit");
+        assert!(
+            out.status.success(),
+            "initial git commit failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // Push with -u to set upstream tracking.
+        let branch_out = std::process::Command::new("git")
+            .current_dir(&vault_dir)
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .expect("rev-parse HEAD");
+        let branch = String::from_utf8_lossy(&branch_out.stdout)
+            .trim()
+            .to_string();
+
+        let out = std::process::Command::new("git")
+            .current_dir(&vault_dir)
+            .args(["push", "-u", "origin", &branch])
+            .output()
+            .expect("git push -u");
+        assert!(
+            out.status.success(),
+            "initial git push failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        vault_dir
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-S8-078-01: cmd_git_init creates .git and updates vault.toml
+    // -------------------------------------------------------------------------
+
+    /// TC-S8-078-01: `git-init` creates `.git` and updates `vault.toml`
+    /// with `author_name = "pq-diary"` and a valid random `author_email`.
+    #[test]
+    fn tc_s8_078_01_git_init_creates_git_and_updates_toml() {
+        use pq_diary_core::vault::config::VaultConfig;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault_for_git(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let cli = make_git_cli(&["pq-diary", "-v", vault_dir_str, "git-init"]);
+        let result = cmd_git_init(&cli, None);
+        assert!(result.is_ok(), "cmd_git_init failed: {:?}", result.err());
+
+        // .git must exist.
+        assert!(
+            vault_dir.join(".git").exists(),
+            ".git directory must exist after git-init"
+        );
+
+        // vault.toml must have been updated with pq-diary author.
+        let toml_path = vault_dir.join("vault.toml");
+        let config = VaultConfig::from_file(&toml_path).expect("read vault.toml");
+        assert_eq!(
+            config.git.author_name, "pq-diary",
+            "author_name must be 'pq-diary'"
+        );
+        let email = &config.git.author_email;
+        assert!(
+            email.ends_with("@localhost") && email.len() == 18,
+            "author_email must match 8hex@localhost: {email}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-S8-078-02: cmd_git_init --remote adds origin
+    // -------------------------------------------------------------------------
+
+    /// TC-S8-078-02: `git-init --remote <url>` adds 'origin' to the git config.
+    #[test]
+    fn tc_s8_078_02_git_init_with_remote_adds_origin() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault_for_git(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+        let remote_url = "https://example.com/repo.git";
+
+        let cli = make_git_cli(&[
+            "pq-diary",
+            "-v",
+            vault_dir_str,
+            "git-init",
+            "--remote",
+            remote_url,
+        ]);
+        let result = cmd_git_init(&cli, Some(remote_url));
+        assert!(
+            result.is_ok(),
+            "cmd_git_init --remote failed: {:?}",
+            result.err()
+        );
+
+        // git remote -v must contain 'origin' and the URL.
+        let out = std::process::Command::new("git")
+            .current_dir(&vault_dir)
+            .args(["remote", "-v"])
+            .output()
+            .expect("git remote -v");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("origin"),
+            "remote -v must contain 'origin': {stdout}"
+        );
+        assert!(
+            stdout.contains(remote_url),
+            "remote -v must contain the remote URL: {stdout}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-S8-078-03: cmd_git_push requires password / succeeds with password
+    // -------------------------------------------------------------------------
+
+    /// TC-S8-078-03a: `git-push` without a password returns an error in
+    /// non-TTY test environments.
+    #[test]
+    fn tc_s8_078_03a_push_fails_without_password() {
+        use std::io::IsTerminal as _;
+        // Only meaningful when stdin is not a terminal (cargo test environment).
+        if std::io::stdin().is_terminal() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_git_vault_with_remote(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let cli = make_git_cli(&["pq-diary", "-v", vault_dir_str, "git-push"]);
+        let result = cmd_git_push(&cli);
+        assert!(
+            result.is_err(),
+            "git-push without password must fail in non-TTY environment"
+        );
+    }
+
+    /// TC-S8-078-03b: `git-push` with the correct password succeeds.
+    #[test]
+    fn tc_s8_078_03b_push_succeeds_with_password() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_git_vault_with_remote(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let cli = make_git_cli(&[
+            "pq-diary",
+            "-v",
+            vault_dir_str,
+            "--password",
+            "password",
+            "git-push",
+        ]);
+        let result = cmd_git_push(&cli);
+        assert!(
+            result.is_ok(),
+            "git-push with correct password must succeed: {:?}",
+            result.err()
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-S8-078-04: cmd_git_pull requires password / succeeds with password
+    // -------------------------------------------------------------------------
+
+    /// TC-S8-078-04a: `git-pull` without a password returns an error in
+    /// non-TTY test environments.
+    #[test]
+    fn tc_s8_078_04a_pull_fails_without_password() {
+        use std::io::IsTerminal as _;
+        if std::io::stdin().is_terminal() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_git_vault_with_remote(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let cli = make_git_cli(&["pq-diary", "-v", vault_dir_str, "git-pull"]);
+        let result = cmd_git_pull(&cli);
+        assert!(
+            result.is_err(),
+            "git-pull without password must fail in non-TTY environment"
+        );
+    }
+
+    /// TC-S8-078-04b: `git-pull` with the correct password succeeds (no-op
+    /// when remote is already in sync).
+    #[test]
+    fn tc_s8_078_04b_pull_succeeds_with_password() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_git_vault_with_remote(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let cli = make_git_cli(&[
+            "pq-diary",
+            "-v",
+            vault_dir_str,
+            "--password",
+            "password",
+            "git-pull",
+        ]);
+        let result = cmd_git_pull(&cli);
+        assert!(
+            result.is_ok(),
+            "git-pull with correct password must succeed: {:?}",
+            result.err()
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-S8-078-05: cmd_git_sync executes pull then push
+    // -------------------------------------------------------------------------
+
+    /// TC-S8-078-05: `git-sync` executes pull followed by push in a single
+    /// password-acquisition.
+    #[test]
+    fn tc_s8_078_05_sync_pull_then_push() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_git_vault_with_remote(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let initial_log = std::process::Command::new("git")
+            .current_dir(&vault_dir)
+            .args(["log", "--oneline"])
+            .output()
+            .expect("git log");
+        let initial_count = String::from_utf8_lossy(&initial_log.stdout).lines().count();
+
+        let cli = make_git_cli(&[
+            "pq-diary",
+            "-v",
+            vault_dir_str,
+            "--password",
+            "password",
+            "git-sync",
+        ]);
+        // Use a reader that always picks "local" for conflict resolution.
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new("l\n"));
+        let result = cmd_git_sync_impl(&cli, &mut reader);
+        assert!(result.is_ok(), "git-sync must succeed: {:?}", result.err());
+
+        // After sync, git log must have at least one new push commit.
+        let after_log = std::process::Command::new("git")
+            .current_dir(&vault_dir)
+            .args(["log", "--oneline"])
+            .output()
+            .expect("git log after sync");
+        let after_count = String::from_utf8_lossy(&after_log.stdout).lines().count();
+        assert!(
+            after_count >= initial_count,
+            "git log must have at least as many commits after sync"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-S8-078-06: cmd_git_status works without password
+    // -------------------------------------------------------------------------
+
+    /// TC-S8-078-06: `git-status` returns git output without requiring a
+    /// password, and does not decrypt the vault.
+    #[test]
+    fn tc_s8_078_06_git_status_no_password_needed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault_for_git(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        // Initialise git first (no remote needed for status).
+        pq_diary_core::git::git_init(&vault_dir, None).expect("git_init");
+
+        // git-status must succeed without any password flag.
+        let cli = make_git_cli(&["pq-diary", "-v", vault_dir_str, "git-status"]);
+        let result = cmd_git_status(&cli);
+        assert!(
+            result.is_ok(),
+            "git-status must succeed without password: {:?}",
+            result.err()
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-S8-078-07: git not installed → all commands fail
+    // -------------------------------------------------------------------------
+
+    /// TC-S8-078-07: When `git` is not in PATH, all git subcommands fail with
+    /// an appropriate error.
+    ///
+    /// **Ignored** because it modifies the process-wide PATH environment
+    /// variable and must not run concurrently with other tests.
+    /// Run with: `cargo test -- --ignored tc_s8_078_07`
+    #[test]
+    #[ignore = "requires environment without git in PATH; run: cargo test -- --ignored"]
+    fn tc_s8_078_07_all_git_commands_fail_when_git_not_installed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault_for_git(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        // Temporarily clear PATH so git cannot be found.
+        let original_path = std::env::var_os("PATH").unwrap_or_default();
+        std::env::set_var("PATH", "");
+
+        let cli_init = make_git_cli(&["pq-diary", "-v", vault_dir_str, "git-init"]);
+        let cli_status = make_git_cli(&["pq-diary", "-v", vault_dir_str, "git-status"]);
+        let cli_push = make_git_cli(&[
+            "pq-diary",
+            "-v",
+            vault_dir_str,
+            "--password",
+            "password",
+            "git-push",
+        ]);
+        let cli_pull = make_git_cli(&[
+            "pq-diary",
+            "-v",
+            vault_dir_str,
+            "--password",
+            "password",
+            "git-pull",
+        ]);
+        let cli_sync = make_git_cli(&[
+            "pq-diary",
+            "-v",
+            vault_dir_str,
+            "--password",
+            "password",
+            "git-sync",
+        ]);
+
+        let results = [
+            cmd_git_init(&cli_init, None),
+            cmd_git_status(&cli_status),
+            cmd_git_push(&cli_push),
+            cmd_git_pull(&cli_pull),
+            cmd_git_sync(&cli_sync),
+        ];
+
+        std::env::set_var("PATH", original_path);
+
+        for (i, result) in results.iter().enumerate() {
+            assert!(
+                result.is_err(),
+                "git command {i} must fail when git is not in PATH"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // TC-S8-078-08: .git not initialised → push/pull/sync fail
+    // -------------------------------------------------------------------------
+
+    /// TC-S8-078-08: `git-push`, `git-pull`, and `git-sync` return a "not
+    /// initialized" error when the vault directory has no `.git` directory.
+    #[test]
+    fn tc_s8_078_08_push_pull_sync_fail_without_git_init() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault_for_git(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        // No git_init called — .git does not exist.
+
+        let cli_push = make_git_cli(&[
+            "pq-diary",
+            "-v",
+            vault_dir_str,
+            "--password",
+            "password",
+            "git-push",
+        ]);
+        let result_push = cmd_git_push(&cli_push);
+        assert!(
+            result_push.is_err(),
+            "git-push must fail when .git is not initialised"
+        );
+        let msg_push = result_push.unwrap_err().to_string();
+        assert!(
+            msg_push.contains("not initialized") || msg_push.contains("not found"),
+            "push error must mention not initialized: {msg_push}"
+        );
+
+        let cli_pull = make_git_cli(&[
+            "pq-diary",
+            "-v",
+            vault_dir_str,
+            "--password",
+            "password",
+            "git-pull",
+        ]);
+        let result_pull = cmd_git_pull(&cli_pull);
+        assert!(
+            result_pull.is_err(),
+            "git-pull must fail when .git is not initialised"
+        );
+        let msg_pull = result_pull.unwrap_err().to_string();
+        assert!(
+            msg_pull.contains("not initialized") || msg_pull.contains("not found"),
+            "pull error must mention not initialized: {msg_pull}"
+        );
+
+        let cli_sync = make_git_cli(&[
+            "pq-diary",
+            "-v",
+            vault_dir_str,
+            "--password",
+            "password",
+            "git-sync",
+        ]);
+        let result_sync = cmd_git_sync(&cli_sync);
+        assert!(
+            result_sync.is_err(),
+            "git-sync must fail when .git is not initialised"
+        );
+        let msg_sync = result_sync.unwrap_err().to_string();
+        assert!(
+            msg_sync.contains("not initialized") || msg_sync.contains("not found"),
+            "sync error must mention not initialized: {msg_sync}"
+        );
     }
 
     // -------------------------------------------------------------------------

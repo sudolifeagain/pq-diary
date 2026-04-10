@@ -491,6 +491,11 @@ pub fn git_pull_merge(
     vault_path: &Path,
     claude_mode: bool,
 ) -> Result<MergeResult, DiaryError> {
+    if !vault_dir.join(".git").exists() {
+        return Err(DiaryError::Git(
+            "git repository is not initialized: .git directory not found".to_string(),
+        ));
+    }
     if !vault_path.exists() {
         return Err(DiaryError::Git("vault.pqd does not exist".to_string()));
     }
@@ -498,10 +503,7 @@ pub fn git_pull_merge(
     // Create backup: vault.pqd → vault.pqd.bak
     let bak_name = format!(
         "{}.bak",
-        vault_path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
+        vault_path.file_name().unwrap_or_default().to_string_lossy()
     );
     let bak_path = vault_path.with_file_name(bak_name);
     std::fs::copy(vault_path, &bak_path)
@@ -575,8 +577,7 @@ fn git_pull_merge_inner(
     }
 
     // 4. Overwrite vault.pqd with the remote version.
-    let checkout_out =
-        run_git_command(vault_dir, &["checkout", &tracking_ref, "--", "vault.pqd"])?;
+    let checkout_out = run_git_command(vault_dir, &["checkout", &tracking_ref, "--", "vault.pqd"])?;
     if !checkout_out.status.success() {
         return Err(DiaryError::Git(format!(
             "git checkout {tracking_ref} -- vault.pqd failed: {}",
@@ -601,11 +602,7 @@ fn git_pull_merge_inner(
     let remote_map: HashMap<[u8; 16], EntryRecord> =
         remote_entries.into_iter().map(|e| (e.uuid, e)).collect();
 
-    let all_uuids: HashSet<[u8; 16]> = local_map
-        .keys()
-        .chain(remote_map.keys())
-        .cloned()
-        .collect();
+    let all_uuids: HashSet<[u8; 16]> = local_map.keys().chain(remote_map.keys()).cloned().collect();
 
     let mut merged: Vec<EntryRecord> = Vec::with_capacity(all_uuids.len());
     let mut added = 0usize;
@@ -678,7 +675,13 @@ fn git_pull_merge_inner(
         .arg(format!("user.name={}", config.git.author_name))
         .arg("-c")
         .arg(format!("user.email={}", config.git.author_email))
-        .args(["commit", "--date", &ts_str, "-m", &config.git.commit_message])
+        .args([
+            "commit",
+            "--date",
+            &ts_str,
+            "-m",
+            &config.git.commit_message,
+        ])
         .env("GIT_AUTHOR_DATE", &ts_str)
         .env("GIT_COMMITTER_DATE", &ts_str)
         .output()
@@ -703,6 +706,30 @@ fn git_pull_merge_inner(
     })
 }
 
+/// Return the output of `git status` in `vault_dir` as a UTF-8 string.
+///
+/// # Errors
+///
+/// Returns [`DiaryError::Git`] if:
+/// - `.git` does not exist in `vault_dir` (EDGE-003)
+/// - the `git status` process cannot be spawned
+/// - the command exits with a non-zero status code
+pub fn git_status(vault_dir: &Path) -> Result<String, DiaryError> {
+    if !vault_dir.join(".git").exists() {
+        return Err(DiaryError::Git(
+            "git repository is not initialized: .git directory not found".to_string(),
+        ));
+    }
+    let out = run_git_command(vault_dir, &["status"])?;
+    if !out.status.success() {
+        return Err(DiaryError::Git(format!(
+            "git status failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 /// Resolve the remote tracking branch ref for HEAD.
 ///
 /// Tries `@{upstream}` first; falls back to `origin/<local_branch>` when the
@@ -720,7 +747,9 @@ fn get_tracking_ref(vault_dir: &Path) -> Result<String, DiaryError> {
     // Fallback: construct "origin/<current branch>".
     let branch_out = run_git_command(vault_dir, &["rev-parse", "--abbrev-ref", "HEAD"])?;
     let branch = if branch_out.status.success() {
-        let s = String::from_utf8_lossy(&branch_out.stdout).trim().to_string();
+        let s = String::from_utf8_lossy(&branch_out.stdout)
+            .trim()
+            .to_string();
         if s.is_empty() {
             "main".to_string()
         } else {
@@ -1597,7 +1626,12 @@ mod tests {
     fn setup_pull_test(
         remote_entries: &[EntryRecord],
         local_entries: &[EntryRecord],
-    ) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf, crate::vault::config::VaultConfig) {
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        crate::vault::config::VaultConfig,
+    ) {
         use crate::vault::format::VaultHeader;
         use crate::vault::writer::write_vault as wv;
 
@@ -1618,7 +1652,11 @@ mod tests {
 
         // Clone the bare remote to a contributor directory.
         let out = std::process::Command::new("git")
-            .args(["clone", bare_dir.to_str().unwrap(), contributor_dir.to_str().unwrap()])
+            .args([
+                "clone",
+                bare_dir.to_str().unwrap(),
+                contributor_dir.to_str().unwrap(),
+            ])
             .output()
             .expect("git clone contributor");
         assert!(
@@ -1627,7 +1665,10 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
 
-        for (k, v) in [("user.name", "contributor"), ("user.email", "contrib@localhost")] {
+        for (k, v) in [
+            ("user.name", "contributor"),
+            ("user.email", "contrib@localhost"),
+        ] {
             std::process::Command::new("git")
                 .current_dir(&contributor_dir)
                 .args(["config", k, v])
@@ -1663,7 +1704,9 @@ mod tests {
             .args(["rev-parse", "--abbrev-ref", "HEAD"])
             .output()
             .expect("contributor git rev-parse");
-        let branch = String::from_utf8_lossy(&branch_out.stdout).trim().to_string();
+        let branch = String::from_utf8_lossy(&branch_out.stdout)
+            .trim()
+            .to_string();
 
         let out = std::process::Command::new("git")
             .current_dir(&contributor_dir)
@@ -1709,7 +1752,10 @@ mod tests {
 
         // vault.pqd must be unchanged.
         let after = std::fs::read(&vault_path).expect("read vault after");
-        assert_eq!(before, after, "vault.pqd must not be modified in no-op case");
+        assert_eq!(
+            before, after,
+            "vault.pqd must not be modified in no-op case"
+        );
 
         // Backup file must be cleaned up.
         let bak_path = vault_path.with_file_name("vault.pqd.bak");
@@ -1953,8 +1999,7 @@ mod tests {
 
         let uuid_b = make_entry(0xB0, 0x02, 100);
 
-        let (_tmp, vault_dir, vault_path, config) =
-            setup_pull_test(&[uuid_b], &[]);
+        let (_tmp, vault_dir, vault_path, config) = setup_pull_test(&[uuid_b], &[]);
 
         let engine = CryptoEngine::new();
         let result = git_pull_merge(&vault_dir, &config, &engine, &vault_path, false);

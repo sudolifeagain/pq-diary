@@ -166,7 +166,11 @@ pub enum Commands {
     },
 
     /// Initialize a git repository for the vault
-    GitInit,
+    GitInit {
+        /// Remote repository URL (optional, added as 'origin')
+        #[arg(long)]
+        remote: Option<String>,
+    },
 
     /// Push vault to the remote git repository
     GitPush,
@@ -353,11 +357,11 @@ fn dispatch(cli: &Cli) -> anyhow::Result<()> {
         Commands::Export => not_implemented("export", "Sprint 5"),
         Commands::ChangePassword => not_implemented("change-password", "Sprint 3"),
         Commands::Info { .. } => not_implemented("info", "Sprint 2"),
-        Commands::GitInit => not_implemented("git-init", "Sprint 8"),
-        Commands::GitPush => not_implemented("git-push", "Sprint 8"),
-        Commands::GitPull => not_implemented("git-pull", "Sprint 8"),
-        Commands::GitSync => not_implemented("git-sync", "Sprint 8"),
-        Commands::GitStatus => not_implemented("git-status", "Sprint 8"),
+        Commands::GitInit { remote } => commands::cmd_git_init(cli, remote.as_deref()),
+        Commands::GitPush => commands::cmd_git_push(cli),
+        Commands::GitPull => commands::cmd_git_pull(cli),
+        Commands::GitSync => commands::cmd_git_sync(cli),
+        Commands::GitStatus => commands::cmd_git_status(cli),
         Commands::Legacy { subcommand } => match subcommand {
             LegacyCommands::Init => not_implemented("legacy init", "Sprint 9"),
             LegacyCommands::Rotate => not_implemented("legacy rotate", "Sprint 9"),

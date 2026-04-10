@@ -327,9 +327,7 @@ fn dispatch(cli: &Cli) -> anyhow::Result<()> {
                 commands::cmd_vault_create(cli, name, policy.as_deref())
             }
             VaultCommands::List => commands::cmd_vault_list(cli),
-            VaultCommands::Policy { name, policy } => {
-                commands::cmd_vault_policy(cli, name, policy)
-            }
+            VaultCommands::Policy { name, policy } => commands::cmd_vault_policy(cli, name, policy),
             VaultCommands::Delete { name, zeroize } => {
                 commands::cmd_vault_delete(cli, name, *zeroize)
             }
@@ -539,8 +537,7 @@ mod tests {
     /// TC-0071-P04: `vault policy <name> <policy>` parses name and policy string.
     #[test]
     fn tc_0071_p04_vault_policy() {
-        let result =
-            Cli::try_parse_from(["pq-diary", "vault", "policy", "myvault", "write_only"]);
+        let result = Cli::try_parse_from(["pq-diary", "vault", "policy", "myvault", "write_only"]);
         assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
         let cli = result.unwrap();
         match cli.command {
@@ -574,8 +571,7 @@ mod tests {
     /// TC-0071-P06: `vault delete <name> --zeroize` parses with zeroize=true.
     #[test]
     fn tc_0071_p06_vault_delete_with_zeroize() {
-        let result =
-            Cli::try_parse_from(["pq-diary", "vault", "delete", "myvault", "--zeroize"]);
+        let result = Cli::try_parse_from(["pq-diary", "vault", "delete", "myvault", "--zeroize"]);
         assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
         let cli = result.unwrap();
         match cli.command {

@@ -1595,11 +1595,7 @@ fn confirm_vault_delete(name: &str, reader: &mut impl std::io::BufRead) -> anyho
 /// Returns an error if the policy string is invalid, the user cancels the
 /// `Full` policy confirmation, password acquisition fails, or vault creation
 /// fails.
-pub fn cmd_vault_create(
-    cli: &Cli,
-    name: &str,
-    policy_str: Option<&str>,
-) -> anyhow::Result<()> {
+pub fn cmd_vault_create(cli: &Cli, name: &str, policy_str: Option<&str>) -> anyhow::Result<()> {
     use pq_diary_core::vault::init::VaultManager;
     cmd_vault_create_impl(
         cli,
@@ -4466,9 +4462,7 @@ mod tests {
     // =========================================================================
 
     /// Create a VaultManager with fast Argon2 params rooted at a temp dir.
-    fn make_vault_mgr(
-        dir: &tempfile::TempDir,
-    ) -> pq_diary_core::vault::init::VaultManager {
+    fn make_vault_mgr(dir: &tempfile::TempDir) -> pq_diary_core::vault::init::VaultManager {
         pq_diary_core::vault::init::VaultManager::new(dir.path().to_path_buf())
             .expect("VaultManager::new")
             .with_kdf_params(fast_params())
@@ -4506,17 +4500,11 @@ mod tests {
         let cli = make_vault_mgmt_cli(base_dir_str, Some("testpass"), &["create", "v030"]);
         let mut reader = std::io::Cursor::new("y\n");
 
-        let result = cmd_vault_create_impl(
-            &cli,
-            "v030",
-            Some("full"),
-            &mut reader,
-            |base_dir| {
-                pq_diary_core::vault::init::VaultManager::new(base_dir)
-                    .map(|m| m.with_kdf_params(fast_params()))
-                    .map_err(|e| anyhow::anyhow!("{e}"))
-            },
-        );
+        let result = cmd_vault_create_impl(&cli, "v030", Some("full"), &mut reader, |base_dir| {
+            pq_diary_core::vault::init::VaultManager::new(base_dir)
+                .map(|m| m.with_kdf_params(fast_params()))
+                .map_err(|e| anyhow::anyhow!("{e}"))
+        });
 
         assert!(
             result.is_ok(),
@@ -4542,16 +4530,11 @@ mod tests {
         let cli = make_vault_mgmt_cli(base_dir_str, Some("testpass"), &["create", "v_e04"]);
         let mut reader = std::io::Cursor::new("");
 
-        let result = cmd_vault_create_impl(
-            &cli,
-            "v_e04",
-            Some("invalid"),
-            &mut reader,
-            |base_dir| {
+        let result =
+            cmd_vault_create_impl(&cli, "v_e04", Some("invalid"), &mut reader, |base_dir| {
                 pq_diary_core::vault::init::VaultManager::new(base_dir)
                     .map_err(|e| anyhow::anyhow!("{e}"))
-            },
-        );
+            });
 
         assert!(result.is_err(), "invalid policy must return an error");
         let err_msg = result.unwrap_err().to_string();
@@ -4574,18 +4557,16 @@ mod tests {
         let cli = make_vault_mgmt_cli(base_dir_str, Some("testpass"), &["create", "v_e05"]);
         let mut reader = std::io::Cursor::new("n\n");
 
-        let result = cmd_vault_create_impl(
-            &cli,
-            "v_e05",
-            Some("full"),
-            &mut reader,
-            |base_dir| {
-                pq_diary_core::vault::init::VaultManager::new(base_dir)
-                    .map_err(|e| anyhow::anyhow!("{e}"))
-            },
-        );
+        let result = cmd_vault_create_impl(&cli, "v_e05", Some("full"), &mut reader, |base_dir| {
+            pq_diary_core::vault::init::VaultManager::new(base_dir)
+                .map_err(|e| anyhow::anyhow!("{e}"))
+        });
 
-        assert!(result.is_ok(), "declined abort must return Ok: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "declined abort must return Ok: {:?}",
+            result.err()
+        );
         assert!(
             !dir.path().join("v_e05").exists(),
             "vault must not be created after declining Full policy warning"
@@ -4651,7 +4632,11 @@ mod tests {
 
         let result = cmd_vault_policy_impl(&cli, "v_e02", "full", &mut reader);
 
-        assert!(result.is_ok(), "declined abort must return Ok: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "declined abort must return Ok: {:?}",
+            result.err()
+        );
         // Verify policy is still WriteOnly.
         let vaults = mgr.list_vaults_with_policy().expect("list");
         let v = vaults.iter().find(|v| v.name == "v_e02").expect("vault");
@@ -4671,8 +4656,12 @@ mod tests {
     fn tc_s7_035_02_delete_declined_aborts() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mgr = make_vault_mgr(&dir);
-        mgr.create_vault("v035", b"testpass", pq_diary_core::policy::AccessPolicy::None)
-            .expect("create_vault");
+        mgr.create_vault(
+            "v035",
+            b"testpass",
+            pq_diary_core::policy::AccessPolicy::None,
+        )
+        .expect("create_vault");
 
         let base_dir_str = dir.path().to_str().expect("utf8");
         let cli = make_vault_mgmt_cli(base_dir_str, None, &["delete", "v035"]);
@@ -4680,7 +4669,11 @@ mod tests {
 
         let result = cmd_vault_delete_impl(&cli, "v035", false, &mut reader);
 
-        assert!(result.is_ok(), "declined abort must return Ok: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "declined abort must return Ok: {:?}",
+            result.err()
+        );
         assert!(
             dir.path().join("v035").exists(),
             "vault must not be deleted after declining"
@@ -4696,8 +4689,12 @@ mod tests {
     fn tc_s7_035_03_delete_with_claude_skips_confirmation() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mgr = make_vault_mgr(&dir);
-        mgr.create_vault("v035c", b"testpass", pq_diary_core::policy::AccessPolicy::None)
-            .expect("create_vault");
+        mgr.create_vault(
+            "v035c",
+            b"testpass",
+            pq_diary_core::policy::AccessPolicy::None,
+        )
+        .expect("create_vault");
 
         let base_dir_str = dir.path().to_str().expect("utf8");
         let cli = crate::Cli::try_parse_from([
@@ -4734,8 +4731,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mgr = make_vault_mgr(&dir);
         // "default" matches AppConfig::default().defaults.vault
-        mgr.create_vault("default", b"testpass", pq_diary_core::policy::AccessPolicy::None)
-            .expect("create_vault");
+        mgr.create_vault(
+            "default",
+            b"testpass",
+            pq_diary_core::policy::AccessPolicy::None,
+        )
+        .expect("create_vault");
 
         let base_dir_str = dir.path().to_str().expect("utf8");
         let cli = make_vault_mgmt_cli(base_dir_str, None, &["delete", "default"]);
@@ -4799,22 +4800,16 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let base_dir_str = dir.path().to_str().expect("utf8");
 
-        let cli =
-            make_vault_mgmt_cli(base_dir_str, Some("testpass"), &["create", "v040b"]);
+        let cli = make_vault_mgmt_cli(base_dir_str, Some("testpass"), &["create", "v040b"]);
         // "n" as reader: if Full warning were shown, this would abort creation.
         let mut reader = std::io::Cursor::new("n\n");
 
-        let result = cmd_vault_create_impl(
-            &cli,
-            "v040b",
-            Some("write_only"),
-            &mut reader,
-            |base_dir| {
+        let result =
+            cmd_vault_create_impl(&cli, "v040b", Some("write_only"), &mut reader, |base_dir| {
                 pq_diary_core::vault::init::VaultManager::new(base_dir)
                     .map(|m| m.with_kdf_params(fast_params()))
                     .map_err(|e| anyhow::anyhow!("{e}"))
-            },
-        );
+            });
 
         assert!(
             result.is_ok(),
@@ -4841,18 +4836,16 @@ mod tests {
         // "n" — the warning IS shown, reader IS consulted, creation is aborted.
         let mut reader = std::io::Cursor::new("n\n");
 
-        let result = cmd_vault_create_impl(
-            &cli,
-            "v040c",
-            Some("full"),
-            &mut reader,
-            |base_dir| {
-                pq_diary_core::vault::init::VaultManager::new(base_dir)
-                    .map_err(|e| anyhow::anyhow!("{e}"))
-            },
-        );
+        let result = cmd_vault_create_impl(&cli, "v040c", Some("full"), &mut reader, |base_dir| {
+            pq_diary_core::vault::init::VaultManager::new(base_dir)
+                .map_err(|e| anyhow::anyhow!("{e}"))
+        });
 
-        assert!(result.is_ok(), "declined abort must return Ok: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "declined abort must return Ok: {:?}",
+            result.err()
+        );
         assert!(
             !dir.path().join("v040c").exists(),
             "vault v040c must not exist — warning was shown and 'n' was read"
@@ -4868,8 +4861,12 @@ mod tests {
     fn tc_s7_040_04_full_policy_change_shows_warning() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mgr = make_vault_mgr(&dir);
-        mgr.create_vault("v040d", b"testpass", pq_diary_core::policy::AccessPolicy::None)
-            .expect("create_vault");
+        mgr.create_vault(
+            "v040d",
+            b"testpass",
+            pq_diary_core::policy::AccessPolicy::None,
+        )
+        .expect("create_vault");
 
         let base_dir_str = dir.path().to_str().expect("utf8");
         let cli = make_vault_mgmt_cli(base_dir_str, None, &["policy", "v040d", "full"]);
@@ -4878,7 +4875,11 @@ mod tests {
 
         let result = cmd_vault_policy_impl(&cli, "v040d", "full", &mut reader);
 
-        assert!(result.is_ok(), "declined abort must return Ok: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "declined abort must return Ok: {:?}",
+            result.err()
+        );
         // Policy must remain None.
         let vaults = mgr.list_vaults_with_policy().expect("list");
         let v = vaults.iter().find(|v| v.name == "v040d").expect("vault");
@@ -4918,7 +4919,11 @@ mod tests {
         );
         let elapsed = start.elapsed();
 
-        assert!(result.is_ok(), "vault create must succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "vault create must succeed: {:?}",
+            result.err()
+        );
         assert!(
             elapsed.as_secs() < 3,
             "vault create must complete within 3 seconds; took {elapsed:?}"
@@ -4947,6 +4952,10 @@ mod tests {
         let cli = make_vault_mgmt_cli(base_dir_str, None, &["list"]);
 
         let result = cmd_vault_list(&cli);
-        assert!(result.is_ok(), "vault list must not error: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "vault list must not error: {:?}",
+            result.err()
+        );
     }
 }

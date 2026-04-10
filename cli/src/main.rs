@@ -221,18 +221,29 @@ pub enum VaultCommands {
     Create {
         /// Name of the new vault
         name: String,
+        /// Access policy (none, write_only, full). Default: none
+        #[arg(long)]
+        policy: Option<String>,
     },
 
     /// List all available vaults
     List,
 
-    /// Manage access policy for the vault
-    Policy,
+    /// Change access policy for a vault
+    Policy {
+        /// Vault name
+        name: String,
+        /// New policy (none, write_only, full)
+        policy: String,
+    },
 
     /// Delete a vault permanently
     Delete {
         /// Name of the vault to delete
         name: String,
+        /// Securely overwrite vault.pqd before deletion
+        #[arg(long)]
+        zeroize: bool,
     },
 }
 
@@ -312,10 +323,16 @@ fn dispatch(cli: &Cli) -> anyhow::Result<()> {
         ),
         Commands::Init => not_implemented("init", "Sprint 2"),
         Commands::Vault { subcommand } => match subcommand {
-            VaultCommands::Create { .. } => not_implemented("vault create", "Sprint 2"),
-            VaultCommands::List => not_implemented("vault list", "Sprint 2"),
-            VaultCommands::Policy => not_implemented("vault policy", "Sprint 7"),
-            VaultCommands::Delete { .. } => not_implemented("vault delete", "Sprint 2"),
+            VaultCommands::Create { name, policy } => {
+                commands::cmd_vault_create(cli, name, policy.as_deref())
+            }
+            VaultCommands::List => commands::cmd_vault_list(cli),
+            VaultCommands::Policy { name, policy } => {
+                commands::cmd_vault_policy(cli, name, policy)
+            }
+            VaultCommands::Delete { name, zeroize } => {
+                commands::cmd_vault_delete(cli, name, *zeroize)
+            }
         },
         Commands::List { tag, query, number } => {
             commands::cmd_list(cli, tag.clone(), query.clone(), *number)
@@ -464,6 +481,112 @@ mod tests {
             result.unwrap_err().kind(),
             clap::error::ErrorKind::DisplayHelp
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // VaultCommands parsing tests (TASK-0071)
+    // -------------------------------------------------------------------------
+
+    /// TC-0071-P01: `vault create <name>` parses with no policy.
+    #[test]
+    fn tc_0071_p01_vault_create_name_only() {
+        let result = Cli::try_parse_from(["pq-diary", "vault", "create", "myvault"]);
+        assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
+        let cli = result.unwrap();
+        match cli.command {
+            Commands::Vault {
+                subcommand: VaultCommands::Create { name, policy },
+            } => {
+                assert_eq!(name, "myvault");
+                assert_eq!(policy, None);
+            }
+            _ => panic!("Expected VaultCommands::Create"),
+        }
+    }
+
+    /// TC-0071-P02: `vault create <name> --policy full` parses name and policy.
+    #[test]
+    fn tc_0071_p02_vault_create_with_policy() {
+        let result =
+            Cli::try_parse_from(["pq-diary", "vault", "create", "myvault", "--policy", "full"]);
+        assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
+        let cli = result.unwrap();
+        match cli.command {
+            Commands::Vault {
+                subcommand: VaultCommands::Create { name, policy },
+            } => {
+                assert_eq!(name, "myvault");
+                assert_eq!(policy, Some("full".to_string()));
+            }
+            _ => panic!("Expected VaultCommands::Create"),
+        }
+    }
+
+    /// TC-0071-P03: `vault list` parses with no arguments.
+    #[test]
+    fn tc_0071_p03_vault_list() {
+        let result = Cli::try_parse_from(["pq-diary", "vault", "list"]);
+        assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
+        let cli = result.unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Vault {
+                subcommand: VaultCommands::List
+            }
+        ));
+    }
+
+    /// TC-0071-P04: `vault policy <name> <policy>` parses name and policy string.
+    #[test]
+    fn tc_0071_p04_vault_policy() {
+        let result =
+            Cli::try_parse_from(["pq-diary", "vault", "policy", "myvault", "write_only"]);
+        assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
+        let cli = result.unwrap();
+        match cli.command {
+            Commands::Vault {
+                subcommand: VaultCommands::Policy { name, policy },
+            } => {
+                assert_eq!(name, "myvault");
+                assert_eq!(policy, "write_only");
+            }
+            _ => panic!("Expected VaultCommands::Policy"),
+        }
+    }
+
+    /// TC-0071-P05: `vault delete <name>` parses with zeroize=false.
+    #[test]
+    fn tc_0071_p05_vault_delete_no_zeroize() {
+        let result = Cli::try_parse_from(["pq-diary", "vault", "delete", "myvault"]);
+        assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
+        let cli = result.unwrap();
+        match cli.command {
+            Commands::Vault {
+                subcommand: VaultCommands::Delete { name, zeroize },
+            } => {
+                assert_eq!(name, "myvault");
+                assert!(!zeroize);
+            }
+            _ => panic!("Expected VaultCommands::Delete"),
+        }
+    }
+
+    /// TC-0071-P06: `vault delete <name> --zeroize` parses with zeroize=true.
+    #[test]
+    fn tc_0071_p06_vault_delete_with_zeroize() {
+        let result =
+            Cli::try_parse_from(["pq-diary", "vault", "delete", "myvault", "--zeroize"]);
+        assert!(result.is_ok(), "parse failed: {:?}", result.unwrap_err());
+        let cli = result.unwrap();
+        match cli.command {
+            Commands::Vault {
+                subcommand: VaultCommands::Delete { name, zeroize },
+            } => {
+                assert_eq!(name, "myvault");
+                assert!(zeroize);
+            }
+            _ => panic!("Expected VaultCommands::Delete"),
+        }
     }
 
     // -------------------------------------------------------------------------

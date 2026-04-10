@@ -10,7 +10,6 @@ use chrono::{DateTime, Duration, Utc};
 use rand::rngs::OsRng;
 use rand::{Rng, RngCore};
 
-use crate::crypto::CryptoEngine;
 use crate::error::DiaryError;
 use crate::vault::config::VaultConfig;
 use crate::vault::format::EntryRecord;
@@ -127,10 +126,10 @@ pub fn generate_random_author_email() -> String {
 
 /// Generate the `.gitignore` content for a pq-diary vault.
 ///
-/// Returns a string that excludes plaintext diary entries (`entries/*.md`)
-/// from Git tracking, ensuring only the encrypted `vault.pqd` is committed.
+/// Returns a string that excludes the plaintext `entries/` directory and
+/// `logs/` from Git tracking, ensuring only encrypted vault files are committed.
 pub fn generate_gitignore() -> String {
-    "entries/*.md\n".to_string()
+    "entries/\nlogs/\n".to_string()
 }
 
 /// Initialise a Git repository in `vault_dir`.
@@ -312,12 +311,12 @@ pub fn get_last_commit_timestamp(vault_dir: &Path) -> Option<DateTime<Utc>> {
 /// [`OsRng`].  The contents are cryptographically random bytes.
 ///
 /// When `max_bytes == 0` an empty `Vec` is returned immediately (REQ-054).
-pub fn generate_extra_padding(max_bytes: usize) -> Vec<u8> {
+pub fn generate_extra_padding(max_bytes: usize) -> zeroize::Zeroizing<Vec<u8>> {
     if max_bytes == 0 {
-        return Vec::new();
+        return zeroize::Zeroizing::new(Vec::new());
     }
     let size = OsRng.gen_range(0..max_bytes);
-    let mut padding = vec![0u8; size];
+    let mut padding = zeroize::Zeroizing::new(vec![0u8; size]);
     OsRng.fill_bytes(&mut padding);
     padding
 }
@@ -348,7 +347,6 @@ pub fn generate_extra_padding(max_bytes: usize) -> Vec<u8> {
 pub fn git_push(
     vault_dir: &Path,
     config: &VaultConfig,
-    _engine: &CryptoEngine,
     vault_path: &Path,
 ) -> Result<(), DiaryError> {
     // Step 1: .git directory must exist (EDGE-003).
@@ -391,6 +389,9 @@ pub fn git_push(
                 })?;
             file.write_all(&extra).map_err(|e| {
                 DiaryError::Git(format!("failed to append extra padding to vault.pqd: {e}"))
+            })?;
+            file.sync_all().map_err(|e| {
+                DiaryError::Git(format!("failed to flush extra padding to disk: {e}"))
             })?;
         }
     }
@@ -487,7 +488,6 @@ pub fn git_push(
 pub fn git_pull_merge(
     vault_dir: &Path,
     config: &VaultConfig,
-    _engine: &CryptoEngine,
     vault_path: &Path,
     claude_mode: bool,
 ) -> Result<MergeResult, DiaryError> {
@@ -557,6 +557,9 @@ fn git_pull_merge_inner(
     // 3. Count commits on remote that are not in local HEAD.
     let count_arg = format!("HEAD..{tracking_ref}");
     let count_out = run_git_command(vault_dir, &["rev-list", &count_arg, "--count"])?;
+    // Parse failure (non-numeric output) is treated as 0 (no remote changes).
+    // This can happen on detached HEAD or other unusual repo states where
+    // rev-list returns unexpected output.
     let count: u64 = if count_out.status.success() {
         String::from_utf8_lossy(&count_out.stdout)
             .trim()
@@ -821,13 +824,13 @@ mod tests {
         );
     }
 
-    /// TC-S8-074-03: generate_gitignore contains "entries/*.md".
+    /// TC-S8-074-03: generate_gitignore contains "entries/".
     #[test]
     fn tc_s8_074_03_gitignore_contains_entries() {
         let content = generate_gitignore();
         assert!(
-            content.contains("entries/*.md"),
-            "gitignore must contain entries/*.md, got: {}",
+            content.contains("entries/"),
+            "gitignore must contain entries/, got: {}",
             content
         );
     }
@@ -844,7 +847,7 @@ mod tests {
         );
     }
 
-    /// TC-S8-074-05: git_init creates .gitignore with entries/*.md content.
+    /// TC-S8-074-05: git_init creates .gitignore with entries/ exclusion.
     #[test]
     fn tc_s8_074_05_git_init_creates_gitignore() {
         let dir = tempdir().expect("tempdir");
@@ -854,8 +857,8 @@ mod tests {
         assert!(gitignore_path.exists(), ".gitignore must exist");
         let content = std::fs::read_to_string(&gitignore_path).expect("read .gitignore");
         assert!(
-            content.contains("entries/*.md"),
-            ".gitignore must contain entries/*.md, got: {}",
+            content.contains("entries/"),
+            ".gitignore must contain entries/, got: {}",
             content
         );
     }
@@ -1290,15 +1293,15 @@ mod tests {
     /// TC-S8-076-01: git_push() re-writes vault.pqd (bytes change after call).
     #[test]
     fn tc_s8_076_01_vault_pqd_bytes_change() {
-        use crate::crypto::CryptoEngine;
+
 
         let config = make_git_push_config("anon", "tc01@localhost", "Update vault", 0, 0);
         let (_tmp, vault_dir, vault_path) = setup_vault_with_remote(&config);
 
         let before = std::fs::read(&vault_path).expect("read vault before");
 
-        let engine = CryptoEngine::new();
-        let result = git_push(&vault_dir, &config, &engine, &vault_path);
+
+        let result = git_push(&vault_dir, &config, &vault_path);
         assert!(result.is_ok(), "git_push failed: {:?}", result);
 
         let after = std::fs::read(&vault_path).expect("read vault after");
@@ -1311,15 +1314,15 @@ mod tests {
     /// TC-S8-076-02: git_push() commits with the anonymous author from vault.toml.
     #[test]
     fn tc_s8_076_02_anonymous_author_used() {
-        use crate::crypto::CryptoEngine;
+
 
         let anon_name = "pq-anon-test";
         let anon_email = "ab12cd34@localhost";
         let config = make_git_push_config(anon_name, anon_email, "Update vault", 0, 0);
         let (_tmp, vault_dir, vault_path) = setup_vault_with_remote(&config);
 
-        let engine = CryptoEngine::new();
-        let result = git_push(&vault_dir, &config, &engine, &vault_path);
+
+        let result = git_push(&vault_dir, &config, &vault_path);
         assert!(result.is_ok(), "git_push failed: {:?}", result);
 
         let out = std::process::Command::new("git")
@@ -1345,14 +1348,14 @@ mod tests {
     /// TC-S8-076-03: git_push() commits with the fixed commit_message from vault.toml.
     #[test]
     fn tc_s8_076_03_fixed_commit_message_used() {
-        use crate::crypto::CryptoEngine;
+
 
         let expected_msg = "pq-diary sync operation";
         let config = make_git_push_config("anon", "tc03@localhost", expected_msg, 0, 0);
         let (_tmp, vault_dir, vault_path) = setup_vault_with_remote(&config);
 
-        let engine = CryptoEngine::new();
-        let result = git_push(&vault_dir, &config, &engine, &vault_path);
+
+        let result = git_push(&vault_dir, &config, &vault_path);
         assert!(result.is_ok(), "git_push failed: {:?}", result);
 
         let out = std::process::Command::new("git")
@@ -1371,7 +1374,7 @@ mod tests {
     /// TC-S8-076-04: git_push() applies timestamp fuzzing (fuzz_hours > 0).
     #[test]
     fn tc_s8_076_04_timestamp_fuzzing_applied() {
-        use crate::crypto::CryptoEngine;
+
         use chrono::Utc;
 
         let fuzz_hours: u64 = 6;
@@ -1379,8 +1382,8 @@ mod tests {
         let (_tmp, vault_dir, vault_path) = setup_vault_with_remote(&config);
 
         let before_push = Utc::now();
-        let engine = CryptoEngine::new();
-        let result = git_push(&vault_dir, &config, &engine, &vault_path);
+
+        let result = git_push(&vault_dir, &config, &vault_path);
         assert!(result.is_ok(), "git_push failed: {:?}", result);
         let after_push = Utc::now();
 
@@ -1413,8 +1416,7 @@ mod tests {
         let config0 = make_git_push_config("anon", "tc04b@localhost", "Update vault", 0, 0);
         let (_tmp2, vault_dir2, vault_path2) = setup_vault_with_remote(&config0);
         let t_before = Utc::now();
-        let engine2 = CryptoEngine::new();
-        let result2 = git_push(&vault_dir2, &config0, &engine2, &vault_path2);
+        let result2 = git_push(&vault_dir2, &config0, &vault_path2);
         assert!(result2.is_ok(), "git_push (fuzz=0) failed: {:?}", result2);
         let t_after = Utc::now();
 
@@ -1439,14 +1441,14 @@ mod tests {
     /// TC-S8-076-05: extra_padding_bytes_max=0 does not add extra bytes.
     #[test]
     fn tc_s8_076_05_no_extra_padding_when_max_zero() {
-        use crate::crypto::CryptoEngine;
+
         use crate::vault::reader::read_vault as rv;
 
         let config = make_git_push_config("anon", "tc05@localhost", "Update vault", 0, 0);
         let (_tmp, vault_dir, vault_path) = setup_vault_with_remote(&config);
 
-        let engine = CryptoEngine::new();
-        let result = git_push(&vault_dir, &config, &engine, &vault_path);
+
+        let result = git_push(&vault_dir, &config, &vault_path);
         assert!(result.is_ok(), "git_push failed: {:?}", result);
 
         // vault.pqd must still be parseable (no format corruption from extra bytes).
@@ -1471,7 +1473,7 @@ mod tests {
     /// TC-S8-076-06: git_push() returns EDGE-003 when .git is not initialized.
     #[test]
     fn tc_s8_076_06_edge_003_no_git_directory() {
-        use crate::crypto::CryptoEngine;
+
         use crate::vault::format::VaultHeader;
         use crate::vault::writer::write_vault as wv;
 
@@ -1481,9 +1483,9 @@ mod tests {
         wv(&vault_path, VaultHeader::new(), &[]).expect("write_vault");
 
         let config = make_git_push_config("anon", "tc06@localhost", "Update vault", 0, 0);
-        let engine = CryptoEngine::new();
 
-        let result = git_push(&vault_dir, &config, &engine, &vault_path);
+
+        let result = git_push(&vault_dir, &config, &vault_path);
         assert!(result.is_err(), "expected Err for missing .git, got Ok");
 
         match result {
@@ -1500,7 +1502,7 @@ mod tests {
     /// TC-S8-076-07: git_push() returns EDGE-002 when no remote is configured.
     #[test]
     fn tc_s8_076_07_edge_002_no_remote_configured() {
-        use crate::crypto::CryptoEngine;
+
         use crate::vault::format::VaultHeader;
         use crate::vault::writer::write_vault as wv;
 
@@ -1525,8 +1527,8 @@ mod tests {
             .expect("git init");
         assert!(out.status.success(), "git init failed");
 
-        let engine = CryptoEngine::new();
-        let result = git_push(&vault_dir, &config, &engine, &vault_path);
+
+        let result = git_push(&vault_dir, &config, &vault_path);
         assert!(result.is_err(), "expected Err for missing remote, got Ok");
 
         match result {
@@ -1546,7 +1548,7 @@ mod tests {
     /// must not appear in the commit produced by `git_push()`.
     #[test]
     fn tc_s8_076_08_only_allowed_files_are_staged() {
-        use crate::crypto::CryptoEngine;
+
 
         let config = make_git_push_config("anon", "tc08@localhost", "Update vault", 0, 0);
         let (_tmp, vault_dir, vault_path) = setup_vault_with_remote(&config);
@@ -1558,8 +1560,8 @@ mod tests {
         std::fs::write(entries_dir.join("secret.txt"), b"should not be committed")
             .expect("write entries/secret.txt");
 
-        let engine = CryptoEngine::new();
-        let result = git_push(&vault_dir, &config, &engine, &vault_path);
+
+        let result = git_push(&vault_dir, &config, &vault_path);
         assert!(result.is_ok(), "git_push failed: {:?}", result);
 
         // Inspect which files appeared in the last commit.
@@ -1732,7 +1734,7 @@ mod tests {
     /// TC-S8-077-01: git_pull_merge returns no-op when remote has no new commits (EDGE-004).
     #[test]
     fn tc_s8_077_01_no_op_when_no_remote_changes() {
-        use crate::crypto::CryptoEngine;
+
 
         // Set up: local and remote at the same commit — no contributor push.
         let config = make_git_push_config("pq-diary", "test@localhost", "Update vault", 0, 0);
@@ -1740,8 +1742,8 @@ mod tests {
 
         let before = std::fs::read(&vault_path).expect("read vault before");
 
-        let engine = CryptoEngine::new();
-        let result = git_pull_merge(&vault_dir, &config, &engine, &vault_path, false);
+
+        let result = git_pull_merge(&vault_dir, &config, &vault_path, false);
         assert!(result.is_ok(), "expected Ok, got: {:?}", result);
 
         let mr = result.unwrap();
@@ -1768,7 +1770,7 @@ mod tests {
     /// TC-S8-077-02: local is empty; all remote entries are adopted (EDGE-005).
     #[test]
     fn tc_s8_077_02_empty_local_accepts_all_remote_entries() {
-        use crate::crypto::CryptoEngine;
+
         use crate::vault::reader::read_vault as rv;
 
         let uuid_a = make_entry(0xA0, 0x01, 100);
@@ -1778,8 +1780,8 @@ mod tests {
         let (_tmp, vault_dir, vault_path, config) =
             setup_pull_test(&remote_entries, &[] /* local: empty */);
 
-        let engine = CryptoEngine::new();
-        let result = git_pull_merge(&vault_dir, &config, &engine, &vault_path, false);
+
+        let result = git_pull_merge(&vault_dir, &config, &vault_path, false);
         assert!(result.is_ok(), "expected Ok, got: {:?}", result);
 
         let mr = result.unwrap();
@@ -1795,7 +1797,7 @@ mod tests {
     /// TC-S8-077-03: local-only entries are preserved after merge.
     #[test]
     fn tc_s8_077_03_local_only_entries_preserved() {
-        use crate::crypto::CryptoEngine;
+
         use crate::vault::reader::read_vault as rv;
 
         let uuid_a = make_entry(0xA0, 0x01, 100);
@@ -1805,8 +1807,8 @@ mod tests {
         let (_tmp, vault_dir, vault_path, config) =
             setup_pull_test(&[] /* remote: empty */, &local_entries);
 
-        let engine = CryptoEngine::new();
-        let result = git_pull_merge(&vault_dir, &config, &engine, &vault_path, false);
+
+        let result = git_pull_merge(&vault_dir, &config, &vault_path, false);
         assert!(result.is_ok(), "expected Ok, got: {:?}", result);
 
         let mr = result.unwrap();
@@ -1823,7 +1825,7 @@ mod tests {
     /// TC-S8-077-04: remote-only entries are added to the merged vault.
     #[test]
     fn tc_s8_077_04_remote_only_entries_added() {
-        use crate::crypto::CryptoEngine;
+
         use crate::vault::reader::read_vault as rv;
 
         let uuid_b = make_entry(0xB0, 0x02, 100);
@@ -1832,8 +1834,8 @@ mod tests {
         let (_tmp, vault_dir, vault_path, config) =
             setup_pull_test(&remote_entries, &[] /* local: empty */);
 
-        let engine = CryptoEngine::new();
-        let result = git_pull_merge(&vault_dir, &config, &engine, &vault_path, false);
+
+        let result = git_pull_merge(&vault_dir, &config, &vault_path, false);
         assert!(result.is_ok(), "expected Ok, got: {:?}", result);
 
         let mr = result.unwrap();
@@ -1850,7 +1852,7 @@ mod tests {
     /// TC-S8-077-05: same UUID + same content_hmac → no update, local preserved.
     #[test]
     fn tc_s8_077_05_same_hmac_no_update() {
-        use crate::crypto::CryptoEngine;
+
         use crate::vault::reader::read_vault as rv;
 
         let uuid_c = make_entry(0xC0, 0x03, 100);
@@ -1858,8 +1860,8 @@ mod tests {
         let (_tmp, vault_dir, vault_path, config) =
             setup_pull_test(&[uuid_c.clone()], &[uuid_c.clone()]);
 
-        let engine = CryptoEngine::new();
-        let result = git_pull_merge(&vault_dir, &config, &engine, &vault_path, false);
+
+        let result = git_pull_merge(&vault_dir, &config, &vault_path, false);
         assert!(result.is_ok(), "expected Ok, got: {:?}", result);
 
         let mr = result.unwrap();
@@ -1875,7 +1877,7 @@ mod tests {
     /// TC-S8-077-06: same UUID + different HMAC → last-write-wins (updated_at).
     #[test]
     fn tc_s8_077_06_last_write_wins_updated_at() {
-        use crate::crypto::CryptoEngine;
+
         use crate::vault::reader::read_vault as rv;
 
         // --- subcase A: remote is newer ---
@@ -1885,8 +1887,7 @@ mod tests {
         let (_tmp_a, vault_dir_a, vault_path_a, config_a) =
             setup_pull_test(&[uuid_d_remote.clone()], &[uuid_d_local.clone()]);
 
-        let engine_a = CryptoEngine::new();
-        let result_a = git_pull_merge(&vault_dir_a, &config_a, &engine_a, &vault_path_a, false);
+        let result_a = git_pull_merge(&vault_dir_a, &config_a, &vault_path_a, false);
         assert!(result_a.is_ok(), "subcase A failed: {:?}", result_a);
         let mr_a = result_a.unwrap();
         assert_eq!(mr_a.updated, 1, "subcase A: updated must be 1");
@@ -1909,8 +1910,7 @@ mod tests {
         let (_tmp_b, vault_dir_b, vault_path_b, config_b) =
             setup_pull_test(&[uuid_d_remote2.clone()], &[uuid_d_local2.clone()]);
 
-        let engine_b = CryptoEngine::new();
-        let result_b = git_pull_merge(&vault_dir_b, &config_b, &engine_b, &vault_path_b, false);
+        let result_b = git_pull_merge(&vault_dir_b, &config_b, &vault_path_b, false);
         assert!(result_b.is_ok(), "subcase B failed: {:?}", result_b);
         let mr_b = result_b.unwrap();
         assert_eq!(mr_b.updated, 1, "subcase B: updated must be 1");
@@ -1929,7 +1929,7 @@ mod tests {
     /// TC-S8-077-07: claude_mode=true auto-resolves true conflicts with local-wins (REQ-026).
     #[test]
     fn tc_s8_077_07_claude_mode_auto_resolves_conflict() {
-        use crate::crypto::CryptoEngine;
+
         use crate::vault::reader::read_vault as rv;
 
         // Same UUID, same updated_at, different HMAC → true conflict.
@@ -1939,9 +1939,9 @@ mod tests {
         let (_tmp, vault_dir, vault_path, config) =
             setup_pull_test(&[uuid_e_remote.clone()], &[uuid_e_local.clone()]);
 
-        let engine = CryptoEngine::new();
+
         // claude_mode = true → auto-resolve with local-wins.
-        let result = git_pull_merge(&vault_dir, &config, &engine, &vault_path, true);
+        let result = git_pull_merge(&vault_dir, &config, &vault_path, true);
         assert!(result.is_ok(), "expected Ok, got: {:?}", result);
 
         let mr = result.unwrap();
@@ -1966,7 +1966,7 @@ mod tests {
     /// TC-S8-077-08: merged vault.pqd is readable and valid after merge (REQ-028).
     #[test]
     fn tc_s8_077_08_merged_vault_is_readable() {
-        use crate::crypto::CryptoEngine;
+
         use crate::vault::reader::read_vault as rv;
 
         let uuid_a = make_entry(0xA0, 0x01, 100);
@@ -1976,8 +1976,8 @@ mod tests {
         let (_tmp, vault_dir, vault_path, config) =
             setup_pull_test(&[uuid_b.clone()], &[uuid_a.clone()]);
 
-        let engine = CryptoEngine::new();
-        let result = git_pull_merge(&vault_dir, &config, &engine, &vault_path, false);
+
+        let result = git_pull_merge(&vault_dir, &config, &vault_path, false);
         assert!(result.is_ok(), "expected Ok, got: {:?}", result);
 
         // vault.pqd must parse without errors (write_vault produced a valid file).
@@ -1995,14 +1995,14 @@ mod tests {
     /// TC-S8-077-09: vault.pqd.bak is deleted after a successful merge.
     #[test]
     fn tc_s8_077_09_backup_deleted_after_successful_merge() {
-        use crate::crypto::CryptoEngine;
+
 
         let uuid_b = make_entry(0xB0, 0x02, 100);
 
         let (_tmp, vault_dir, vault_path, config) = setup_pull_test(&[uuid_b], &[]);
 
-        let engine = CryptoEngine::new();
-        let result = git_pull_merge(&vault_dir, &config, &engine, &vault_path, false);
+
+        let result = git_pull_merge(&vault_dir, &config, &vault_path, false);
         assert!(result.is_ok(), "expected Ok, got: {:?}", result);
 
         let bak_path = vault_path.with_file_name("vault.pqd.bak");

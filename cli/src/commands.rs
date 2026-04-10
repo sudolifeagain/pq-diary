@@ -2054,7 +2054,7 @@ pub fn cmd_git_init(cli: &Cli, remote: Option<&str>) -> anyhow::Result<()> {
 /// vault unlock fails, or any step of the push pipeline fails.
 pub fn cmd_git_push(cli: &Cli) -> anyhow::Result<()> {
     use pq_diary_core::{
-        crypto::CryptoEngine, git, policy::OperationType, vault::config::VaultConfig,
+        git, policy::OperationType, vault::config::VaultConfig,
     };
     use secrecy::{ExposeSecret as _, SecretBox};
 
@@ -2083,9 +2083,8 @@ pub fn cmd_git_push(cli: &Cli) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
     let _guard = VaultGuard::new(&mut core);
 
-    // CryptoEngine is required by the function signature but unused internally.
-    let engine = CryptoEngine::new();
-    git::git_push(&vault_dir, &config, &engine, &vault_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    git::git_push(&vault_dir, &config, &vault_path).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     println!("Pushed vault to remote.");
     // _guard drops here → lock() called
@@ -2112,7 +2111,7 @@ pub fn cmd_git_pull(cli: &Cli) -> anyhow::Result<()> {
 /// resolutions without touching the real stdin.
 fn cmd_git_pull_impl(cli: &Cli, reader: &mut impl std::io::BufRead) -> anyhow::Result<()> {
     use pq_diary_core::{
-        crypto::CryptoEngine, git, policy::OperationType, vault::config::VaultConfig,
+        git, policy::OperationType, vault::config::VaultConfig,
     };
     use secrecy::{ExposeSecret as _, SecretBox};
 
@@ -2141,9 +2140,8 @@ fn cmd_git_pull_impl(cli: &Cli, reader: &mut impl std::io::BufRead) -> anyhow::R
         .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
     let _guard = VaultGuard::new(&mut core);
 
-    // CryptoEngine is required by the function signature but unused internally.
-    let engine = CryptoEngine::new();
-    let result = git::git_pull_merge(&vault_dir, &config, &engine, &vault_path, cli.claude)
+
+    let result = git::git_pull_merge(&vault_dir, &config, &vault_path, cli.claude)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     if !result.conflicts.is_empty() && !cli.claude {
@@ -2178,7 +2176,7 @@ pub fn cmd_git_sync(cli: &Cli) -> anyhow::Result<()> {
 /// Internal implementation of `cmd_git_sync` with an injectable stdin reader.
 fn cmd_git_sync_impl(cli: &Cli, reader: &mut impl std::io::BufRead) -> anyhow::Result<()> {
     use pq_diary_core::{
-        crypto::CryptoEngine, git, policy::OperationType, vault::config::VaultConfig,
+        git, policy::OperationType, vault::config::VaultConfig,
     };
     use secrecy::{ExposeSecret as _, SecretBox};
 
@@ -2208,11 +2206,10 @@ fn cmd_git_sync_impl(cli: &Cli, reader: &mut impl std::io::BufRead) -> anyhow::R
         .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
     let _guard = VaultGuard::new(&mut core);
 
-    // CryptoEngine is required by the function signature but unused internally.
-    let engine = CryptoEngine::new();
+
 
     // Phase 1: Pull + merge.
-    let pull_result = git::git_pull_merge(&vault_dir, &config, &engine, &vault_path, cli.claude)
+    let pull_result = git::git_pull_merge(&vault_dir, &config, &vault_path, cli.claude)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     if !pull_result.conflicts.is_empty() && !cli.claude {
@@ -2226,7 +2223,7 @@ fn cmd_git_sync_impl(cli: &Cli, reader: &mut impl std::io::BufRead) -> anyhow::R
     }
 
     // Phase 2: Push.
-    git::git_push(&vault_dir, &config, &engine, &vault_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    git::git_push(&vault_dir, &config, &vault_path).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     println!("Sync complete.");
     println!(
@@ -6786,7 +6783,7 @@ parallelism = 1
 
     /// TC-S8-INT-02: After `git-init`:
     /// - `.git` directory exists
-    /// - `.gitignore` contains the `entries/*.md` privacy rule
+    /// - `.gitignore` contains the `entries/` privacy rule
     /// - `vault.toml` has `author_name = "pq-diary"` and anonymous `author_email`
     ///
     /// Validates REQ-001, REQ-016~017.
@@ -6808,7 +6805,7 @@ parallelism = 1
             ".git directory must exist after git-init"
         );
 
-        // .gitignore must contain the entries/*.md exclusion rule.
+        // .gitignore must contain the entries/ exclusion rule.
         let gitignore_path = vault_dir.join(".gitignore");
         assert!(
             gitignore_path.exists(),
@@ -6816,8 +6813,8 @@ parallelism = 1
         );
         let gitignore_content = std::fs::read_to_string(&gitignore_path).expect("read .gitignore");
         assert!(
-            gitignore_content.contains("entries/*.md"),
-            ".gitignore must contain 'entries/*.md' rule; got: {gitignore_content}"
+            gitignore_content.contains("entries/"),
+            ".gitignore must contain 'entries/' rule; got: {gitignore_content}"
         );
 
         // vault.toml author must be the anonymous pq-diary identity.
@@ -7460,10 +7457,10 @@ parallelism = 1
     }
 
     // -------------------------------------------------------------------------
-    // TC-S8-SEC-01: entries/*.md not in git staging after push
+    // TC-S8-SEC-01: entries/ not in git staging after push
     // -------------------------------------------------------------------------
 
-    /// TC-S8-SEC-01: After `git-push`, `entries/*.md` files are never staged
+    /// TC-S8-SEC-01: After `git-push`, `entries/` files are never staged
     /// or committed — the `.gitignore` exclusion rule keeps them out of git.
     ///
     /// Validates REQ-022.

@@ -1,3 +1,402 @@
 //! Git synchronisation operations.
 //!
-//! Full implementation is planned for Sprint 8.
+//! Provides Git repository initialisation and related utilities for pq-diary vaults.
+//! Full push/pull/merge support is planned for later Sprint 8 tasks.
+
+use std::path::{Path, PathBuf};
+
+use rand::rngs::OsRng;
+use rand::RngCore;
+
+use crate::error::DiaryError;
+use crate::vault::config::VaultConfig;
+
+// =============================================================================
+// Types
+// =============================================================================
+
+/// Git operation context for a vault directory.
+///
+/// Holds the path to the vault directory and provides a context for all
+/// Git operations performed on that vault.
+pub struct GitOperations {
+    /// Path to the vault directory (parent of `.git`).
+    vault_dir: PathBuf,
+}
+
+impl GitOperations {
+    /// Create a new [`GitOperations`] context for the given `vault_dir`.
+    pub fn new(vault_dir: PathBuf) -> Self {
+        Self { vault_dir }
+    }
+
+    /// Return the vault directory path.
+    pub fn vault_dir(&self) -> &Path {
+        &self.vault_dir
+    }
+}
+
+// =============================================================================
+// Public functions
+// =============================================================================
+
+/// Check whether `git` is installed and available in `PATH`.
+///
+/// Runs `git --version` and returns `Ok(())` if the command exits successfully.
+///
+/// # Errors
+///
+/// Returns [`DiaryError::Git`] if `git` is not found or cannot be executed.
+pub fn check_git_available() -> Result<(), DiaryError> {
+    let output = std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .map_err(|_| DiaryError::Git("git is not installed or not found in PATH".to_string()))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(DiaryError::Git(
+            "git is not installed or not found in PATH".to_string(),
+        ))
+    }
+}
+
+/// Generate a privacy-preserving random author email address.
+///
+/// Uses [`OsRng`] to produce 4 cryptographically random bytes, encodes them
+/// as an 8-character lowercase hex string, and appends `@localhost`.
+///
+/// # Format
+///
+/// Returns a string matching the pattern `^[0-9a-f]{8}@localhost$`.
+pub fn generate_random_author_email() -> String {
+    let mut bytes = [0u8; 4];
+    OsRng.fill_bytes(&mut bytes);
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}@localhost",
+        bytes[0], bytes[1], bytes[2], bytes[3]
+    )
+}
+
+/// Generate the `.gitignore` content for a pq-diary vault.
+///
+/// Returns a string that excludes plaintext diary entries (`entries/*.md`)
+/// from Git tracking, ensuring only the encrypted `vault.pqd` is committed.
+pub fn generate_gitignore() -> String {
+    "entries/*.md\n".to_string()
+}
+
+/// Initialise a Git repository in `vault_dir`.
+///
+/// # Steps
+///
+/// 1. Checks that `.git` does not already exist (returns an error if present).
+/// 2. Runs `git init`.
+/// 3. Writes `.gitignore` using [`generate_gitignore`].
+/// 4. Generates a random author email via [`generate_random_author_email`].
+/// 5. Configures `user.name = "pq-diary"` and `user.email`.
+/// 6. If `vault.toml` exists, atomically updates its `[git]` section.
+/// 7. If `remote` is `Some(url)`, runs `git remote add origin <url>`.
+///
+/// # Errors
+///
+/// Returns [`DiaryError::Git`] if `.git` already exists, any Git command fails,
+/// or `vault.toml` cannot be read/written.
+pub fn git_init(vault_dir: &Path, remote: Option<&str>) -> Result<(), DiaryError> {
+    // Step 1: Check if already initialised (EDGE-006).
+    if vault_dir.join(".git").exists() {
+        return Err(DiaryError::Git("already initialized".to_string()));
+    }
+
+    // Step 2: git init (REQ-001).
+    let out = run_git_command(vault_dir, &["init"])?;
+    if !out.status.success() {
+        return Err(DiaryError::Git(format!(
+            "git init failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )));
+    }
+
+    // Step 3: Write .gitignore (REQ-002).
+    std::fs::write(vault_dir.join(".gitignore"), generate_gitignore())
+        .map_err(|e| DiaryError::Git(format!("failed to write .gitignore: {e}")))?;
+
+    // Steps 4-5: Generate random author email and configure git user (REQ-003).
+    let author_email = generate_random_author_email();
+
+    let out = run_git_command(vault_dir, &["config", "user.name", "pq-diary"])?;
+    if !out.status.success() {
+        return Err(DiaryError::Git(format!(
+            "git config user.name failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )));
+    }
+
+    let out = run_git_command(vault_dir, &["config", "user.email", &author_email])?;
+    if !out.status.success() {
+        return Err(DiaryError::Git(format!(
+            "git config user.email failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )));
+    }
+
+    // Step 6: Atomically update vault.toml [git] section if present (REQ-004).
+    let toml_path = vault_dir.join("vault.toml");
+    if toml_path.exists() {
+        let content = std::fs::read_to_string(&toml_path)
+            .map_err(|e| DiaryError::Git(format!("failed to read vault.toml: {e}")))?;
+        let mut config: VaultConfig = toml::from_str(&content)
+            .map_err(|e| DiaryError::Git(format!("failed to parse vault.toml: {e}")))?;
+        config.git.author_name = "pq-diary".to_string();
+        config.git.author_email = author_email;
+        let new_content = toml::to_string_pretty(&config)
+            .map_err(|e| DiaryError::Git(format!("failed to serialize vault.toml: {e}")))?;
+        // Atomic write: .toml.tmp → rename to vault.toml (mirrors set_policy pattern).
+        let tmp_path = toml_path.with_extension("toml.tmp");
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&tmp_path)
+                .map_err(|e| DiaryError::Git(format!("failed to create temp file: {e}")))?;
+            file.write_all(new_content.as_bytes())
+                .map_err(|e| DiaryError::Git(format!("failed to write temp file: {e}")))?;
+            file.sync_all()
+                .map_err(|e| DiaryError::Git(format!("failed to sync temp file: {e}")))?;
+        }
+        if let Err(e) = std::fs::rename(&tmp_path, &toml_path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(DiaryError::Io(e));
+        }
+    }
+
+    // Step 7: Add remote if provided (REQ-005).
+    if let Some(url) = remote {
+        let out = run_git_command(vault_dir, &["remote", "add", "origin", url])?;
+        if !out.status.success() {
+            return Err(DiaryError::Git(format!(
+                "git remote add origin failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+// =============================================================================
+// Private helpers
+// =============================================================================
+
+/// Run a Git command in `vault_dir` with the specified `args`.
+///
+/// Returns the [`std::process::Output`] from the Git process.
+///
+/// # Errors
+///
+/// Returns [`DiaryError::Git`] if the process cannot be spawned.
+fn run_git_command(vault_dir: &Path, args: &[&str]) -> Result<std::process::Output, DiaryError> {
+    std::process::Command::new("git")
+        .current_dir(vault_dir)
+        .args(args)
+        .output()
+        .map_err(|e| DiaryError::Git(format!("failed to run git {}: {e}", args.join(" "))))
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    /// TC-S8-074-01: check_git_available succeeds in a git-installed environment.
+    #[test]
+    fn tc_s8_074_01_check_git_available_success() {
+        // Assumes git is installed in the test environment.
+        let result = check_git_available();
+        assert!(result.is_ok(), "expected Ok(()), got: {:?}", result);
+    }
+
+    /// TC-S8-074-02: generate_random_author_email returns the correct format.
+    #[test]
+    fn tc_s8_074_02_random_author_email_format() {
+        let email = generate_random_author_email();
+
+        // Must match ^[0-9a-f]{8}@localhost$
+        assert!(
+            email.ends_with("@localhost"),
+            "must end with @localhost: {}",
+            email
+        );
+        let hex_part = email.trim_end_matches("@localhost");
+        assert_eq!(hex_part.len(), 8, "hex part must be 8 chars: {}", email);
+        assert!(
+            hex_part.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+            "hex part must be lowercase hex: {}",
+            email
+        );
+
+        // Multiple calls should return different values
+        let email2 = generate_random_author_email();
+        let email3 = generate_random_author_email();
+        assert!(
+            email != email2 || email != email3,
+            "multiple calls should return different values"
+        );
+    }
+
+    /// TC-S8-074-03: generate_gitignore contains "entries/*.md".
+    #[test]
+    fn tc_s8_074_03_gitignore_contains_entries() {
+        let content = generate_gitignore();
+        assert!(
+            content.contains("entries/*.md"),
+            "gitignore must contain entries/*.md, got: {}",
+            content
+        );
+    }
+
+    /// TC-S8-074-04: git_init creates a .git directory.
+    #[test]
+    fn tc_s8_074_04_git_init_creates_git_directory() {
+        let dir = tempdir().expect("tempdir");
+        let result = git_init(dir.path(), None);
+        assert!(result.is_ok(), "git_init failed: {:?}", result);
+        assert!(
+            dir.path().join(".git").exists(),
+            ".git directory must exist after git_init"
+        );
+    }
+
+    /// TC-S8-074-05: git_init creates .gitignore with entries/*.md content.
+    #[test]
+    fn tc_s8_074_05_git_init_creates_gitignore() {
+        let dir = tempdir().expect("tempdir");
+        git_init(dir.path(), None).expect("git_init");
+
+        let gitignore_path = dir.path().join(".gitignore");
+        assert!(gitignore_path.exists(), ".gitignore must exist");
+        let content = std::fs::read_to_string(&gitignore_path).expect("read .gitignore");
+        assert!(
+            content.contains("entries/*.md"),
+            ".gitignore must contain entries/*.md, got: {}",
+            content
+        );
+    }
+
+    /// TC-S8-074-06: git_init updates vault.toml with author_name and random email.
+    #[test]
+    fn tc_s8_074_06_git_init_updates_vault_toml() {
+        use crate::vault::config::VaultConfig;
+
+        let dir = tempdir().expect("tempdir");
+
+        // Create a vault.toml before git_init.
+        let config = VaultConfig::default();
+        let toml_path = dir.path().join("vault.toml");
+        config.to_file(&toml_path).expect("write vault.toml");
+
+        git_init(dir.path(), None).expect("git_init");
+
+        // Re-read vault.toml and verify [git] section.
+        let updated = VaultConfig::from_file(&toml_path).expect("read vault.toml");
+        assert_eq!(
+            updated.git.author_name, "pq-diary",
+            "author_name must be 'pq-diary'"
+        );
+
+        // author_email must match ^[0-9a-f]{8}@localhost$
+        let email = &updated.git.author_email;
+        assert!(
+            email.ends_with("@localhost"),
+            "author_email must end with @localhost: {}",
+            email
+        );
+        let hex_part = email.trim_end_matches("@localhost");
+        assert_eq!(hex_part.len(), 8, "hex part must be 8 chars: {}", email);
+        assert!(
+            hex_part.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+            "hex part must be lowercase hex: {}",
+            email
+        );
+    }
+
+    /// TC-S8-074-07: git_init with remote adds origin.
+    #[test]
+    fn tc_s8_074_07_git_init_with_remote() {
+        let dir = tempdir().expect("tempdir");
+        let remote_url = "https://example.com/repo.git";
+
+        git_init(dir.path(), Some(remote_url)).expect("git_init with remote");
+
+        // Verify remote was added via git remote -v.
+        let out = std::process::Command::new("git")
+            .current_dir(dir.path())
+            .args(["remote", "-v"])
+            .output()
+            .expect("git remote -v");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("origin"),
+            "remote -v must contain 'origin': {}",
+            stdout
+        );
+        assert!(
+            stdout.contains(remote_url),
+            "remote -v must contain the URL: {}",
+            stdout
+        );
+    }
+
+    /// TC-S8-074-08: git_init returns error when already initialized (EDGE-006).
+    #[test]
+    fn tc_s8_074_08_git_init_already_initialized() {
+        let dir = tempdir().expect("tempdir");
+
+        // First init succeeds.
+        git_init(dir.path(), None).expect("first git_init");
+
+        // Second init must fail with "already initialized".
+        let result = git_init(dir.path(), None);
+        assert!(result.is_err(), "second git_init must fail");
+
+        match result {
+            Err(DiaryError::Git(msg)) => {
+                assert!(
+                    msg.contains("already initialized"),
+                    "error must mention 'already initialized': {}",
+                    msg
+                );
+            }
+            other => panic!("expected DiaryError::Git, got {:?}", other),
+        }
+    }
+
+    /// TC-S8-074-09: check_git_available returns useful error when git is not installed (EDGE-001).
+    ///
+    /// This test modifies the process-wide PATH environment variable and must
+    /// be run in isolation. Execute with: `cargo test -- --ignored tc_s8_074_09`
+    #[test]
+    #[ignore = "requires environment without git in PATH; run: cargo test -- --ignored"]
+    fn tc_s8_074_09_git_not_installed_error_message() {
+        // Temporarily clear PATH so git cannot be found.
+        // WARNING: modifies process-wide environment; do not run in parallel.
+        let original_path = std::env::var_os("PATH").unwrap_or_default();
+        std::env::set_var("PATH", "");
+        let result = check_git_available();
+        std::env::set_var("PATH", original_path);
+
+        match result {
+            Err(DiaryError::Git(msg)) => {
+                assert!(
+                    msg.contains("git is not installed") || msg.contains("not found in PATH"),
+                    "error message must be user-friendly: {}",
+                    msg
+                );
+            }
+            Ok(()) => panic!("expected error when git is not in PATH"),
+            Err(e) => panic!("unexpected error type: {}", e),
+        }
+    }
+}

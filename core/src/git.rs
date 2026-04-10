@@ -474,7 +474,7 @@ pub fn git_push(
 ///      (`MergeResult.updated++`).
 ///    - Both sides, different `content_hmac`, same `updated_at`
 ///      → true conflict.  When `claude_mode` is `true`, local wins silently.
-///      Otherwise the conflict is recorded in [`MergeResult.conflicts`] and
+///      Otherwise the conflict is recorded in `MergeResult.conflicts` and
 ///      local is used as the provisional resolution.
 /// 9. Write merged records atomically via [`write_vault`].
 /// 10. `git add vault.pqd` + `git commit` with the privacy pipeline from

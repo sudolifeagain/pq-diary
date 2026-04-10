@@ -117,7 +117,7 @@ fn check_claude_policy(
     let vault_path = resolve_vault_path(cli)?;
     let toml_path = vault_path
         .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
+        .ok_or_else(|| anyhow::anyhow!("vault path has no parent directory"))?
         .join("vault.toml");
     let config = VaultConfig::from_file(&toml_path).map_err(|e| anyhow::anyhow!("{e}"))?;
     let decision = policy::check_access(true, config.access.policy, operation, &config.vault.name);

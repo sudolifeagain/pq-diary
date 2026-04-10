@@ -281,12 +281,8 @@ impl VaultManager {
         // Step 4: Initialise the vault.
         self.init_vault(name, password)?;
 
-        // Step 5: Apply the access policy by updating vault.toml.
-        // (set_policy() will be implemented in TASK-0070; patched inline here.)
-        let vault_toml_path = vault_path.join("vault.toml");
-        let mut vault_config = VaultConfig::from_file(&vault_toml_path)?;
-        vault_config.access.policy = policy;
-        vault_config.to_file(&vault_toml_path)?;
+        // Step 5: Apply the access policy via atomic write.
+        self.set_policy(name, policy)?;
 
         Ok(())
     }
@@ -400,7 +396,10 @@ impl VaultManager {
             file.write_all(new_content.as_bytes())?;
             file.sync_all()?;
         }
-        std::fs::rename(&tmp_path, &toml_path)?;
+        if let Err(e) = std::fs::rename(&tmp_path, &toml_path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(DiaryError::Io(e));
+        }
         Ok(())
     }
 
@@ -429,7 +428,7 @@ impl VaultManager {
                 let size = usize::try_from(std::fs::metadata(&pqd_path)?.len()).map_err(|_| {
                     DiaryError::Vault("vault.pqd size exceeds addressable memory".to_string())
                 })?;
-                let mut random_data = vec![0u8; size];
+                let mut random_data = zeroize::Zeroizing::new(vec![0u8; size]);
                 OsRng.fill_bytes(&mut random_data);
                 {
                     use std::io::Write;

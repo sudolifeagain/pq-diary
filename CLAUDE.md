@@ -12,7 +12,7 @@ Rust製・耐量子暗号CLIジャーナルツール。詳細は `requirements.m
 
 ## Rust規約
 
-- `unsafe` は mlock/VirtualLock/PR_SET_DUMPABLE/Win32 Console API (GetConsoleMode/SetConsoleMode/ReadConsoleW) のみ許可。それ以外は禁止
+- `unsafe` は mlock/VirtualLock/PR_SET_DUMPABLE/IsDebuggerPresent/Win32 Console API (GetConsoleMode/SetConsoleMode/ReadConsoleW) のみ許可。それ以外は禁止
 - 秘密データは必ず `zeroize` / `SecretString` / `SecretBytes` で保持。生の `Vec<u8>` / `String` 禁止
 - `unwrap()` / `expect()` はテストコードのみ許可。本番コードは `Result` を返す
 - エラーは `thiserror` で定義。`anyhow` はcli/のみ許可

@@ -1,6 +1,7 @@
 mod commands;
 mod editor;
 mod password;
+mod security;
 
 use clap::{Args, Parser, Subcommand};
 use secrecy::SecretString;
@@ -411,6 +412,8 @@ fn not_implemented(cmd_name: &str, sprint: &str) -> anyhow::Result<()> {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    security::harden_process();
+    security::check_debugger();
     dispatch(&cli)
 }
 

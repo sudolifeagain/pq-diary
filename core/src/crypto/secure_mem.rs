@@ -219,9 +219,15 @@ pub fn mlock_master_key(mk: &MasterKey) -> Result<(), DiaryError> {
 ///
 /// Always returns `Ok(())`.
 pub fn munlock_master_key(mk: &MasterKey) -> Result<(), DiaryError> {
-    let _ = munlock_buffer(&mk.sym_key);
-    let _ = munlock_buffer(mk.dsa_sk.as_ref());
-    let _ = munlock_buffer(mk.kem_sk.as_ref());
+    if let Err(e) = munlock_buffer(&mk.sym_key) {
+        eprintln!("warning: munlock sym_key failed: {e}");
+    }
+    if let Err(e) = munlock_buffer(mk.dsa_sk.as_ref()) {
+        eprintln!("warning: munlock dsa_sk failed: {e}");
+    }
+    if let Err(e) = munlock_buffer(mk.kem_sk.as_ref()) {
+        eprintln!("warning: munlock kem_sk failed: {e}");
+    }
     Ok(())
 }
 

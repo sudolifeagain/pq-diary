@@ -56,6 +56,8 @@ pub fn check_debugger() {
         if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
             for line in status.lines() {
                 if line.starts_with("TracerPid:") {
+                    // unwrap_or is safe per CLAUDE.md rules (only unwrap()/expect() banned).
+                    // Fallback to "0"/0 treats unparseable TracerPid as "no debugger".
                     let pid: u32 = line
                         .split(':')
                         .nth(1)

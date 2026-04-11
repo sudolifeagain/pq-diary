@@ -25,7 +25,6 @@ pub use secure_mem::{CryptoEngine, MasterKey, SecureBuffer, ZeroizingKey};
 
 use crate::error::DiaryError;
 use secrecy::{ExposeSecret, SecretBox};
-use zeroize::Zeroizing;
 
 impl CryptoEngine {
     /// Unlock the engine using the given password.
@@ -128,18 +127,22 @@ impl CryptoEngine {
             SecureBuffer::new(vec![])
         };
 
-        // M-2/M-4: Wrap intermediate Vec<u8> buffers in Zeroizing to ensure
-        // they are zeroed when they fall out of scope, preventing key material
-        // from lingering in freed memory.
+        // M-2/M-4: Copy key bytes directly into Box<[u8]> without creating
+        // an intermediate unzeroized Vec<u8>.  copy_from_slice avoids .clone()
+        // which would produce an unprotected copy.
         let master_key = MasterKey {
             sym_key: *sym_key.as_ref(),
             kem_sk: {
-                let tmp = Zeroizing::new(kem_sk.as_ref().to_vec());
-                (*tmp).clone().into_boxed_slice()
+                let src = kem_sk.as_ref();
+                let mut boxed = vec![0u8; src.len()].into_boxed_slice();
+                boxed.copy_from_slice(src);
+                boxed
             },
             dsa_sk: {
-                let tmp = Zeroizing::new(dsa_sk.as_ref().to_vec());
-                (*tmp).clone().into_boxed_slice()
+                let src = dsa_sk.as_ref();
+                let mut boxed = vec![0u8; src.len()].into_boxed_slice();
+                boxed.copy_from_slice(src);
+                boxed
             },
         };
 

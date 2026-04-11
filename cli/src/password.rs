@@ -41,21 +41,27 @@ impl PasswordSource {
 /// Obtain the master password using a three-stage fallback strategy.
 ///
 /// Priority order:
-/// 1. `flag_value` — value of the `--password` CLI argument, if present.
-///    A warning is written to stderr because passing passwords on the command
-///    line is insecure.
+/// 1. `flag_value` — value of the `--password` CLI argument as a [`SecretString`],
+///    if present.  A warning is written to stderr because passing passwords on
+///    the command line is insecure.
 /// 2. `PQ_DIARY_PASSWORD` environment variable.
 /// 3. Interactive TTY prompt with echo disabled.
+///
+/// Accepting `Option<&SecretString>` instead of `Option<&str>` ensures that the
+/// password is never held as a plain `String` on the call stack.
 ///
 /// # Errors
 ///
 /// Returns [`DiaryError::Password`] when stdin is not a terminal and neither
 /// `flag_value` nor `PQ_DIARY_PASSWORD` is set.
-pub fn get_password(flag_value: Option<&str>) -> Result<PasswordSource, DiaryError> {
+pub fn get_password(flag_value: Option<&SecretString>) -> Result<PasswordSource, DiaryError> {
     // Stage 1: --password flag
-    if let Some(v) = flag_value {
+    if let Some(secret) = flag_value {
         eprintln!("Warning: Specifying a password on the command line is a security risk.");
-        return Ok(PasswordSource::Flag(SecretBox::new(v.into())));
+        use secrecy::ExposeSecret as _;
+        return Ok(PasswordSource::Flag(SecretBox::new(Box::from(
+            secret.expose_secret(),
+        ))));
     }
 
     // Stage 2: PQ_DIARY_PASSWORD environment variable
@@ -290,6 +296,59 @@ mod tests {
     /// access from parallel tests causes flaky failures.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Helper: construct a `SecretString` from a literal for use in tests.
+    fn make_secret(s: &str) -> SecretString {
+        SecretString::from(s.to_string())
+    }
+
+    // -------------------------------------------------------------------------
+    // TASK-0081 tests: H-1 get_password SecretString シグネチャ変更
+    // -------------------------------------------------------------------------
+
+    /// TC-S9-081-03: `get_password(Some(&SecretString))` からパスワード文字列を正しく取得する。
+    #[test]
+    fn tc_s9_081_03_get_password_with_secret_string() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("PQ_DIARY_PASSWORD");
+
+        let secret = make_secret("my_pass");
+        let result = get_password(Some(&secret));
+        assert!(result.is_ok(), "Expected Ok, got: {:?}", result.err());
+        let source = result.unwrap();
+        assert!(
+            matches!(source, PasswordSource::Flag(_)),
+            "Expected PasswordSource::Flag variant"
+        );
+        assert_eq!(source.secret().expose_secret(), "my_pass");
+    }
+
+    /// TC-S9-081-04: `get_password(None)` が非TTY環境でエラーを返すことを検証する。
+    ///
+    /// テスト環境では stdin が TTY ではないため、`None` かつ環境変数なしの場合は
+    /// `DiaryError::Password` が返る。これは既存テスト TC-0034-04 と同じ条件での
+    /// インタラクティブフォールバック検証である。
+    #[test]
+    fn tc_s9_081_04_get_password_none_falls_back_to_interactive() {
+        let _lock = ENV_LOCK.lock().unwrap();
+
+        use std::io::IsTerminal as _;
+        if std::io::stdin().is_terminal() {
+            // Running in an interactive TTY — skip this test.
+            return;
+        }
+
+        std::env::remove_var("PQ_DIARY_PASSWORD");
+        let result = get_password(None);
+        assert!(
+            matches!(result, Err(DiaryError::Password(_))),
+            "Expected DiaryError::Password when no credentials and stdin is not a terminal"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Existing tests (updated to use Option<&SecretString> API)
+    // -------------------------------------------------------------------------
+
     /// TC-0034-01: `--password` flag returns `PasswordSource::Flag` with the
     /// correct secret value.
     #[test]
@@ -297,7 +356,8 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         std::env::remove_var("PQ_DIARY_PASSWORD");
 
-        let result = get_password(Some("flag_test_password"));
+        let secret = make_secret("flag_test_password");
+        let result = get_password(Some(&secret));
         assert!(result.is_ok(), "Expected Ok, got: {:?}", result.err());
         let source = result.unwrap();
         assert!(
@@ -333,7 +393,8 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
 
         std::env::set_var("PQ_DIARY_PASSWORD", "env_pass_03");
-        let result = get_password(Some("flag_pass_03"));
+        let secret = make_secret("flag_pass_03");
+        let result = get_password(Some(&secret));
         std::env::remove_var("PQ_DIARY_PASSWORD");
 
         let source = result.expect("Expected Ok");
@@ -374,7 +435,8 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         std::env::remove_var("PQ_DIARY_PASSWORD");
 
-        let result = get_password(Some("super_secret_value")).expect("Expected Ok");
+        let secret = make_secret("super_secret_value");
+        let result = get_password(Some(&secret)).expect("Expected Ok");
         assert_eq!(result.secret().expose_secret(), "super_secret_value");
         let debug_repr = format!("{:?}", result.secret());
         assert!(
@@ -391,7 +453,8 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         std::env::remove_var("PQ_DIARY_PASSWORD");
 
-        let result = get_password(Some(""));
+        let secret = make_secret("");
+        let result = get_password(Some(&secret));
         assert!(result.is_ok(), "Empty password via flag must not panic");
         let source = result.unwrap();
         assert!(matches!(source, PasswordSource::Flag(_)));

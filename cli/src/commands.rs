@@ -194,7 +194,7 @@ pub fn cmd_new(
 
     // Step 1: Obtain password and unlock the vault.
     let password_source =
-        get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let vault_path = resolve_vault_path(cli)?;
     let vault_str = vault_path
@@ -358,7 +358,7 @@ pub fn cmd_list(
     check_claude_policy(cli, OperationType::Read)?;
 
     let password_source =
-        get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let vault_path = resolve_vault_path(cli)?;
     let vault_str = vault_path
@@ -427,7 +427,7 @@ fn cmd_show_impl(cli: &Cli, id: String, out: &mut dyn std::io::Write) -> anyhow:
     check_claude_policy(cli, OperationType::Read)?;
 
     let password_source =
-        get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let vault_path = resolve_vault_path(cli)?;
     let vault_str = vault_path
@@ -579,7 +579,7 @@ where
     check_claude_policy(cli, OperationType::Write)?;
 
     let password_source =
-        get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let vault_path = resolve_vault_path(cli)?;
     let vault_str = vault_path
@@ -751,7 +751,7 @@ fn cmd_delete_impl(
     check_claude_policy(cli, OperationType::Write)?;
 
     let password_source =
-        get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let vault_path = resolve_vault_path(cli)?;
     let vault_str = vault_path
@@ -854,7 +854,7 @@ where
     check_claude_policy(cli, OperationType::Write)?;
 
     let password_source =
-        get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let vault_path = resolve_vault_path(cli)?;
     let vault_str = vault_path
@@ -941,7 +941,7 @@ pub fn cmd_template_list(cli: &Cli) -> anyhow::Result<()> {
     check_claude_policy(cli, OperationType::Read)?;
 
     let password_source =
-        get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let vault_path = resolve_vault_path(cli)?;
     let vault_str = vault_path
@@ -986,7 +986,7 @@ pub fn cmd_template_show(cli: &Cli, name: String) -> anyhow::Result<()> {
     check_claude_policy(cli, OperationType::Read)?;
 
     let password_source =
-        get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let vault_path = resolve_vault_path(cli)?;
     let vault_str = vault_path
@@ -1043,7 +1043,7 @@ fn cmd_template_delete_impl(
     check_claude_policy(cli, OperationType::Write)?;
 
     let password_source =
-        get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let vault_path = resolve_vault_path(cli)?;
     let vault_str = vault_path
@@ -1124,7 +1124,7 @@ where
     check_claude_policy(cli, OperationType::Write)?;
 
     let password_source =
-        get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let vault_path = resolve_vault_path(cli)?;
     let vault_str = vault_path
@@ -1265,7 +1265,7 @@ pub(crate) fn cmd_search_to(
     check_claude_policy(cli, OperationType::Read)?;
 
     let password_source =
-        get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let vault_path = resolve_vault_path(cli)?;
     let vault_str = vault_path
@@ -1371,7 +1371,7 @@ pub(crate) fn cmd_stats_to(
     check_claude_policy(cli, OperationType::Read)?;
 
     let password_source =
-        get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let vault_path = resolve_vault_path(cli)?;
     let vault_str = vault_path
@@ -1572,7 +1572,7 @@ pub(crate) fn cmd_import_to(
 
     // 3. Acquire password.
     let password_source =
-        get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // 4. Open and unlock vault.
     let vault_path = resolve_vault_path(cli)?;
@@ -1721,7 +1721,7 @@ fn cmd_vault_create_impl(
 
     // Step 3: Get password.
     let password_source =
-        get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // Step 4: Create vault.
     let base_dir = resolve_vaults_base_dir(cli)?;
@@ -2067,7 +2067,7 @@ pub fn cmd_git_push(cli: &Cli) -> anyhow::Result<()> {
     let config = VaultConfig::from_file(&toml_path).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let password_source =
-        get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let vault_str = vault_path
         .to_str()
@@ -2121,7 +2121,7 @@ fn cmd_git_pull_impl(cli: &Cli, reader: &mut impl std::io::BufRead) -> anyhow::R
     let config = VaultConfig::from_file(&toml_path).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let password_source =
-        get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let vault_str = vault_path
         .to_str()
@@ -2184,7 +2184,7 @@ fn cmd_git_sync_impl(cli: &Cli, reader: &mut impl std::io::BufRead) -> anyhow::R
 
     // Single password prompt for both pull and push.
     let password_source =
-        get_password(cli.password.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let vault_str = vault_path
         .to_str()

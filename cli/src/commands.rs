@@ -5374,7 +5374,9 @@ mod tests {
     // -------------------------------------------------------------------------
 
     /// TC-S7-NFR-003-01: `vault create` with default Argon2 params completes within 3s.
+    /// Run with `cargo test -- --ignored` (excluded from parallel runs due to CPU sensitivity).
     #[test]
+    #[ignore]
     fn tc_s7_nfr_003_01_vault_create_within_3_seconds() {
         use std::time::Instant;
 
@@ -5391,11 +5393,8 @@ mod tests {
             None, // None policy — no confirmation, no extra latency
             &mut reader,
             |base_dir| {
-                // Use fast Argon2 params to avoid flaky timing on loaded systems.
-                // The real NFR target (< 3s with 64MB Argon2) is validated
-                // separately in core's tc_026_02 with controlled parameters.
+                // Use real (default) Argon2 params for the NFR measurement.
                 pq_diary_core::vault::init::VaultManager::new(base_dir)
-                    .map(|m| m.with_kdf_params(fast_params()))
                     .map_err(|e| anyhow::anyhow!("{e}"))
             },
         );
@@ -5407,8 +5406,8 @@ mod tests {
             result.err()
         );
         assert!(
-            elapsed.as_secs() < 5,
-            "vault create must complete within 5 seconds; took {elapsed:?}"
+            elapsed.as_secs() < 3,
+            "vault create must complete within 3 seconds; took {elapsed:?}"
         );
     }
 
@@ -7427,7 +7426,9 @@ parallelism = 1
     /// `git --version` is a single process spawn with no I/O.  NFR-001 targets
     /// 100 ms; the test allows 500 ms to accommodate CI/Windows process-spawn
     /// overhead while still catching pathological slowdowns.
+    /// Run with `cargo test -- --ignored` (excluded from parallel runs due to process-spawn sensitivity).
     #[test]
+    #[ignore]
     fn tc_s8_nfr_001_01_check_git_available_under_100ms() {
         use std::time::Instant;
 
@@ -7441,8 +7442,8 @@ parallelism = 1
         );
         // Allow 500 ms in CI/Windows; the production NFR target is 100 ms.
         assert!(
-            elapsed.as_millis() < 2000,
-            "check_git_available must complete in < 2000 ms; took {:?}",
+            elapsed.as_millis() < 100,
+            "check_git_available must complete in < 100 ms; took {:?}",
             elapsed
         );
     }
@@ -7565,7 +7566,9 @@ parallelism = 1
     ///
     /// Verifies NFR-101: only vault.toml is read (no vault.pqd decryption),
     /// so the check must be nearly instantaneous.
+    /// Run with `cargo test -- --ignored` (excluded from parallel runs due to timing sensitivity).
     #[test]
+    #[ignore]
     fn tc_s7_nfr_001_01_none_policy_denial_under_10ms() {
         use std::time::Instant;
 
@@ -7581,8 +7584,8 @@ parallelism = 1
 
         assert!(result.is_err(), "--claude + None must be denied");
         assert!(
-            elapsed.as_millis() < 100,
-            "None policy denial must complete in < 100 ms; took {elapsed:?}"
+            elapsed.as_millis() < 10,
+            "None policy denial must complete in < 10 ms; took {elapsed:?}"
         );
     }
 
@@ -8035,6 +8038,7 @@ parallelism = 1
     ///
     /// Uses Argon2id fast_params to ensure test stability (REQ-NFR-001).
     #[test]
+    #[ignore]
     fn tc_s9_perf_01_init_under_5s() {
         use std::time::Instant;
         use pq_diary_core::vault::init::VaultManager;
@@ -8061,6 +8065,7 @@ parallelism = 1
     ///
     /// Measures the time from DiaryCore::unlock call to completion.
     #[test]
+    #[ignore]
     fn tc_s9_perf_02_unlock_under_5s() {
         use std::time::Instant;
 
@@ -8092,6 +8097,7 @@ parallelism = 1
     ///
     /// Measures entry creation time excluding unlock overhead.
     #[test]
+    #[ignore]
     fn tc_s9_perf_03_new_entry_under_200ms() {
         use std::time::Instant;
 
@@ -8126,6 +8132,7 @@ parallelism = 1
     ///
     /// Pre-populates 100 entries then measures list performance.
     #[test]
+    #[ignore]
     fn tc_s9_perf_04_list_100_entries_under_500ms() {
         use std::time::Instant;
 
@@ -8170,6 +8177,7 @@ parallelism = 1
     ///
     /// Measures DiaryCore::lock() invocation time on an unlocked vault.
     #[test]
+    #[ignore]
     fn tc_s9_perf_05_lock_under_50ms() {
         use std::time::Instant;
 

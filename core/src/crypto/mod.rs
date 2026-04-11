@@ -689,6 +689,7 @@ mod tests {
     /// The 5-second upper bound accounts for CI environment variability while still
     /// providing a meaningful regression guard.
     #[test]
+    #[ignore]
     fn tc_017_02_unlock_performance_within_5_seconds() {
         use std::time::Instant;
 

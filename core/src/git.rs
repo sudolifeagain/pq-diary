@@ -1094,7 +1094,7 @@ mod tests {
                 "padding length {} must be <= {max}",
                 padding.len()
             );
-            if padding.len() > 0 {
+            if !padding.is_empty() {
                 any_nonzero = true;
             }
         }
@@ -1829,7 +1829,7 @@ mod tests {
         let uuid_c = make_entry(0xC0, 0x03, 100);
         // Both local and remote have the same entry (same HMAC).
         let (_tmp, vault_dir, vault_path, config) =
-            setup_pull_test(&[uuid_c.clone()], &[uuid_c.clone()]);
+            setup_pull_test(std::slice::from_ref(&uuid_c), std::slice::from_ref(&uuid_c));
 
         let result = git_pull_merge(&vault_dir, &config, &vault_path, false);
         assert!(result.is_ok(), "expected Ok, got: {:?}", result);
@@ -1854,7 +1854,7 @@ mod tests {
         let uuid_d_remote = make_entry(0xD0, 0x20, 200); // remote updated_at=200 (newer)
 
         let (_tmp_a, vault_dir_a, vault_path_a, config_a) =
-            setup_pull_test(&[uuid_d_remote.clone()], &[uuid_d_local.clone()]);
+            setup_pull_test(std::slice::from_ref(&uuid_d_remote), std::slice::from_ref(&uuid_d_local));
 
         let result_a = git_pull_merge(&vault_dir_a, &config_a, &vault_path_a, false);
         assert!(result_a.is_ok(), "subcase A failed: {:?}", result_a);
@@ -1877,7 +1877,7 @@ mod tests {
         let uuid_d_remote2 = make_entry(0xD0, 0x20, 100); // remote updated_at=100
 
         let (_tmp_b, vault_dir_b, vault_path_b, config_b) =
-            setup_pull_test(&[uuid_d_remote2.clone()], &[uuid_d_local2.clone()]);
+            setup_pull_test(std::slice::from_ref(&uuid_d_remote2), std::slice::from_ref(&uuid_d_local2));
 
         let result_b = git_pull_merge(&vault_dir_b, &config_b, &vault_path_b, false);
         assert!(result_b.is_ok(), "subcase B failed: {:?}", result_b);
@@ -1905,7 +1905,7 @@ mod tests {
         let uuid_e_remote = make_entry(0xE0, 0x20, 100); // remote version (same updated_at)
 
         let (_tmp, vault_dir, vault_path, config) =
-            setup_pull_test(&[uuid_e_remote.clone()], &[uuid_e_local.clone()]);
+            setup_pull_test(std::slice::from_ref(&uuid_e_remote), std::slice::from_ref(&uuid_e_local));
 
         // claude_mode = true → auto-resolve with local-wins.
         let result = git_pull_merge(&vault_dir, &config, &vault_path, true);
@@ -1940,7 +1940,7 @@ mod tests {
 
         // Remote has UUID-B (remote-only → added); local has UUID-A (local-only → kept).
         let (_tmp, vault_dir, vault_path, config) =
-            setup_pull_test(&[uuid_b.clone()], &[uuid_a.clone()]);
+            setup_pull_test(std::slice::from_ref(&uuid_b), std::slice::from_ref(&uuid_a));
 
         let result = git_pull_merge(&vault_dir, &config, &vault_path, false);
         assert!(result.is_ok(), "expected Ok, got: {:?}", result);

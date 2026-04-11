@@ -240,7 +240,7 @@ mod tests {
         DiaryCore,
     };
     use secrecy::SecretBox;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
     // -------------------------------------------------------------------------
@@ -269,7 +269,7 @@ mod tests {
 
     /// Patch the `created_at` (and `updated_at`) timestamps of all ENTRY records
     /// in `vault_path`, in order, using values from `timestamps`.
-    fn patch_entry_timestamps(vault_path: &PathBuf, timestamps: &[u64]) {
+    fn patch_entry_timestamps(vault_path: &Path, timestamps: &[u64]) {
         let (header, mut records) = read_vault(vault_path).expect("read_vault");
         let mut ts_iter = timestamps.iter();
         for record in &mut records {

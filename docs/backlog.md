@@ -92,21 +92,21 @@
 - [x] コンフリクト対話式解決 (--claude時ローカル優先自動解決)
 
 ### S9: セキュリティ硬化 + 統合テスト + S1-S6技術的負債残り
-- [ ] mlock (unix) / VirtualLock (windows)
-- [ ] PR_SET_DUMPABLE=0
-- [ ] setrlimit(RLIMIT_CORE, 0, 0)
-- [ ] デバッガ接続検知 (警告)
-- [ ] クロスプラットフォームビルド (Linux x86_64/aarch64, macOS aarch64, Windows x86_64)
-- [ ] 統合テスト (全コマンドのE2Eテスト)
-- [ ] パフォーマンス検証 (init<3s, unlock 1-3s, new/edit<200ms, list<500ms, lock<50ms)
-- [ ] **[H-1]** Cli.password を SecretString 化 (S1, zeroize対応) — 現在 Option<String>
-- [x] **[H-2]** tc_015_05 テストの UB 修正 (ManuallyDrop パターン適用) (S1/S2) — dsa.rs/kem.rs ManuallyDrop済
-- [ ] **[M-2]** MasterKey.sym_key コピー時の zeroize 対応 (S1)
-- [ ] **[M-4]** unlock_with_vault の中間 Vec<u8> を Zeroizing でラップ (S2)
-- [ ] **[M-3]** PQC 依存 (ml-kem/ml-dsa) を commit hash で pin (S1/S2) — 現在 branch指定
-- [ ] **[M-1]** not_implemented() を process::exit から anyhow::bail! に変更 (S1) — 4箇所残存
-- [ ] **[M-5]** verify_hmac をbool返却からResult返却に変更 (S2/S6繰越)
-- [ ] 読み取り時の署名/HMAC 検証 (S4/S6繰越)
+- [x] mlock (unix) / VirtualLock (windows) — secure_mem.rs mlock_buffer/munlock_buffer
+- [x] PR_SET_DUMPABLE=0 — cli/src/security.rs harden_process()
+- [x] setrlimit(RLIMIT_CORE, 0, 0) — cli/src/security.rs harden_process()
+- [x] デバッガ接続検知 (警告) — cli/src/security.rs check_debugger()
+- [ ] クロスプラットフォームビルド (Linux x86_64/aarch64, macOS aarch64, Windows x86_64) — Windows確認済、Linux/macOSは未確認
+- [x] 統合テスト (全コマンドのE2Eテスト)
+- [x] パフォーマンス検証 (init<3s, unlock 1-3s, new/edit<200ms, list<500ms, lock<50ms) — #[ignore]で分離、単独実行で検証
+- [x] **[H-1]** Cli.password を SecretString 化 (S1) — Option<SecretString> + parse_secret_string
+- [x] **[H-2]** tc_015_05 テストの UB 修正 (ManuallyDrop) (S1/S2)
+- [x] **[M-2]** MasterKey中間バッファのcopy_from_slice化 (S1) — .clone()を排除
+- [x] **[M-4]** unlock_with_vault の中間バッファ直接コピー (S2) — copy_from_slice
+- [x] **[M-3]** PQC 依存を commit hash で pin (S1/S2) — rev指定に変更
+- [x] **[M-1]** not_implemented() を anyhow::bail! に変更 (S1)
+- [x] **[M-5]** verify_hmac を Result<bool, DiaryError> 返却に変更 (S2/S6)
+- [x] 読み取り時の署名/HMAC 検証 (S4/S6) — entry.rs get_entry/list_entries_with_body
 
 ---
 

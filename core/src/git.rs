@@ -1094,7 +1094,7 @@ mod tests {
                 "padding length {} must be <= {max}",
                 padding.len()
             );
-            if padding.len() > 0 {
+            if !padding.is_empty() {
                 any_nonzero = true;
             }
         }
@@ -1293,13 +1293,10 @@ mod tests {
     /// TC-S8-076-01: git_push() re-writes vault.pqd (bytes change after call).
     #[test]
     fn tc_s8_076_01_vault_pqd_bytes_change() {
-
-
         let config = make_git_push_config("anon", "tc01@localhost", "Update vault", 0, 0);
         let (_tmp, vault_dir, vault_path) = setup_vault_with_remote(&config);
 
         let before = std::fs::read(&vault_path).expect("read vault before");
-
 
         let result = git_push(&vault_dir, &config, &vault_path);
         assert!(result.is_ok(), "git_push failed: {:?}", result);
@@ -1314,13 +1311,10 @@ mod tests {
     /// TC-S8-076-02: git_push() commits with the anonymous author from vault.toml.
     #[test]
     fn tc_s8_076_02_anonymous_author_used() {
-
-
         let anon_name = "pq-anon-test";
         let anon_email = "ab12cd34@localhost";
         let config = make_git_push_config(anon_name, anon_email, "Update vault", 0, 0);
         let (_tmp, vault_dir, vault_path) = setup_vault_with_remote(&config);
-
 
         let result = git_push(&vault_dir, &config, &vault_path);
         assert!(result.is_ok(), "git_push failed: {:?}", result);
@@ -1348,12 +1342,9 @@ mod tests {
     /// TC-S8-076-03: git_push() commits with the fixed commit_message from vault.toml.
     #[test]
     fn tc_s8_076_03_fixed_commit_message_used() {
-
-
         let expected_msg = "pq-diary sync operation";
         let config = make_git_push_config("anon", "tc03@localhost", expected_msg, 0, 0);
         let (_tmp, vault_dir, vault_path) = setup_vault_with_remote(&config);
-
 
         let result = git_push(&vault_dir, &config, &vault_path);
         assert!(result.is_ok(), "git_push failed: {:?}", result);
@@ -1374,7 +1365,6 @@ mod tests {
     /// TC-S8-076-04: git_push() applies timestamp fuzzing (fuzz_hours > 0).
     #[test]
     fn tc_s8_076_04_timestamp_fuzzing_applied() {
-
         use chrono::Utc;
 
         let fuzz_hours: u64 = 6;
@@ -1441,12 +1431,10 @@ mod tests {
     /// TC-S8-076-05: extra_padding_bytes_max=0 does not add extra bytes.
     #[test]
     fn tc_s8_076_05_no_extra_padding_when_max_zero() {
-
         use crate::vault::reader::read_vault as rv;
 
         let config = make_git_push_config("anon", "tc05@localhost", "Update vault", 0, 0);
         let (_tmp, vault_dir, vault_path) = setup_vault_with_remote(&config);
-
 
         let result = git_push(&vault_dir, &config, &vault_path);
         assert!(result.is_ok(), "git_push failed: {:?}", result);
@@ -1473,7 +1461,6 @@ mod tests {
     /// TC-S8-076-06: git_push() returns EDGE-003 when .git is not initialized.
     #[test]
     fn tc_s8_076_06_edge_003_no_git_directory() {
-
         use crate::vault::format::VaultHeader;
         use crate::vault::writer::write_vault as wv;
 
@@ -1483,7 +1470,6 @@ mod tests {
         wv(&vault_path, VaultHeader::new(), &[]).expect("write_vault");
 
         let config = make_git_push_config("anon", "tc06@localhost", "Update vault", 0, 0);
-
 
         let result = git_push(&vault_dir, &config, &vault_path);
         assert!(result.is_err(), "expected Err for missing .git, got Ok");
@@ -1502,7 +1488,6 @@ mod tests {
     /// TC-S8-076-07: git_push() returns EDGE-002 when no remote is configured.
     #[test]
     fn tc_s8_076_07_edge_002_no_remote_configured() {
-
         use crate::vault::format::VaultHeader;
         use crate::vault::writer::write_vault as wv;
 
@@ -1527,7 +1512,6 @@ mod tests {
             .expect("git init");
         assert!(out.status.success(), "git init failed");
 
-
         let result = git_push(&vault_dir, &config, &vault_path);
         assert!(result.is_err(), "expected Err for missing remote, got Ok");
 
@@ -1548,8 +1532,6 @@ mod tests {
     /// must not appear in the commit produced by `git_push()`.
     #[test]
     fn tc_s8_076_08_only_allowed_files_are_staged() {
-
-
         let config = make_git_push_config("anon", "tc08@localhost", "Update vault", 0, 0);
         let (_tmp, vault_dir, vault_path) = setup_vault_with_remote(&config);
 
@@ -1559,7 +1541,6 @@ mod tests {
         std::fs::create_dir_all(&entries_dir).expect("create entries dir");
         std::fs::write(entries_dir.join("secret.txt"), b"should not be committed")
             .expect("write entries/secret.txt");
-
 
         let result = git_push(&vault_dir, &config, &vault_path);
         assert!(result.is_ok(), "git_push failed: {:?}", result);
@@ -1734,14 +1715,11 @@ mod tests {
     /// TC-S8-077-01: git_pull_merge returns no-op when remote has no new commits (EDGE-004).
     #[test]
     fn tc_s8_077_01_no_op_when_no_remote_changes() {
-
-
         // Set up: local and remote at the same commit — no contributor push.
         let config = make_git_push_config("pq-diary", "test@localhost", "Update vault", 0, 0);
         let (_tmp, vault_dir, vault_path) = setup_vault_with_remote(&config);
 
         let before = std::fs::read(&vault_path).expect("read vault before");
-
 
         let result = git_pull_merge(&vault_dir, &config, &vault_path, false);
         assert!(result.is_ok(), "expected Ok, got: {:?}", result);
@@ -1770,7 +1748,6 @@ mod tests {
     /// TC-S8-077-02: local is empty; all remote entries are adopted (EDGE-005).
     #[test]
     fn tc_s8_077_02_empty_local_accepts_all_remote_entries() {
-
         use crate::vault::reader::read_vault as rv;
 
         let uuid_a = make_entry(0xA0, 0x01, 100);
@@ -1779,7 +1756,6 @@ mod tests {
 
         let (_tmp, vault_dir, vault_path, config) =
             setup_pull_test(&remote_entries, &[] /* local: empty */);
-
 
         let result = git_pull_merge(&vault_dir, &config, &vault_path, false);
         assert!(result.is_ok(), "expected Ok, got: {:?}", result);
@@ -1797,7 +1773,6 @@ mod tests {
     /// TC-S8-077-03: local-only entries are preserved after merge.
     #[test]
     fn tc_s8_077_03_local_only_entries_preserved() {
-
         use crate::vault::reader::read_vault as rv;
 
         let uuid_a = make_entry(0xA0, 0x01, 100);
@@ -1806,7 +1781,6 @@ mod tests {
         // Remote: just re-writes an empty vault (count > 0 due to random padding).
         let (_tmp, vault_dir, vault_path, config) =
             setup_pull_test(&[] /* remote: empty */, &local_entries);
-
 
         let result = git_pull_merge(&vault_dir, &config, &vault_path, false);
         assert!(result.is_ok(), "expected Ok, got: {:?}", result);
@@ -1825,7 +1799,6 @@ mod tests {
     /// TC-S8-077-04: remote-only entries are added to the merged vault.
     #[test]
     fn tc_s8_077_04_remote_only_entries_added() {
-
         use crate::vault::reader::read_vault as rv;
 
         let uuid_b = make_entry(0xB0, 0x02, 100);
@@ -1833,7 +1806,6 @@ mod tests {
 
         let (_tmp, vault_dir, vault_path, config) =
             setup_pull_test(&remote_entries, &[] /* local: empty */);
-
 
         let result = git_pull_merge(&vault_dir, &config, &vault_path, false);
         assert!(result.is_ok(), "expected Ok, got: {:?}", result);
@@ -1852,14 +1824,12 @@ mod tests {
     /// TC-S8-077-05: same UUID + same content_hmac → no update, local preserved.
     #[test]
     fn tc_s8_077_05_same_hmac_no_update() {
-
         use crate::vault::reader::read_vault as rv;
 
         let uuid_c = make_entry(0xC0, 0x03, 100);
         // Both local and remote have the same entry (same HMAC).
         let (_tmp, vault_dir, vault_path, config) =
-            setup_pull_test(&[uuid_c.clone()], &[uuid_c.clone()]);
-
+            setup_pull_test(std::slice::from_ref(&uuid_c), std::slice::from_ref(&uuid_c));
 
         let result = git_pull_merge(&vault_dir, &config, &vault_path, false);
         assert!(result.is_ok(), "expected Ok, got: {:?}", result);
@@ -1877,7 +1847,6 @@ mod tests {
     /// TC-S8-077-06: same UUID + different HMAC → last-write-wins (updated_at).
     #[test]
     fn tc_s8_077_06_last_write_wins_updated_at() {
-
         use crate::vault::reader::read_vault as rv;
 
         // --- subcase A: remote is newer ---
@@ -1885,7 +1854,7 @@ mod tests {
         let uuid_d_remote = make_entry(0xD0, 0x20, 200); // remote updated_at=200 (newer)
 
         let (_tmp_a, vault_dir_a, vault_path_a, config_a) =
-            setup_pull_test(&[uuid_d_remote.clone()], &[uuid_d_local.clone()]);
+            setup_pull_test(std::slice::from_ref(&uuid_d_remote), std::slice::from_ref(&uuid_d_local));
 
         let result_a = git_pull_merge(&vault_dir_a, &config_a, &vault_path_a, false);
         assert!(result_a.is_ok(), "subcase A failed: {:?}", result_a);
@@ -1908,7 +1877,7 @@ mod tests {
         let uuid_d_remote2 = make_entry(0xD0, 0x20, 100); // remote updated_at=100
 
         let (_tmp_b, vault_dir_b, vault_path_b, config_b) =
-            setup_pull_test(&[uuid_d_remote2.clone()], &[uuid_d_local2.clone()]);
+            setup_pull_test(std::slice::from_ref(&uuid_d_remote2), std::slice::from_ref(&uuid_d_local2));
 
         let result_b = git_pull_merge(&vault_dir_b, &config_b, &vault_path_b, false);
         assert!(result_b.is_ok(), "subcase B failed: {:?}", result_b);
@@ -1929,7 +1898,6 @@ mod tests {
     /// TC-S8-077-07: claude_mode=true auto-resolves true conflicts with local-wins (REQ-026).
     #[test]
     fn tc_s8_077_07_claude_mode_auto_resolves_conflict() {
-
         use crate::vault::reader::read_vault as rv;
 
         // Same UUID, same updated_at, different HMAC → true conflict.
@@ -1937,8 +1905,7 @@ mod tests {
         let uuid_e_remote = make_entry(0xE0, 0x20, 100); // remote version (same updated_at)
 
         let (_tmp, vault_dir, vault_path, config) =
-            setup_pull_test(&[uuid_e_remote.clone()], &[uuid_e_local.clone()]);
-
+            setup_pull_test(std::slice::from_ref(&uuid_e_remote), std::slice::from_ref(&uuid_e_local));
 
         // claude_mode = true → auto-resolve with local-wins.
         let result = git_pull_merge(&vault_dir, &config, &vault_path, true);
@@ -1966,7 +1933,6 @@ mod tests {
     /// TC-S8-077-08: merged vault.pqd is readable and valid after merge (REQ-028).
     #[test]
     fn tc_s8_077_08_merged_vault_is_readable() {
-
         use crate::vault::reader::read_vault as rv;
 
         let uuid_a = make_entry(0xA0, 0x01, 100);
@@ -1974,8 +1940,7 @@ mod tests {
 
         // Remote has UUID-B (remote-only → added); local has UUID-A (local-only → kept).
         let (_tmp, vault_dir, vault_path, config) =
-            setup_pull_test(&[uuid_b.clone()], &[uuid_a.clone()]);
-
+            setup_pull_test(std::slice::from_ref(&uuid_b), std::slice::from_ref(&uuid_a));
 
         let result = git_pull_merge(&vault_dir, &config, &vault_path, false);
         assert!(result.is_ok(), "expected Ok, got: {:?}", result);
@@ -1995,12 +1960,9 @@ mod tests {
     /// TC-S8-077-09: vault.pqd.bak is deleted after a successful merge.
     #[test]
     fn tc_s8_077_09_backup_deleted_after_successful_merge() {
-
-
         let uuid_b = make_entry(0xB0, 0x02, 100);
 
         let (_tmp, vault_dir, vault_path, config) = setup_pull_test(&[uuid_b], &[]);
-
 
         let result = git_pull_merge(&vault_dir, &config, &vault_path, false);
         assert!(result.is_ok(), "expected Ok, got: {:?}", result);

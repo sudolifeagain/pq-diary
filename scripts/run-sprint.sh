@@ -8,34 +8,34 @@ set -euo pipefail
 # =============================================================================
 
 # === 設定 ===
-SPRINT_NAME="s8-git-sync"
-SPRINT_TAG="s8"
+SPRINT_NAME="s9-security-hardening"
+SPRINT_TAG="s9"
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TASKS_DIR="${PROJECT_ROOT}/docs/tasks/${SPRINT_NAME}"
 PROMPTS_DIR="$(dirname "$0")/prompts"
 LOG_DIR="${PROJECT_ROOT}/logs/sprint-${SPRINT_NAME}"
 
 # タスク一覧 (依存順)
-TASKS=(TASK-0074 TASK-0075 TASK-0076 TASK-0077 TASK-0078 TASK-0079)
+TASKS=(TASK-0080 TASK-0081 TASK-0082 TASK-0083 TASK-0084 TASK-0085)
 
 # タスクタイプ
 declare -A TASK_TYPES=(
-    [TASK-0074]="TDD"
-    [TASK-0075]="TDD"
-    [TASK-0076]="TDD"
-    [TASK-0077]="TDD"
-    [TASK-0078]="TDD"
-    [TASK-0079]="TDD"
+    [TASK-0080]="TDD"
+    [TASK-0081]="TDD"
+    [TASK-0082]="TDD"
+    [TASK-0083]="TDD"
+    [TASK-0084]="TDD"
+    [TASK-0085]="TDD"
 )
 
 # タスク名 (コミットメッセージ用)
 declare -A TASK_NAMES=(
-    [TASK-0074]="git foundation check_git_available and git-init"
-    [TASK-0075]="privacy helpers author timestamp fuzzing padding"
-    [TASK-0076]="git-push with privacy pipeline"
-    [TASK-0077]="git-pull and 3-way merge by UUID HMAC"
-    [TASK-0078]="CLI git subcommand handlers"
-    [TASK-0079]="integration tests doc comments and run-sprint update"
+    [TASK-0080]="tech debt M-1 bail M-3 PQC pin M-5 verify_hmac Result"
+    [TASK-0081]="tech debt H-1 SecretString M-2 M-4 Zeroizing intermediates"
+    [TASK-0082]="entry read signature and HMAC verification"
+    [TASK-0083]="mlock VirtualLock memory locking"
+    [TASK-0084]="process hardening PR_SET_DUMPABLE RLIMIT_CORE debugger detection"
+    [TASK-0085]="E2E tests performance verification run-sprint update"
 )
 
 # モデル設定

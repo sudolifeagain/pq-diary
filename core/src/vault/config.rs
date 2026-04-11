@@ -235,7 +235,7 @@ mod tests {
         assert_eq!(config.vault.name, "default");
         assert_eq!(config.vault.schema_version, 4);
         assert_eq!(config.access.policy, AccessPolicy::None);
-        assert!(config.git.commit_message.len() > 0);
+        assert!(!config.git.commit_message.is_empty());
         assert_eq!(config.argon2.memory_cost_kb, 65536);
         assert_eq!(config.argon2.time_cost, 3);
         assert_eq!(config.argon2.parallelism, 1);

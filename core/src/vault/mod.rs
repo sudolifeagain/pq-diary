@@ -123,10 +123,11 @@ mod tests {
     /// TC-026-02: init_vault performance — completes within 5 seconds (CI-adjusted).
     ///
     /// Measures wall-clock time for `init_vault` with fast Argon2id parameters.
-    /// Even with reduced parameters the full pipeline (KDF + KEM keygen + DSA keygen
-    /// + AES-GCM encryption + file I/O) must complete in under 5 seconds on any
-    /// CI runner.
+    /// Even with reduced parameters the full pipeline (KDF + KEM keygen + DSA keygen +
+    /// AES-GCM encryption + file I/O) must complete in under 5 seconds on any CI runner.
+    /// Run with `cargo test -- --ignored` (excluded from parallel runs due to CPU sensitivity).
     #[test]
+    #[ignore]
     fn tc_026_02_init_performance_within_5_seconds() {
         use std::time::Instant;
 

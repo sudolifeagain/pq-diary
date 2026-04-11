@@ -1,6 +1,6 @@
 # Sprint Status
 
-## Current: Sprint 8 — Git連携 (completed)
+## Current: Sprint 9 — セキュリティ硬化 + 統合テスト + 技術的負債 (completed)
 
 ## Progress
 
@@ -14,7 +14,7 @@
 | S6 | 検索 + 統計 + インポート + 技術的負債 | completed (s6-done) | 6 |
 | S7 | アクセス制御 + Claude連携 | completed (s7-done) | 7 |
 | S8 | Git連携 | completed (s8-done) | 8 |
-| S9 | セキュリティ硬化 + 統合テスト + S1-S2負債 | blocked by S6-S8 | 9 |
+| S9 | セキュリティ硬化 + 統合テスト + 技術的負債 | completed (s9-done) | 9 |
 
 ## Sprint Scope
 

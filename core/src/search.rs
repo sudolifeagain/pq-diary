@@ -126,6 +126,14 @@ pub fn search_entries(
 
         match record.record_type {
             RECORD_TYPE_ENTRY => {
+                // Verify HMAC over ciphertext before decryption.
+                if !engine.hmac_verify(&record.ciphertext, &record.content_hmac)? {
+                    return Err(DiaryError::Crypto(format!(
+                        "content HMAC verification failed for entry {}",
+                        uuid_hex
+                    )));
+                }
+
                 // Decrypt and deserialize. `plaintext` is ZeroizeOnDrop; its
                 // contents are zeroed when the match arm exits.
                 let decrypted = engine.decrypt(&record.iv, &record.ciphertext)?;
@@ -656,5 +664,84 @@ mod tests {
         // and context_blocks — never the full plaintext body.
         assert_eq!(sm.matched_field, "body");
         assert!(sm.context_blocks.is_empty());
+    }
+
+    // =========================================================================
+    // TASK-0082: search での HMAC 検証
+    // =========================================================================
+
+    /// TC-S9-082-06: search verifies HMAC for each entry; tampered entry causes an error.
+    #[test]
+    fn tc_s9_082_06_search_hmac_verification() {
+        use crate::vault::{reader::read_vault, writer::write_vault};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_pqd = setup_test_vault(&dir);
+
+        let mut core = DiaryCore::new(vault_pqd.to_str().expect("utf8")).expect("DiaryCore::new");
+        core.unlock(secret("password")).expect("unlock");
+
+        // Create an entry that the search will match.
+        core.new_entry("検索テスト", "FINDME content", vec![])
+            .expect("new_entry");
+
+        // Part 1: normal search succeeds and finds the entry.
+        let results = core
+            .search(&make_query("FINDME"))
+            .expect("search must succeed");
+        assert_eq!(results.matched_entry_count, 1, "expected 1 matching entry");
+
+        // Part 2: tamper the ciphertext of the entry; search must now return an error.
+        core.lock();
+        {
+            let (header, mut records) = read_vault(&vault_pqd).expect("read_vault");
+            if let Some(b) = records
+                .iter_mut()
+                .find(|r| r.record_type == crate::vault::format::RECORD_TYPE_ENTRY)
+                .and_then(|r| r.ciphertext.get_mut(7))
+            {
+                *b ^= 0xFF;
+            }
+            write_vault(&vault_pqd, header, &records).expect("write_vault");
+        }
+
+        // Re-open and unlock; list_entries_with_body is called during unlock,
+        // so we need to create a fresh DiaryCore without calling unlock (which would fail).
+        // Instead, call search_entries directly with a manual engine.
+        {
+            use crate::crypto::CryptoEngine;
+
+            // Re-derive the engine using the vault header.
+            let mut file = std::fs::File::open(&vault_pqd).expect("open vault");
+            let header = crate::vault::reader::read_header(&mut file).expect("read_header");
+            let params = fast_params();
+            let mut engine = CryptoEngine::new();
+            engine
+                .unlock_with_vault(
+                    b"password",
+                    &header.kdf_salt,
+                    &crate::crypto::kdf::Argon2Params {
+                        memory_cost_kb: params.memory_cost_kb,
+                        time_cost: params.time_cost,
+                        parallelism: params.parallelism,
+                    },
+                    header.verification_iv,
+                    &header.verification_ct,
+                    &header.kem_encrypted_sk,
+                    &header.dsa_encrypted_sk,
+                )
+                .expect("unlock_with_vault");
+
+            let query = make_query("FINDME");
+            let err = match search_entries(&vault_pqd, &engine, &query) {
+                Ok(_) => panic!("search_entries must fail on tampered entry"),
+                Err(e) => e,
+            };
+            assert!(
+                matches!(err, crate::error::DiaryError::Crypto(_)),
+                "expected DiaryError::Crypto, got {:?}",
+                err
+            );
+        }
     }
 }

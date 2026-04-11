@@ -1,8 +1,19 @@
 mod commands;
 mod editor;
 mod password;
+mod security;
 
 use clap::{Args, Parser, Subcommand};
+use secrecy::SecretString;
+
+/// Custom clap value parser that converts a `&str` into [`SecretString`].
+///
+/// `clap` does not natively support `SecretString`, so this parser wraps the
+/// raw argument string immediately, preventing the plaintext from lingering in
+/// a plain `String` field.
+fn parse_secret_string(s: &str) -> Result<SecretString, std::convert::Infallible> {
+    Ok(SecretString::from(s.to_string()))
+}
 
 /// Post-quantum cryptography CLI journal.
 #[derive(Debug, Parser)]
@@ -17,8 +28,8 @@ pub struct Cli {
     pub vault: Option<String>,
 
     /// Master password (insecure; use interactive prompt instead)
-    #[arg(long, global = true)]
-    pub password: Option<String>,
+    #[arg(long, global = true, value_parser = parse_secret_string)]
+    pub password: Option<SecretString>,
 
     /// Enable Claude AI integration
     #[arg(long, global = true)]
@@ -390,17 +401,19 @@ fn dispatch(cli: &Cli) -> anyhow::Result<()> {
     }
 }
 
-/// Print a "not yet implemented" message and exit with code 1.
+/// Return an error for a command that has not been implemented yet.
 ///
-/// Returns the never type `!` which coerces to any `Result` type, allowing
-/// it to be used directly in match arms that return `anyhow::Result<()>`.
+/// Uses [`anyhow::bail!`] to return `Err` with a message containing the command
+/// name and the planned sprint, allowing normal stack unwinding so that all
+/// `Drop` implementations (including `zeroize`) run correctly.
 fn not_implemented(cmd_name: &str, sprint: &str) -> anyhow::Result<()> {
-    eprintln!("Command '{cmd_name}' is not yet implemented. Planned for {sprint}.");
-    std::process::exit(1);
+    anyhow::bail!("Command '{cmd_name}' is not yet implemented. Planned for {sprint}.")
 }
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    security::harden_process();
+    security::check_debugger();
     dispatch(&cli)
 }
 
@@ -408,6 +421,85 @@ fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+    use secrecy::ExposeSecret as _;
+
+    // -------------------------------------------------------------------------
+    // TASK-0081 tests: H-1 Cli.password SecretString化
+    // -------------------------------------------------------------------------
+
+    /// TC-S9-081-01: `Cli.password` フィールドが `Option<SecretString>` 型であることをコンパイル時に検証する。
+    ///
+    /// このテストがコンパイルされる事実自体が型の正確性の証明となる。
+    #[test]
+    fn tc_s9_081_01_password_field_is_option_secret_string() {
+        let cli = Cli::try_parse_from(["pq-diary", "list"]).unwrap();
+        // This binding asserts the type is Option<SecretString> at compile time.
+        let _: Option<SecretString> = cli.password;
+    }
+
+    /// TC-S9-081-02: `parse_secret_string` が `SecretString` を正しく生成する。
+    ///
+    /// `expose_secret()` で元のパスワード文字列が取得できることを検証する。
+    #[test]
+    fn tc_s9_081_02_parse_secret_string_returns_correct_value() {
+        let result = parse_secret_string("test_password");
+        assert!(result.is_ok(), "parse_secret_string must return Ok");
+        let secret = result.unwrap();
+        assert_eq!(
+            secret.expose_secret(),
+            "test_password",
+            "expose_secret() must return the original value"
+        );
+    }
+
+    /// TC-S9-081-06: `SecretString` の `Debug` 表示にパスワード平文が含まれない。
+    ///
+    /// `--password` フラグで与えたパスワードが `{:?}` でマスクされることを確認する。
+    #[test]
+    fn tc_s9_081_06_secret_string_debug_redacts_password() {
+        let cli = Cli::try_parse_from(["pq-diary", "--password", "my_secret_pw", "list"]).unwrap();
+        let debug_repr = format!("{:?}", cli.password);
+        assert!(
+            !debug_repr.contains("my_secret_pw"),
+            "Debug output must not contain the plaintext password, got: {debug_repr}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TASK-0080 tests: M-1 not_implemented() → bail!
+    // -------------------------------------------------------------------------
+
+    /// TC-S9-080-01: not_implemented() returns Err (does not call process::exit).
+    #[test]
+    fn tc_s9_080_01_not_implemented_returns_err() {
+        let result = not_implemented("test-cmd", "S99");
+        assert!(
+            result.is_err(),
+            "not_implemented must return Err, not exit the process"
+        );
+    }
+
+    /// TC-S9-080-02: not_implemented() error message contains the command name.
+    #[test]
+    fn tc_s9_080_02_error_message_contains_command_name() {
+        let result = not_implemented("test-cmd", "S99");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("test-cmd"),
+            "error message must contain command name 'test-cmd', got: {err_msg}"
+        );
+    }
+
+    /// TC-S9-080-03: not_implemented() error message contains the planned sprint.
+    #[test]
+    fn tc_s9_080_03_error_message_contains_sprint() {
+        let result = not_implemented("test-cmd", "S99");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("S99"),
+            "error message must contain planned sprint 'S99', got: {err_msg}"
+        );
+    }
 
     #[test]
     fn test_help_contains_all_subcommands() {

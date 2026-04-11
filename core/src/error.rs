@@ -161,7 +161,7 @@ mod tests {
         fn check(e: &DiaryError) {
             assert!(!format!("{}", e).is_empty());
         }
-        check(&DiaryError::Io(io::Error::new(io::ErrorKind::Other, "x")));
+        check(&DiaryError::Io(io::Error::other("x")));
         check(&DiaryError::Config("x".into()));
         check(&DiaryError::Vault("x".into()));
         check(&DiaryError::Entry("x".into()));

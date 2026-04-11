@@ -30,13 +30,17 @@ pub fn compute(key: &[u8], data: &[u8]) -> Result<[u8; 32], DiaryError> {
 ///
 /// Uses constant-time comparison via [`hmac::Mac::verify_slice`] to prevent
 /// timing side-channel attacks.
-/// Returns `true` if the MAC matches, `false` otherwise.
-pub fn verify_hmac(key: &[u8], data: &[u8], expected: &[u8; 32]) -> bool {
-    let Ok(mut mac) = HmacSha256::new_from_slice(key) else {
-        return false;
-    };
+/// Returns `Ok(true)` if the MAC matches, `Ok(false)` otherwise.
+///
+/// # Errors
+///
+/// Returns [`DiaryError::Crypto`] if the key is rejected by the HMAC implementation
+/// (this is unreachable in practice since HMAC-SHA256 accepts all key lengths).
+pub fn verify_hmac(key: &[u8], data: &[u8], expected: &[u8; 32]) -> Result<bool, DiaryError> {
+    let mut mac = HmacSha256::new_from_slice(key)
+        .map_err(|e| DiaryError::Crypto(format!("HMAC key error: {e}")))?;
     mac.update(data);
-    mac.verify_slice(expected).is_ok()
+    Ok(mac.verify_slice(expected).is_ok())
 }
 
 #[cfg(test)]
@@ -62,21 +66,21 @@ mod tests {
         assert_ne!(mac1, mac2);
     }
 
-    /// TC-006-03: verify_hmac returns true for the correct MAC.
+    /// TC-006-03: verify_hmac returns Ok(true) for the correct MAC.
     #[test]
     fn tc_006_03_verify_correct_mac_returns_true() {
         let data = b"journal entry content";
         let mac = compute(test_key(), data).expect("compute");
-        assert!(verify_hmac(test_key(), data, &mac));
+        assert!(verify_hmac(test_key(), data, &mac).expect("verify_hmac"));
     }
 
-    /// TC-006-E01: tampered data → verify_hmac returns false.
+    /// TC-006-E01: tampered data → verify_hmac returns Ok(false).
     #[test]
     fn tc_006_e01_tampered_data_returns_false() {
         let data = b"original content";
         let mac = compute(test_key(), data).expect("compute");
         // Tamper the data.
-        assert!(!verify_hmac(test_key(), b"tampered content", &mac));
+        assert!(!verify_hmac(test_key(), b"tampered content", &mac).expect("verify_hmac"));
     }
 
     /// TC-A09-01: compute() returns Result<[u8; 32], DiaryError>.
@@ -107,12 +111,12 @@ mod tests {
         assert_ne!(mac1, mac2);
     }
 
-    /// Wrong key → verify_hmac returns false.
+    /// Wrong key → verify_hmac returns Ok(false).
     #[test]
     fn wrong_key_returns_false() {
         let data = b"content";
         let mac = compute(test_key(), data).expect("compute");
-        assert!(!verify_hmac(b"wrong-key", data, &mac));
+        assert!(!verify_hmac(b"wrong-key", data, &mac).expect("verify_hmac"));
     }
 
     /// Empty key is accepted (any key length is valid for HMAC).
@@ -120,7 +124,7 @@ mod tests {
     fn empty_key_is_accepted() {
         let mac = compute(b"", b"data").expect("compute");
         assert_eq!(mac.len(), 32);
-        assert!(verify_hmac(b"", b"data", &mac));
+        assert!(verify_hmac(b"", b"data", &mac).expect("verify_hmac"));
     }
 
     /// Empty data is accepted.
@@ -128,6 +132,65 @@ mod tests {
     fn empty_data_is_accepted() {
         let mac = compute(test_key(), b"").expect("compute");
         assert_eq!(mac.len(), 32);
-        assert!(verify_hmac(test_key(), b"", &mac));
+        assert!(verify_hmac(test_key(), b"", &mac).expect("verify_hmac"));
+    }
+
+    // -------------------------------------------------------------------------
+    // TASK-0080 tests: M-5 verify_hmac Result化
+    // -------------------------------------------------------------------------
+
+    /// TC-S9-080-07: verify_hmac returns Ok(true) for correct HMAC.
+    #[test]
+    fn tc_s9_080_07_verify_hmac_ok_true_for_correct_mac() {
+        let key = b"known-key-for-tc-s9-080";
+        let data = b"known data content";
+        let mac = compute(key, data).expect("compute");
+        let result = verify_hmac(key, data, &mac);
+        assert!(result.is_ok(), "verify_hmac must return Ok for valid key");
+        assert!(
+            result.unwrap(),
+            "verify_hmac must return Ok(true) for matching MAC"
+        );
+    }
+
+    /// TC-S9-080-08: verify_hmac returns Ok(false) for tampered HMAC.
+    #[test]
+    fn tc_s9_080_08_verify_hmac_ok_false_for_wrong_mac() {
+        let key = b"known-key-for-tc-s9-080";
+        let data = b"known data content";
+        let mut wrong_mac = compute(key, data).expect("compute");
+        // Tamper one byte.
+        wrong_mac[0] ^= 0xff;
+        let result = verify_hmac(key, data, &wrong_mac);
+        assert!(
+            result.is_ok(),
+            "verify_hmac must return Ok even for mismatched MAC"
+        );
+        assert!(
+            !result.unwrap(),
+            "verify_hmac must return Ok(false) for mismatched MAC"
+        );
+    }
+
+    /// TC-S9-080-09: verify_hmac returns Result<bool, DiaryError> (type-level check).
+    ///
+    /// Note: HmacSha256::new_from_slice accepts any key length, so the
+    /// Err(DiaryError::Crypto) path cannot be triggered at runtime for HMAC-SHA256.
+    /// This test verifies the function signature compiles as Result and that
+    /// edge-case keys (empty, very short) are handled correctly via Ok(…).
+    #[test]
+    fn tc_s9_080_09_verify_hmac_result_type_and_edge_keys() {
+        // Type annotation confirms the return type is Result<bool, DiaryError>.
+        let _: Result<bool, crate::error::DiaryError> = verify_hmac(b"k", b"d", &[0u8; 32]);
+
+        // Empty key returns Ok (HMAC accepts any key length).
+        let mac_empty_key = compute(b"", b"data").expect("compute");
+        let r = verify_hmac(b"", b"data", &mac_empty_key);
+        assert!(r.is_ok(), "empty key must return Ok, not Err");
+
+        // Single-byte key returns Ok.
+        let mac_short_key = compute(b"x", b"data").expect("compute");
+        let r2 = verify_hmac(b"x", b"data", &mac_short_key);
+        assert!(r2.is_ok(), "single-byte key must return Ok, not Err");
     }
 }

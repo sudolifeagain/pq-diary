@@ -63,6 +63,35 @@ pub fn sign(sk: &SecureBuffer, message: &[u8]) -> Result<Vec<u8>, DiaryError> {
     Ok(sig.encode().to_vec())
 }
 
+/// Verify `signature` on `message` using the verifying key derived from `seed`.
+///
+/// Derives the ML-DSA-65 verifying (public) key from the 32-byte `seed` and
+/// verifies the signature.  This avoids storing the public key separately;
+/// the verifying key is always reconstructable from the signing key seed.
+///
+/// Returns `Ok(true)` if the signature is valid, `Ok(false)` otherwise.
+/// A malformed or unparseable signature also returns `Ok(false)`.
+///
+/// # Errors
+///
+/// Returns [`DiaryError::Crypto`] if `seed` does not contain a valid 32-byte seed.
+pub fn verify_from_seed(
+    seed: &SecureBuffer,
+    message: &[u8],
+    signature: &[u8],
+) -> Result<bool, DiaryError> {
+    let seed_val: ml_dsa::Seed = seed.as_ref().try_into().map_err(|_| {
+        DiaryError::Crypto(format!(
+            "invalid signing key seed size: expected 32 bytes, got {}",
+            seed.len()
+        ))
+    })?;
+    let signing_key = MlDsa65::from_seed(&seed_val);
+    let vk = signing_key.verifying_key();
+    let vk_bytes = vk.encode().to_vec();
+    verify(&vk_bytes, message, signature)
+}
+
 /// Verify `signature` on `message` using the verifying key `pk`.
 ///
 /// Returns `Ok(true)` if the signature is valid, `Ok(false)` if not.

@@ -197,6 +197,10 @@ impl IdPrefix {
 /// `engine.decrypt()`, deserialises the JSON payload into [`EntryPlaintext`],
 /// and returns a flat [`Vec<EntryMeta>`] suitable for display or filtering.
 ///
+/// HMAC and signature verification are intentionally **skipped** in this function
+/// to preserve list performance.  Use [`get_entry`] or [`list_entries_with_body`]
+/// when integrity checking is required.
+///
 /// Sorting and filtering are intentionally left to the caller (e.g. the CLI).
 ///
 /// # Errors
@@ -236,10 +240,15 @@ pub fn list_entries(
 /// Used internally by `DiaryCore::unlock` to build the [`crate::link::LinkIndex`]
 /// in a single vault read.
 ///
+/// Verifies `content_hmac` (HMAC-SHA256 over the ciphertext) and the ML-DSA-65
+/// signature for every entry before decryption.  Returns [`DiaryError::Crypto`]
+/// at the first integrity failure.
+///
 /// # Errors
 ///
 /// Returns [`DiaryError::Io`] on vault I/O failure.
-/// Returns [`DiaryError::Crypto`] if decryption fails for any record.
+/// Returns [`DiaryError::Crypto`] if HMAC or signature verification fails, or if
+///   decryption fails for any record.
 /// Returns [`DiaryError::Entry`] if JSON deserialisation fails for any record.
 pub fn list_entries_with_body(
     vault_path: &Path,
@@ -251,10 +260,29 @@ pub fn list_entries_with_body(
         if record.record_type != RECORD_TYPE_ENTRY {
             continue;
         }
+        let uuid_hex: String = record.uuid.iter().map(|b| format!("{:02x}", b)).collect();
+
+        // Verify HMAC over ciphertext before decryption.
+        if !engine.hmac_verify(&record.ciphertext, &record.content_hmac)? {
+            return Err(DiaryError::Crypto(format!(
+                "content HMAC verification failed for entry {}",
+                uuid_hex
+            )));
+        }
+
+        // Verify ML-DSA-65 signature over ciphertext (skip if signature is absent).
+        if !record.signature.is_empty()
+            && !engine.dsa_verify_entry(&record.ciphertext, &record.signature)?
+        {
+            return Err(DiaryError::Crypto(format!(
+                "signature verification failed for entry {}",
+                uuid_hex
+            )));
+        }
+
         let decrypted = engine.decrypt(&record.iv, &record.ciphertext)?;
         let mut plaintext: EntryPlaintext = serde_json::from_slice(decrypted.as_ref())
             .map_err(|e| DiaryError::Entry(format!("deserialization failed: {e}")))?;
-        let uuid_hex: String = record.uuid.iter().map(|b| format!("{:02x}", b)).collect();
         let title = std::mem::take(&mut plaintext.title);
         let tags = std::mem::take(&mut plaintext.tags);
         let body = Zeroizing::new(std::mem::take(&mut plaintext.body));
@@ -348,14 +376,18 @@ pub fn create_entry(
 /// Processing:
 /// 1. Read all [`EntryRecord`]s from the vault.
 /// 2. Filter records whose UUID hex starts with `prefix`.
-/// 3. Exactly one match: decrypt the ciphertext and return `(record, plaintext)`.
+/// 3. Exactly one match:
+///    a. Verify `content_hmac` (HMAC-SHA256 over the ciphertext).
+///    b. Verify the ML-DSA-65 signature over the ciphertext.
+///    c. Decrypt and deserialise.
 /// 4. Zero matches: return a "not found" error.
 /// 5. Multiple matches: return an error listing candidate UUID hexes.
 ///
 /// # Errors
 ///
 /// Returns [`DiaryError::Io`] on vault I/O failure.
-/// Returns [`DiaryError::Crypto`] if decryption fails.
+/// Returns [`DiaryError::Crypto`] if HMAC or signature verification fails, or if
+///   decryption fails.
 /// Returns [`DiaryError::Entry`] if JSON deserialisation fails, no match is
 ///   found, or multiple matches are found.
 /// Returns [`DiaryError::NotUnlocked`] if the engine is locked.
@@ -375,6 +407,26 @@ pub fn get_entry(
         0 => Err(DiaryError::Entry("エントリが見つかりません".to_string())),
         1 => {
             let record = matches.remove(0);
+            let uuid_hex: String = record.uuid.iter().map(|b| format!("{:02x}", b)).collect();
+
+            // Verify HMAC over ciphertext before decryption.
+            if !engine.hmac_verify(&record.ciphertext, &record.content_hmac)? {
+                return Err(DiaryError::Crypto(format!(
+                    "content HMAC verification failed for entry {}",
+                    uuid_hex
+                )));
+            }
+
+            // Verify ML-DSA-65 signature over ciphertext (skip if signature is absent).
+            if !record.signature.is_empty()
+                && !engine.dsa_verify_entry(&record.ciphertext, &record.signature)?
+            {
+                return Err(DiaryError::Crypto(format!(
+                    "signature verification failed for entry {}",
+                    uuid_hex
+                )));
+            }
+
             let decrypted = engine.decrypt(&record.iv, &record.ciphertext)?;
             let plaintext: EntryPlaintext = serde_json::from_slice(decrypted.as_ref())
                 .map_err(|e| DiaryError::Entry(format!("deserialization failed: {e}")))?;
@@ -1542,5 +1594,318 @@ mod tests {
         let nonexistent_uuid = [0xffu8; 16];
         let err = delete_entry(&vault_path, &engine, nonexistent_uuid).expect_err("should be Err");
         assert!(matches!(err, DiaryError::Entry(_)));
+    }
+
+    // =========================================================================
+    // TASK-0082: 読み取り時 HMAC / 署名検証
+    // =========================================================================
+
+    /// Helper: build an IdPrefix from the first 8 hex chars of a Uuid.
+    fn prefix_from_uuid(uuid: &uuid::Uuid) -> IdPrefix {
+        let hex: String = uuid
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+        IdPrefix::new(&hex[..8]).expect("valid prefix")
+    }
+
+    /// TC-S9-082-01: get_entry with a valid entry (correct HMAC and signature) succeeds.
+    #[test]
+    fn tc_s9_082_01_get_entry_valid_hmac_and_sig() {
+        let dir = tempdir().expect("tempdir");
+        let vault_path = dir.path().join("vault.pqd");
+        let engine = make_test_engine();
+        init_test_vault(&vault_path);
+
+        let plaintext = EntryPlaintext {
+            title: "Integrity Test".to_string(),
+            tags: vec!["security".to_string()],
+            body: "body text".to_string(),
+        };
+        let uuid = create_entry(&vault_path, &engine, &plaintext).expect("create_entry");
+        let prefix = prefix_from_uuid(&uuid);
+
+        let (_record, recovered) =
+            get_entry(&vault_path, &engine, &prefix).expect("get_entry must succeed");
+        assert_eq!(recovered.title, plaintext.title);
+        assert_eq!(recovered.body, plaintext.body);
+    }
+
+    /// TC-S9-082-02: get_entry with a tampered ciphertext returns DiaryError::Crypto
+    /// containing "content HMAC verification failed".
+    #[test]
+    fn tc_s9_082_02_get_entry_tampered_ciphertext_hmac_error() {
+        let dir = tempdir().expect("tempdir");
+        let vault_path = dir.path().join("vault.pqd");
+        let engine = make_test_engine();
+        init_test_vault(&vault_path);
+
+        let plaintext = EntryPlaintext {
+            title: "Tamper Ciphertext".to_string(),
+            tags: vec![],
+            body: "original body".to_string(),
+        };
+        let uuid = create_entry(&vault_path, &engine, &plaintext).expect("create_entry");
+
+        // Tamper the ciphertext: flip a byte to invalidate the HMAC.
+        {
+            let (header, mut records) = read_vault(&vault_path).expect("read_vault");
+            if let Some(b) = records[0].ciphertext.get_mut(5) {
+                *b ^= 0xFF;
+            }
+            write_vault(&vault_path, header, &records).expect("write_vault");
+        }
+
+        let prefix = prefix_from_uuid(&uuid);
+        let err = get_entry(&vault_path, &engine, &prefix).expect_err("must fail");
+        assert!(
+            matches!(err, DiaryError::Crypto(_)),
+            "expected DiaryError::Crypto, got {:?}",
+            err
+        );
+        if let DiaryError::Crypto(msg) = err {
+            assert!(
+                msg.contains("content HMAC verification failed"),
+                "error message must mention HMAC failure, got: {}",
+                msg
+            );
+        }
+    }
+
+    /// TC-S9-082-03: get_entry with a tampered signature returns DiaryError::Crypto
+    /// containing "signature verification failed".
+    #[test]
+    fn tc_s9_082_03_get_entry_tampered_signature_error() {
+        let dir = tempdir().expect("tempdir");
+        let vault_path = dir.path().join("vault.pqd");
+        let engine = make_test_engine();
+        init_test_vault(&vault_path);
+
+        let plaintext = EntryPlaintext {
+            title: "Tamper Signature".to_string(),
+            tags: vec![],
+            body: "body text".to_string(),
+        };
+        let uuid = create_entry(&vault_path, &engine, &plaintext).expect("create_entry");
+
+        // Tamper the signature: flip a byte (ciphertext is unchanged so HMAC passes).
+        {
+            let (header, mut records) = read_vault(&vault_path).expect("read_vault");
+            if let Some(b) = records[0].signature.get_mut(100) {
+                *b ^= 0xFF;
+            }
+            write_vault(&vault_path, header, &records).expect("write_vault");
+        }
+
+        let prefix = prefix_from_uuid(&uuid);
+        let err = get_entry(&vault_path, &engine, &prefix).expect_err("must fail");
+        assert!(
+            matches!(err, DiaryError::Crypto(_)),
+            "expected DiaryError::Crypto, got {:?}",
+            err
+        );
+        if let DiaryError::Crypto(msg) = err {
+            assert!(
+                msg.contains("signature verification failed"),
+                "error message must mention signature failure, got: {}",
+                msg
+            );
+        }
+    }
+
+    /// TC-S9-082-04: list_entries_with_body with all valid entries returns every entry.
+    #[test]
+    fn tc_s9_082_04_list_entries_with_body_all_valid() {
+        let dir = tempdir().expect("tempdir");
+        let vault_path = dir.path().join("vault.pqd");
+        let engine = make_test_engine();
+        init_test_vault(&vault_path);
+
+        let originals = [("Alpha", "body A"), ("Beta", "body B"), ("Gamma", "body C")];
+        for (title, body) in &originals {
+            let pt = EntryPlaintext {
+                title: title.to_string(),
+                tags: vec![],
+                body: body.to_string(),
+            };
+            create_entry(&vault_path, &engine, &pt).expect("create_entry");
+        }
+
+        let entries = list_entries_with_body(&vault_path, &engine).expect("list_entries_with_body");
+        assert_eq!(entries.len(), 3, "expected 3 entries");
+        for (meta, body) in &entries {
+            let found = originals
+                .iter()
+                .any(|(t, b)| *t == meta.title && *b == body.as_str());
+            assert!(found, "unexpected entry: title={}", meta.title);
+        }
+    }
+
+    /// TC-S9-082-05: list_entries_with_body with one tampered ciphertext returns DiaryError::Crypto.
+    #[test]
+    fn tc_s9_082_05_list_entries_with_body_tampered_entry_error() {
+        let dir = tempdir().expect("tempdir");
+        let vault_path = dir.path().join("vault.pqd");
+        let engine = make_test_engine();
+        init_test_vault(&vault_path);
+
+        for i in 0..3 {
+            let pt = EntryPlaintext {
+                title: format!("Entry {i}"),
+                tags: vec![],
+                body: format!("body {i}"),
+            };
+            create_entry(&vault_path, &engine, &pt).expect("create_entry");
+        }
+
+        // Tamper the second entry's ciphertext.
+        {
+            let (header, mut records) = read_vault(&vault_path).expect("read_vault");
+            if let Some(b) = records[1].ciphertext.get_mut(5) {
+                *b ^= 0xFF;
+            }
+            write_vault(&vault_path, header, &records).expect("write_vault");
+        }
+
+        let err = match list_entries_with_body(&vault_path, &engine) {
+            Ok(_) => panic!("list_entries_with_body must fail on tampered entry"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, DiaryError::Crypto(_)),
+            "expected DiaryError::Crypto, got {:?}",
+            err
+        );
+    }
+
+    /// TC-S9-082-07: list_entries (metadata only) skips HMAC/signature verification
+    /// and returns metadata normally.
+    #[test]
+    fn tc_s9_082_07_list_entries_metadata_skips_verification() {
+        let dir = tempdir().expect("tempdir");
+        let vault_path = dir.path().join("vault.pqd");
+        let engine = make_test_engine();
+        init_test_vault(&vault_path);
+
+        let pt = EntryPlaintext {
+            title: "Metadata Only".to_string(),
+            tags: vec!["tag1".to_string()],
+            body: "some body".to_string(),
+        };
+        create_entry(&vault_path, &engine, &pt).expect("create_entry");
+
+        // list_entries must succeed and return the metadata.
+        let metas = list_entries(&vault_path, &engine).expect("list_entries must succeed");
+        assert_eq!(metas.len(), 1, "expected 1 meta");
+        assert_eq!(metas[0].title, pt.title);
+        assert_eq!(metas[0].tags, pt.tags);
+    }
+
+    /// TC-S9-082-08: create → get_entry round-trip still passes after adding verification.
+    #[test]
+    fn tc_s9_082_08_create_read_roundtrip_passes_verification() {
+        let dir = tempdir().expect("tempdir");
+        let vault_path = dir.path().join("vault.pqd");
+        let engine = make_test_engine();
+        init_test_vault(&vault_path);
+
+        let plaintext = EntryPlaintext {
+            title: "Roundtrip".to_string(),
+            tags: vec!["integrity".to_string()],
+            body: "intact body".to_string(),
+        };
+        let uuid = create_entry(&vault_path, &engine, &plaintext).expect("create_entry");
+        let prefix = prefix_from_uuid(&uuid);
+
+        let (_record, recovered) =
+            get_entry(&vault_path, &engine, &prefix).expect("get_entry must succeed");
+        assert_eq!(recovered.title, plaintext.title);
+        assert_eq!(recovered.tags, plaintext.tags);
+        assert_eq!(recovered.body, plaintext.body);
+    }
+
+    /// TC-S9-082-09: HMAC mismatch error message contains the entry UUID.
+    #[test]
+    fn tc_s9_082_09_hmac_error_message_contains_uuid() {
+        let dir = tempdir().expect("tempdir");
+        let vault_path = dir.path().join("vault.pqd");
+        let engine = make_test_engine();
+        init_test_vault(&vault_path);
+
+        let pt = EntryPlaintext {
+            title: "UUID in Error".to_string(),
+            tags: vec![],
+            body: "body".to_string(),
+        };
+        let uuid = create_entry(&vault_path, &engine, &pt).expect("create_entry");
+        let uuid_hex: String = uuid
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+
+        // Tamper ciphertext to trigger HMAC failure.
+        {
+            let (header, mut records) = read_vault(&vault_path).expect("read_vault");
+            if let Some(b) = records[0].ciphertext.get_mut(3) {
+                *b ^= 0xAB;
+            }
+            write_vault(&vault_path, header, &records).expect("write_vault");
+        }
+
+        let prefix = prefix_from_uuid(&uuid);
+        let err = get_entry(&vault_path, &engine, &prefix).expect_err("must fail");
+        if let DiaryError::Crypto(msg) = err {
+            assert!(
+                msg.contains(&uuid_hex),
+                "error message must contain the UUID hex, got: {}",
+                msg
+            );
+        } else {
+            panic!("expected DiaryError::Crypto");
+        }
+    }
+
+    /// TC-S9-082-10: Signature verification failure error message contains the entry UUID.
+    #[test]
+    fn tc_s9_082_10_signature_error_message_contains_uuid() {
+        let dir = tempdir().expect("tempdir");
+        let vault_path = dir.path().join("vault.pqd");
+        let engine = make_test_engine();
+        init_test_vault(&vault_path);
+
+        let pt = EntryPlaintext {
+            title: "UUID in Sig Error".to_string(),
+            tags: vec![],
+            body: "body".to_string(),
+        };
+        let uuid = create_entry(&vault_path, &engine, &pt).expect("create_entry");
+        let uuid_hex: String = uuid
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+
+        // Tamper signature to trigger signature verification failure.
+        {
+            let (header, mut records) = read_vault(&vault_path).expect("read_vault");
+            if let Some(b) = records[0].signature.get_mut(50) {
+                *b ^= 0xDE;
+            }
+            write_vault(&vault_path, header, &records).expect("write_vault");
+        }
+
+        let prefix = prefix_from_uuid(&uuid);
+        let err = get_entry(&vault_path, &engine, &prefix).expect_err("must fail");
+        if let DiaryError::Crypto(msg) = err {
+            assert!(
+                msg.contains(&uuid_hex),
+                "error message must contain the UUID hex, got: {}",
+                msg
+            );
+        } else {
+            panic!("expected DiaryError::Crypto");
+        }
     }
 }

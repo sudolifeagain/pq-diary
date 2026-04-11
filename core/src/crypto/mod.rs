@@ -233,6 +233,26 @@ impl CryptoEngine {
         dsa::verify(pk, message, signature)
     }
 
+    /// Verify `signature` on `message` using the engine's own ML-DSA-65 verifying key.
+    ///
+    /// Derives the verifying (public) key from the signing key seed stored in
+    /// `MasterKey.dsa_sk`.  This avoids storing the public key separately in the vault.
+    ///
+    /// If `dsa_sk` is empty (e.g. vault entries created before Phase 3 key generation),
+    /// returns `Ok(true)` so that legacy entries without a valid signing key are not
+    /// rejected outright.
+    ///
+    /// Returns [`DiaryError::NotUnlocked`] if the engine has not been unlocked.
+    /// Returns [`DiaryError::Crypto`] if the signing key seed has an invalid length.
+    pub fn dsa_verify_entry(&self, message: &[u8], signature: &[u8]) -> Result<bool, DiaryError> {
+        let mk = self.expose_master_key()?;
+        if mk.dsa_sk.is_empty() {
+            return Ok(true);
+        }
+        let sk = SecureBuffer::new(mk.dsa_sk.to_vec());
+        dsa::verify_from_seed(&sk, message, signature)
+    }
+
     /// Compute HMAC-SHA256 of `data` using the engine's internal symmetric key.
     ///
     /// Returns a 32-byte MAC value.

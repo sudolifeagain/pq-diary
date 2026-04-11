@@ -66,6 +66,12 @@ impl CryptoEngine {
         };
 
         self.master_key = Some(SecretBox::new(Box::new(master_key)));
+
+        // Lock key material in physical memory to prevent swapping (fail-soft: warning on failure).
+        if let Some(ref sb) = self.master_key {
+            let _ = secure_mem::mlock_master_key(sb.expose_secret());
+        }
+
         Ok(())
     }
 
@@ -138,15 +144,27 @@ impl CryptoEngine {
         };
 
         self.master_key = Some(SecretBox::new(Box::new(master_key)));
+
+        // Lock key material in physical memory to prevent swapping (fail-soft: warning on failure).
+        if let Some(ref sb) = self.master_key {
+            let _ = secure_mem::mlock_master_key(sb.expose_secret());
+        }
+
         Ok(())
     }
 
     /// Lock the engine, securely erasing the master key from memory.
     ///
     /// After this call [`is_unlocked`](CryptoEngine::is_unlocked) returns `false`.
-    /// The [`MasterKey`] is dropped and all key material is zeroed on drop via
-    /// [`ZeroizeOnDrop`](zeroize::ZeroizeOnDrop).
+    /// Before dropping the key material, `munlock` is called on each buffer so that
+    /// the OS memory-lock is released prior to the [`ZeroizeOnDrop`](zeroize::ZeroizeOnDrop)
+    /// zeroing the bytes.
     pub fn lock(&mut self) {
+        // Release OS memory-lock before dropping the key so the kernel can update
+        // its locked-page accounting before we free the allocation.
+        if let Some(ref sb) = self.master_key {
+            let _ = secure_mem::munlock_master_key(sb.expose_secret());
+        }
         self.master_key.take();
     }
 

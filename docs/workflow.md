@@ -105,12 +105,19 @@ tdd-verify-complete  全テスト実行・網羅率チェック
 1. docs/definition-of-done.md のチェックリストを確認
 2. docs/sprint-status.md を更新 (Status → completed)
 3. docs/backlog.md の該当アイテムにチェック
+4. CHANGELOG.md の [Unreleased] セクションを更新
 
-# マージ
+# マージ (S14 以降、スプリント単位のタグは打たない)
 git checkout main
 git merge --no-ff sprint/s{N} -m "Sprint {N}: {テーマ}"
-git tag s{N}-done
+
+# Phase 完了時のみタグを打つ
+# 例: git tag phase2-done
 ```
+
+スプリント完了の証跡は **PR マージコミット** が担う (`git log --merges`)。
+過去の `s1-done` 〜 `s13-done` + `phase1-done` タグは残し、CHANGELOG.md の
+History 表で参照する。
 
 ## 8. 生成ファイルマップ
 
@@ -157,7 +164,7 @@ main                    常に安定・DoD通過済み
 
 - `main` への直接コミット禁止
 - 各スプリントは `sprint/s{N}` ブランチで作業
-- スプリント完了後 `main` へ `--no-ff` マージ + タグ `s{N}-done`
+- スプリント完了後 `main` へ `--no-ff` マージ (PR 経由)
 - スプリント内のコミットは機能単位で細かく (1タスク1コミット目安)
 - マージ前に DoD チェックリスト通過必須
 
@@ -179,7 +186,13 @@ type:
 
 ### タグ
 
-| タグ | タイミング |
-|------|-----------|
-| `s{N}-done` | スプリントN完了・mainマージ後 |
-| `phase1-done` | Sprint 9 完了後 |
+| タグ | タイミング | 状態 |
+|------|-----------|------|
+| `s1-done` 〜 `s13-done` | スプリント N 完了・main マージ後 | 既存 (S14 以降は打たない) |
+| `phase1-done` | Sprint 9 完了後 (2026-04-11; S11 完了は `s11-done` で追跡) | 既存 |
+| `phase2-done` | Phase 2 全機能完了後 (未着手) | 予定 |
+| `v0.x.0` | 初リリース時 (バイナリ配布開始) | 未定 |
+
+**S14 以降の運用**: スプリント単位の `s{N}-done` タグは廃止。スプリント完了の証跡は
+PR マージコミット (`git log --merges`) と `CHANGELOG.md` で担保する。Phase 全完了時のみ
+`phaseN-done` タグを切る。

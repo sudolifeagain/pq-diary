@@ -11,7 +11,10 @@ use std::io::{self, Read};
 use std::path::Path;
 
 use crate::error::DiaryError;
-use crate::vault::format::{EntryRecord, VaultHeader, MAGIC, SCHEMA_VERSION};
+use crate::vault::format::{
+    AttachmentRecord, EntryRecord, VaultHeader, MAGIC, RECORD_TYPE_ATTACHMENT, SCHEMA_VERSION,
+    SCHEMA_VERSION_MIN,
+};
 
 /// Fixed size of the on-disk verification-token ciphertext field (bytes 92–140).
 const VERIFICATION_CT_LEN: usize = 48;
@@ -54,12 +57,16 @@ pub fn read_header(reader: &mut impl Read) -> Result<VaultHeader, DiaryError> {
     }
 
     // --- Schema version [8] ---
+    // Accept any version in [SCHEMA_VERSION_MIN, SCHEMA_VERSION] inclusive so
+    // S13 readers can still open pre-S13 (v4) vaults. Writes always stamp the
+    // current SCHEMA_VERSION, so reading-then-writing migrates v4 → v5.
     let mut version_buf = [0u8; 1];
     reader.read_exact(&mut version_buf)?;
-    if version_buf[0] != SCHEMA_VERSION {
+    let on_disk_version = version_buf[0];
+    if !(SCHEMA_VERSION_MIN..=SCHEMA_VERSION).contains(&on_disk_version) {
         return Err(DiaryError::Vault(format!(
-            "unsupported schema version: expected 0x{:02x}, got 0x{:02x}",
-            SCHEMA_VERSION, version_buf[0]
+            "unsupported schema version: accepted 0x{:02x}..=0x{:02x}, got 0x{:02x}",
+            SCHEMA_VERSION_MIN, SCHEMA_VERSION, on_disk_version
         )));
     }
 
@@ -136,25 +143,46 @@ pub fn read_header(reader: &mut impl Read) -> Result<VaultHeader, DiaryError> {
     })
 }
 
-/// Read all [`EntryRecord`]s from `reader` until a zero-length sentinel is encountered.
-///
-/// Each record begins with a LE u32 length prefix. A zero prefix signals the
-/// end of the entry section; any trailing bytes (random file padding) are left
-/// in the stream.
+/// Read all entry-shaped records (entries + templates) from `reader`,
+/// silently dropping any attachment records. Provided for backwards
+/// compatibility with pre-S13 call sites; new code should use
+/// [`read_records`] when it needs the attachment metadata.
 ///
 /// # Errors
 ///
 /// Returns [`DiaryError::Io`] on any underlying I/O failure.
 pub fn read_entries(reader: &mut impl Read) -> Result<Vec<EntryRecord>, DiaryError> {
+    let (entries, _attachments) = read_records(reader)?;
+    Ok(entries)
+}
+
+/// Read all records (entries, templates, attachments) from `reader` until a
+/// zero-length sentinel is encountered, partitioning them by `record_type`.
+///
+/// Each record begins with a LE u32 length prefix. A zero prefix signals the
+/// end of the record section; any trailing bytes (random file padding) are
+/// left in the stream. Unknown `record_type` bytes are rejected as
+/// `DiaryError::Vault` to keep readers strict.
+///
+/// # Errors
+///
+/// - [`DiaryError::Vault`] on unknown record types or oversized fields.
+/// - [`DiaryError::Io`] on any underlying I/O failure.
+pub fn read_records(
+    reader: &mut impl Read,
+) -> Result<(Vec<EntryRecord>, Vec<AttachmentRecord>), DiaryError> {
+    use crate::vault::format::{RECORD_TYPE_ENTRY, RECORD_TYPE_TEMPLATE};
+
     let mut entries = Vec::new();
+    let mut attachments = Vec::new();
 
     loop {
-        // Read record length prefix (LE u32).
+        // Record length prefix (LE u32).
         let mut len_bytes = [0u8; 4];
         reader.read_exact(&mut len_bytes)?;
         let record_len = u32::from_le_bytes(len_bytes) as usize;
 
-        // Zero sentinel signals end of entry section.
+        // Zero sentinel signals end of record section.
         if record_len == 0 {
             break;
         }
@@ -162,15 +190,33 @@ pub fn read_entries(reader: &mut impl Read) -> Result<Vec<EntryRecord>, DiaryErr
         // Guard against oversized records before allocating.
         check_field_size(record_len)?;
 
-        // Read the record payload into a bounded buffer then parse it.
+        // Read the record payload into a bounded buffer.
         let mut payload = vec![0u8; record_len];
         reader.read_exact(&mut payload)?;
 
-        let entry = parse_entry_payload(&payload)?;
-        entries.push(entry);
+        // Peek the record_type byte (first byte of every payload).
+        let record_type = *payload
+            .first()
+            .ok_or_else(|| DiaryError::Vault("record payload is empty".to_string()))?;
+
+        match record_type {
+            RECORD_TYPE_ENTRY | RECORD_TYPE_TEMPLATE => {
+                let entry = parse_entry_payload(&payload)?;
+                entries.push(entry);
+            }
+            RECORD_TYPE_ATTACHMENT => {
+                let attachment = parse_attachment_payload(&payload)?;
+                attachments.push(attachment);
+            }
+            other => {
+                return Err(DiaryError::Vault(format!(
+                    "unknown record_type 0x{other:02x} in vault.pqd payload"
+                )));
+            }
+        }
     }
 
-    Ok(entries)
+    Ok((entries, attachments))
 }
 
 /// Parse a single [`EntryRecord`] from a pre-read payload buffer.
@@ -270,6 +316,81 @@ fn parse_entry_payload(payload: &[u8]) -> Result<EntryRecord, DiaryError> {
     })
 }
 
+/// Parse a single [`AttachmentRecord`] from a pre-read payload buffer (S13).
+fn parse_attachment_payload(payload: &[u8]) -> Result<AttachmentRecord, DiaryError> {
+    let mut cursor = io::Cursor::new(payload);
+
+    // record_type (must equal RECORD_TYPE_ATTACHMENT by caller invariant)
+    let mut type_buf = [0u8; 1];
+    cursor.read_exact(&mut type_buf)?;
+    let record_type = type_buf[0];
+
+    // UUID (16 bytes)
+    let mut uuid = [0u8; 16];
+    cursor.read_exact(&mut uuid)?;
+
+    // IV (12 bytes)
+    let mut iv = [0u8; 12];
+    cursor.read_exact(&mut iv)?;
+
+    // Ciphertext length (LE u32) + ciphertext
+    let mut u32_buf = [0u8; 4];
+    cursor.read_exact(&mut u32_buf)?;
+    let ct_len = u32::from_le_bytes(u32_buf) as usize;
+    check_field_size(ct_len)?;
+    let mut ciphertext = vec![0u8; ct_len];
+    if ct_len > 0 {
+        cursor.read_exact(&mut ciphertext)?;
+    }
+
+    // Signature length (LE u32) + signature
+    cursor.read_exact(&mut u32_buf)?;
+    let sig_len = u32::from_le_bytes(u32_buf) as usize;
+    check_field_size(sig_len)?;
+    let mut signature = vec![0u8; sig_len];
+    if sig_len > 0 {
+        cursor.read_exact(&mut signature)?;
+    }
+
+    // HMAC-SHA256 (32 bytes)
+    let mut content_hmac = [0u8; 32];
+    cursor.read_exact(&mut content_hmac)?;
+
+    // Legacy flag (1 byte)
+    let mut flag_buf = [0u8; 1];
+    cursor.read_exact(&mut flag_buf)?;
+    let legacy_flag = flag_buf[0];
+
+    // Legacy key block length (LE u32) + legacy key block
+    cursor.read_exact(&mut u32_buf)?;
+    let lkb_len = u32::from_le_bytes(u32_buf) as usize;
+    check_field_size(lkb_len)?;
+    let mut legacy_key_block = vec![0u8; lkb_len];
+    if lkb_len > 0 {
+        cursor.read_exact(&mut legacy_key_block)?;
+    }
+
+    // Padding length (1 byte) + padding
+    cursor.read_exact(&mut flag_buf)?;
+    let pad_len = flag_buf[0] as usize;
+    let mut padding = vec![0u8; pad_len];
+    if pad_len > 0 {
+        cursor.read_exact(&mut padding)?;
+    }
+
+    Ok(AttachmentRecord {
+        record_type,
+        uuid,
+        iv,
+        ciphertext,
+        signature,
+        content_hmac,
+        legacy_flag,
+        legacy_key_block,
+        padding,
+    })
+}
+
 /// Read a complete vault from `path`.
 ///
 /// Opens the file at `path`, reads the header (verifying magic bytes and schema
@@ -277,15 +398,28 @@ fn parse_entry_payload(payload: &[u8]) -> Result<EntryRecord, DiaryError> {
 /// random padding bytes written by [`crate::vault::writer::write_vault`] are
 /// silently ignored.
 ///
+/// Attachment records (S13) are dropped here for backwards compatibility —
+/// new callers that need the attachment metadata should use
+/// [`read_vault_with_attachments`].
+///
 /// # Errors
 ///
 /// - [`DiaryError::Vault`] on magic or version mismatch.
 /// - [`DiaryError::Io`] on any I/O failure.
 pub fn read_vault(path: &Path) -> Result<(VaultHeader, Vec<EntryRecord>), DiaryError> {
+    let (header, entries, _attachments) = read_vault_with_attachments(path)?;
+    Ok((header, entries))
+}
+
+/// Read a complete vault from `path`, returning entries and attachments
+/// (S13). Otherwise identical to [`read_vault`].
+pub fn read_vault_with_attachments(
+    path: &Path,
+) -> Result<(VaultHeader, Vec<EntryRecord>, Vec<AttachmentRecord>), DiaryError> {
     let mut file = std::fs::File::open(path)?;
     let header = read_header(&mut file)?;
-    let entries = read_entries(&mut file)?;
-    Ok((header, entries))
+    let (entries, attachments) = read_records(&mut file)?;
+    Ok((header, entries, attachments))
 }
 
 // =============================================================================
@@ -352,6 +486,110 @@ mod tests {
             attachment_offset: 0,
             padding: vec![],
         }
+    }
+
+    /// Build a recognisable [`AttachmentRecord`] for round-trip tests.
+    fn make_test_attachment() -> AttachmentRecord {
+        AttachmentRecord {
+            record_type: crate::vault::format::RECORD_TYPE_ATTACHMENT,
+            uuid: [0xEFu8; 16],
+            iv: [0x09u8; 12],
+            ciphertext: vec![0x55, 0x66, 0x77, 0x88],
+            signature: vec![0x99, 0xAA],
+            content_hmac: [0x5Du8; 32],
+            legacy_flag: 0x01,
+            legacy_key_block: vec![0xCC; 60],
+            padding: vec![0xBB; 7],
+        }
+    }
+
+    /// TC-S13-002-01: A single AttachmentRecord round-trips through
+    /// write_vault_with_attachments → read_vault_with_attachments without loss.
+    #[test]
+    fn tc_s13_002_01_attachment_roundtrip() {
+        use crate::vault::writer::write_vault_with_attachments;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault.pqd");
+        let entry = make_test_entry();
+        let attachment = make_test_attachment();
+
+        write_vault_with_attachments(
+            &path,
+            VaultHeader::new(),
+            std::slice::from_ref(&entry),
+            std::slice::from_ref(&attachment),
+        )
+        .expect("write_vault_with_attachments");
+
+        let (_header, entries, attachments) =
+            read_vault_with_attachments(&path).expect("read_vault_with_attachments");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(attachments.len(), 1);
+        let got = &attachments[0];
+        assert_eq!(got.uuid, attachment.uuid);
+        assert_eq!(got.iv, attachment.iv);
+        assert_eq!(got.ciphertext, attachment.ciphertext);
+        assert_eq!(got.signature, attachment.signature);
+        assert_eq!(got.content_hmac, attachment.content_hmac);
+        assert_eq!(got.legacy_flag, attachment.legacy_flag);
+        assert_eq!(got.legacy_key_block, attachment.legacy_key_block);
+    }
+
+    /// TC-S13-002-02: read_vault (legacy API) silently drops attachments,
+    /// keeping the pre-S13 call sites unchanged.
+    #[test]
+    fn tc_s13_002_02_legacy_read_vault_drops_attachments() {
+        use crate::vault::writer::write_vault_with_attachments;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault.pqd");
+        write_vault_with_attachments(
+            &path,
+            VaultHeader::new(),
+            &[make_test_entry()],
+            &[make_test_attachment(), make_test_attachment()],
+        )
+        .expect("write_vault_with_attachments");
+
+        let (_header, entries) = read_vault(&path).expect("read_vault");
+        assert_eq!(entries.len(), 1, "legacy read_vault keeps entries");
+    }
+
+    /// TC-S13-002-03: read_header accepts pre-S13 vaults stamped 0x04
+    /// (backwards compatibility — REQ-EDGE-301).
+    #[test]
+    fn tc_s13_002_03_read_v4_header() {
+        use crate::vault::writer::write_header;
+
+        // Build a header but flip the schema_version byte to 0x04 before reading.
+        let mut buf: Vec<u8> = Vec::new();
+        let header = VaultHeader::new();
+        write_header(&mut buf, &header).expect("write_header");
+        // schema_version is at offset 8 in the on-disk layout.
+        buf[8] = 0x04;
+
+        let mut cursor = io::Cursor::new(&buf);
+        let parsed = read_header(&mut cursor).expect("read_header v4");
+        assert_eq!(parsed.schema_version, 0x04);
+    }
+
+    /// TC-S13-002-04: read_header rejects unknown schema versions
+    /// (e.g. a hypothetical v6 vault we don't understand yet).
+    #[test]
+    fn tc_s13_002_04_read_unknown_schema_version() {
+        use crate::vault::writer::write_header;
+        let mut buf: Vec<u8> = Vec::new();
+        write_header(&mut buf, &VaultHeader::new()).expect("write_header");
+        buf[8] = 0x06; // future schema we don't support yet
+
+        let mut cursor = io::Cursor::new(&buf);
+        let result = read_header(&mut cursor);
+        assert!(
+            matches!(result, Err(DiaryError::Vault(_))),
+            "expected DiaryError::Vault for unknown schema version, got {:?}",
+            result
+        );
     }
 
     /// TC-001-01: write_header → read_header produces matching header fields.

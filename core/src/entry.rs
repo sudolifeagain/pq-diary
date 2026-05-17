@@ -8,8 +8,8 @@ use crate::{
     error::DiaryError,
     vault::{
         format::{generate_entry_padding, EntryRecord, RECORD_TYPE_ENTRY},
-        reader::read_vault,
-        writer::write_vault,
+        reader::{read_vault, read_vault_with_attachments},
+        writer::{write_vault, write_vault_with_attachments},
     },
 };
 use serde::{Deserialize, Serialize};
@@ -513,10 +513,10 @@ pub fn update_entry(
 /// Returns [`DiaryError::Io`] on vault I/O failure.
 pub fn delete_entry(
     vault_path: &Path,
-    _engine: &CryptoEngine,
+    engine: &CryptoEngine,
     uuid: [u8; 16],
 ) -> Result<(), DiaryError> {
-    let (header, mut entries) = read_vault(vault_path)?;
+    let (header, mut entries, attachments) = read_vault_with_attachments(vault_path)?;
 
     if !entries.iter().any(|r| r.uuid == uuid) {
         return Err(DiaryError::Entry("エントリが見つかりません".to_string()));
@@ -524,7 +524,30 @@ pub fn delete_entry(
 
     entries.retain(|r| r.uuid != uuid);
 
-    write_vault(vault_path, header, &entries)?;
+    let mut kept_attachments = Vec::with_capacity(attachments.len());
+    let mut removed_blobs = std::collections::HashSet::new();
+    let mut kept_blobs = std::collections::HashSet::new();
+
+    for record in attachments {
+        let decrypted = engine.decrypt(&record.iv, &record.ciphertext)?;
+        let plaintext = crate::attachment::AttachmentPlaintext::decode(decrypted.as_ref())?;
+        if plaintext.entry_uuid == uuid {
+            removed_blobs.insert(plaintext.blob_uuid);
+        } else {
+            kept_blobs.insert(plaintext.blob_uuid);
+            kept_attachments.push(record);
+        }
+    }
+
+    write_vault_with_attachments(vault_path, header, &entries, &kept_attachments)?;
+
+    if let Some(vault_dir) = vault_path.parent() {
+        for blob_uuid in removed_blobs.difference(&kept_blobs) {
+            crate::attachment::zeroize_and_delete(&crate::attachment::blob_path(
+                vault_dir, blob_uuid,
+            ))?;
+        }
+    }
     Ok(())
 }
 

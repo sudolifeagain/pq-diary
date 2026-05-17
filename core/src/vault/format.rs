@@ -17,8 +17,17 @@ use zeroize::Zeroizing;
 /// vault.pqd magic bytes (8 bytes, ASCII "PQDIARY" followed by a NUL byte).
 pub const MAGIC: &[u8; 8] = b"PQDIARY\0";
 
-/// Current schema version embedded in every vault.pqd header.
-pub const SCHEMA_VERSION: u8 = 0x04;
+/// Current schema version embedded in every newly-written vault.pqd header.
+///
+/// Pre-S13 vaults are stamped 0x04 — they're still readable because they
+/// contain only [`RECORD_TYPE_ENTRY`] and [`RECORD_TYPE_TEMPLATE`] records and
+/// the binary layout is unchanged. The bump to 0x05 advertises the optional
+/// presence of [`RECORD_TYPE_ATTACHMENT`] records so a hypothetical
+/// strict v4 reader can refuse a vault that may contain them.
+pub const SCHEMA_VERSION: u8 = 0x05;
+
+/// Earliest schema version a current reader still accepts.
+pub const SCHEMA_VERSION_MIN: u8 = 0x04;
 
 /// Size in bytes of the fixed portion of the vault.pqd header.
 ///
@@ -42,6 +51,20 @@ pub const RECORD_TYPE_ENTRY: u8 = 0x01;
 /// Record type byte: entry template.
 pub const RECORD_TYPE_TEMPLATE: u8 = 0x02;
 
+/// Record type byte: attachment metadata (S13). The binary body lives in a
+/// separate `<vault_dir>/.attachments/<blob_uuid>.bin` file; this record only
+/// holds the encrypted [`AttachmentPlaintext`] metadata plus integrity proofs.
+pub const RECORD_TYPE_ATTACHMENT: u8 = 0x03;
+
+/// Maximum attachments per entry (REQ-NFR-301). The on-disk field is u16 but
+/// we cap at 256 to keep linear scans cheap and to match the user-facing limit
+/// declared in `acceptance-criteria.md` TC-S13-EDGE-02.
+pub const MAX_ATTACHMENTS_PER_ENTRY: u16 = 256;
+
+/// Maximum size in bytes for a single attachment (REQ-104).
+/// Stored payload exceeds this by ~chunk_count × 28 bytes of AES-GCM overhead.
+pub const MAX_ATTACHMENT_SIZE_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
+
 // =============================================================================
 // VaultHeader
 // =============================================================================
@@ -56,7 +79,7 @@ pub const RECORD_TYPE_TEMPLATE: u8 = 0x02;
 /// purposes.
 #[derive(Debug)]
 pub struct VaultHeader {
-    /// Schema version byte (0x04 for v4).
+    /// Schema version byte (0x04 for pre-S13 vaults, 0x05 for S13+).
     pub schema_version: u8,
 
     /// Header flags (reserved for future use; currently 0x00).
@@ -171,6 +194,51 @@ pub struct EntryRecord {
     pub attachment_offset: u64,
 
     /// Random padding appended to this record (variable length).
+    pub padding: Vec<u8>,
+}
+
+// =============================================================================
+// AttachmentRecord (S13)
+// =============================================================================
+
+/// Encrypted attachment metadata stored in the vault.pqd payload section.
+///
+/// One [`AttachmentRecord`] per attachment slot. The binary body lives in
+/// `<vault_dir>/.attachments/<blob_uuid>.bin` (encrypted under a per-blob
+/// `FileKey`); this record holds only the metadata + integrity proofs, all
+/// encrypted under `K_master` via [`AttachmentPlaintext`].
+#[derive(Debug, Clone)]
+pub struct AttachmentRecord {
+    /// Record type: [`RECORD_TYPE_ATTACHMENT`] (0x03).
+    pub record_type: u8,
+
+    /// Stable record UUID (16 bytes, UUID v4). Distinct from `blob_uuid` —
+    /// multiple records can share a blob via SHA-256 dedup.
+    pub uuid: [u8; 16],
+
+    /// AES-256-GCM IV (12 bytes) for `ciphertext`.
+    pub iv: [u8; 12],
+
+    /// AES-256-GCM(K_master, AttachmentPlaintext) — the only place
+    /// `filename`, `mime_type`, `size_bytes`, `sha256`, and `file_key` live
+    /// on disk in encrypted form.
+    pub ciphertext: Vec<u8>,
+
+    /// ML-DSA-65 detached signature over `ciphertext`.
+    pub signature: Vec<u8>,
+
+    /// HMAC-SHA-256 over `ciphertext`.
+    pub content_hmac: [u8; 32],
+
+    /// S12 legacy disposition: `0x00` = DESTROY (default), `0x01` = INHERIT.
+    pub legacy_flag: u8,
+
+    /// AES-256-GCM(K_legacy, AttachmentLegacyPlaintext). Empty when
+    /// `legacy_flag == 0x00`. Populated when INHERIT so the heir can
+    /// decrypt the `.attachments/<blob_uuid>.bin` body without K_master.
+    pub legacy_key_block: Vec<u8>,
+
+    /// 0–255 bytes of random padding (size-analysis hardening).
     pub padding: Vec<u8>,
 }
 
@@ -330,13 +398,56 @@ mod tests {
         assert_eq!(MAGIC.len(), 8);
     }
 
-    /// TC-020-02: SCHEMA_VERSION equals 0x04.
+    /// TC-020-02: SCHEMA_VERSION equals 0x05 (S13).
     ///
-    /// Given the SCHEMA_VERSION constant, when its value is inspected,
-    /// then it must equal 0x04.
+    /// Pre-S13 vaults were stamped 0x04. Bumping to 0x05 advertises that the
+    /// vault MAY contain RECORD_TYPE_ATTACHMENT records. The reader still
+    /// accepts SCHEMA_VERSION_MIN (0x04) for backwards compatibility.
     #[test]
     fn test_schema_version_value() {
-        assert_eq!(SCHEMA_VERSION, 0x04);
+        // S13: writes are stamped 0x05, reads accept SCHEMA_VERSION_MIN..=SCHEMA_VERSION.
+        assert_eq!(SCHEMA_VERSION, 0x05);
+        assert_eq!(SCHEMA_VERSION_MIN, 0x04);
+    }
+
+    /// TC-S13-001-01: RECORD_TYPE_ATTACHMENT constant equals 0x03 and is
+    /// distinct from the existing ENTRY / TEMPLATE types.
+    #[test]
+    fn tc_s13_001_01_record_type_attachment_constant() {
+        assert_eq!(RECORD_TYPE_ATTACHMENT, 0x03);
+        assert_ne!(RECORD_TYPE_ATTACHMENT, RECORD_TYPE_ENTRY);
+        assert_ne!(RECORD_TYPE_ATTACHMENT, RECORD_TYPE_TEMPLATE);
+    }
+
+    /// TC-S13-001-02: attachment limits match the EARS requirements.
+    /// REQ-NFR-301 (256 per entry) and REQ-104 (1 GiB per file).
+    #[test]
+    fn tc_s13_001_02_attachment_limits() {
+        assert_eq!(MAX_ATTACHMENTS_PER_ENTRY, 256);
+        assert_eq!(MAX_ATTACHMENT_SIZE_BYTES, 1024 * 1024 * 1024);
+    }
+
+    /// TC-S13-001-03: AttachmentRecord constructs and clones with the
+    /// expected field layout — guards against accidental reordering when
+    /// the struct grows in future revisions.
+    #[test]
+    fn tc_s13_001_03_attachment_record_construct() {
+        let r = AttachmentRecord {
+            record_type: RECORD_TYPE_ATTACHMENT,
+            uuid: [0xAA; 16],
+            iv: [0x01; 12],
+            ciphertext: vec![0x10, 0x20],
+            signature: vec![0x30, 0x40],
+            content_hmac: [0x7F; 32],
+            legacy_flag: 0x01,
+            legacy_key_block: vec![0x50],
+            padding: vec![],
+        };
+        let cloned = r.clone();
+        assert_eq!(cloned.record_type, RECORD_TYPE_ATTACHMENT);
+        assert_eq!(cloned.uuid, [0xAA; 16]);
+        assert_eq!(cloned.legacy_flag, 0x01);
+        assert_eq!(cloned.ciphertext, vec![0x10, 0x20]);
     }
 
     /// TC-020-03: VaultHeader::new() returns correct default values.

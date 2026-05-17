@@ -23,8 +23,6 @@ use crate::error::DiaryError;
 use crate::vault::format::{
     generate_verification_token, EntryRecord, VaultHeader, RECORD_TYPE_ENTRY,
 };
-use crate::vault::reader::read_vault;
-use crate::vault::writer::write_vault;
 
 /// Re-encrypt the vault at `vault_dir` with a new master password.
 ///
@@ -67,8 +65,9 @@ pub fn re_encrypt_vault(
         parallelism: vault_config.argon2.parallelism,
     };
 
-    // Step 1: read current vault.
-    let (header, entries) = read_vault(&vault_pqd)?;
+    // Step 1: read current vault (entries + attachments).
+    let (header, entries, attachments) =
+        crate::vault::reader::read_vault_with_attachments(&vault_pqd)?;
 
     // Step 2: derive OLD symmetric key from old password and stored salt.
     let old_key = kdf::derive_key(
@@ -125,6 +124,17 @@ pub fn re_encrypt_vault(
         new_entries.push(new_record);
     }
 
+    // S13: re-encrypt attachment metadata. The `.attachments/<uuid>.bin` body
+    // files are NOT touched — design Q4 keeps a per-blob FileKey inside the
+    // encrypted metadata so password rotation never has to read or rewrite the
+    // possibly-gigabyte binaries.
+    let new_attachments = crate::attachment::reencrypt_attachments_for_change_password(
+        &attachments,
+        old_key.as_ref(),
+        new_key.as_ref(),
+        &dsa_seed,
+    )?;
+
     // Step 9: write the new vault to vault.pqd.tmp.path() then atomically rename
     // it on top of the original. write_vault already performs the .tmp+rename
     // dance internally, so we redirect it at a side-by-side path and then move
@@ -132,7 +142,12 @@ pub fn re_encrypt_vault(
     // until the very last fs::rename, and the temporary file is cleaned up on
     // failure.
     let final_tmp = vault_dir.join("vault.pqd.tmp.new");
-    let write_result = write_vault(&final_tmp, new_header, &new_entries);
+    let write_result = crate::vault::writer::write_vault_with_attachments(
+        &final_tmp,
+        new_header,
+        &new_entries,
+        &new_attachments,
+    );
     if let Err(e) = write_result {
         cleanup_tmp(&final_tmp);
         return Err(e);
@@ -271,6 +286,7 @@ mod tests {
     use super::*;
     use crate::crypto::kdf::Argon2Params;
     use crate::vault::init::VaultManager;
+    use crate::vault::reader::read_vault;
     use crate::DiaryCore;
     use secrecy::SecretBox;
     use tempfile::tempdir;

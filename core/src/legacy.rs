@@ -30,8 +30,8 @@ use crate::entry::EntryPlaintext;
 use crate::error::DiaryError;
 use crate::vault::config::{ConfirmationMode, VaultConfig};
 use crate::vault::format::{
-    generate_verification_token, EntryRecord, VaultHeader, HEADER_SIZE, RECORD_TYPE_ENTRY,
-    SCHEMA_VERSION,
+    generate_verification_token, EntryRecord, VaultHeader, HEADER_SIZE, RECORD_TYPE_ATTACHMENT,
+    RECORD_TYPE_ENTRY, RECORD_TYPE_TEMPLATE, SCHEMA_VERSION,
 };
 use crate::vault::reader::read_vault;
 use crate::vault::writer::write_vault;
@@ -115,10 +115,20 @@ pub struct LegacyEntryStatus {
 }
 
 /// Summary returned by [`execute_legacy_access`].
-#[derive(Debug, Clone, Copy)]
+///
+/// The `inherited` / `destroyed` counters report diary entries; the
+/// `_attachments` variants report attachment records (S13).
+#[derive(Debug, Clone, Copy, Default)]
 pub struct LegacyAccessReport {
+    /// Entries that survived (carried into the heir's vault).
     pub inherited: usize,
+    /// Entries that were destroyed.
     pub destroyed: usize,
+    /// Attachments carried into the heir's vault (S13).
+    pub inherited_attachments: usize,
+    /// Attachments destroyed during legacy-access (S13). Blob files are
+    /// only zeroize-deleted once their reference count drops to zero.
+    pub destroyed_attachments: usize,
 }
 
 // ============================================================================
@@ -338,7 +348,8 @@ pub fn rotate_legacy_code(
         ));
     }
 
-    let (header, mut entries) = read_vault(&vault_pqd)?;
+    let (header, mut entries, mut attachments) =
+        crate::vault::reader::read_vault_with_attachments(&vault_pqd)?;
     let params = argon2_params_from(&config);
     let _k_master = verify_master(&header, master_pwd, &params)?;
 
@@ -359,6 +370,16 @@ pub fn rotate_legacy_code(
         rotated += 1;
     }
 
+    // S13: also rotate INHERIT attachment legacy blocks.
+    for record in attachments.iter_mut() {
+        if LegacyFlag::from_byte(record.legacy_flag)? != LegacyFlag::Inherit {
+            continue;
+        }
+        let plain = decrypt_legacy_block(&k_legacy_old, &record.legacy_key_block)?;
+        record.legacy_key_block = encrypt_legacy_block(&k_legacy_new, plain.as_ref())?;
+        rotated += 1;
+    }
+
     // Refresh the verification token under K_legacy_new.
     let (iv, ct) = generate_verification_token(&k_legacy_new)?;
     config.legacy.verification_iv_b64 = Some(B64.encode(iv));
@@ -370,7 +391,12 @@ pub fn rotate_legacy_code(
     cleanup_sensitive_file(&writer_tmp_path(&vault_tmp));
     cleanup_sensitive_file(&toml_tmp);
 
-    if let Err(e) = write_vault(&vault_tmp, header, &entries) {
+    if let Err(e) = crate::vault::writer::write_vault_with_attachments(
+        &vault_tmp,
+        header,
+        &entries,
+        &attachments,
+    ) {
         cleanup_sensitive_file(&vault_tmp);
         cleanup_sensitive_file(&writer_tmp_path(&vault_tmp));
         return Err(e);
@@ -422,7 +448,8 @@ where
         ));
     }
 
-    let (old_header, old_entries) = read_vault(&vault_pqd)?;
+    let (old_header, old_entries, old_attachments) =
+        crate::vault::reader::read_vault_with_attachments(&vault_pqd)?;
     let k_legacy = deriver.derive(
         legacy_code.expose_secret().as_bytes(),
         &old_header.legacy_salt,
@@ -443,6 +470,7 @@ where
     // counted as destroyed diary entries in the user-facing report.
     let mut inherited_plaintexts: Vec<(EntryRecord, Zeroizing<Vec<u8>>)> = Vec::new();
     let mut destroyed = 0_usize;
+    let mut inherited_entry_uuids: std::collections::HashSet<[u8; 16]> = Default::default();
     for record in old_entries {
         if record.record_type != RECORD_TYPE_ENTRY {
             continue;
@@ -450,6 +478,7 @@ where
         match LegacyFlag::from_byte(record.legacy_flag)? {
             LegacyFlag::Inherit => {
                 let plain = decrypt_legacy_block(&k_legacy, &record.legacy_key_block)?;
+                inherited_entry_uuids.insert(record.uuid);
                 inherited_plaintexts.push((record, plain));
             }
             LegacyFlag::Destroy => {
@@ -477,6 +506,68 @@ where
     }
     let inherited = new_entries.len();
 
+    // Attachment processing (S13).
+    //
+    // Rules:
+    // - INHERIT attachment + INHERIT parent entry → carry over to new vault.
+    // - INHERIT attachment + DESTROY parent entry → destroyed (REQ-504 cascade).
+    // - DESTROY attachment → destroyed regardless of parent.
+    //
+    // For destroyed attachments we track the blob_uuid as "queued for delete";
+    // for inherited attachments we track it as "surviving". A blob is only
+    // physically removed if it's in queued-for-delete AND not in surviving
+    // (reference-counting per design Q5).
+    let mut new_attachments = Vec::with_capacity(old_attachments.len());
+    let mut inherited_attachments = 0_usize;
+    let mut destroyed_attachments = 0_usize;
+    let mut surviving_blobs: std::collections::HashSet<[u8; 16]> = Default::default();
+    // entry_uuid → number of inherited attachments tied to that entry.
+    let mut per_entry_attach_count: std::collections::HashMap<[u8; 16], u16> = Default::default();
+
+    for record in &old_attachments {
+        let is_inherit = LegacyFlag::from_byte(record.legacy_flag)? == LegacyFlag::Inherit;
+        if !is_inherit {
+            // DESTROY records have no decryptable legacy_key_block, so we
+            // cannot recover the blob_uuid here. The blob is only removed
+            // when a parallel INHERIT sibling identifies it — otherwise
+            // it persists, awaiting an explicit `pq-diary attachment
+            // delete` from the heir.
+            destroyed_attachments += 1;
+            continue;
+        }
+        let lpt = match crate::attachment::decrypt_attachment_legacy_block(record, &k_legacy) {
+            Ok(v) => v,
+            Err(_) => {
+                // Corrupted legacy block on an INHERIT record — treat as destroy.
+                destroyed_attachments += 1;
+                continue;
+            }
+        };
+        if !inherited_entry_uuids.contains(&lpt.entry_uuid) {
+            // REQ-504: parent entry is DESTROY → cascade to attachment.
+            destroyed_attachments += 1;
+            continue;
+        }
+        let entry_uuid_copy = lpt.entry_uuid;
+        let new_rec = crate::attachment::rebuild_attachment_record_for_heir(
+            record.uuid,
+            &lpt,
+            now,
+            &k_legacy,
+            &dsa_seed_zeroized,
+        )?;
+        new_attachments.push(new_rec);
+        surviving_blobs.insert(lpt.blob_uuid);
+        inherited_attachments += 1;
+        *per_entry_attach_count.entry(entry_uuid_copy).or_insert(0) += 1;
+    }
+
+    // Refresh attachment_count on each inherited entry to match what we're
+    // actually writing into the heir's vault.
+    for entry in new_entries.iter_mut() {
+        entry.attachment_count = *per_entry_attach_count.get(&entry.uuid).unwrap_or(&0);
+    }
+
     // Reset the legacy section — the heir starts from a clean slate and can
     // run `pq-diary legacy init` again to nominate their own heir.
     config.legacy.initialized = false;
@@ -489,7 +580,12 @@ where
     cleanup_sensitive_file(&writer_tmp_path(&vault_tmp));
     cleanup_sensitive_file(&toml_tmp);
 
-    if let Err(e) = write_vault(&vault_tmp, new_header, &new_entries) {
+    if let Err(e) = crate::vault::writer::write_vault_with_attachments(
+        &vault_tmp,
+        new_header,
+        &new_entries,
+        &new_attachments,
+    ) {
         cleanup_sensitive_file(&vault_tmp);
         cleanup_sensitive_file(&writer_tmp_path(&vault_tmp));
         return Err(e);
@@ -500,7 +596,12 @@ where
         return Err(e);
     }
 
-    zeroize_non_inherited_record_ciphertexts(&vault_pqd, &old_header)?;
+    let keep_record_uuids: std::collections::HashSet<[u8; 16]> = new_entries
+        .iter()
+        .map(|r| r.uuid)
+        .chain(new_attachments.iter().map(|r| r.uuid))
+        .collect();
+    zeroize_non_inherited_record_ciphertexts(&vault_pqd, &old_header, &keep_record_uuids)?;
     replace_vault_and_toml(
         &vault_pqd,
         &vault_tmp,
@@ -509,10 +610,51 @@ where
         ".bak.legacy",
     )?;
 
+    // After the atomic swap, sweep .attachments/ for blobs that no surviving
+    // INHERIT record refers to. We collect on-disk filenames and prune the
+    // ones not in `surviving_blobs`. This zeroizes-and-deletes orphaned
+    // bodies regardless of whether they were originally INHERIT (parent
+    // entry destroyed) or DESTROY records — matching REQ-302 and REQ-503.
+    let attachments_dir = crate::attachment::attachments_dir(vault_dir);
+    if attachments_dir.is_dir() {
+        if let Ok(read_dir) = std::fs::read_dir(&attachments_dir) {
+            for entry in read_dir.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) != Some("bin") {
+                    continue;
+                }
+                let stem = match path.file_stem().and_then(|s| s.to_str()) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let uuid_bytes = match parse_hex_uuid(stem) {
+                    Some(u) => u,
+                    None => continue,
+                };
+                if !surviving_blobs.contains(&uuid_bytes) {
+                    let _ = crate::attachment::zeroize_and_delete(&path);
+                }
+            }
+        }
+    }
+
     Ok(LegacyAccessReport {
         inherited,
         destroyed,
+        inherited_attachments,
+        destroyed_attachments,
     })
+}
+
+fn parse_hex_uuid(s: &str) -> Option<[u8; 16]> {
+    if s.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for i in 0..16 {
+        out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
 }
 
 // ============================================================================
@@ -546,7 +688,10 @@ fn verify_master(
     Ok(Zeroizing::new(*key.as_ref()))
 }
 
-fn verify_legacy_code(config: &VaultConfig, k_legacy: &[u8; 32]) -> Result<(), DiaryError> {
+pub(crate) fn verify_legacy_code(
+    config: &VaultConfig,
+    k_legacy: &[u8; 32],
+) -> Result<(), DiaryError> {
     let iv_b64 = config
         .legacy
         .verification_iv_b64
@@ -708,6 +853,7 @@ fn zeroize_file_range(file: &mut std::fs::File, offset: u64, len: u64) -> Result
 fn zeroize_non_inherited_record_ciphertexts(
     vault_path: &Path,
     header: &VaultHeader,
+    keep_record_uuids: &std::collections::HashSet<[u8; 16]>,
 ) -> Result<(), DiaryError> {
     use std::io::{Read as _, Seek as _};
 
@@ -737,8 +883,7 @@ fn zeroize_non_inherited_record_ciphertexts(
         let mut payload = vec![0u8; record_len as usize];
         file.read_exact(&mut payload)?;
         let parsed = parse_record_offsets_for_zeroize(&payload)?;
-        let should_zeroize =
-            parsed.record_type != RECORD_TYPE_ENTRY || parsed.legacy_flag != LegacyFlag::Inherit;
+        let should_zeroize = !keep_record_uuids.contains(&parsed.uuid);
         if should_zeroize && parsed.ciphertext_len > 0 {
             zeroize_file_range(
                 &mut file,
@@ -755,36 +900,52 @@ fn zeroize_non_inherited_record_ciphertexts(
 }
 
 struct RecordOffsets {
-    record_type: u8,
-    legacy_flag: LegacyFlag,
+    uuid: [u8; 16],
     ciphertext_offset: usize,
     ciphertext_len: usize,
 }
 
 fn parse_record_offsets_for_zeroize(payload: &[u8]) -> Result<RecordOffsets, DiaryError> {
-    const CT_LEN_OFFSET: usize = 1 + 16 + 8 + 8 + aead::NONCE_SIZE;
-    const CT_OFFSET: usize = CT_LEN_OFFSET + 4;
+    const UUID_OFFSET: usize = 1;
+    const UUID_END: usize = UUID_OFFSET + 16;
 
-    if payload.len() < CT_OFFSET {
+    if payload.len() < UUID_END {
+        return Err(DiaryError::Vault(
+            "record payload is too short for record uuid".to_string(),
+        ));
+    }
+    let record_type = payload[0];
+    let uuid: [u8; 16] = payload[UUID_OFFSET..UUID_END]
+        .try_into()
+        .map_err(|_| DiaryError::Vault("record payload has invalid uuid".to_string()))?;
+    let ct_len_offset = match record_type {
+        RECORD_TYPE_ENTRY | RECORD_TYPE_TEMPLATE => 1 + 16 + 8 + 8 + aead::NONCE_SIZE,
+        RECORD_TYPE_ATTACHMENT => 1 + 16 + aead::NONCE_SIZE,
+        other => {
+            return Err(DiaryError::Vault(format!(
+                "unknown record_type 0x{other:02x} while zeroizing legacy vault"
+            )))
+        }
+    };
+    let ct_offset = checked_add(ct_len_offset, 4, "ciphertext offset")?;
+    if payload.len() < ct_offset {
         return Err(DiaryError::Vault(
             "record payload is too short for ciphertext length".to_string(),
         ));
     }
-    let record_type = payload[0];
-    let ct_len = read_u32_at(payload, CT_LEN_OFFSET, "ciphertext length")? as usize;
-    let sig_len_offset = checked_add(CT_OFFSET, ct_len, "ciphertext end")?;
+    let ct_len = read_u32_at(payload, ct_len_offset, "ciphertext length")? as usize;
+    let sig_len_offset = checked_add(ct_offset, ct_len, "ciphertext end")?;
     let sig_len = read_u32_at(payload, sig_len_offset, "signature length")? as usize;
     let sig_offset = checked_add(sig_len_offset, 4, "signature offset")?;
     let hmac_offset = checked_add(sig_offset, sig_len, "signature end")?;
     let legacy_flag_offset = checked_add(hmac_offset, 32, "content_hmac end")?;
-    let flag_byte = *payload
+    let _flag_byte = *payload
         .get(legacy_flag_offset)
         .ok_or_else(|| DiaryError::Vault("record payload is missing legacy flag".to_string()))?;
 
     Ok(RecordOffsets {
-        record_type,
-        legacy_flag: LegacyFlag::from_byte(flag_byte)?,
-        ciphertext_offset: CT_OFFSET,
+        uuid,
+        ciphertext_offset: ct_offset,
         ciphertext_len: ct_len,
     })
 }
@@ -974,6 +1135,14 @@ mod tests {
 
     fn vault_pqd_str(vault_dir: &Path) -> String {
         vault_dir.join("vault.pqd").to_str().unwrap().to_string()
+    }
+
+    fn hex_to_uuid(hex: &str) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        for i in 0..16 {
+            out[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        out
     }
 
     fn always_confirm(_: ConfirmationMode) -> Result<bool, DiaryError> {
@@ -1514,7 +1683,8 @@ mod tests {
             .clone();
         assert!(destroy_before.iter().any(|&b| b != 0));
 
-        zeroize_non_inherited_record_ciphertexts(&vault_pqd, &header).unwrap();
+        let keep_record_uuids = std::collections::HashSet::from([hex_to_uuid(&ids[0])]);
+        zeroize_non_inherited_record_ciphertexts(&vault_pqd, &header, &keep_record_uuids).unwrap();
 
         let (_header_after, records_after) = read_vault(&vault_pqd).unwrap();
         let inherit_after = records_after
@@ -1598,5 +1768,107 @@ mod tests {
         heir.unlock(secret("legacy-code")).unwrap();
         assert!(heir.list_entries(None).unwrap().is_empty());
         assert!(heir.list_templates().unwrap().is_empty());
+    }
+
+    /// TC-S13-LEGACY-01: legacy-access carries INHERIT attachments only when
+    /// their parent entry is also INHERIT, and destroys cascaded blobs.
+    #[test]
+    fn tc_s13_legacy_access_attachment_inherit_and_parent_cascade() {
+        let dir = tempdir().unwrap();
+        let (vault_dir, ids) = vault_with_one_entry(&dir, 2);
+
+        let keep_src = dir.path().join("keep.txt");
+        let drop_src = dir.path().join("drop.txt");
+        std::fs::write(&keep_src, b"keep payload").unwrap();
+        std::fs::write(&drop_src, b"drop payload").unwrap();
+
+        crate::attachment::add_attachment(
+            &vault_dir,
+            &secret("master-pw"),
+            &ids[0][..8],
+            &keep_src,
+        )
+        .unwrap();
+        crate::attachment::add_attachment(
+            &vault_dir,
+            &secret("master-pw"),
+            &ids[1][..8],
+            &drop_src,
+        )
+        .unwrap();
+
+        set_entry_flag(
+            &vault_dir,
+            &secret("master-pw"),
+            Some(&secret("legacy-code")),
+            &ids[0][..8],
+            LegacyFlag::Inherit,
+            &fast_deriver(),
+        )
+        .unwrap();
+        crate::attachment::set_attachment_legacy_flag(
+            &vault_dir,
+            &secret("master-pw"),
+            Some(&secret("legacy-code")),
+            &ids[0][..8],
+            "keep.txt",
+            LegacyFlag::Inherit,
+            &fast_deriver(),
+        )
+        .unwrap();
+        crate::attachment::set_attachment_legacy_flag(
+            &vault_dir,
+            &secret("master-pw"),
+            Some(&secret("legacy-code")),
+            &ids[1][..8],
+            "drop.txt",
+            LegacyFlag::Inherit,
+            &fast_deriver(),
+        )
+        .unwrap();
+
+        let dropped = crate::attachment::list_attachments(
+            &vault_dir,
+            &secret("master-pw"),
+            Some(&ids[1][..8]),
+        )
+        .unwrap();
+        let dropped_blob = crate::attachment::blob_path(&vault_dir, &dropped[0].blob_uuid);
+
+        let report = execute_legacy_access(
+            &vault_dir,
+            &secret("legacy-code"),
+            &fast_deriver(),
+            always_confirm,
+        )
+        .unwrap();
+        assert_eq!(report.inherited, 1);
+        assert_eq!(report.destroyed, 1);
+        assert_eq!(report.inherited_attachments, 1);
+        assert_eq!(report.destroyed_attachments, 1);
+        assert!(
+            !dropped_blob.exists(),
+            "attachment whose parent entry is DESTROY must be physically removed"
+        );
+
+        let metas = crate::attachment::list_attachments(
+            &vault_dir,
+            &secret("legacy-code"),
+            Some(&ids[0][..8]),
+        )
+        .unwrap();
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].filename, "keep.txt");
+
+        let restored = dir.path().join("restored.txt");
+        crate::attachment::extract_attachment(
+            &vault_dir,
+            &secret("legacy-code"),
+            &ids[0][..8],
+            "keep.txt",
+            &restored,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(restored).unwrap(), b"keep payload");
     }
 }

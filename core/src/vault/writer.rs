@@ -13,7 +13,7 @@ use std::path::Path;
 use rand::Rng;
 
 use crate::error::DiaryError;
-use crate::vault::format::{EntryRecord, VaultHeader, MAGIC};
+use crate::vault::format::{AttachmentRecord, EntryRecord, VaultHeader, MAGIC, SCHEMA_VERSION};
 
 // Fixed size of the on-disk verification-token ciphertext field (bytes 92-140).
 const VERIFICATION_CT_LEN: usize = 48;
@@ -106,6 +106,18 @@ pub fn write_header<W: Write>(writer: &mut W, header: &VaultHeader) -> Result<()
 /// After all records a zero sentinel (`0u32` in LE) is appended so readers
 /// can detect the end of the entry section without a separate count field.
 pub fn write_entries<W: Write>(writer: &mut W, entries: &[EntryRecord]) -> Result<(), DiaryError> {
+    write_entries_no_sentinel(writer, entries)?;
+    writer.write_all(&0u32.to_le_bytes())?;
+    Ok(())
+}
+
+/// Like [`write_entries`] but does NOT emit the zero sentinel — used by
+/// [`write_vault_with_attachments`] so it can stitch entries + attachments
+/// together and emit the sentinel exactly once at the end.
+fn write_entries_no_sentinel<W: Write>(
+    writer: &mut W,
+    entries: &[EntryRecord],
+) -> Result<(), DiaryError> {
     for entry in entries {
         // Serialise the record payload into a temporary buffer so we know the length.
         let mut payload: Vec<u8> = Vec::new();
@@ -152,9 +164,58 @@ pub fn write_entries<W: Write>(writer: &mut W, entries: &[EntryRecord]) -> Resul
         writer.write_all(&payload)?;
     }
 
-    // Zero sentinel — signals end of entry section to the reader.
-    writer.write_all(&0u32.to_le_bytes())?;
+    Ok(())
+}
 
+/// Serialise an [`AttachmentRecord`] slice into `writer` using the same
+/// length-prefixed layout as [`write_entries`] but with the
+/// attachment-specific payload schema. Does NOT emit a zero sentinel —
+/// callers stitching entries + attachments together should write attachments
+/// after entries and emit the sentinel once at the end.
+pub fn write_attachments<W: Write>(
+    writer: &mut W,
+    attachments: &[AttachmentRecord],
+) -> Result<(), DiaryError> {
+    for a in attachments {
+        let mut payload: Vec<u8> = Vec::new();
+
+        payload.push(a.record_type);
+        payload.extend_from_slice(&a.uuid);
+        payload.extend_from_slice(&a.iv);
+
+        let ct_len = u32::try_from(a.ciphertext.len()).map_err(|_| {
+            DiaryError::Vault("attachment ciphertext length exceeds u32 maximum".to_string())
+        })?;
+        payload.extend_from_slice(&ct_len.to_le_bytes());
+        payload.extend_from_slice(&a.ciphertext);
+
+        let sig_len = u32::try_from(a.signature.len()).map_err(|_| {
+            DiaryError::Vault("attachment signature length exceeds u32 maximum".to_string())
+        })?;
+        payload.extend_from_slice(&sig_len.to_le_bytes());
+        payload.extend_from_slice(&a.signature);
+
+        payload.extend_from_slice(&a.content_hmac);
+        payload.push(a.legacy_flag);
+
+        let lkb_len = u32::try_from(a.legacy_key_block.len()).map_err(|_| {
+            DiaryError::Vault("attachment legacy_key_block length exceeds u32 maximum".to_string())
+        })?;
+        payload.extend_from_slice(&lkb_len.to_le_bytes());
+        payload.extend_from_slice(&a.legacy_key_block);
+
+        let pad_len = u8::try_from(a.padding.len()).map_err(|_| {
+            DiaryError::Vault("attachment padding length exceeds 255-byte maximum".to_string())
+        })?;
+        payload.push(pad_len);
+        payload.extend_from_slice(&a.padding);
+
+        let record_len = u32::try_from(payload.len()).map_err(|_| {
+            DiaryError::Vault("attachment record length exceeds u32 maximum".to_string())
+        })?;
+        writer.write_all(&record_len.to_le_bytes())?;
+        writer.write_all(&payload)?;
+    }
     Ok(())
 }
 
@@ -170,14 +231,38 @@ pub fn write_entries<W: Write>(writer: &mut W, entries: &[EntryRecord]) -> Resul
 /// Returns [`DiaryError::Io`] on any I/O failure.
 pub fn write_vault(
     path: &Path,
-    mut header: VaultHeader,
+    header: VaultHeader,
     entries: &[EntryRecord],
 ) -> Result<(), DiaryError> {
-    // Serialise entries first to measure the exact payload size.
+    let attachments = match crate::vault::reader::read_vault_with_attachments(path) {
+        Ok((_existing_header, _existing_entries, attachments)) => attachments,
+        Err(DiaryError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e),
+    };
+    write_vault_with_attachments(path, header, entries, &attachments)
+}
+
+/// Write a complete vault containing entries + attachments (S13). The
+/// attachment records are appended after the entry records in the same
+/// length-prefixed payload section, and the zero sentinel terminates both.
+pub fn write_vault_with_attachments(
+    path: &Path,
+    mut header: VaultHeader,
+    entries: &[EntryRecord],
+    attachments: &[AttachmentRecord],
+) -> Result<(), DiaryError> {
+    // All writes migrate accepted older vaults to the current schema.
+    header.schema_version = SCHEMA_VERSION;
+
+    // Serialise records first to measure the exact payload size.
+    // Entries first, then attachments, then the single zero sentinel —
+    // matches the partitioning logic in `reader::read_records`.
     let mut entry_buf: Vec<u8> = Vec::new();
-    write_entries(&mut entry_buf, entries)?;
+    write_entries_no_sentinel(&mut entry_buf, entries)?;
+    write_attachments(&mut entry_buf, attachments)?;
+    entry_buf.extend_from_slice(&0u32.to_le_bytes()); // sentinel
     header.payload_size = u32::try_from(entry_buf.len())
-        .map_err(|_| DiaryError::Vault("entry section length exceeds u32 maximum".to_string()))?;
+        .map_err(|_| DiaryError::Vault("payload section length exceeds u32 maximum".to_string()))?;
 
     // Generate cryptographically random padding (512–4 096 bytes).
     let mut rng = rand::thread_rng();
@@ -234,7 +319,10 @@ pub fn write_vault(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vault::format::{EntryRecord, VaultHeader, MAGIC, RECORD_TYPE_ENTRY};
+    use crate::vault::format::{
+        AttachmentRecord, EntryRecord, VaultHeader, MAGIC, RECORD_TYPE_ATTACHMENT,
+        RECORD_TYPE_ENTRY,
+    };
 
     /// Build a minimal [`EntryRecord`] with known content for testing.
     fn make_test_entry() -> EntryRecord {
@@ -251,6 +339,20 @@ mod tests {
             legacy_key_block: vec![],
             attachment_count: 0,
             attachment_offset: 0,
+            padding: vec![],
+        }
+    }
+
+    fn make_test_attachment() -> AttachmentRecord {
+        AttachmentRecord {
+            record_type: RECORD_TYPE_ATTACHMENT,
+            uuid: [0xCDu8; 16],
+            iv: [0x02u8; 12],
+            ciphertext: vec![0xAA, 0xBB],
+            signature: vec![0xCC],
+            content_hmac: [0x7Eu8; 32],
+            legacy_flag: 0x00,
+            legacy_key_block: vec![],
             padding: vec![],
         }
     }
@@ -416,5 +518,23 @@ mod tests {
             "must read back 1 entry after atomic write"
         );
         assert_eq!(entries[0].uuid, [0xABu8; 16]);
+    }
+
+    /// TC-S13-W01: any write migrates the header to the current schema version.
+    #[test]
+    fn tc_s13_w01_write_stamps_current_schema() {
+        use crate::vault::reader::read_header;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault.pqd");
+        let mut header = VaultHeader::new();
+        header.schema_version = 0x04;
+
+        write_vault_with_attachments(&path, header, &[], &[make_test_attachment()])
+            .expect("write_vault_with_attachments");
+
+        let mut file = std::fs::File::open(&path).expect("open vault");
+        let parsed = read_header(&mut file).expect("read_header");
+        assert_eq!(parsed.schema_version, crate::vault::format::SCHEMA_VERSION);
     }
 }

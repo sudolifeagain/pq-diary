@@ -178,6 +178,9 @@ impl std::ops::Deref for VaultGuard<'_> {
 ///
 /// Returns an error if password acquisition, vault unlock, editor launch,
 /// stdin read, or entry creation fails.
+/// Convenience wrapper retained for test call sites (production dispatch
+/// uses [`cmd_new_with_attach`] directly).
+#[allow(dead_code)]
 pub fn cmd_new(
     cli: &Cli,
     title: Option<String>,
@@ -185,12 +188,29 @@ pub fn cmd_new(
     tags: Vec<String>,
     template: Option<String>,
 ) -> anyhow::Result<()> {
+    cmd_new_with_attach(cli, title, body, tags, template, Vec::new())
+}
+
+/// Same as [`cmd_new`] but additionally attaches each `attach` file to the
+/// freshly-created entry (S13). On attach failure the entry is not rolled back —
+/// the user can re-run `attachment add` or `delete` the partial entry.
+pub fn cmd_new_with_attach(
+    cli: &Cli,
+    title: Option<String>,
+    body: Option<String>,
+    tags: Vec<String>,
+    template: Option<String>,
+    attach: Vec<PathBuf>,
+) -> anyhow::Result<()> {
     use pq_diary_core::policy::OperationType;
     use secrecy::{ExposeSecret as _, SecretBox};
     use std::io::{BufRead as _, IsTerminal as _, Read as _};
 
     // Step 0: Policy check (before any password prompt or vault decryption).
     check_claude_policy(cli, OperationType::Write)?;
+    if cli.claude && !attach.is_empty() {
+        anyhow::bail!("--attach is not permitted with --claude");
+    }
 
     // Step 1: Obtain password and unlock the vault.
     let password_source =
@@ -329,6 +349,28 @@ pub fn cmd_new(
     // Step 5: Print success message with an 8-character ID prefix.
     let prefix = &uuid_hex[..8];
     println!("Created: {prefix} \"{actual_title}\"");
+
+    // Step 6 (S13): Attach files if --attach was given. Drop the vault guard
+    // so that `add_attachment` (which self-locks) gets clean ownership.
+    if !attach.is_empty() {
+        drop(guard);
+        let vault_dir = resolve_legacy_vault_dir(cli)?;
+        let master_pwd: secrecy::SecretString =
+            SecretBox::new(Box::from(password_source.secret().expose_secret()));
+        for path in &attach {
+            match pq_diary_core::attachment::add_attachment(&vault_dir, &master_pwd, prefix, path) {
+                Ok(_) => {
+                    let filename = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("attachment");
+                    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                    println!("Attached: {filename} ({})", human_size(size));
+                }
+                Err(e) => anyhow::bail!("failed to attach {}: {e}", path.display()),
+            }
+        }
+    }
 
     // guard drops here, automatically calling lock().
     Ok(())
@@ -492,6 +534,34 @@ fn cmd_show_impl(cli: &Cli, id: String, out: &mut dyn std::io::Write) -> anyhow:
                     }
                 }
             }
+        }
+    }
+
+    // Display attachments (S13). Lists the attachment record(s) tied to this
+    // entry by re-opening the vault directory; `record.attachment_count`
+    // tells us whether to bother.
+    if record.attachment_count > 0 {
+        let vault_dir = resolve_legacy_vault_dir(cli)?;
+        let listing_pwd: secrecy::SecretString =
+            SecretBox::new(Box::from(password_source.secret().expose_secret()));
+        match pq_diary_core::attachment::list_attachments(&vault_dir, &listing_pwd, Some(&id)) {
+            Ok(metas) if !metas.is_empty() => {
+                writeln!(out).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+                writeln!(out, "--- Attachments ({}) ---", metas.len())
+                    .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+                for m in &metas {
+                    writeln!(
+                        out,
+                        "  {} ({}, {})",
+                        m.filename,
+                        human_size(m.size_bytes),
+                        m.mime_type,
+                    )
+                    .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+                }
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("warning: failed to list attachments: {e}"),
         }
     }
 
@@ -2628,17 +2698,98 @@ fn cmd_export_impl(
     }
 
     let count = targets.len();
+    // S13: attachment dir (created lazily — only if any entry has attachments).
+    let attachments_dir = dir.join("attachments");
+    let mut attachment_count = 0_usize;
+    let mut exported_attachment_files: std::collections::HashMap<String, [u8; 32]> =
+        std::collections::HashMap::new();
     for (meta, path) in &targets {
         let id_hex = meta.uuid_hex.clone();
         let (_, plaintext) = guard
             .get_entry(&id_hex)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let content = build_export_content(meta, &plaintext.body);
+        // Build base MD body.
+        let mut body = plaintext.body.clone();
+
+        // S13: append `![[filename]]` for each attachment, and extract the
+        // decrypted file into `<dir>/attachments/`.
+        let listing_pwd: secrecy::SecretString =
+            secrecy::SecretBox::new(Box::from(password_source.secret().expose_secret()));
+        if let Ok(metas) =
+            pq_diary_core::attachment::list_attachments(&vault_dir, &listing_pwd, Some(&id_hex))
+        {
+            if !metas.is_empty() {
+                std::fs::create_dir_all(&attachments_dir).map_err(|e| {
+                    anyhow::anyhow!("Failed to create {}: {e}", attachments_dir.display())
+                })?;
+                if !body.is_empty() && !body.ends_with('\n') {
+                    body.push('\n');
+                }
+                for m in &metas {
+                    let mut export_filename = m.filename.clone();
+                    let mut out_path = attachments_dir.join(&export_filename);
+                    let mut already_exported = false;
+
+                    if let Some(existing_sha) = exported_attachment_files.get(&export_filename) {
+                        if existing_sha == &m.sha256 {
+                            already_exported = true;
+                        } else {
+                            export_filename = disambiguate_attachment_export_filename(
+                                &m.filename,
+                                &m.sha256,
+                                &attachments_dir,
+                                &exported_attachment_files,
+                            );
+                            out_path = attachments_dir.join(&export_filename);
+                        }
+                    } else if out_path.exists() {
+                        export_filename = disambiguate_attachment_export_filename(
+                            &m.filename,
+                            &m.sha256,
+                            &attachments_dir,
+                            &exported_attachment_files,
+                        );
+                        out_path = attachments_dir.join(&export_filename);
+                    }
+                    if exported_attachment_files
+                        .get(&export_filename)
+                        .is_some_and(|existing_sha| existing_sha == &m.sha256)
+                    {
+                        already_exported = true;
+                    }
+
+                    if !already_exported {
+                        pq_diary_core::attachment::extract_attachment(
+                            &vault_dir,
+                            &listing_pwd,
+                            &id_hex,
+                            &m.filename,
+                            &out_path,
+                        )
+                        .map_err(|e| anyhow::anyhow!("attachment extract: {e}"))?;
+                        exported_attachment_files.insert(export_filename.clone(), m.sha256);
+                    }
+                    body.push_str(&format!("\n![[{}]]", export_filename));
+                    attachment_count += 1;
+                }
+            }
+        }
+
+        let content = build_export_content(meta, &body);
         std::fs::write(path, content)
             .map_err(|e| anyhow::anyhow!("Failed to write {}: {e}", path.display()))?;
     }
 
-    println!("Exported {} entries to {}", count, dir.display());
+    if attachment_count > 0 {
+        println!(
+            "Exported {} entries with {} attachments to {}",
+            count,
+            attachment_count,
+            dir.display()
+        );
+    } else {
+        println!("Exported {} entries to {}", count, dir.display());
+    }
     Ok(())
 }
 
@@ -2675,6 +2826,45 @@ fn build_export_content(meta: &pq_diary_core::EntryMeta, body: &str) -> String {
     out.push_str("---\n\n");
     out.push_str(body);
     out
+}
+
+fn disambiguate_attachment_export_filename(
+    filename: &str,
+    sha256: &[u8; 32],
+    attachments_dir: &std::path::Path,
+    exported: &std::collections::HashMap<String, [u8; 32]>,
+) -> String {
+    let suffix = short_sha_hex(sha256);
+    let path = std::path::Path::new(filename);
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("attachment");
+    let ext = path.extension().and_then(|s| s.to_str());
+
+    for attempt in 0..1000 {
+        let candidate = match (ext, attempt) {
+            (Some(ext), 0) => format!("{stem}-{suffix}.{ext}"),
+            (None, 0) => format!("{stem}-{suffix}"),
+            (Some(ext), n) => format!("{stem}-{suffix}-{n}.{ext}"),
+            (None, n) => format!("{stem}-{suffix}-{n}"),
+        };
+        if let Some(existing_sha) = exported.get(&candidate) {
+            if existing_sha == sha256 {
+                return candidate;
+            }
+            continue;
+        }
+        if !attachments_dir.join(&candidate).exists() {
+            return candidate;
+        }
+    }
+
+    format!("{stem}-{suffix}-overflow")
+}
+
+fn short_sha_hex(sha256: &[u8; 32]) -> String {
+    sha256.iter().take(4).map(|b| format!("{b:02x}")).collect()
 }
 
 fn slugify(title: &str) -> String {
@@ -3058,6 +3248,243 @@ fn prompt_phrase(expected: &str) -> Result<bool, pq_diary_core::error::DiaryErro
         .read_line(&mut line)
         .map_err(pq_diary_core::error::DiaryError::Io)?;
     Ok(line.trim() == expected)
+}
+
+// ---------------------------------------------------------------------------
+// Attachment commands (S13)
+// ---------------------------------------------------------------------------
+
+fn human_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max - 1).collect();
+        out.push('…');
+        out
+    }
+}
+
+fn attachment_argon2_deriver(
+    vault_dir: &std::path::Path,
+) -> anyhow::Result<pq_diary_core::legacy::Argon2LegacyDeriver> {
+    Ok(pq_diary_core::legacy::Argon2LegacyDeriver::new(
+        argon2_params_from_vault(vault_dir)?,
+    ))
+}
+
+/// `pq-diary attachment add <ENTRY_ID> <FILE>` 相当。
+pub fn cmd_attachment_add(cli: &Cli, entry: String, path: PathBuf) -> anyhow::Result<()> {
+    use pq_diary_core::attachment::add_attachment;
+    use secrecy::{ExposeSecret as _, SecretBox, SecretString};
+
+    if cli.claude {
+        anyhow::bail!("attachment add is not permitted with --claude");
+    }
+    let vault_dir = resolve_legacy_vault_dir(cli)?;
+    let master_source = get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let master_pwd: SecretString =
+        SecretBox::new(Box::from(master_source.secret().expose_secret()));
+    drop(master_source);
+
+    let uuid = add_attachment(&vault_dir, &master_pwd, &entry, &path)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("attachment");
+    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    println!(
+        "Added: {filename} ({}) → {} (record {})",
+        human_size(size),
+        entry,
+        uuid.as_simple()
+    );
+    Ok(())
+}
+
+/// `pq-diary attachment list [<ENTRY_ID>]` 相当。
+pub fn cmd_attachment_list(cli: &Cli, entry: Option<String>) -> anyhow::Result<()> {
+    use pq_diary_core::attachment::list_attachments;
+    use pq_diary_core::legacy::LegacyFlag;
+    use pq_diary_core::policy::OperationType;
+    use secrecy::{ExposeSecret as _, SecretBox, SecretString};
+
+    if cli.claude {
+        // R1 recommendation: list is read-only; allow under `full` policy only.
+        check_claude_policy(cli, OperationType::Read)?;
+    }
+    let vault_dir = resolve_legacy_vault_dir(cli)?;
+    let master_source = get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let master_pwd: SecretString =
+        SecretBox::new(Box::from(master_source.secret().expose_secret()));
+    drop(master_source);
+
+    let metas = list_attachments(&vault_dir, &master_pwd, entry.as_deref())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if metas.is_empty() {
+        println!("No attachments.");
+        return Ok(());
+    }
+    println!(
+        "{:<10} {:<24} {:>10}  {:<12} FLAG",
+        "ENTRY", "FILE", "SIZE", "ADDED"
+    );
+    for m in &metas {
+        let entry_short: String = m
+            .entry_uuid
+            .iter()
+            .take(4)
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let flag = match m.legacy_flag {
+            LegacyFlag::Inherit => "INHERIT",
+            LegacyFlag::Destroy => "DESTROY",
+        };
+        println!(
+            "{:<10} {:<24} {:>10}  {:<12} {}",
+            entry_short,
+            truncate(&m.filename, 24),
+            human_size(m.size_bytes),
+            format_timestamp(m.created_at),
+            flag,
+        );
+    }
+    println!();
+    println!("Summary: {} attachment(s)", metas.len());
+    Ok(())
+}
+
+/// `pq-diary attachment extract <ENTRY_ID> <FILE> --out <PATH>` 相当。
+pub fn cmd_attachment_extract(
+    cli: &Cli,
+    entry: String,
+    filename: String,
+    out: PathBuf,
+) -> anyhow::Result<()> {
+    use pq_diary_core::attachment::extract_attachment;
+    use secrecy::{ExposeSecret as _, SecretBox, SecretString};
+
+    if cli.claude {
+        anyhow::bail!("attachment extract is not permitted with --claude");
+    }
+    let vault_dir = resolve_legacy_vault_dir(cli)?;
+    let master_source = get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let master_pwd: SecretString =
+        SecretBox::new(Box::from(master_source.secret().expose_secret()));
+    drop(master_source);
+
+    extract_attachment(&vault_dir, &master_pwd, &entry, &filename, &out)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!(
+        "Extracted: {filename} → {} (SHA-256 verified)",
+        out.display()
+    );
+    Ok(())
+}
+
+/// `pq-diary attachment delete <ENTRY_ID> <FILE> [--force]` 相当。
+pub fn cmd_attachment_delete(
+    cli: &Cli,
+    entry: String,
+    filename: String,
+    force: bool,
+) -> anyhow::Result<()> {
+    use pq_diary_core::attachment::delete_attachment;
+    use secrecy::{ExposeSecret as _, SecretBox, SecretString};
+
+    if cli.claude {
+        anyhow::bail!("attachment delete is not permitted with --claude");
+    }
+    if !force {
+        print!("Delete attachment '{filename}' from entry {entry}? [y/N]: ");
+        use std::io::{BufRead as _, Write as _};
+        std::io::stdout().flush().ok();
+        let mut line = String::new();
+        std::io::stdin().lock().read_line(&mut line)?;
+        if !matches!(line.trim(), "y" | "Y" | "yes" | "YES") {
+            anyhow::bail!("cancelled");
+        }
+    }
+    let vault_dir = resolve_legacy_vault_dir(cli)?;
+    let master_source = get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let master_pwd: SecretString =
+        SecretBox::new(Box::from(master_source.secret().expose_secret()));
+    drop(master_source);
+
+    delete_attachment(&vault_dir, &master_pwd, &entry, &filename)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!("Deleted: {filename}");
+    Ok(())
+}
+
+/// `pq-diary attachment set <ENTRY_ID> <FILE> --inherit | --destroy` 相当。
+pub fn cmd_attachment_set(
+    cli: &Cli,
+    entry: String,
+    filename: String,
+    inherit: bool,
+    destroy: bool,
+) -> anyhow::Result<()> {
+    use pq_diary_core::attachment::set_attachment_legacy_flag;
+    use pq_diary_core::legacy::LegacyFlag;
+    use secrecy::{ExposeSecret as _, SecretBox, SecretString};
+
+    if cli.claude {
+        anyhow::bail!("attachment set is not permitted with --claude");
+    }
+    let flag = match (inherit, destroy) {
+        (true, false) => LegacyFlag::Inherit,
+        (false, true) => LegacyFlag::Destroy,
+        (false, false) => anyhow::bail!("--inherit or --destroy is required"),
+        (true, true) => anyhow::bail!("--inherit cannot be used with --destroy"),
+    };
+
+    let vault_dir = resolve_legacy_vault_dir(cli)?;
+    let master_source = get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let master_pwd: SecretString =
+        SecretBox::new(Box::from(master_source.secret().expose_secret()));
+    drop(master_source);
+
+    let legacy_code_opt = if flag == LegacyFlag::Inherit {
+        Some(
+            crate::password::prompt_password("Legacy code: ")
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+        )
+    } else {
+        None
+    };
+
+    let deriver = attachment_argon2_deriver(&vault_dir)?;
+    set_attachment_legacy_flag(
+        &vault_dir,
+        &master_pwd,
+        legacy_code_opt.as_ref(),
+        &entry,
+        &filename,
+        flag,
+        &deriver,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    match flag {
+        LegacyFlag::Inherit => println!("Attachment '{filename}' set to INHERIT"),
+        LegacyFlag::Destroy => println!("Attachment '{filename}' set to DESTROY"),
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -9688,6 +10115,23 @@ parallelism = 1
         let name = build_export_filename(&meta);
         assert!(name.starts_with("2025-05-17-Hello-World-3c6b775f"));
         assert!(name.ends_with(".md"));
+    }
+
+    /// TC-501-AttachmentName: same attachment filename with different content is disambiguated.
+    #[test]
+    fn tc_501_attachment_export_filename_disambiguates_collision() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut exported = std::collections::HashMap::new();
+        exported.insert("photo.png".to_string(), [0x11; 32]);
+
+        let name = disambiguate_attachment_export_filename(
+            "photo.png",
+            &[0x22; 32],
+            dir.path(),
+            &exported,
+        );
+
+        assert_eq!(name, "photo-22222222.png");
     }
 
     /// TC-503-01: build_export_content emits expected YAML keys.

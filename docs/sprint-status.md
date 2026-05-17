@@ -1,6 +1,6 @@
 # Sprint Status
 
-## Current: Sprint 9 — セキュリティ硬化 + 統合テスト + 技術的負債 (completed)
+## Current: Sprint 10 — 運用機能 + CLI整合性 (in_progress)
 
 ## Progress
 
@@ -15,6 +15,7 @@
 | S7 | アクセス制御 + Claude連携 | completed (s7-done) | 7 |
 | S8 | Git連携 | completed (s8-done) | 8 |
 | S9 | セキュリティ硬化 + 統合テスト + 技術的負債 | completed (s9-done) | 9 |
+| S10 | 運用機能 + CLI整合性 | in_progress | 10 |
 
 ## Sprint Scope
 
@@ -80,3 +81,12 @@
 - PR_SET_DUMPABLE, コアダンプ無効化
 - クロスプラットフォームビルド確認
 - 統合テスト + パフォーマンス検証
+
+### S10: 運用機能 + CLI整合性
+- init コマンド実装 (vault create と切り分け: config.toml + default vault 生成)
+- sync コマンド実装 (config 駆動ディスパッチャ、Phase 1 では git バックエンド固定)
+- change-password (全エントリ再暗号化、アトミック書き戻し)
+- info / info --security (vault メタ情報・鍵パラメータ・セキュリティ状態表示)
+- export [DIR] (全エントリ復号して MD 書き出し、--claude ブロック対象)
+- DoD 強化: CLI ヘルプと実装の整合性チェック追加 (smoke test)
+- 未実装スケルトン整理: legacy/daemon を `#[command(hide = true)]` でヘルプから除外

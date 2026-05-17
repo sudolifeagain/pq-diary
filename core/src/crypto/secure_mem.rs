@@ -235,17 +235,25 @@ pub fn munlock_master_key(mk: &MasterKey) -> Result<(), DiaryError> {
 
 #[cfg(unix)]
 fn mlock_buffer_platform(buf: &[u8]) -> Result<(), DiaryError> {
-    // SAFETY: `buf` is a valid, live, non-empty slice.
+    // nix 0.29+ requires NonNull<c_void> instead of a raw pointer.
+    let ptr = std::ptr::NonNull::new(buf.as_ptr() as *mut core::ffi::c_void)
+        .ok_or_else(|| DiaryError::Crypto("mlock: buffer pointer is null".to_string()))?;
+    // SAFETY: `buf` is a valid, live, non-empty slice; `ptr` is derived from it
+    // and is non-null by the check above.
     // `mlock(2)` is in CLAUDE.md's allowed unsafe list.
-    unsafe { nix::sys::mman::mlock(buf.as_ptr() as *const _, buf.len()) }
+    unsafe { nix::sys::mman::mlock(ptr, buf.len()) }
         .map_err(|e| DiaryError::Crypto(format!("mlock failed: {e}")))
 }
 
 #[cfg(unix)]
 fn munlock_buffer_platform(buf: &[u8]) -> Result<(), DiaryError> {
-    // SAFETY: `buf` is a valid, live, non-empty slice.
+    // nix 0.29+ requires NonNull<c_void> instead of a raw pointer.
+    let ptr = std::ptr::NonNull::new(buf.as_ptr() as *mut core::ffi::c_void)
+        .ok_or_else(|| DiaryError::Crypto("munlock: buffer pointer is null".to_string()))?;
+    // SAFETY: `buf` is a valid, live, non-empty slice; `ptr` is derived from it
+    // and is non-null by the check above.
     // `munlock(2)` is in CLAUDE.md's allowed unsafe list.
-    unsafe { nix::sys::mman::munlock(buf.as_ptr() as *const _, buf.len()) }
+    unsafe { nix::sys::mman::munlock(ptr, buf.len()) }
         .map_err(|e| DiaryError::Crypto(format!("munlock failed: {e}")))
 }
 

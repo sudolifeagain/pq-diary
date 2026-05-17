@@ -11,6 +11,8 @@ use std::path::PathBuf;
 
 use secrecy::ExposeSecret;
 
+/// Attachment CRUD + legacy integration (S13).
+pub mod attachment;
 /// Secure memory types: `SecureBuffer`, `ZeroizingKey`, `MasterKey`, `CryptoEngine`.
 pub mod crypto;
 /// Entry CRUD operations (implemented in Sprint 4).

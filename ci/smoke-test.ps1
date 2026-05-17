@@ -50,7 +50,7 @@ $subcommands = @(
     'new', 'list', 'show', 'edit', 'delete',
     'today', 'search', 'stats', 'import', 'vault',
     'git-init', 'git-push', 'git-pull', 'git-sync', 'git-status',
-    'template', 'legacy', 'legacy-access'
+    'template', 'legacy', 'legacy-access', 'attachment'
 )
 
 foreach ($cmd in $subcommands) {
@@ -83,6 +83,19 @@ if ($legacyHelp -match 'init') {
     Assert-Pass "legacy --help lists 'init'"
 } else {
     Assert-Fail "legacy --help missing 'init'"
+}
+
+# Attachment subcommand listing (S13).
+$attachmentHelp = (& $Bin attachment --help 2>&1 | Out-String)
+if ($attachmentHelp -match 'add') {
+    Assert-Pass "attachment --help lists 'add'"
+} else {
+    Assert-Fail "attachment --help missing 'add'"
+}
+if ($attachmentHelp -match 'extract') {
+    Assert-Pass "attachment --help lists 'extract'"
+} else {
+    Assert-Fail "attachment --help missing 'extract'"
 }
 
 # ---------------------------------------------------------------------------

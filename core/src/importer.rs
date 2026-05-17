@@ -28,6 +28,59 @@ static WIKI_LINK_RE: LazyLock<Regex> =
 
 static TAG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"#([\w/]+)").unwrap());
 
+/// Obsidian attachment-embed pattern: `![[filename.ext]]` (S13).
+static ATTACHMENT_LINK_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"!\[\[([^\]|]+)(?:\|[^\]]+)?\]\]").unwrap());
+
+/// Extract every `![[filename]]` reference from a markdown body, returning
+/// the captured filenames in document order (duplicates preserved). Used by
+/// the CLI import path to walk source `attachments/<filename>` files and
+/// attach them to the freshly-imported entry (S13).
+pub fn parse_obsidian_attachment_links(body: &str) -> Vec<String> {
+    ATTACHMENT_LINK_RE
+        .captures_iter(body)
+        .map(|c| c[1].trim().to_string())
+        .collect()
+}
+
+#[cfg(test)]
+mod attachment_link_tests {
+    use super::parse_obsidian_attachment_links;
+
+    /// TC-S13-010-01: extracts single ![[FILE]] reference.
+    #[test]
+    fn tc_s13_010_01_single_link() {
+        let body = "See ![[photo.png]] for details.";
+        assert_eq!(parse_obsidian_attachment_links(body), vec!["photo.png"]);
+    }
+
+    /// TC-S13-010-02: extracts multiple references in document order.
+    #[test]
+    fn tc_s13_010_02_multiple_links() {
+        let body = "![[a.png]] and ![[b.pdf]]\n\nand ![[c.txt]]";
+        assert_eq!(
+            parse_obsidian_attachment_links(body),
+            vec!["a.png", "b.pdf", "c.txt"]
+        );
+    }
+
+    /// TC-S13-010-03: ignores plain `[[wiki links]]` (no leading `!`).
+    #[test]
+    fn tc_s13_010_03_ignores_plain_wiki_link() {
+        let body = "See [[entry]] not ![[attachment.png]]";
+        assert_eq!(
+            parse_obsidian_attachment_links(body),
+            vec!["attachment.png"]
+        );
+    }
+
+    /// TC-S13-010-04: empty body yields empty Vec.
+    #[test]
+    fn tc_s13_010_04_empty_body() {
+        assert!(parse_obsidian_attachment_links("").is_empty());
+    }
+}
+
 static FENCED_CODE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?s)```[^\n]*\n.*?```").unwrap());
 

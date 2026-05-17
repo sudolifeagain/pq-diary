@@ -43,7 +43,7 @@ SUBCOMMANDS=(
   new list show edit delete
   today search stats import vault
   git-init git-push git-pull git-sync git-status
-  template legacy legacy-access
+  template legacy legacy-access attachment
 )
 
 for cmd in "${SUBCOMMANDS[@]}"; do
@@ -74,6 +74,18 @@ if "$BIN" legacy --help 2>&1 | grep -q 'init'; then
   pass "legacy --help lists 'init'"
 else
   fail "legacy --help missing 'init'"
+fi
+
+# Attachment subcommand listing (S13).
+if "$BIN" attachment --help 2>&1 | grep -q 'add'; then
+  pass "attachment --help lists 'add'"
+else
+  fail "attachment --help missing 'add'"
+fi
+if "$BIN" attachment --help 2>&1 | grep -q 'extract'; then
+  pass "attachment --help lists 'extract'"
+else
+  fail "attachment --help missing 'extract'"
 fi
 
 # ---------------------------------------------------------------------------

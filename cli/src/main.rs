@@ -120,6 +120,10 @@ pub enum Commands {
         /// Template name to use as initial body content
         #[arg(long)]
         template: Option<String>,
+
+        /// Attach a file to the new entry (repeatable: --attach a.png --attach b.pdf)
+        #[arg(long = "attach", value_name = "FILE")]
+        attach: Vec<std::path::PathBuf>,
     },
 
     /// List diary entries
@@ -211,6 +215,12 @@ pub enum Commands {
     /// Open the digital legacy: inherit INHERIT entries and erase the rest
     LegacyAccess,
 
+    /// Manage entry attachments (binary files)
+    Attachment {
+        #[command(subcommand)]
+        subcommand: AttachmentCommands,
+    },
+
     /// Manage the background daemon
     #[command(hide = true)]
     Daemon {
@@ -267,6 +277,50 @@ pub enum VaultCommands {
         /// Securely overwrite vault.pqd before deletion
         #[arg(long)]
         zeroize: bool,
+    },
+}
+
+/// Subcommands for attachment management (S13).
+#[derive(Debug, Subcommand)]
+pub enum AttachmentCommands {
+    /// Add a binary file to an entry.
+    Add {
+        /// Entry ID prefix (e.g. first 8 hex characters of the UUID)
+        entry: String,
+        /// Path to the file to attach
+        path: std::path::PathBuf,
+    },
+    /// List attachments (entire vault if no entry given).
+    List {
+        /// Optional entry ID prefix
+        entry: Option<String>,
+    },
+    /// Extract an attachment to a file path.
+    Extract {
+        entry: String,
+        filename: String,
+        /// Output path for the decrypted file
+        #[arg(long)]
+        out: std::path::PathBuf,
+    },
+    /// Delete an attachment (zeroize-overwrite + remove if last reference).
+    Delete {
+        entry: String,
+        filename: String,
+        /// Skip the y/N confirmation prompt
+        #[arg(long)]
+        force: bool,
+    },
+    /// Set the legacy flag on an attachment (S12 integration).
+    Set {
+        entry: String,
+        filename: String,
+        /// Mark INHERIT (carried over by `legacy-access`)
+        #[arg(long, conflicts_with = "destroy")]
+        inherit: bool,
+        /// Mark DESTROY (zeroize-deleted by `legacy-access`)
+        #[arg(long, conflicts_with = "inherit")]
+        destroy: bool,
     },
 }
 
@@ -346,12 +400,14 @@ fn dispatch(cli: &Cli) -> anyhow::Result<()> {
             body,
             tag,
             template,
-        } => commands::cmd_new(
+            attach,
+        } => commands::cmd_new_with_attach(
             cli,
             title.clone(),
             body.clone(),
             tag.clone(),
             template.clone(),
+            attach.clone(),
         ),
         Commands::Init => commands::cmd_init(cli),
         Commands::Vault { subcommand } => match subcommand {
@@ -401,6 +457,36 @@ fn dispatch(cli: &Cli) -> anyhow::Result<()> {
             LegacyCommands::List => commands::cmd_legacy_list(cli),
         },
         Commands::LegacyAccess => commands::cmd_legacy_access(cli),
+        Commands::Attachment { subcommand } => match subcommand {
+            AttachmentCommands::Add { entry, path } => {
+                commands::cmd_attachment_add(cli, entry.clone(), path.clone())
+            }
+            AttachmentCommands::List { entry } => commands::cmd_attachment_list(cli, entry.clone()),
+            AttachmentCommands::Extract {
+                entry,
+                filename,
+                out,
+            } => {
+                commands::cmd_attachment_extract(cli, entry.clone(), filename.clone(), out.clone())
+            }
+            AttachmentCommands::Delete {
+                entry,
+                filename,
+                force,
+            } => commands::cmd_attachment_delete(cli, entry.clone(), filename.clone(), *force),
+            AttachmentCommands::Set {
+                entry,
+                filename,
+                inherit,
+                destroy,
+            } => commands::cmd_attachment_set(
+                cli,
+                entry.clone(),
+                filename.clone(),
+                *inherit,
+                *destroy,
+            ),
+        },
         Commands::Daemon { subcommand } => match subcommand {
             DaemonCommands::Start => not_implemented("daemon start", "Phase 2"),
             DaemonCommands::Stop => not_implemented("daemon stop", "Phase 2"),
@@ -553,6 +639,7 @@ mod tests {
             "template",
             "legacy",
             "legacy-access",
+            "attachment",
         ] {
             assert!(
                 help_text.contains(cmd),
@@ -830,11 +917,13 @@ mod tests {
                 body,
                 tag,
                 template,
+                attach,
             } => {
                 assert_eq!(title, None);
                 assert_eq!(body, None);
                 assert!(tag.is_empty());
                 assert_eq!(template, None);
+                assert!(attach.is_empty());
             }
             _ => panic!("Expected Commands::New"),
         }

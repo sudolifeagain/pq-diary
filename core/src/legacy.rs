@@ -115,10 +115,20 @@ pub struct LegacyEntryStatus {
 }
 
 /// Summary returned by [`execute_legacy_access`].
-#[derive(Debug, Clone, Copy)]
+///
+/// The `inherited` / `destroyed` counters report diary entries; the
+/// `_attachments` variants report attachment records (S13).
+#[derive(Debug, Clone, Copy, Default)]
 pub struct LegacyAccessReport {
+    /// Entries that survived (carried into the heir's vault).
     pub inherited: usize,
+    /// Entries that were destroyed.
     pub destroyed: usize,
+    /// Attachments carried into the heir's vault (S13).
+    pub inherited_attachments: usize,
+    /// Attachments destroyed during legacy-access (S13). Blob files are
+    /// only zeroize-deleted once their reference count drops to zero.
+    pub destroyed_attachments: usize,
 }
 
 // ============================================================================
@@ -338,7 +348,8 @@ pub fn rotate_legacy_code(
         ));
     }
 
-    let (header, mut entries) = read_vault(&vault_pqd)?;
+    let (header, mut entries, mut attachments) =
+        crate::vault::reader::read_vault_with_attachments(&vault_pqd)?;
     let params = argon2_params_from(&config);
     let _k_master = verify_master(&header, master_pwd, &params)?;
 
@@ -359,6 +370,16 @@ pub fn rotate_legacy_code(
         rotated += 1;
     }
 
+    // S13: also rotate INHERIT attachment legacy blocks.
+    for record in attachments.iter_mut() {
+        if LegacyFlag::from_byte(record.legacy_flag)? != LegacyFlag::Inherit {
+            continue;
+        }
+        let plain = decrypt_legacy_block(&k_legacy_old, &record.legacy_key_block)?;
+        record.legacy_key_block = encrypt_legacy_block(&k_legacy_new, plain.as_ref())?;
+        rotated += 1;
+    }
+
     // Refresh the verification token under K_legacy_new.
     let (iv, ct) = generate_verification_token(&k_legacy_new)?;
     config.legacy.verification_iv_b64 = Some(B64.encode(iv));
@@ -370,7 +391,12 @@ pub fn rotate_legacy_code(
     cleanup_sensitive_file(&writer_tmp_path(&vault_tmp));
     cleanup_sensitive_file(&toml_tmp);
 
-    if let Err(e) = write_vault(&vault_tmp, header, &entries) {
+    if let Err(e) = crate::vault::writer::write_vault_with_attachments(
+        &vault_tmp,
+        header,
+        &entries,
+        &attachments,
+    ) {
         cleanup_sensitive_file(&vault_tmp);
         cleanup_sensitive_file(&writer_tmp_path(&vault_tmp));
         return Err(e);
@@ -422,7 +448,8 @@ where
         ));
     }
 
-    let (old_header, old_entries) = read_vault(&vault_pqd)?;
+    let (old_header, old_entries, old_attachments) =
+        crate::vault::reader::read_vault_with_attachments(&vault_pqd)?;
     let k_legacy = deriver.derive(
         legacy_code.expose_secret().as_bytes(),
         &old_header.legacy_salt,
@@ -443,6 +470,7 @@ where
     // counted as destroyed diary entries in the user-facing report.
     let mut inherited_plaintexts: Vec<(EntryRecord, Zeroizing<Vec<u8>>)> = Vec::new();
     let mut destroyed = 0_usize;
+    let mut inherited_entry_uuids: std::collections::HashSet<[u8; 16]> = Default::default();
     for record in old_entries {
         if record.record_type != RECORD_TYPE_ENTRY {
             continue;
@@ -450,6 +478,7 @@ where
         match LegacyFlag::from_byte(record.legacy_flag)? {
             LegacyFlag::Inherit => {
                 let plain = decrypt_legacy_block(&k_legacy, &record.legacy_key_block)?;
+                inherited_entry_uuids.insert(record.uuid);
                 inherited_plaintexts.push((record, plain));
             }
             LegacyFlag::Destroy => {
@@ -477,6 +506,68 @@ where
     }
     let inherited = new_entries.len();
 
+    // Attachment processing (S13).
+    //
+    // Rules:
+    // - INHERIT attachment + INHERIT parent entry → carry over to new vault.
+    // - INHERIT attachment + DESTROY parent entry → destroyed (REQ-504 cascade).
+    // - DESTROY attachment → destroyed regardless of parent.
+    //
+    // For destroyed attachments we track the blob_uuid as "queued for delete";
+    // for inherited attachments we track it as "surviving". A blob is only
+    // physically removed if it's in queued-for-delete AND not in surviving
+    // (reference-counting per design Q5).
+    let mut new_attachments = Vec::with_capacity(old_attachments.len());
+    let mut inherited_attachments = 0_usize;
+    let mut destroyed_attachments = 0_usize;
+    let mut surviving_blobs: std::collections::HashSet<[u8; 16]> = Default::default();
+    // entry_uuid → number of inherited attachments tied to that entry.
+    let mut per_entry_attach_count: std::collections::HashMap<[u8; 16], u16> = Default::default();
+
+    for record in &old_attachments {
+        let is_inherit = LegacyFlag::from_byte(record.legacy_flag)? == LegacyFlag::Inherit;
+        if !is_inherit {
+            // DESTROY records have no decryptable legacy_key_block, so we
+            // cannot recover the blob_uuid here. The blob is only removed
+            // when a parallel INHERIT sibling identifies it — otherwise
+            // it persists, awaiting an explicit `pq-diary attachment
+            // delete` from the heir.
+            destroyed_attachments += 1;
+            continue;
+        }
+        let lpt = match crate::attachment::decrypt_attachment_legacy_block(record, &k_legacy) {
+            Ok(v) => v,
+            Err(_) => {
+                // Corrupted legacy block on an INHERIT record — treat as destroy.
+                destroyed_attachments += 1;
+                continue;
+            }
+        };
+        if !inherited_entry_uuids.contains(&lpt.entry_uuid) {
+            // REQ-504: parent entry is DESTROY → cascade to attachment.
+            destroyed_attachments += 1;
+            continue;
+        }
+        let entry_uuid_copy = lpt.entry_uuid;
+        let new_rec = crate::attachment::rebuild_attachment_record_for_heir(
+            record.uuid,
+            &lpt,
+            now,
+            &k_legacy,
+            &dsa_seed_zeroized,
+        )?;
+        new_attachments.push(new_rec);
+        surviving_blobs.insert(lpt.blob_uuid);
+        inherited_attachments += 1;
+        *per_entry_attach_count.entry(entry_uuid_copy).or_insert(0) += 1;
+    }
+
+    // Refresh attachment_count on each inherited entry to match what we're
+    // actually writing into the heir's vault.
+    for entry in new_entries.iter_mut() {
+        entry.attachment_count = *per_entry_attach_count.get(&entry.uuid).unwrap_or(&0);
+    }
+
     // Reset the legacy section — the heir starts from a clean slate and can
     // run `pq-diary legacy init` again to nominate their own heir.
     config.legacy.initialized = false;
@@ -489,7 +580,12 @@ where
     cleanup_sensitive_file(&writer_tmp_path(&vault_tmp));
     cleanup_sensitive_file(&toml_tmp);
 
-    if let Err(e) = write_vault(&vault_tmp, new_header, &new_entries) {
+    if let Err(e) = crate::vault::writer::write_vault_with_attachments(
+        &vault_tmp,
+        new_header,
+        &new_entries,
+        &new_attachments,
+    ) {
         cleanup_sensitive_file(&vault_tmp);
         cleanup_sensitive_file(&writer_tmp_path(&vault_tmp));
         return Err(e);
@@ -509,10 +605,51 @@ where
         ".bak.legacy",
     )?;
 
+    // After the atomic swap, sweep .attachments/ for blobs that no surviving
+    // INHERIT record refers to. We collect on-disk filenames and prune the
+    // ones not in `surviving_blobs`. This zeroizes-and-deletes orphaned
+    // bodies regardless of whether they were originally INHERIT (parent
+    // entry destroyed) or DESTROY records — matching REQ-302 and REQ-503.
+    let attachments_dir = crate::attachment::attachments_dir(vault_dir);
+    if attachments_dir.is_dir() {
+        if let Ok(read_dir) = std::fs::read_dir(&attachments_dir) {
+            for entry in read_dir.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) != Some("bin") {
+                    continue;
+                }
+                let stem = match path.file_stem().and_then(|s| s.to_str()) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let uuid_bytes = match parse_hex_uuid(stem) {
+                    Some(u) => u,
+                    None => continue,
+                };
+                if !surviving_blobs.contains(&uuid_bytes) {
+                    let _ = crate::attachment::zeroize_and_delete(&path);
+                }
+            }
+        }
+    }
+
     Ok(LegacyAccessReport {
         inherited,
         destroyed,
+        inherited_attachments,
+        destroyed_attachments,
     })
+}
+
+fn parse_hex_uuid(s: &str) -> Option<[u8; 16]> {
+    if s.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for i in 0..16 {
+        out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
 }
 
 // ============================================================================
@@ -546,7 +683,10 @@ fn verify_master(
     Ok(Zeroizing::new(*key.as_ref()))
 }
 
-fn verify_legacy_code(config: &VaultConfig, k_legacy: &[u8; 32]) -> Result<(), DiaryError> {
+pub(crate) fn verify_legacy_code(
+    config: &VaultConfig,
+    k_legacy: &[u8; 32],
+) -> Result<(), DiaryError> {
     let iv_b64 = config
         .legacy
         .verification_iv_b64

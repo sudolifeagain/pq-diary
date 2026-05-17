@@ -1,6 +1,6 @@
 # Sprint Status
 
-## Current: Sprint 13 — 添付ファイル (attachments) — 設計フェーズ進行中
+## Current: Sprint 13 — 添付ファイル (attachments) — 実装フェーズ進行中
 
 ## Progress
 
@@ -18,7 +18,7 @@
 | S10 | 運用機能 + CLI整合性 | completed (s10-done) | 10 |
 | S11 | クロスプラットフォーム検証 + toolchain 固定 | completed (s11-done) | 11 |
 | S12 | デジタル遺言 (legacy) | completed (s12-done) | 12 |
-| S13 | 添付ファイル (attachments) | in_progress (design phase) | 13 |
+| S13 | 添付ファイル (attachments) | in_progress (implementation phase) | 13 |
 
 ## Sprint Scope
 
@@ -114,12 +114,18 @@
 - 設計 (PR #5): 信頼性 🔵 100%
 - マージ後 hardening (PR #6 review fix): rotate / legacy-access を 2-file アトミック (sidecar tmp + replace + backup)
 
-### S13: 添付ファイル (attachments) — 設計フェーズ
-- vault.pqd v4 の予約済み `attachment_count` (u16) / `attachment_offset` (u64) を活用し、S13 は schema_version v5 へ更新
+### S13: 添付ファイル (attachments) — 実装フェーズ
+- vault.pqd schema_version v4 → v5 へ更新、reader は両方対応 (後方互換 EDGE-301)
 - ストレージ分離: vault.pqd (暗号化 AttachmentPlaintext を持つ `RECORD_TYPE_ATTACHMENT=0x03`) + `.attachments/<blob_uuid>.bin` (本体)
-- chunk 暗号化: 1MB chunk + FileKey + AES-GCM、AAD に chunk_index + total + blob_uuid で改ざん検出
-- サイズ上限: 1 ファイル 1GB (ストリーミング処理)
-- legacy 連動 (S12 拡張): ファイル個別 INHERIT/DESTROY フラグ、エントリ DESTROY 時は添付も自動連動
-- 双方向 Obsidian 互換: export で `![[FILE]]` 埋め込み + `attachments/` 別ディレクトリ、import で同形式読み取り
+- chunk 暗号化: 1MB chunk + FileKey + AES-GCM、AAD = chunk_index || total || blob_uuid で改ざん検出
+- サイズ上限: 1 ファイル 1GB (ストリーミング処理、メモリピーク ≤ 6MB)
+- AttachmentPlaintext (K_master 暗号化) + AttachmentLegacyPlaintext (K_legacy 暗号化) の分離
+- ランダム FileKey 設計: change-password で `.bin` 本体の再暗号化が不要
+- SHA-256 重複排除 + 参照カウント方式の delete
+- legacy 連動 (S12 拡張): ファイル個別 INHERIT/DESTROY フラグ、エントリ DESTROY 時は添付も自動連動 (REQ-504)
+- export で `attachments/` 別ディレクトリ + `![[FILE]]` 埋め込み
+- importer に `parse_obsidian_attachment_links()` 追加 (cmd_import 統合は follow-up)
 - CLI 5 コマンド: `attachment add/list/extract/delete/set` + `new --attach` + `show` 拡張
-- 設計 spike (本 PR): 信頼性 🟡 100% (PRD §10 明示なし、PR review で 🔵 昇格を狙う)
+- LegacyAccessReport を attachment 統計まで拡張
+- 設計 (PR #7) + 実装 (本 PR): 信頼性 🟡 → 🔵 (R1〜R5 を実装で確定)
+- workspace 721 テスト全パス (4 ignored)、smoke-test 34/34

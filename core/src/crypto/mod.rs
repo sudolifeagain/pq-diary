@@ -20,6 +20,8 @@ pub mod kdf;
 pub mod kem;
 /// Secure memory types: `SecureBuffer`, `ZeroizingKey`, `MasterKey`, `CryptoEngine`.
 pub mod secure_mem;
+/// Streaming AES-256-GCM for attachment payloads (S13, chunked).
+pub mod streaming;
 
 pub use secure_mem::{CryptoEngine, MasterKey, SecureBuffer, ZeroizingKey};
 

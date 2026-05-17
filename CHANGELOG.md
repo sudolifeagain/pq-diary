@@ -66,23 +66,40 @@ PRD §17 で定義された Phase 1 を 2026-04-11 (s9) → 2026-05-17 (s11) で
 
 将来、HQC ハイブリッド KEM 対応で v5 → v6 を予定 (Phase 4)。
 
-## History (git tags)
+## History
 
-スプリントごとの詳細な変更点は `docs/sprint-status.md` と各 `s{N}-done` git tag を参照。
+スプリント単位の詳細は `docs/sprint-status.md` を、メタ情報は git の
+PR マージコミット (`git log --merges`) を参照。S14 以降は個別の
+スプリントタグを打たず、Phase 完了でのみ `phaseN-done` を切る運用 (`docs/workflow.md` 参照)。
+
+### Phase 1 タグ (履歴として残置)
 
 | Tag | Date | Theme |
 |-----|------|-------|
-| s1-done | 2026-04-03 | 基盤構築 (workspace, CI, clap skeleton) |
-| s2-done | 2026-04-03 | 暗号コア (Argon2 / AES-GCM / ML-KEM / ML-DSA / HMAC) |
-| s3-done | 2026-04-03 | vault.pqd v4 + vault.toml + config.toml |
-| s4-done | 2026-04-05 | Entry CRUD + CLI + パスワード 3 段階 + ネストタグ |
-| s5-done | 2026-04-08 | today + テンプレート + `[[link]]` + バックリンク |
-| s6-done | 2026-04-09 | search + stats + Obsidian import + 技術的負債 |
-| s7-done | 2026-04-10 | アクセス制御 + `--claude` 4 層チェック |
-| s8-done | 2026-04-11 | Git 連携 + privacy + 3-way merge |
-| s9-done | 2026-04-11 | セキュリティ硬化 (mlock / coredump / debugger) |
-| s10-done | 2026-05-17 | 運用機能 (init / sync / change-password / info / export) |
-| phase1-done | 2026-05-17 | Phase 1 完了マイルストーン |
-| s11-done | 2026-05-17 | クロスプラットフォーム検証 + toolchain pin |
-| s12-done | 2026-05-18 | デジタル遺言 (legacy) |
-| s13-done | 2026-05-18 | 添付ファイル + cmd_import follow-up (S13.1) |
+| `s1-done` | 2026-04-03 | 基盤構築 (workspace, CI, clap skeleton) |
+| `s2-done` | 2026-04-03 | 暗号コア (Argon2 / AES-GCM / ML-KEM / ML-DSA / HMAC) |
+| `s3-done` | 2026-04-03 | vault.pqd v4 + vault.toml + config.toml |
+| `s4-done` | 2026-04-05 | Entry CRUD + CLI + パスワード 3 段階 + ネストタグ |
+| `s5-done` | 2026-04-08 | today + テンプレート + `[[link]]` + バックリンク |
+| `s6-done` | 2026-04-09 | search + stats + Obsidian import + 技術的負債 |
+| `s7-done` | 2026-04-10 | アクセス制御 + `--claude` 4 層チェック |
+| `s8-done` | 2026-04-11 | Git 連携 + privacy + 3-way merge |
+| `s9-done` | 2026-04-11 | セキュリティ硬化 (mlock / coredump / debugger) |
+| `s10-done` | 2026-05-17 | 運用機能 (init / sync / change-password / info / export) |
+| `s11-done` | 2026-05-17 | クロスプラットフォーム検証 + toolchain pin |
+| **`phase1-done`** | 2026-05-17 | **Phase 1 完了マイルストーン** |
+
+### Phase 2 タグ (一部のみ、運用変更後)
+
+| Tag | Date | Theme |
+|-----|------|-------|
+| `s12-done` | 2026-05-18 | デジタル遺言 (legacy) — S14 運用変更前に既に切られていたため残置 |
+| `s13-done` | 2026-05-18 | 添付ファイル + cmd_import follow-up (S13.1) — 同上 |
+| `phase2-done` | (未着手) | Phase 2 全機能完了時に切る予定 |
+
+### Phase 2 以降は PR ベース
+
+S14 以降の作業は git tag を打たず、PR マージコミットで追跡:
+
+- S14 (本 PR): Phase 2 棚卸し + CHANGELOG.md 新規作成 — タグなし
+- S15 以降: 未定 (Phase 2 残候補: Bases like ビュー / 固定ブロック OQ-20 / Web Clipper / 鍵素材 XOR 分散 / Unix ソケット + デーモン)

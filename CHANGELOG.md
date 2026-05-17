@@ -34,12 +34,12 @@ Phase 2 中核 (legacy / attachments) を完了。残候補は Bases like ビュ
 
 #### Documentation
 - `CHANGELOG.md` 新規 (S14 棚卸し)。
-- `docs/backlog.md` 古い `[ ]` 表現を実装状態に補正 (S4 / S5 全項目、M-5 / H-3、Phase 4 の v4 → v5 マイグレーション)。
+- `docs/backlog.md` 古い `[ ]` 表現を実装状態に補正 (S4 / S5 全項目、M-5 / H-3、S13 v4 → v5 と Phase 4 v5 → v6 の整理)。
 - `requirements.md` を v5 対応に更新 (§6 / §5.4 / §Phase 4)。
 
 ### Phase 1 (完了済み)
 
-PRD §17 で定義された Phase 1 を 2026-04-11 (s9) → 2026-05-17 (s11) で完走。
+PRD §15 で定義された Phase 1 を 2026-04-11 (s9) → 2026-05-17 (s11) で完走。
 
 #### Highlights
 - Cargo ワークスペース (`core/` + `cli/`) と CI 基盤 (test / clippy / audit + cross-platform matrix)。
@@ -87,7 +87,7 @@ PR マージコミット (`git log --merges`) を参照。S14 以降は個別の
 | `s9-done` | 2026-04-11 | セキュリティ硬化 (mlock / coredump / debugger) |
 | `s10-done` | 2026-05-17 | 運用機能 (init / sync / change-password / info / export) |
 | `s11-done` | 2026-05-17 | クロスプラットフォーム検証 + toolchain pin |
-| **`phase1-done`** | 2026-05-17 | **Phase 1 完了マイルストーン** |
+| **`phase1-done`** | 2026-04-11 | **S9時点のPhase 1タグ (S10/S11 follow-up前; 真の完了は `s11-done` で追跡)** |
 
 ### Phase 2 タグ (一部のみ、運用変更後)
 

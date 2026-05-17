@@ -925,4 +925,4 @@ pq-diaryが守る脅威:
 | OQ-19 | タイムスタンプファジングとmerge-baseの関係 | オープン | content_hmac依存なので軽微。要検証 |
 | OQ-20 | 固定ブロックサイズ化による差分完全隠蔽 | **Phase 2検討** | 64KB単位切り上げ。トレードオフあり |
 | OQ-21 | vault.tomlのcreatedフィールド削除による利便性への影響 | **v4.0で削除** | Gitの最初のコミット日時で代替可能 |
-| OQ-22 | HQCハイブリッドKEM追加時のvault.pqdフォーマット（v5設計） | 2027年以降 | RustCrypto HQC実装登場後に設計 |
+| OQ-22 | HQCハイブリッドKEM追加時のvault.pqdフォーマット（v6設計） | 2027年以降 | RustCrypto HQC実装登場後に設計 |

@@ -141,7 +141,7 @@
 - [ ] Unixソケット + ロックデーモン (V-1〜V-8対策)
 - [ ] 鍵素材のXOR分散保持
 - [ ] 固定ブロックサイズ化 (64KB単位, OQ-20)
-- [x] 添付ファイル (バイナリ暗号化, v4予約フィールド使用) — S13 で完了 (PR #7 設計 + 実装 PR)
+- [x] 添付ファイル (バイナリ暗号化, v4予約フィールド使用) — S13 で完了 (PR #7 設計 + 実装 PR; schema_version v4 → v5 bump、reader は v4/v5 両受理)
 - [ ] Web Clipper連携 (clip --url / パイプ入力)
 - [ ] Basesライクビュー (list拡張: 複合フィルタ・ソート・JSON出力)
 - [x] change-password (全エントリ再暗号化) — S10 で完了
@@ -160,7 +160,7 @@
 - [ ] HQC FIPS最終標準確認
 - [ ] RustCrypto品質 pure Rust HQC実装の採用
 - [ ] ML-KEM + HQCハイブリッドKEM
-- [x] vault.pqd v4 → v5マイグレーション — S13 で attachment record (`RECORD_TYPE=0x03`) を追加するため schema_version を v5 に bump、reader は v4/v5 両受理 (v5→v6 への将来 migration は HQC 標準化後を想定)
+- [ ] vault.pqd v5 → v6マイグレーション — HQC ハイブリッド KEM 対応時に実施 (S13 の v4 → v5 は添付ファイル対応として完了済み)
 
 ## Open Questions
 

@@ -66,6 +66,13 @@ pub struct ImportArgs {
     pub dry_run: bool,
 }
 
+/// Arguments for the `export` subcommand.
+#[derive(Debug, Args)]
+pub struct ExportArgs {
+    /// Output directory (must already exist).
+    pub dir: std::path::PathBuf,
+}
+
 /// Arguments for the `search` subcommand.
 #[derive(Debug, Args)]
 pub struct SearchArgs {
@@ -164,7 +171,7 @@ pub enum Commands {
     Sync,
 
     /// Export diary entries to an external format
-    Export,
+    Export(ExportArgs),
 
     /// Change the vault master password
     ChangePassword,
@@ -196,15 +203,18 @@ pub enum Commands {
     GitStatus,
 
     /// Manage digital legacy configuration
+    #[command(hide = true)]
     Legacy {
         #[command(subcommand)]
         subcommand: LegacyCommands,
     },
 
     /// Access a legacy vault as a designated trustee
+    #[command(hide = true)]
     LegacyAccess,
 
     /// Manage the background daemon
+    #[command(hide = true)]
     Daemon {
         #[command(subcommand)]
         subcommand: DaemonCommands,
@@ -336,7 +346,7 @@ fn dispatch(cli: &Cli) -> anyhow::Result<()> {
             tag.clone(),
             template.clone(),
         ),
-        Commands::Init => not_implemented("init", "Sprint 2"),
+        Commands::Init => commands::cmd_init(cli),
         Commands::Vault { subcommand } => match subcommand {
             VaultCommands::Create { name, policy } => {
                 commands::cmd_vault_create(cli, name, policy.as_deref())
@@ -364,27 +374,27 @@ fn dispatch(cli: &Cli) -> anyhow::Result<()> {
             remove_tag.clone(),
         ),
         Commands::Delete { id, force } => commands::cmd_delete(cli, id.clone(), *force),
-        Commands::Sync => not_implemented("sync", "Sprint 8"),
-        Commands::Export => not_implemented("export", "Sprint 5"),
-        Commands::ChangePassword => not_implemented("change-password", "Sprint 3"),
-        Commands::Info { .. } => not_implemented("info", "Sprint 2"),
+        Commands::Sync => commands::cmd_sync(cli),
+        Commands::Export(args) => commands::cmd_export(cli, args.dir.clone()),
+        Commands::ChangePassword => commands::cmd_change_password(cli),
+        Commands::Info { security } => commands::cmd_info(cli, *security),
         Commands::GitInit { remote } => commands::cmd_git_init(cli, remote.as_deref()),
         Commands::GitPush => commands::cmd_git_push(cli),
         Commands::GitPull => commands::cmd_git_pull(cli),
         Commands::GitSync => commands::cmd_git_sync(cli),
         Commands::GitStatus => commands::cmd_git_status(cli),
         Commands::Legacy { subcommand } => match subcommand {
-            LegacyCommands::Init => not_implemented("legacy init", "Sprint 9"),
-            LegacyCommands::Rotate => not_implemented("legacy rotate", "Sprint 9"),
-            LegacyCommands::Set => not_implemented("legacy set", "Sprint 9"),
-            LegacyCommands::List => not_implemented("legacy list", "Sprint 9"),
+            LegacyCommands::Init => not_implemented("legacy init", "Phase 2"),
+            LegacyCommands::Rotate => not_implemented("legacy rotate", "Phase 2"),
+            LegacyCommands::Set => not_implemented("legacy set", "Phase 2"),
+            LegacyCommands::List => not_implemented("legacy list", "Phase 2"),
         },
-        Commands::LegacyAccess => not_implemented("legacy-access", "Sprint 9"),
+        Commands::LegacyAccess => not_implemented("legacy-access", "Phase 2"),
         Commands::Daemon { subcommand } => match subcommand {
-            DaemonCommands::Start => not_implemented("daemon start", "Sprint 10"),
-            DaemonCommands::Stop => not_implemented("daemon stop", "Sprint 10"),
-            DaemonCommands::Status => not_implemented("daemon status", "Sprint 10"),
-            DaemonCommands::Lock => not_implemented("daemon lock", "Sprint 10"),
+            DaemonCommands::Start => not_implemented("daemon start", "Phase 2"),
+            DaemonCommands::Stop => not_implemented("daemon stop", "Phase 2"),
+            DaemonCommands::Status => not_implemented("daemon status", "Phase 2"),
+            DaemonCommands::Lock => not_implemented("daemon lock", "Phase 2"),
         },
         Commands::Today => commands::cmd_today(cli),
         Commands::Search(args) => commands::cmd_search(cli, args),
@@ -525,9 +535,6 @@ mod tests {
             "git-pull",
             "git-sync",
             "git-status",
-            "legacy",
-            "legacy-access",
-            "daemon",
             "today",
             "search",
             "stats",
@@ -537,6 +544,13 @@ mod tests {
             assert!(
                 help_text.contains(cmd),
                 "help text missing subcommand: {cmd}"
+            );
+        }
+        // Hidden subcommands (legacy/legacy-access/daemon) must NOT appear in help.
+        for hidden in &["legacy", "legacy-access", "daemon"] {
+            assert!(
+                !help_text.contains(hidden),
+                "hidden subcommand should not appear in help: {hidden}"
             );
         }
     }

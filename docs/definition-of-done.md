@@ -16,3 +16,9 @@
 - [ ] 公開APIに `Result` を返さない関数がない (テストコード除く)
 - [ ] core/ にプラットフォーム依存UIコードが入っていない
 - [ ] `docs/backlog.md` の該当アイテムにチェックが入っている
+
+## CLI 整合性 (S10 から)
+- [ ] `cargo run -- <CMD> --help` で表示される全トップレベルコマンドが、実行時に `not_implemented` を返さず正常終了する (smoke test で検証)
+- [ ] 未実装スケルトンは clap 定義から削除、または `#[command(hide = true)]` 属性でヘルプから除外する (`legacy*` / `daemon*` 等)
+- [ ] CI に CLI smoke test (`ci/smoke-test.sh` / `ci/smoke-test.ps1`) が組み込まれており、各 PR で実行される
+- [ ] スプリント完了時、`docs/backlog.md` の Phase 整理が新コマンドの追加・hide 化と整合している

@@ -17,3 +17,30 @@ jobs:
       - run: cargo clippy --workspace -- -D warnings
       - run: cargo install cargo-audit --locked
       - run: cargo audit
+
+  smoke:
+    name: CLI smoke test
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --workspace
+
+      - name: CLI smoke test (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          chmod +x ./ci/smoke-test.sh
+          ./ci/smoke-test.sh ./target/release/pq-diary
+
+      - name: CLI smoke test (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./ci/smoke-test.ps1 -Bin ./target/release/pq-diary.exe

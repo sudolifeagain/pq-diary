@@ -5,7 +5,7 @@
 //! TOML serialisation/deserialisation and file I/O helpers.
 
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::DiaryError;
 use crate::policy::AccessPolicy;
@@ -137,48 +137,84 @@ impl VaultConfig {
 // AppConfig — config.toml
 // =============================================================================
 
-/// Top-level structure for `config.toml`.
+/// Application-wide configuration stored in `~/.pq-diary/config.toml`.
 ///
-/// Contains application-wide defaults and background-daemon settings.
+/// Created by the `init` command and consulted by `sync`, `info`, and other
+/// top-level commands. Contains the default vault name and the sync backend
+/// identifier.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct AppConfig {
-    /// Default vault and editor settings.
-    pub defaults: DefaultsSection,
-    /// Background daemon settings.
-    pub daemon: DaemonSection,
+    /// `[app]` section.
+    pub app: AppSection,
 }
 
-/// `[defaults]` section of `config.toml`.
+/// `[app]` section of `config.toml`.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
-pub struct DefaultsSection {
-    /// Default vault name used when `--vault` is not specified.
-    pub vault: String,
-}
-
-/// `[daemon]` section of `config.toml`.
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
-pub struct DaemonSection {
-    /// Directory that holds the daemon Unix-domain socket.
-    pub socket_dir: String,
-    /// Session inactivity timeout in seconds (vault auto-locks after this).
-    pub timeout_secs: u64,
+pub struct AppSection {
+    /// Vault name used when `--vault` is not given on the command line.
+    pub default_vault: String,
+    /// Identifier of the sync backend (currently `"git"`; future values may
+    /// include `"socket"`, `"kms"`, etc.).
+    pub sync_backend: String,
 }
 
 impl Default for AppConfig {
+    /// Returns the default configuration:
+    /// `default_vault = "default"`, `sync_backend = "git"`.
     fn default() -> Self {
         Self {
-            defaults: DefaultsSection {
-                vault: "default".to_owned(),
-            },
-            daemon: DaemonSection {
-                socket_dir: "~/.pq-diary/run".to_owned(),
-                timeout_secs: 300,
+            app: AppSection {
+                default_vault: "default".to_owned(),
+                sync_backend: "git".to_owned(),
             },
         }
     }
 }
 
 impl AppConfig {
+    /// Resolve the directory that contains `config.toml` and `vaults/`.
+    ///
+    /// When the `PQ_DIARY_HOME` environment variable is set its value is
+    /// returned as the configuration root verbatim (so tests can redirect
+    /// the layout to a temporary directory). Otherwise the function falls
+    /// back to `<home>/.pq-diary` via [`dirs::home_dir`].
+    fn config_root() -> Result<PathBuf, DiaryError> {
+        if let Some(override_root) = std::env::var_os("PQ_DIARY_HOME") {
+            return Ok(PathBuf::from(override_root));
+        }
+        let home = dirs::home_dir()
+            .ok_or_else(|| DiaryError::Config("Cannot determine home directory".to_string()))?;
+        Ok(home.join(".pq-diary"))
+    }
+
+    /// Absolute path to the default application config file
+    /// (`~/.pq-diary/config.toml`).
+    ///
+    /// `PQ_DIARY_HOME` overrides the `~/.pq-diary` prefix when set; the
+    /// `config.toml` file name is always appended.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DiaryError::Config`] when the user's home directory cannot
+    /// be determined (i.e. [`dirs::home_dir`] returns `None`).
+    pub fn default_path() -> Result<PathBuf, DiaryError> {
+        Ok(Self::config_root()?.join("config.toml"))
+    }
+
+    /// Absolute path to the directory that holds individual vaults
+    /// (`~/.pq-diary/vaults/`).
+    ///
+    /// `PQ_DIARY_HOME` overrides the `~/.pq-diary` prefix when set; the
+    /// `vaults` subdirectory is always appended.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DiaryError::Config`] when the user's home directory cannot
+    /// be determined.
+    pub fn default_vaults_dir() -> Result<PathBuf, DiaryError> {
+        Ok(Self::config_root()?.join("vaults"))
+    }
+
     /// Read and deserialise an [`AppConfig`] from a TOML file at `path`.
     ///
     /// # Errors
@@ -190,16 +226,25 @@ impl AppConfig {
         toml::from_str(&content).map_err(|e| DiaryError::Config(e.to_string()))
     }
 
-    /// Serialise this [`AppConfig`] as pretty TOML and write it to `path`.
+    /// Serialise this [`AppConfig`] as TOML and write it to `path`.
+    ///
+    /// On Unix the file permission is set to `0o600` after writing so that
+    /// only the owner can read or modify the configuration (REQ-611).
+    /// On Windows the default ACL (owner-only by default in the user's
+    /// home directory) is left untouched.
     ///
     /// # Errors
     ///
-    /// Returns [`DiaryError::Config`] on serialisation failures and
-    /// [`DiaryError::Io`] on file-write failures.
+    /// Returns [`DiaryError::Config`] on TOML serialisation failures and
+    /// [`DiaryError::Io`] on file-write or permission-set failures.
     pub fn to_file(&self, path: &Path) -> Result<(), DiaryError> {
-        let content =
-            toml::to_string_pretty(self).map_err(|e| DiaryError::Config(e.to_string()))?;
+        let content = toml::to_string(self).map_err(|e| DiaryError::Config(e.to_string()))?;
         std::fs::write(path, content)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
         Ok(())
     }
 }
@@ -317,6 +362,104 @@ parallelism = 1
             matches!(result, Err(DiaryError::Config(_))),
             "expected DiaryError::Config, got {:?}",
             result
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TASK-0087: AppConfig (~/.pq-diary/config.toml) tests
+    // -------------------------------------------------------------------------
+
+    /// TC-S10-087-01: AppConfig::default() returns the documented default values.
+    ///
+    /// REQ-602: `default_vault` must be `"default"`.
+    /// REQ-603: `sync_backend` must be `"git"`.
+    #[test]
+    fn tc_s10_087_01_app_config_default_values() {
+        let config = AppConfig::default();
+        assert_eq!(config.app.default_vault, "default");
+        assert_eq!(config.app.sync_backend, "git");
+    }
+
+    /// TC-S10-087-02: to_file followed by from_file round-trips an AppConfig.
+    ///
+    /// Given an AppConfig written to a temporary file, when it is read back
+    /// from the same path, the result must equal the original.
+    #[test]
+    fn tc_s10_087_02_app_config_round_trip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+
+        let original = AppConfig::default();
+        original.to_file(&path).expect("to_file");
+        let restored = AppConfig::from_file(&path).expect("from_file");
+
+        assert_eq!(original, restored);
+    }
+
+    /// TC-S10-087-03: default_path() returns a path ending in `.pq-diary/config.toml`.
+    ///
+    /// The exact prefix depends on the user's home directory (via
+    /// `dirs::home_dir()`), so we only verify the trailing components.
+    #[test]
+    fn tc_s10_087_03_default_path_format() {
+        let path = AppConfig::default_path().expect("default_path");
+        assert!(
+            path.ends_with(std::path::Path::new(".pq-diary").join("config.toml")),
+            "expected path ending in `.pq-diary/config.toml`, got {:?}",
+            path
+        );
+    }
+
+    /// TC-S10-087-04: default_vaults_dir() returns a path ending in `.pq-diary/vaults`.
+    #[test]
+    fn tc_s10_087_04_default_vaults_dir_format() {
+        let path = AppConfig::default_vaults_dir().expect("default_vaults_dir");
+        assert!(
+            path.ends_with(std::path::Path::new(".pq-diary").join("vaults")),
+            "expected path ending in `.pq-diary/vaults`, got {:?}",
+            path
+        );
+    }
+
+    /// TC-S10-087-05: from_file with invalid TOML content returns DiaryError::Config.
+    ///
+    /// EDGE-005: Malformed config.toml must be rejected with a `Config`
+    /// error (not a panic or `Io` error).
+    #[test]
+    fn tc_s10_087_05_invalid_toml() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, b"this is not valid = toml [").expect("write temp file");
+
+        let result = AppConfig::from_file(&path);
+        assert!(
+            matches!(result, Err(DiaryError::Config(_))),
+            "expected DiaryError::Config, got {:?}",
+            result
+        );
+    }
+
+    /// TC-S10-087-06: to_file on Unix sets file permission to 0o600.
+    ///
+    /// REQ-611: config.toml must be readable/writable only by the owner.
+    #[cfg(unix)]
+    #[test]
+    fn tc_s10_087_06_unix_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        AppConfig::default().to_file(&path).expect("to_file");
+
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "expected file permission 0o600, got {:o}",
+            mode
         );
     }
 }

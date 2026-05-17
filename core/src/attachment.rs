@@ -438,7 +438,11 @@ pub fn extract_attachment(
         cleanup_sensitive_file(&tmp_path);
         return Err(e);
     }
-    std::fs::rename(&tmp_path, out_path).map_err(DiaryError::Io)
+    if let Err(e) = std::fs::rename(&tmp_path, out_path) {
+        cleanup_sensitive_file(&tmp_path);
+        return Err(DiaryError::Io(e));
+    }
+    Ok(())
 }
 
 /// Delete the attachment named `filename` on entry `entry_id_prefix`. The
@@ -1266,10 +1270,87 @@ mod tests {
         assert!(!out.exists(), "tmp file must not be promoted on failure");
     }
 
-    /// TC-S13-004-10: 256 attachments per entry max.
+    /// TC-S13-004-10: legacy write paths preserve attachment records.
+    #[test]
+    fn tc_s13_004_10_write_vault_preserves_attachments() {
+        let dir = tempdir().unwrap();
+        let (vault_dir, entry_id) = vault_with_entry(&dir);
+        let src = write_source(&dir, "keep.txt", b"keep me");
+        add_attachment(&vault_dir, &secret("master-pw"), &entry_id[..8], &src).unwrap();
+
+        let mut core = DiaryCore::new(vault_dir.join("vault.pqd").to_str().unwrap()).unwrap();
+        core.unlock(secret("master-pw")).unwrap();
+        core.new_entry("second", "body", vec![]).unwrap();
+        drop(core);
+
+        let metas =
+            list_attachments(&vault_dir, &secret("master-pw"), Some(&entry_id[..8])).unwrap();
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].filename, "keep.txt");
+    }
+
+    /// TC-S13-004-11: deleting an entry cascades to its attachment records and blobs.
+    #[test]
+    fn tc_s13_004_11_delete_entry_removes_own_attachments() {
+        let dir = tempdir().unwrap();
+        let (vault_dir, entry_id) = vault_with_entry(&dir);
+        let mut core = DiaryCore::new(vault_dir.join("vault.pqd").to_str().unwrap()).unwrap();
+        core.unlock(secret("master-pw")).unwrap();
+        let id2 = core.new_entry("second", "body", vec![]).unwrap();
+        drop(core);
+
+        let src1 = write_source(&dir, "one.txt", b"one");
+        let src2 = write_source(&dir, "two.txt", b"two");
+        add_attachment(&vault_dir, &secret("master-pw"), &entry_id[..8], &src1).unwrap();
+        add_attachment(&vault_dir, &secret("master-pw"), &id2[..8], &src2).unwrap();
+        let first_meta =
+            list_attachments(&vault_dir, &secret("master-pw"), Some(&entry_id[..8])).unwrap();
+        let first_blob = blob_path(&vault_dir, &first_meta[0].blob_uuid);
+
+        let mut core = DiaryCore::new(vault_dir.join("vault.pqd").to_str().unwrap()).unwrap();
+        core.unlock(secret("master-pw")).unwrap();
+        core.delete_entry(&entry_id[..8]).unwrap();
+        drop(core);
+
+        assert!(
+            !first_blob.exists(),
+            "deleted entry's private blob is removed"
+        );
+        let remaining = list_attachments(&vault_dir, &secret("master-pw"), None).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].filename, "two.txt");
+    }
+
+    /// TC-S13-004-12: extract cleans up decrypted temp output if final rename fails.
+    #[test]
+    fn tc_s13_004_12_extract_rename_failure_cleans_tmp() {
+        let dir = tempdir().unwrap();
+        let (vault_dir, entry_id) = vault_with_entry(&dir);
+        let src = write_source(&dir, "x.txt", b"abcdef");
+        add_attachment(&vault_dir, &secret("master-pw"), &entry_id[..8], &src).unwrap();
+
+        let out_dir = dir.path().join("existing-dir");
+        std::fs::create_dir(&out_dir).unwrap();
+        let tmp_path = with_extension(&out_dir, "pq-diary.tmp");
+        let result = extract_attachment(
+            &vault_dir,
+            &secret("master-pw"),
+            &entry_id[..8],
+            "x.txt",
+            &out_dir,
+        );
+
+        assert!(matches!(result, Err(DiaryError::Io(_))));
+        assert!(
+            !tmp_path.exists(),
+            "decrypted temp file must be removed after rename failure"
+        );
+    }
+
+    /// TC-S13-004-13: 256 attachments per entry max.
     #[test]
     #[ignore = "slow: 257 small attachments take ~minutes on a CI runner"]
-    fn tc_s13_004_10_max_attachments_per_entry() {
+    fn tc_s13_004_13_max_attachments_per_entry() {
         let dir = tempdir().unwrap();
         let (vault_dir, entry_id) = vault_with_entry(&dir);
         for i in 0..MAX_ATTACHMENTS_PER_ENTRY {
@@ -1281,9 +1362,9 @@ mod tests {
         assert!(matches!(result, Err(DiaryError::InvalidArgument(_))));
     }
 
-    /// TC-S13-004-11: set_attachment_legacy_flag INHERIT/DESTROY round-trip.
+    /// TC-S13-004-14: set_attachment_legacy_flag INHERIT/DESTROY round-trip.
     #[test]
-    fn tc_s13_004_11_set_legacy_flag() {
+    fn tc_s13_004_14_set_legacy_flag() {
         let dir = tempdir().unwrap();
         let (vault_dir, entry_id) = vault_with_entry(&dir);
         crate::legacy::initialize_legacy(

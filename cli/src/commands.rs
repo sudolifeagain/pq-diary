@@ -2701,6 +2701,8 @@ fn cmd_export_impl(
     // S13: attachment dir (created lazily — only if any entry has attachments).
     let attachments_dir = dir.join("attachments");
     let mut attachment_count = 0_usize;
+    let mut exported_attachment_files: std::collections::HashMap<String, [u8; 32]> =
+        std::collections::HashMap::new();
     for (meta, path) in &targets {
         let id_hex = meta.uuid_hex.clone();
         let (_, plaintext) = guard
@@ -2724,10 +2726,39 @@ fn cmd_export_impl(
                     body.push('\n');
                 }
                 for m in &metas {
-                    let out_path = attachments_dir.join(&m.filename);
-                    // Skip if a same-named file is already there (dedup shared
-                    // blobs across entries).
-                    if !out_path.exists() {
+                    let mut export_filename = m.filename.clone();
+                    let mut out_path = attachments_dir.join(&export_filename);
+                    let mut already_exported = false;
+
+                    if let Some(existing_sha) = exported_attachment_files.get(&export_filename) {
+                        if existing_sha == &m.sha256 {
+                            already_exported = true;
+                        } else {
+                            export_filename = disambiguate_attachment_export_filename(
+                                &m.filename,
+                                &m.sha256,
+                                &attachments_dir,
+                                &exported_attachment_files,
+                            );
+                            out_path = attachments_dir.join(&export_filename);
+                        }
+                    } else if out_path.exists() {
+                        export_filename = disambiguate_attachment_export_filename(
+                            &m.filename,
+                            &m.sha256,
+                            &attachments_dir,
+                            &exported_attachment_files,
+                        );
+                        out_path = attachments_dir.join(&export_filename);
+                    }
+                    if exported_attachment_files
+                        .get(&export_filename)
+                        .is_some_and(|existing_sha| existing_sha == &m.sha256)
+                    {
+                        already_exported = true;
+                    }
+
+                    if !already_exported {
                         pq_diary_core::attachment::extract_attachment(
                             &vault_dir,
                             &listing_pwd,
@@ -2736,8 +2767,9 @@ fn cmd_export_impl(
                             &out_path,
                         )
                         .map_err(|e| anyhow::anyhow!("attachment extract: {e}"))?;
+                        exported_attachment_files.insert(export_filename.clone(), m.sha256);
                     }
-                    body.push_str(&format!("\n![[{}]]", m.filename));
+                    body.push_str(&format!("\n![[{}]]", export_filename));
                     attachment_count += 1;
                 }
             }
@@ -2794,6 +2826,45 @@ fn build_export_content(meta: &pq_diary_core::EntryMeta, body: &str) -> String {
     out.push_str("---\n\n");
     out.push_str(body);
     out
+}
+
+fn disambiguate_attachment_export_filename(
+    filename: &str,
+    sha256: &[u8; 32],
+    attachments_dir: &std::path::Path,
+    exported: &std::collections::HashMap<String, [u8; 32]>,
+) -> String {
+    let suffix = short_sha_hex(sha256);
+    let path = std::path::Path::new(filename);
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("attachment");
+    let ext = path.extension().and_then(|s| s.to_str());
+
+    for attempt in 0..1000 {
+        let candidate = match (ext, attempt) {
+            (Some(ext), 0) => format!("{stem}-{suffix}.{ext}"),
+            (None, 0) => format!("{stem}-{suffix}"),
+            (Some(ext), n) => format!("{stem}-{suffix}-{n}.{ext}"),
+            (None, n) => format!("{stem}-{suffix}-{n}"),
+        };
+        if let Some(existing_sha) = exported.get(&candidate) {
+            if existing_sha == sha256 {
+                return candidate;
+            }
+            continue;
+        }
+        if !attachments_dir.join(&candidate).exists() {
+            return candidate;
+        }
+    }
+
+    format!("{stem}-{suffix}-overflow")
+}
+
+fn short_sha_hex(sha256: &[u8; 32]) -> String {
+    sha256.iter().take(4).map(|b| format!("{b:02x}")).collect()
 }
 
 fn slugify(title: &str) -> String {
@@ -10044,6 +10115,23 @@ parallelism = 1
         let name = build_export_filename(&meta);
         assert!(name.starts_with("2025-05-17-Hello-World-3c6b775f"));
         assert!(name.ends_with(".md"));
+    }
+
+    /// TC-501-AttachmentName: same attachment filename with different content is disambiguated.
+    #[test]
+    fn tc_501_attachment_export_filename_disambiguates_collision() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut exported = std::collections::HashMap::new();
+        exported.insert("photo.png".to_string(), [0x11; 32]);
+
+        let name = disambiguate_attachment_export_filename(
+            "photo.png",
+            &[0x22; 32],
+            dir.path(),
+            &exported,
+        );
+
+        assert_eq!(name, "photo-22222222.png");
     }
 
     /// TC-503-01: build_export_content emits expected YAML keys.

@@ -13,7 +13,7 @@ use std::path::Path;
 use rand::Rng;
 
 use crate::error::DiaryError;
-use crate::vault::format::{AttachmentRecord, EntryRecord, VaultHeader, MAGIC};
+use crate::vault::format::{AttachmentRecord, EntryRecord, VaultHeader, MAGIC, SCHEMA_VERSION};
 
 // Fixed size of the on-disk verification-token ciphertext field (bytes 92-140).
 const VERIFICATION_CT_LEN: usize = 48;
@@ -234,7 +234,12 @@ pub fn write_vault(
     header: VaultHeader,
     entries: &[EntryRecord],
 ) -> Result<(), DiaryError> {
-    write_vault_with_attachments(path, header, entries, &[])
+    let attachments = match crate::vault::reader::read_vault_with_attachments(path) {
+        Ok((_existing_header, _existing_entries, attachments)) => attachments,
+        Err(DiaryError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e),
+    };
+    write_vault_with_attachments(path, header, entries, &attachments)
 }
 
 /// Write a complete vault containing entries + attachments (S13). The
@@ -246,6 +251,9 @@ pub fn write_vault_with_attachments(
     entries: &[EntryRecord],
     attachments: &[AttachmentRecord],
 ) -> Result<(), DiaryError> {
+    // All writes migrate accepted older vaults to the current schema.
+    header.schema_version = SCHEMA_VERSION;
+
     // Serialise records first to measure the exact payload size.
     // Entries first, then attachments, then the single zero sentinel —
     // matches the partitioning logic in `reader::read_records`.
@@ -311,7 +319,10 @@ pub fn write_vault_with_attachments(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vault::format::{EntryRecord, VaultHeader, MAGIC, RECORD_TYPE_ENTRY};
+    use crate::vault::format::{
+        AttachmentRecord, EntryRecord, VaultHeader, MAGIC, RECORD_TYPE_ATTACHMENT,
+        RECORD_TYPE_ENTRY,
+    };
 
     /// Build a minimal [`EntryRecord`] with known content for testing.
     fn make_test_entry() -> EntryRecord {
@@ -328,6 +339,20 @@ mod tests {
             legacy_key_block: vec![],
             attachment_count: 0,
             attachment_offset: 0,
+            padding: vec![],
+        }
+    }
+
+    fn make_test_attachment() -> AttachmentRecord {
+        AttachmentRecord {
+            record_type: RECORD_TYPE_ATTACHMENT,
+            uuid: [0xCDu8; 16],
+            iv: [0x02u8; 12],
+            ciphertext: vec![0xAA, 0xBB],
+            signature: vec![0xCC],
+            content_hmac: [0x7Eu8; 32],
+            legacy_flag: 0x00,
+            legacy_key_block: vec![],
             padding: vec![],
         }
     }
@@ -493,5 +518,23 @@ mod tests {
             "must read back 1 entry after atomic write"
         );
         assert_eq!(entries[0].uuid, [0xABu8; 16]);
+    }
+
+    /// TC-S13-W01: any write migrates the header to the current schema version.
+    #[test]
+    fn tc_s13_w01_write_stamps_current_schema() {
+        use crate::vault::reader::read_header;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault.pqd");
+        let mut header = VaultHeader::new();
+        header.schema_version = 0x04;
+
+        write_vault_with_attachments(&path, header, &[], &[make_test_attachment()])
+            .expect("write_vault_with_attachments");
+
+        let mut file = std::fs::File::open(&path).expect("open vault");
+        let parsed = read_header(&mut file).expect("read_header");
+        assert_eq!(parsed.schema_version, crate::vault::format::SCHEMA_VERSION);
     }
 }

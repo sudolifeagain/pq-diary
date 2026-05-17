@@ -321,10 +321,10 @@ impl VaultManager {
 
     /// Return the name of the default vault from `config.toml`.
     ///
-    /// Returns `[defaults] vault` from `{base_dir}/config.toml`, defaulting to
-    /// `"default"` when no `config.toml` is present.
+    /// Returns `[app] default_vault` from `{base_dir}/config.toml`, defaulting
+    /// to `"default"` when no `config.toml` is present.
     pub fn default_vault(&self) -> &str {
-        &self.app_config.defaults.vault
+        &self.app_config.app.default_vault
     }
 
     /// Return the names and access policies of all initialised vaults.
@@ -549,7 +549,7 @@ mod tests {
 
     /// TC-025-01: default_vault returns the vault name from config.toml.
     ///
-    /// Given a `config.toml` with `[defaults] vault = "my_vault"`, when a
+    /// Given a `config.toml` with `[app] default_vault = "my_vault"`, when a
     /// `VaultManager` is created from the same directory, `default_vault()`
     /// must return `"my_vault"`.
     #[test]
@@ -558,7 +558,7 @@ mod tests {
 
         // Write a custom config.toml before constructing the manager.
         let mut app_config = AppConfig::default();
-        app_config.defaults.vault = "my_vault".to_owned();
+        app_config.app.default_vault = "my_vault".to_owned();
         app_config
             .to_file(&dir.path().join("config.toml"))
             .expect("write config.toml");

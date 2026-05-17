@@ -5209,7 +5209,7 @@ mod tests {
     fn tc_s7_035_e01_default_vault_deletion_shows_warning() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mgr = make_vault_mgr(&dir);
-        // "default" matches AppConfig::default().defaults.vault
+        // "default" matches AppConfig::default().app.default_vault
         mgr.create_vault(
             "default",
             b"testpass",

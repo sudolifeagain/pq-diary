@@ -1150,7 +1150,8 @@ mod tests {
     ) -> crate::vault::config::VaultConfig {
         use crate::policy::AccessPolicy;
         use crate::vault::config::{
-            AccessSection, Argon2Section, GitPrivacySection, GitSection, VaultConfig, VaultSection,
+            AccessSection, Argon2Section, GitPrivacySection, GitSection, LegacySection,
+            VaultConfig, VaultSection,
         };
 
         VaultConfig {
@@ -1175,6 +1176,7 @@ mod tests {
                 time_cost: 3,
                 parallelism: 1,
             },
+            legacy: LegacySection::default(),
         }
     }
 

@@ -43,7 +43,7 @@ SUBCOMMANDS=(
   new list show edit delete
   today search stats import vault
   git-init git-push git-pull git-sync git-status
-  template
+  template legacy legacy-access
 )
 
 for cmd in "${SUBCOMMANDS[@]}"; do
@@ -55,18 +55,25 @@ for cmd in "${SUBCOMMANDS[@]}"; do
 done
 
 # ---------------------------------------------------------------------------
-# 2. Root --help must not advertise hidden legacy/daemon subcommands
+# 2. Root --help advertises legacy / legacy-access (S12) but not daemon
 # ---------------------------------------------------------------------------
 HELP_OUT=$("$BIN" --help 2>&1 || true)
 if echo "$HELP_OUT" | grep -qi 'legacy'; then
-  fail "help contains 'legacy'"
+  pass "help advertises 'legacy'"
 else
-  pass "help no 'legacy'"
+  fail "help missing 'legacy'"
 fi
 if echo "$HELP_OUT" | grep -qi 'daemon'; then
-  fail "help contains 'daemon'"
+  fail "help contains 'daemon' (must stay hidden)"
 else
   pass "help no 'daemon'"
+fi
+
+# Legacy subcommand listing.
+if "$BIN" legacy --help 2>&1 | grep -q 'init'; then
+  pass "legacy --help lists 'init'"
+else
+  fail "legacy --help missing 'init'"
 fi
 
 # ---------------------------------------------------------------------------

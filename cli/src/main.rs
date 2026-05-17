@@ -203,14 +203,12 @@ pub enum Commands {
     GitStatus,
 
     /// Manage digital legacy configuration
-    #[command(hide = true)]
     Legacy {
         #[command(subcommand)]
         subcommand: LegacyCommands,
     },
 
-    /// Access a legacy vault as a designated trustee
-    #[command(hide = true)]
+    /// Open the digital legacy: inherit INHERIT entries and erase the rest
     LegacyAccess,
 
     /// Manage the background daemon
@@ -275,16 +273,25 @@ pub enum VaultCommands {
 /// Subcommands for digital legacy management.
 #[derive(Debug, Subcommand)]
 pub enum LegacyCommands {
-    /// Initialize legacy configuration
+    /// Initialize the post-mortem access code
     Init,
 
-    /// Rotate legacy trustee keys
+    /// Rotate the post-mortem access code
     Rotate,
 
-    /// Set a legacy trustee
-    Set,
+    /// Mark an entry as INHERIT or DESTROY
+    Set {
+        /// Entry ID prefix (e.g. first 8 hex characters of the UUID)
+        id: String,
+        /// Mark the entry as INHERIT (carried over to the heir)
+        #[arg(long, conflicts_with = "destroy")]
+        inherit: bool,
+        /// Mark the entry as DESTROY (erased on legacy-access)
+        #[arg(long, conflicts_with = "inherit")]
+        destroy: bool,
+    },
 
-    /// List legacy trustees
+    /// Show the legacy disposition of every entry
     List,
 }
 
@@ -384,12 +391,16 @@ fn dispatch(cli: &Cli) -> anyhow::Result<()> {
         Commands::GitSync => commands::cmd_git_sync(cli),
         Commands::GitStatus => commands::cmd_git_status(cli),
         Commands::Legacy { subcommand } => match subcommand {
-            LegacyCommands::Init => not_implemented("legacy init", "Phase 2"),
-            LegacyCommands::Rotate => not_implemented("legacy rotate", "Phase 2"),
-            LegacyCommands::Set => not_implemented("legacy set", "Phase 2"),
-            LegacyCommands::List => not_implemented("legacy list", "Phase 2"),
+            LegacyCommands::Init => commands::cmd_legacy_init(cli),
+            LegacyCommands::Rotate => commands::cmd_legacy_rotate(cli),
+            LegacyCommands::Set {
+                id,
+                inherit,
+                destroy,
+            } => commands::cmd_legacy_set(cli, id.clone(), *inherit, *destroy),
+            LegacyCommands::List => commands::cmd_legacy_list(cli),
         },
-        Commands::LegacyAccess => not_implemented("legacy-access", "Phase 2"),
+        Commands::LegacyAccess => commands::cmd_legacy_access(cli),
         Commands::Daemon { subcommand } => match subcommand {
             DaemonCommands::Start => not_implemented("daemon start", "Phase 2"),
             DaemonCommands::Stop => not_implemented("daemon stop", "Phase 2"),
@@ -540,19 +551,19 @@ mod tests {
             "stats",
             "import",
             "template",
+            "legacy",
+            "legacy-access",
         ] {
             assert!(
                 help_text.contains(cmd),
                 "help text missing subcommand: {cmd}"
             );
         }
-        // Hidden subcommands (legacy/legacy-access/daemon) must NOT appear in help.
-        for hidden in &["legacy", "legacy-access", "daemon"] {
-            assert!(
-                !help_text.contains(hidden),
-                "hidden subcommand should not appear in help: {hidden}"
-            );
-        }
+        // `daemon` is still hidden (Phase 2).
+        assert!(
+            !help_text.contains("daemon"),
+            "hidden subcommand should not appear in help: daemon"
+        );
     }
 
     #[test]

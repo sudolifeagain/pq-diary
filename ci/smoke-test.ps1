@@ -50,7 +50,7 @@ $subcommands = @(
     'new', 'list', 'show', 'edit', 'delete',
     'today', 'search', 'stats', 'import', 'vault',
     'git-init', 'git-push', 'git-pull', 'git-sync', 'git-status',
-    'template'
+    'template', 'legacy', 'legacy-access'
 )
 
 foreach ($cmd in $subcommands) {
@@ -63,18 +63,26 @@ foreach ($cmd in $subcommands) {
 }
 
 # ---------------------------------------------------------------------------
-# 2. Root --help must not advertise hidden legacy/daemon subcommands
+# 2. Root --help advertises legacy / legacy-access (S12) but not daemon
 # ---------------------------------------------------------------------------
 $helpText = (& $Bin --help 2>&1 | Out-String)
 if ($helpText -match '(?i)legacy') {
-    Assert-Fail "help contains 'legacy'"
+    Assert-Pass "help advertises 'legacy'"
 } else {
-    Assert-Pass "help no 'legacy'"
+    Assert-Fail "help missing 'legacy'"
 }
 if ($helpText -match '(?i)daemon') {
-    Assert-Fail "help contains 'daemon'"
+    Assert-Fail "help contains 'daemon' (must stay hidden)"
 } else {
     Assert-Pass "help no 'daemon'"
+}
+
+# Legacy subcommand listing.
+$legacyHelp = (& $Bin legacy --help 2>&1 | Out-String)
+if ($legacyHelp -match 'init') {
+    Assert-Pass "legacy --help lists 'init'"
+} else {
+    Assert-Fail "legacy --help missing 'init'"
 }
 
 # ---------------------------------------------------------------------------

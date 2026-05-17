@@ -135,9 +135,9 @@
 
 ---
 
-## Phase 2 (未スケジュール、change-password / info --security / export は S10 で完了)
+## Phase 2 (未スケジュール、change-password / info --security / export / legacy は S10–S12 で完了)
 
-- [ ] デジタル遺言 (K_legacy, INHERIT/DESTROY, legacy-access)
+- [x] デジタル遺言 (K_legacy, INHERIT/DESTROY, legacy-access) — S12 で完了
 - [ ] Unixソケット + ロックデーモン (V-1〜V-8対策)
 - [ ] 鍵素材のXOR分散保持
 - [ ] 固定ブロックサイズ化 (64KB単位, OQ-20)
@@ -170,5 +170,5 @@
 | OQ-6 | SSD wear levelingのユーザー周知 | ドキュメント |
 | OQ-7 | バイナリ形式のデバッグ手段 (--debug JSON出力) | S4で実装 |
 | OQ-16 | fullポリシーへの間接プロンプトインジェクション | ドキュメント |
-| OQ-18 | legacy-access後のvault暗号鍵 | Phase 2 |
+| OQ-18 | legacy-access後のvault暗号鍵 | S12で確定: K_legacy が新マスター鍵、kdf_salt=元 legacy_salt、KEM/DSA は新規生成 |
 | OQ-19 | タイムスタンプファジングとmerge-baseの関係 | S8で検証 |

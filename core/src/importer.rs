@@ -222,6 +222,18 @@ pub fn should_skip_path(path: &Path) -> bool {
     path.components().any(|c| c.as_os_str() == ".obsidian")
 }
 
+/// Returns `true` for files under the source directory's top-level
+/// `attachments/` directory.
+///
+/// Obsidian attachment imports use this directory as binary payload storage, so
+/// its contents must not also be imported as diary entries.
+fn is_top_level_attachments_path(source_dir: &Path, path: &Path) -> bool {
+    path.strip_prefix(source_dir)
+        .ok()
+        .and_then(|relative| relative.components().next())
+        .is_some_and(|c| c.as_os_str() == "attachments")
+}
+
 /// Create multiple vault entries in a single `write_vault` call.
 ///
 /// Reads the existing vault, encrypts and signs every [`MarkdownFile`] as an
@@ -347,6 +359,12 @@ pub fn import_directory(
 
         // Directories are traversed but not counted.
         if entry.file_type().is_dir() {
+            continue;
+        }
+
+        // Top-level attachments/ is reserved for Obsidian embed payloads and
+        // is handled by the CLI import attachment pass.
+        if is_top_level_attachments_path(source_dir, path) {
             continue;
         }
 

@@ -27,23 +27,23 @@
 - [x] 検証トークンによるパスワード正当性チェック
 
 ### S4: エントリ操作 + CLI
-- [ ] new (タイトル, ボディ, タグ指定)
-- [ ] list (タグフィルタ, クエリ, 件数制限)
-- [ ] show (ID_PREFIX指定)
-- [ ] edit ($EDITOR起動)
-- [ ] delete (確認プロンプト付き)
-- [ ] パスワード入力3段階 (--password / env / TTY termios)
-- [ ] $EDITOR一時ファイル制御 ($TMPDIR上書き, vimオプション強制)
-- [ ] 一時ファイルzeroize削除
-- [ ] ネストタグ (#親/子/孫, 前方一致検索)
+- [x] new (タイトル, ボディ, タグ指定)
+- [x] list (タグフィルタ, クエリ, 件数制限)
+- [x] show (ID_PREFIX指定)
+- [x] edit ($EDITOR起動)
+- [x] delete (確認プロンプト付き)
+- [x] パスワード入力3段階 (--password / env / TTY termios)
+- [x] $EDITOR一時ファイル制御 ($TMPDIR上書き, vimオプション強制)
+- [x] 一時ファイルzeroize削除
+- [x] ネストタグ (#親/子/孫, 前方一致検索)
 
 ### S5: デイリーノート + テンプレート + リンク
-- [ ] today コマンド (YYYY-MM-DDエントリ自動生成/開く)
-- [ ] テンプレートCRUD (template add/list/show/delete)
-- [ ] new --template <name>
-- [ ] [[タイトル]] リンク解決
-- [ ] バックリンクインデックス構築
-- [ ] show時にバックリンク表示
+- [x] today コマンド (YYYY-MM-DDエントリ自動生成/開く)
+- [x] テンプレートCRUD (template add/list/show/delete)
+- [x] new --template <name>
+- [x] [[タイトル]] リンク解決
+- [x] バックリンクインデックス構築
+- [x] show時にバックリンク表示
 - [x] $EDITOR内vimカスタム補完関数 ([[入力時タイトル候補表示)
 - [x] 補完用一時ファイル (/dev/shm, zeroize削除)
 
@@ -62,10 +62,10 @@
 - [x] **[M-7]** vim に nowritebackup / viminfo=NONE 追加 (S4) — editor.rs viminfo=''/shada=''
 - [x] **[M-8]** PQ_DIARY_PASSWORD 読み取り後に env::remove_var (S4) — password.rs
 - [x] **[M-9]** tmp ファイルパーミッションを 0600 に (S4) — editor.rs mode(0o600)
-- [ ] **[M-5]** HMAC エラー時にゼロMAC返却でなくResult返却 (S2) → S9で対応
+- [x] **[M-5]** HMAC エラー時にゼロMAC返却でなくResult返却 (S2) — S9 で `hmac_util::compute` を `Result<[u8;32], DiaryError>` 化
 - [x] EntryPlaintext に Zeroize/ZeroizeOnDrop 追加 (S4/S5技術的負債 H-1)
 - [x] list_entries_with_body の中間 Vec<String> zeroize 対応 (S5 H-2) — Zeroizing<String>
-- [ ] 読み取り時の署名/HMAC 検証 (S4技術的負債 H-3) → S9で対応
+- [x] 読み取り時の署名/HMAC 検証 (S4技術的負債 H-3) — S9 で `list_entries_with_body` / `get_entry` に `hmac_verify` + `dsa_verify_entry` を追加
 - [x] Win32コンソールAPI unsafe の ADR 作成 (S5 M-7) — docs/adr/0007
 - [x] CLI vault操作のボイラープレート抽出 (S5 L-2) — VaultGuard パターン
 
@@ -160,7 +160,7 @@
 - [ ] HQC FIPS最終標準確認
 - [ ] RustCrypto品質 pure Rust HQC実装の採用
 - [ ] ML-KEM + HQCハイブリッドKEM
-- [ ] vault.pqd v4 → v5マイグレーション
+- [x] vault.pqd v4 → v5マイグレーション — S13 で attachment record (`RECORD_TYPE=0x03`) を追加するため schema_version を v5 に bump、reader は v4/v5 両受理 (v5→v6 への将来 migration は HQC 標準化後を想定)
 
 ## Open Questions
 

@@ -1,6 +1,10 @@
 # Sprint Status
 
-## Current: Sprint 13 — 添付ファイル (attachments) — 実装フェーズ進行中
+## Current: Phase 2 中核完了 — 次スプリント未定 (棚卸し済み)
+
+Phase 1 全完了 + Phase 2 で legacy (S12) / 添付ファイル (S13 + S13.1) / change-password / info --security / export を完了。
+
+残 Phase 2 候補: Bases like ビュー、固定ブロックサイズ化 OQ-20、Web Clipper、鍵素材 XOR 分散、Unix ソケット + ロックデーモン。
 
 ## Progress
 
@@ -18,7 +22,9 @@
 | S10 | 運用機能 + CLI整合性 | completed (s10-done) | 10 |
 | S11 | クロスプラットフォーム検証 + toolchain 固定 | completed (s11-done) | 11 |
 | S12 | デジタル遺言 (legacy) | completed (s12-done) | 12 |
-| S13 | 添付ファイル (attachments) | in_progress (implementation phase) | 13 |
+| S13 | 添付ファイル (attachments) | completed (s13-done) | 13 |
+| S13.1 | cmd_import の `![[FILE]]` 統合 (S13 follow-up) | completed (PR #9) | 13 |
+| S14 | Phase 2 棚卸し + CHANGELOG.md 新規作成 | in_progress (housekeeping) | 14 |
 
 ## Sprint Scope
 
@@ -129,3 +135,10 @@
 - LegacyAccessReport を attachment 統計まで拡張
 - 設計 (PR #7) + 実装 (本 PR): 信頼性 🟡 → 🔵 (R1〜R5 を実装で確定)
 - workspace 721 テスト全パス (4 ignored)、smoke-test 34/34
+
+### S14: Phase 2 棚卸し + CHANGELOG.md 新規作成
+- `CHANGELOG.md` 新規作成 (Keep a Changelog 形式、S1-S13.1 を Released として整理)
+- `docs/backlog.md` の古い `[ ]` 表記を実装状態に補正 (S4/S5 の全項目、M-5/H-3、v4→v5)
+- `requirements.md` v4 → v5 migration ノート追加 (vault.pqd format §6 と Phase 4 §15)
+- 棚卸し範囲: S10〜S13.1 で蓄積された大変更 (5 スプリント連続) を一度整理
+- 動作確認: manual E2E (init → new → attachment add/list/extract → SHA-256 検証 OK) + smoke-test 34/34

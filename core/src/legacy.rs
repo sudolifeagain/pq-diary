@@ -17,7 +17,7 @@
 //!   `initialize_legacy`, `set_entry_flag`, `list_legacy_status`,
 //!   `rotate_legacy_code`, `execute_legacy_access`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use rand::{rngs::OsRng, RngCore};
@@ -30,7 +30,8 @@ use crate::entry::EntryPlaintext;
 use crate::error::DiaryError;
 use crate::vault::config::{ConfirmationMode, VaultConfig};
 use crate::vault::format::{
-    generate_verification_token, EntryRecord, VaultHeader, RECORD_TYPE_ENTRY, SCHEMA_VERSION,
+    generate_verification_token, EntryRecord, VaultHeader, HEADER_SIZE, RECORD_TYPE_ENTRY,
+    SCHEMA_VERSION,
 };
 use crate::vault::reader::read_vault;
 use crate::vault::writer::write_vault;
@@ -363,8 +364,29 @@ pub fn rotate_legacy_code(
     config.legacy.verification_iv_b64 = Some(B64.encode(iv));
     config.legacy.verification_ct_b64 = Some(B64.encode(&ct));
 
-    write_vault(&vault_pqd, header, &entries)?;
-    write_vault_toml_atomic(&vault_toml, &config)?;
+    let vault_tmp = sidecar_path(&vault_pqd, ".tmp.rotate")?;
+    let toml_tmp = sidecar_path(&vault_toml, ".tmp.rotate")?;
+    cleanup_sensitive_file(&vault_tmp);
+    cleanup_sensitive_file(&writer_tmp_path(&vault_tmp));
+    cleanup_sensitive_file(&toml_tmp);
+
+    if let Err(e) = write_vault(&vault_tmp, header, &entries) {
+        cleanup_sensitive_file(&vault_tmp);
+        cleanup_sensitive_file(&writer_tmp_path(&vault_tmp));
+        return Err(e);
+    }
+    if let Err(e) = write_vault_toml_sidecar(&toml_tmp, &config) {
+        cleanup_sensitive_file(&vault_tmp);
+        cleanup_sensitive_file(&toml_tmp);
+        return Err(e);
+    }
+    replace_vault_and_toml(
+        &vault_pqd,
+        &vault_tmp,
+        &vault_toml,
+        &toml_tmp,
+        ".bak.rotate",
+    )?;
 
     Ok(rotated)
 }
@@ -417,11 +439,12 @@ where
     }
 
     // Decrypt every INHERIT block; everything else is dropped on the floor.
+    // Non-entry records are omitted from the heir's vault, but they are not
+    // counted as destroyed diary entries in the user-facing report.
     let mut inherited_plaintexts: Vec<(EntryRecord, Zeroizing<Vec<u8>>)> = Vec::new();
     let mut destroyed = 0_usize;
     for record in old_entries {
         if record.record_type != RECORD_TYPE_ENTRY {
-            destroyed += 1;
             continue;
         }
         match LegacyFlag::from_byte(record.legacy_flag)? {
@@ -454,23 +477,37 @@ where
     }
     let inherited = new_entries.len();
 
-    // Atomic write to vault.pqd.tmp.legacy → rename.
-    let final_tmp = vault_dir.join("vault.pqd.tmp.legacy");
-    if let Err(e) = write_vault(&final_tmp, new_header, &new_entries) {
-        let _ = std::fs::remove_file(&final_tmp);
-        return Err(e);
-    }
-    if let Err(e) = std::fs::rename(&final_tmp, &vault_pqd) {
-        let _ = std::fs::remove_file(&final_tmp);
-        return Err(DiaryError::Io(e));
-    }
-
     // Reset the legacy section — the heir starts from a clean slate and can
     // run `pq-diary legacy init` again to nominate their own heir.
     config.legacy.initialized = false;
     config.legacy.verification_iv_b64 = None;
     config.legacy.verification_ct_b64 = None;
-    write_vault_toml_atomic(&vault_toml, &config)?;
+
+    let vault_tmp = sidecar_path(&vault_pqd, ".tmp.legacy")?;
+    let toml_tmp = sidecar_path(&vault_toml, ".tmp.legacy")?;
+    cleanup_sensitive_file(&vault_tmp);
+    cleanup_sensitive_file(&writer_tmp_path(&vault_tmp));
+    cleanup_sensitive_file(&toml_tmp);
+
+    if let Err(e) = write_vault(&vault_tmp, new_header, &new_entries) {
+        cleanup_sensitive_file(&vault_tmp);
+        cleanup_sensitive_file(&writer_tmp_path(&vault_tmp));
+        return Err(e);
+    }
+    if let Err(e) = write_vault_toml_sidecar(&toml_tmp, &config) {
+        cleanup_sensitive_file(&vault_tmp);
+        cleanup_sensitive_file(&toml_tmp);
+        return Err(e);
+    }
+
+    zeroize_non_inherited_record_ciphertexts(&vault_pqd, &old_header)?;
+    replace_vault_and_toml(
+        &vault_pqd,
+        &vault_tmp,
+        &vault_toml,
+        &toml_tmp,
+        ".bak.legacy",
+    )?;
 
     Ok(LegacyAccessReport {
         inherited,
@@ -494,7 +531,7 @@ fn verify_master(
     header: &VaultHeader,
     master_pwd: &SecretString,
     params: &kdf::Argon2Params,
-) -> Result<[u8; 32], DiaryError> {
+) -> Result<Zeroizing<[u8; 32]>, DiaryError> {
     let key = kdf::derive_key(
         master_pwd.expose_secret().as_bytes(),
         &header.kdf_salt,
@@ -506,7 +543,7 @@ fn verify_master(
         &header.verification_ct,
     )
     .map_err(|_| DiaryError::Crypto("invalid master password".to_string()))?;
-    Ok(*key.as_ref())
+    Ok(Zeroizing::new(*key.as_ref()))
 }
 
 fn verify_legacy_code(config: &VaultConfig, k_legacy: &[u8; 32]) -> Result<(), DiaryError> {
@@ -549,6 +586,222 @@ fn write_vault_toml_atomic(path: &Path, config: &VaultConfig) -> Result<(), Diar
     config.to_file(&tmp_path)?;
     std::fs::rename(&tmp_path, path).map_err(DiaryError::Io)?;
     Ok(())
+}
+
+fn write_vault_toml_sidecar(path: &Path, config: &VaultConfig) -> Result<(), DiaryError> {
+    config.to_file(path)?;
+    Ok(())
+}
+
+fn sidecar_path(path: &Path, suffix: &str) -> Result<PathBuf, DiaryError> {
+    let mut name = path
+        .file_name()
+        .ok_or_else(|| DiaryError::Vault("path has no file name".to_string()))?
+        .to_os_string();
+    name.push(suffix);
+    Ok(path.with_file_name(name))
+}
+
+fn writer_tmp_path(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(".tmp");
+    path.with_file_name(name)
+}
+
+fn replace_vault_and_toml(
+    vault_path: &Path,
+    vault_tmp: &Path,
+    toml_path: &Path,
+    toml_tmp: &Path,
+    backup_suffix: &str,
+) -> Result<(), DiaryError> {
+    let vault_bak = sidecar_path(vault_path, backup_suffix)?;
+    let toml_bak = sidecar_path(toml_path, backup_suffix)?;
+    cleanup_sensitive_file(&vault_bak);
+    cleanup_sensitive_file(&toml_bak);
+
+    let mut vault_backed_up = false;
+    let mut toml_backed_up = false;
+    let mut vault_replaced = false;
+
+    let result = (|| -> Result<(), DiaryError> {
+        std::fs::rename(vault_path, &vault_bak).map_err(DiaryError::Io)?;
+        vault_backed_up = true;
+        std::fs::rename(toml_path, &toml_bak).map_err(DiaryError::Io)?;
+        toml_backed_up = true;
+        std::fs::rename(vault_tmp, vault_path).map_err(DiaryError::Io)?;
+        vault_replaced = true;
+        std::fs::rename(toml_tmp, toml_path).map_err(DiaryError::Io)?;
+        Ok(())
+    })();
+
+    if let Err(e) = result {
+        if vault_replaced {
+            cleanup_sensitive_file(vault_path);
+        }
+        if toml_backed_up {
+            restore_backup(&toml_bak, toml_path);
+        }
+        if vault_backed_up {
+            restore_backup(&vault_bak, vault_path);
+        }
+        cleanup_sensitive_file(vault_tmp);
+        cleanup_sensitive_file(toml_tmp);
+        return Err(e);
+    }
+
+    cleanup_sensitive_file(&vault_bak);
+    cleanup_sensitive_file(&toml_bak);
+    Ok(())
+}
+
+fn restore_backup(backup: &Path, target: &Path) {
+    if let Err(e) = std::fs::rename(backup, target) {
+        eprintln!("Warning: failed to restore backup {backup:?} to {target:?}: {e}");
+    }
+}
+
+fn cleanup_sensitive_file(path: &Path) {
+    if path.is_dir() {
+        return;
+    }
+    if path.is_file() {
+        if let Err(e) = zeroize_file(path) {
+            eprintln!("Warning: failed to zeroize temporary file {path:?}: {e}");
+        }
+    }
+    if let Err(e) = std::fs::remove_file(path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            eprintln!("Warning: failed to remove temporary file {path:?}: {e}");
+        }
+    }
+}
+
+fn zeroize_file(path: &Path) -> Result<(), DiaryError> {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
+    let len = file.metadata()?.len();
+    zeroize_file_range(&mut file, 0, len)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn zeroize_file_range(file: &mut std::fs::File, offset: u64, len: u64) -> Result<(), DiaryError> {
+    use std::io::{Seek as _, Write as _};
+
+    file.seek(std::io::SeekFrom::Start(offset))?;
+    let zeros = [0u8; 8192];
+    let mut remaining = len;
+    while remaining > 0 {
+        let chunk_len = remaining.min(zeros.len() as u64) as usize;
+        file.write_all(&zeros[..chunk_len])?;
+        remaining -= chunk_len as u64;
+    }
+    Ok(())
+}
+
+fn zeroize_non_inherited_record_ciphertexts(
+    vault_path: &Path,
+    header: &VaultHeader,
+) -> Result<(), DiaryError> {
+    use std::io::{Read as _, Seek as _};
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(vault_path)?;
+    let entries_start = HEADER_SIZE as u64
+        + 4
+        + u64::try_from(header.kem_encrypted_sk.len())
+            .map_err(|_| DiaryError::Vault("KEM key length overflow".to_string()))?
+        + 4
+        + u64::try_from(header.dsa_encrypted_sk.len())
+            .map_err(|_| DiaryError::Vault("DSA key length overflow".to_string()))?;
+
+    file.seek(std::io::SeekFrom::Start(entries_start))?;
+    loop {
+        let record_len_pos = file.stream_position()?;
+        let mut len_buf = [0u8; 4];
+        file.read_exact(&mut len_buf)?;
+        let record_len = u32::from_le_bytes(len_buf);
+        if record_len == 0 {
+            break;
+        }
+
+        let payload_start = record_len_pos + 4;
+        let mut payload = vec![0u8; record_len as usize];
+        file.read_exact(&mut payload)?;
+        let parsed = parse_record_offsets_for_zeroize(&payload)?;
+        let should_zeroize =
+            parsed.record_type != RECORD_TYPE_ENTRY || parsed.legacy_flag != LegacyFlag::Inherit;
+        if should_zeroize && parsed.ciphertext_len > 0 {
+            zeroize_file_range(
+                &mut file,
+                payload_start + parsed.ciphertext_offset as u64,
+                parsed.ciphertext_len as u64,
+            )?;
+        }
+        file.seek(std::io::SeekFrom::Start(
+            payload_start + u64::from(record_len),
+        ))?;
+    }
+    file.sync_all()?;
+    Ok(())
+}
+
+struct RecordOffsets {
+    record_type: u8,
+    legacy_flag: LegacyFlag,
+    ciphertext_offset: usize,
+    ciphertext_len: usize,
+}
+
+fn parse_record_offsets_for_zeroize(payload: &[u8]) -> Result<RecordOffsets, DiaryError> {
+    const CT_LEN_OFFSET: usize = 1 + 16 + 8 + 8 + aead::NONCE_SIZE;
+    const CT_OFFSET: usize = CT_LEN_OFFSET + 4;
+
+    if payload.len() < CT_OFFSET {
+        return Err(DiaryError::Vault(
+            "record payload is too short for ciphertext length".to_string(),
+        ));
+    }
+    let record_type = payload[0];
+    let ct_len = read_u32_at(payload, CT_LEN_OFFSET, "ciphertext length")? as usize;
+    let sig_len_offset = checked_add(CT_OFFSET, ct_len, "ciphertext end")?;
+    let sig_len = read_u32_at(payload, sig_len_offset, "signature length")? as usize;
+    let sig_offset = checked_add(sig_len_offset, 4, "signature offset")?;
+    let hmac_offset = checked_add(sig_offset, sig_len, "signature end")?;
+    let legacy_flag_offset = checked_add(hmac_offset, 32, "content_hmac end")?;
+    let flag_byte = *payload
+        .get(legacy_flag_offset)
+        .ok_or_else(|| DiaryError::Vault("record payload is missing legacy flag".to_string()))?;
+
+    Ok(RecordOffsets {
+        record_type,
+        legacy_flag: LegacyFlag::from_byte(flag_byte)?,
+        ciphertext_offset: CT_OFFSET,
+        ciphertext_len: ct_len,
+    })
+}
+
+fn read_u32_at(payload: &[u8], offset: usize, label: &str) -> Result<u32, DiaryError> {
+    let end = checked_add(offset, 4, label)?;
+    let bytes: [u8; 4] = payload
+        .get(offset..end)
+        .ok_or_else(|| DiaryError::Vault(format!("record payload is missing {label}")))?
+        .try_into()
+        .map_err(|_| DiaryError::Vault(format!("record payload has invalid {label}")))?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn checked_add(a: usize, b: usize, label: &str) -> Result<usize, DiaryError> {
+    a.checked_add(b)
+        .ok_or_else(|| DiaryError::Vault(format!("record payload offset overflow at {label}")))
 }
 
 fn encrypt_legacy_block(k_legacy: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, DiaryError> {
@@ -1051,6 +1304,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rotated, 1);
+        assert!(!vault_dir.join("vault.pqd.bak.rotate").exists());
+        assert!(!vault_dir.join("vault.toml.bak.rotate").exists());
 
         // execute_legacy_access must accept the new code, not the old one.
         let bad = execute_legacy_access(
@@ -1161,6 +1416,8 @@ mod tests {
         // vault.toml [legacy] is reset for the heir.
         let cfg = VaultConfig::from_file(&vault_dir.join("vault.toml")).unwrap();
         assert!(!cfg.legacy.initialized);
+        assert!(!vault_dir.join("vault.pqd.bak.legacy").exists());
+        assert!(!vault_dir.join("vault.toml.bak.legacy").exists());
     }
 
     /// TC-S12-007-02: user cancellation leaves the vault unchanged.
@@ -1223,5 +1480,123 @@ mod tests {
             always_confirm,
         );
         assert!(matches!(result, Err(DiaryError::Vault(_))));
+    }
+
+    /// TC-S12-007-05: legacy-access physical deletion step zeroizes
+    /// non-INHERIT ciphertext bytes while leaving INHERIT ciphertext intact.
+    #[test]
+    fn tc_s12_007_05_zeroize_non_inherited_ciphertexts() {
+        let dir = tempdir().unwrap();
+        let (vault_dir, ids) = vault_with_one_entry(&dir, 2);
+        set_entry_flag(
+            &vault_dir,
+            &secret("master-pw"),
+            Some(&secret("legacy-code")),
+            &ids[0][..8],
+            LegacyFlag::Inherit,
+            &fast_deriver(),
+        )
+        .unwrap();
+
+        let vault_pqd = vault_dir.join("vault.pqd");
+        let (header, records_before) = read_vault(&vault_pqd).unwrap();
+        let inherit_before = records_before
+            .iter()
+            .find(|r| hex_lower(&r.uuid) == ids[0])
+            .unwrap()
+            .ciphertext
+            .clone();
+        let destroy_before = records_before
+            .iter()
+            .find(|r| hex_lower(&r.uuid) == ids[1])
+            .unwrap()
+            .ciphertext
+            .clone();
+        assert!(destroy_before.iter().any(|&b| b != 0));
+
+        zeroize_non_inherited_record_ciphertexts(&vault_pqd, &header).unwrap();
+
+        let (_header_after, records_after) = read_vault(&vault_pqd).unwrap();
+        let inherit_after = records_after
+            .iter()
+            .find(|r| hex_lower(&r.uuid) == ids[0])
+            .unwrap();
+        let destroy_after = records_after
+            .iter()
+            .find(|r| hex_lower(&r.uuid) == ids[1])
+            .unwrap();
+
+        assert_eq!(inherit_after.ciphertext, inherit_before);
+        assert!(destroy_after.ciphertext.iter().all(|&b| b == 0));
+    }
+
+    /// TC-S12-007-06: if the reset vault.toml sidecar cannot be written, the
+    /// original vault is left untouched because destructive zeroize has not run.
+    #[test]
+    fn tc_s12_007_06_toml_sidecar_failure_keeps_vault() {
+        let dir = tempdir().unwrap();
+        let (vault_dir, ids) = vault_with_one_entry(&dir, 1);
+        set_entry_flag(
+            &vault_dir,
+            &secret("master-pw"),
+            Some(&secret("legacy-code")),
+            &ids[0][..8],
+            LegacyFlag::Inherit,
+            &fast_deriver(),
+        )
+        .unwrap();
+        let bytes_before = std::fs::read(vault_dir.join("vault.pqd")).unwrap();
+
+        let blocked_toml_tmp = vault_dir.join("vault.toml.tmp.legacy");
+        std::fs::create_dir(&blocked_toml_tmp).unwrap();
+        let result = execute_legacy_access(
+            &vault_dir,
+            &secret("legacy-code"),
+            &fast_deriver(),
+            always_confirm,
+        );
+        assert!(matches!(result, Err(DiaryError::Io(_))));
+
+        let bytes_after = std::fs::read(vault_dir.join("vault.pqd")).unwrap();
+        assert_eq!(bytes_before, bytes_after);
+        assert!(!vault_dir.join("vault.pqd.tmp.legacy").exists());
+    }
+
+    /// TC-S12-007-07: non-entry records are dropped during legacy-access but
+    /// not counted as destroyed diary entries.
+    #[test]
+    fn tc_s12_007_07_templates_dropped_not_counted_as_destroyed_entries() {
+        let dir = tempdir().unwrap();
+        let vault_dir = setup_vault(&dir, b"master-pw");
+        let vault_pqd = vault_pqd_str(&vault_dir);
+        let mut core = DiaryCore::new(&vault_pqd).unwrap();
+        core.unlock(secret("master-pw")).unwrap();
+        core.new_entry("entry", "body", vec![]).unwrap();
+        core.new_template("daily", "template body").unwrap();
+        drop(core);
+
+        initialize_legacy(
+            &vault_dir,
+            &secret("master-pw"),
+            &secret("legacy-code"),
+            ConfirmationMode::Yn,
+            &fast_deriver(),
+        )
+        .unwrap();
+
+        let report = execute_legacy_access(
+            &vault_dir,
+            &secret("legacy-code"),
+            &fast_deriver(),
+            always_confirm,
+        )
+        .unwrap();
+        assert_eq!(report.inherited, 0);
+        assert_eq!(report.destroyed, 1);
+
+        let mut heir = DiaryCore::new(&vault_pqd).unwrap();
+        heir.unlock(secret("legacy-code")).unwrap();
+        assert!(heir.list_entries(None).unwrap().is_empty());
+        assert!(heir.list_templates().unwrap().is_empty());
     }
 }

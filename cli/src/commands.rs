@@ -9,7 +9,7 @@ use crate::password::get_password;
 use crate::Cli;
 use chrono::{DateTime, Local, Utc};
 use pq_diary_core::{DiaryCore, EntryMeta, EntryPlaintext, Tag};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
 // Private helpers
@@ -33,6 +33,36 @@ fn resolve_vault_path(cli: &Cli) -> anyhow::Result<PathBuf> {
         None => PathBuf::from("vault.pqd"),
     };
     Ok(path)
+}
+
+/// Resolve an Obsidian `![[...]]` attachment target against the import
+/// `attachments/` directory without allowing absolute paths, `..`, or symlink
+/// escapes outside that directory.
+fn resolve_import_attachment_source(attachments_dir: &Path, link_target: &str) -> Option<PathBuf> {
+    let relative = Path::new(link_target.trim());
+    let mut has_component = false;
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(_) => has_component = true,
+            _ => return None,
+        }
+    }
+    if !has_component {
+        return None;
+    }
+
+    let candidate = attachments_dir.join(relative);
+    if !candidate.is_file() {
+        return None;
+    }
+
+    let attachments_dir = attachments_dir.canonicalize().ok()?;
+    let candidate = candidate.canonicalize().ok()?;
+    if candidate.starts_with(&attachments_dir) && candidate.is_file() {
+        Some(candidate)
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1681,6 +1711,8 @@ pub(crate) fn cmd_import_to(
     let mut attached = 0_usize;
     let mut skipped_links: Vec<String> = Vec::new();
     let mut pending_attachments: Vec<(String, std::path::PathBuf)> = Vec::new();
+    let mut queued_attachments: std::collections::HashSet<(String, std::path::PathBuf)> =
+        std::collections::HashSet::new();
     if !args.dry_run {
         let attachments_dir = args.dir.join("attachments");
         let post_metas = guard
@@ -1696,9 +1728,11 @@ pub(crate) fn cmd_import_to(
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             let links = pq_diary_core::importer::parse_obsidian_attachment_links(&plaintext.body);
             for filename in links {
-                let src = attachments_dir.join(&filename);
-                if src.is_file() {
-                    pending_attachments.push((id_prefix.to_string(), src));
+                if let Some(src) = resolve_import_attachment_source(&attachments_dir, &filename) {
+                    let id_prefix = id_prefix.to_string();
+                    if queued_attachments.insert((id_prefix.clone(), src.clone())) {
+                        pending_attachments.push((id_prefix, src));
+                    }
                 } else {
                     skipped_links.push(filename);
                 }
@@ -6152,6 +6186,142 @@ mod tests {
             output.contains("unresolved") && output.contains("missing.pdf"),
             "output must list the unresolved attachment reference: {output}"
         );
+    }
+
+    /// TC-S13-110-03: `import <DIR>` must not resolve attachment links outside
+    /// `<DIR>/attachments/`, even when the referenced outside file exists.
+    #[test]
+    fn tc_s13_110_03_import_rejects_attachment_path_escape() {
+        use secrecy::SecretBox;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let src_dir = tempfile::tempdir().expect("src tempdir");
+        std::fs::write(
+            src_dir.path().join("note.md"),
+            "# Note\n\n![[../outside.txt]]\n",
+        )
+        .expect("write md");
+        std::fs::create_dir_all(src_dir.path().join("attachments")).expect("mkdir attachments");
+        std::fs::write(src_dir.path().join("outside.txt"), b"outside attachment")
+            .expect("write outside");
+
+        let cli = parse_import_cli(vault_dir_str, src_dir.path().to_str().expect("utf8"), &[]);
+        let import_args = extract_import_args(&cli);
+
+        let mut out = Vec::new();
+        cmd_import_to(&cli, import_args, &mut out).expect("cmd_import_to");
+        let output = String::from_utf8(out).expect("utf8");
+
+        assert!(
+            output.contains("unresolved") && output.contains("../outside.txt"),
+            "path escape must be reported as unresolved: {output}"
+        );
+
+        let pwd = SecretBox::new(Box::from("password"));
+        let metas = pq_diary_core::attachment::list_attachments(&vault_dir, &pwd, None)
+            .expect("list_attachments");
+        assert!(
+            metas.is_empty(),
+            "outside file must not be imported as an attachment"
+        );
+    }
+
+    /// TC-S13-110-04: repeated `![[FILE]]` links in the same imported entry
+    /// attach the file once and report the real number of added records.
+    #[test]
+    fn tc_s13_110_04_import_dedupes_duplicate_attachment_links() {
+        use secrecy::SecretBox;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let src_dir = tempfile::tempdir().expect("src tempdir");
+        std::fs::write(
+            src_dir.path().join("note.md"),
+            "# Note\n\n![[photo.png]]\n![[photo.png]]\n",
+        )
+        .expect("write md");
+        std::fs::create_dir_all(src_dir.path().join("attachments")).expect("mkdir attachments");
+        std::fs::write(
+            src_dir.path().join("attachments/photo.png"),
+            b"fake png body",
+        )
+        .expect("write attachment");
+
+        let cli = parse_import_cli(vault_dir_str, src_dir.path().to_str().expect("utf8"), &[]);
+        let import_args = extract_import_args(&cli);
+
+        let mut out = Vec::new();
+        cmd_import_to(&cli, import_args, &mut out).expect("cmd_import_to");
+        let output = String::from_utf8(out).expect("utf8");
+        assert!(
+            output.contains("Attachments: 1 added"),
+            "duplicate link must report a single added attachment: {output}"
+        );
+
+        let pwd = SecretBox::new(Box::from("password"));
+        let metas = pq_diary_core::attachment::list_attachments(&vault_dir, &pwd, None)
+            .expect("list_attachments");
+        assert_eq!(metas.len(), 1, "duplicate links must create one attachment");
+    }
+
+    /// TC-S13-110-05: files in top-level `<DIR>/attachments/` are attachment
+    /// payloads and must not also be imported as diary entries.
+    #[test]
+    fn tc_s13_110_05_import_ignores_attachments_dir_as_entries() {
+        use secrecy::SecretBox;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let src_dir = tempfile::tempdir().expect("src tempdir");
+        std::fs::write(
+            src_dir.path().join("note.md"),
+            "# Note\n\n![[snippet.md]]\n",
+        )
+        .expect("write md");
+        std::fs::create_dir_all(src_dir.path().join("attachments")).expect("mkdir attachments");
+        std::fs::write(
+            src_dir.path().join("attachments/snippet.md"),
+            "# Not a diary entry\n",
+        )
+        .expect("write attachment");
+
+        let cli = parse_import_cli(vault_dir_str, src_dir.path().to_str().expect("utf8"), &[]);
+        let import_args = extract_import_args(&cli);
+
+        let mut out = Vec::new();
+        cmd_import_to(&cli, import_args, &mut out).expect("cmd_import_to");
+        let output = String::from_utf8(out).expect("utf8");
+        assert!(
+            output.contains("Imported: 1, Skipped: 0"),
+            "attachments/ files must not affect entry import counts: {output}"
+        );
+
+        let vault_pqd_str = vault_dir.join("vault.pqd");
+        let mut core =
+            DiaryCore::new(vault_pqd_str.to_str().expect("utf8")).expect("DiaryCore::new");
+        core.unlock(SecretBox::new(Box::from("password")))
+            .expect("unlock");
+        let entries = core.list_entries(None).expect("list_entries");
+        core.lock();
+        assert_eq!(
+            entries.len(),
+            1,
+            "only note.md must be imported as an entry"
+        );
+        assert_eq!(entries[0].title, "note");
+
+        let pwd = SecretBox::new(Box::from("password"));
+        let metas = pq_diary_core::attachment::list_attachments(&vault_dir, &pwd, None)
+            .expect("list_attachments");
+        assert_eq!(metas.len(), 1, "snippet.md must still be attached");
+        assert_eq!(metas[0].filename, "snippet.md");
     }
 
     /// TC-D07-02: `--dry-run` shows `[DRY RUN]` and `Would import` preview.

@@ -13,10 +13,11 @@
 **信頼性**: 🔵 *ヒアリング Q1/Q2/Q3/Q4 + 既存実装*
 
 添付ファイルは **メタデータ/本体分離方式** を採用する:
-- **メタデータ**: vault.pqd 内の attachment レコード (新 `RECORD_TYPE_ATTACHMENT = 0x03`)、
-  K_master で暗号化済み (既存 entry record と同形式)
-- **本体**: `<vault_dir>/.attachments/<file_uuid>.bin`、
-  AES-256-GCM 1MB chunk ストリーミング暗号化
+- **メタデータ**: vault.pqd v5 内の attachment レコード (新 `RECORD_TYPE_ATTACHMENT = 0x03`)。
+  ファイル名・MIME・サイズ・SHA-256・FileKey は `AttachmentPlaintext` として
+  K_master で暗号化する (既存 entry record と同じ HMAC + signature モデル)
+- **本体**: `<vault_dir>/.attachments/<blob_uuid>.bin`。
+  OsRng 生成の添付専用 FileKey で AES-256-GCM 1MB chunk ストリーミング暗号化
 
 ```
 通常時:
@@ -57,14 +58,14 @@ legacy-access:
 │    fn set_attachment_legacy_flag(...)                   │
 │                                                          │
 │  core/src/crypto/streaming.rs (新規):                   │
-│    fn encrypt_stream<R, W>(key, reader, writer, file_uuid)│
-│    fn decrypt_stream<R, W>(key, reader, writer, file_uuid)│
+│    fn encrypt_stream<R, W>(file_key, reader, writer, blob_uuid)│
+│    fn decrypt_stream<R, W>(file_key, reader, writer, blob_uuid)│
 │    (1MB chunk 単位の AES-GCM + AAD)                      │
 │                                                          │
 │  core/src/vault/format.rs (改訂):                       │
 │    const RECORD_TYPE_ATTACHMENT: u8 = 0x03               │
 │    struct AttachmentRecord (新)                          │
-│    EntryRecord はそのまま (attachment_count / attachment_offset 使用開始)│
+│    EntryRecord はそのまま (attachment_count 使用開始 / attachment_offset は 0)│
 │                                                          │
 │  core/src/vault/reader.rs (改訂):                       │
 │    read_vault() が AttachmentRecord も読む               │
@@ -77,7 +78,7 @@ legacy-access:
 │    rotate_legacy_code が attachment レコードも対象        │
 │                                                          │
 │  core/src/entry.rs (拡張):                              │
-│    create_entry が attachment_offset を設定可             │
+│    create_entry は attachment_offset=0 のまま             │
 │                                                          │
 │  core/src/importer.rs (拡張):                           │
 │    parse_obsidian_attachment_links()                    │
@@ -86,12 +87,12 @@ legacy-access:
                          │
 ┌────────────────────────▼────────────────────────────────┐
 │           ストレージ層                                   │
-│  vault.pqd v4:                                          │
+│  vault.pqd v5:                                          │
 │    EntryRecord.attachment_count: u16 (使用開始)         │
-│    EntryRecord.attachment_offset: u64 (使用開始)         │
+│    EntryRecord.attachment_offset: u64 (0 固定)           │
 │    AttachmentRecord (新タイプ 0x03)                      │
 │  <vault_dir>/.attachments/:                              │
-│    <file_uuid>.bin (chunk 暗号化バイナリ)                 │
+│    <blob_uuid>.bin (chunk 暗号化バイナリ、重複時は共有)   │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -104,8 +105,8 @@ legacy-access:
 ```rust
 //! Attachment CRUD + legacy 連動。
 //!
-//! 添付メタデータは vault.pqd の AttachmentRecord (新タイプ 0x03)、
-//! 本体は <vault_dir>/.attachments/<uuid>.bin に AES-GCM 1MB chunk で保管。
+//! 添付メタデータは vault.pqd v5 の AttachmentRecord (新タイプ 0x03)、
+//! 本体は <vault_dir>/.attachments/<blob_uuid>.bin に AES-GCM 1MB chunk で保管。
 
 use crate::error::DiaryError;
 use crate::vault::format::AttachmentRecord;
@@ -173,21 +174,21 @@ pub fn set_attachment_legacy_flag(
 //! Bin layout (variable repetitions per chunk):
 //!   [chunk_iv: 12B][chunk_ct + tag: chunk_size + 16B]
 //!
-//! AAD per chunk = chunk_index (LE u32) || total_chunks (LE u32) || file_uuid (16B)
+//! AAD per chunk = chunk_index (LE u32) || total_chunks (LE u32) || blob_uuid (16B)
 //! → chunk reorder / truncation / file substitution detection.
 
 pub const CHUNK_SIZE: usize = 1024 * 1024; // 1 MiB
 
 pub fn encrypt_stream<R: std::io::Read, W: std::io::Write>(
     key: &[u8; 32],
-    file_uuid: &[u8; 16],
+    blob_uuid: &[u8; 16],
     reader: &mut R,
     writer: &mut W,
 ) -> Result<(u64, [u8; 32]), DiaryError>;  // returns (total_bytes_read, sha256_plain)
 
 pub fn decrypt_stream<R: std::io::Read, W: std::io::Write>(
     key: &[u8; 32],
-    file_uuid: &[u8; 16],
+    blob_uuid: &[u8; 16],
     expected_size: u64,
     expected_sha256: &[u8; 32],
     reader: &mut R,
@@ -203,25 +204,34 @@ pub const RECORD_TYPE_ATTACHMENT: u8 = 0x03;
 #[derive(Debug, Clone)]
 pub struct AttachmentRecord {
     pub record_type: u8,                  // 0x03
-    pub uuid: [u8; 16],
-    pub entry_uuid: [u8; 16],
-    pub created_at: u64,
-    pub filename: String,
-    pub mime_type: String,
-    pub size_bytes: u64,
-    pub chunk_count: u32,
-    pub sha256: [u8; 32],
+    pub uuid: [u8; 16],                   // attachment record UUID
+    pub iv: [u8; 12],
+    pub ciphertext: Vec<u8>,              // encrypted AttachmentPlaintext
     pub content_hmac: [u8; 32],
     pub signature: Vec<u8>,
     pub legacy_flag: u8,
     pub legacy_key_block: Vec<u8>,
     pub padding: Vec<u8>,
 }
+
+#[derive(Debug, Clone)]
+pub struct AttachmentPlaintext {
+    pub entry_uuid: [u8; 16],
+    pub blob_uuid: [u8; 16],
+    pub created_at: u64,
+    pub filename: String,
+    pub mime_type: String,
+    pub size_bytes: u64,
+    pub chunk_count: u32,
+    pub sha256: [u8; 32],
+    pub file_key: [u8; 32],               // Zeroizing in implementation
+}
 ```
 
 Reader / Writer は `record_type` で分岐し、Entry / Template / Attachment を
-区別する。EntryRecord の `attachment_count` と `attachment_offset` は、
-このエントリに紐付く AttachmentRecord 群のインデックスとして使用。
+区別する。EntryRecord の `attachment_count` は表示・境界チェック用に使用し、
+`attachment_offset` は v5 でも 0 固定。紐付けは復号後の
+`AttachmentPlaintext.entry_uuid` で行う。
 
 ### 4. CLI 構造拡張 🟡
 
@@ -268,12 +278,12 @@ attach: Vec<PathBuf>,
 
 | S13 機能 | 統合先 | 統合方法 |
 |---|---|---|
-| chunk 暗号化 | `core/src/crypto/aead.rs` | 既存 `encrypt` / `decrypt` を内部で繰り返し呼ぶ |
+| chunk 暗号化 | `core/src/crypto/aead.rs` | FileKey で既存 `encrypt` / `decrypt` を内部で繰り返し呼ぶ |
 | sha256 | `core/src/crypto/hmac_util.rs` 周辺 | 新規 `streaming::compute_sha256_streaming` |
-| メタデータ署名 | `engine.dsa_sign` | sha256 + filename + size を message に |
-| HMAC | `engine.hmac` | 既存 API 流用 |
+| メタデータ署名 | `engine.dsa_sign` | AttachmentRecord.ciphertext を message に |
+| HMAC | `engine.hmac` | AttachmentRecord.ciphertext に対して既存 API 流用 |
 | vault.pqd I/O | `reader.rs` / `writer.rs` | record_type 分岐拡張 |
-| change-password | `change_password::re_encrypt_vault` | attachment レコードも再暗号化対象 |
+| change-password | `change_password::re_encrypt_vault` | AttachmentPlaintext を新 K_master で再暗号化、FileKey と `.bin` は維持 |
 | legacy-access | `legacy::execute_legacy_access` | attachment INHERIT/DESTROY 処理追加 |
 | export | `commands::cmd_export` | `<DIR>/attachments/` 生成、`![[FILE]]` 埋め込み |
 | import | `importer.rs` | `attachments/` スキャン、`![[...]]` パース |
@@ -295,10 +305,14 @@ attach: Vec<PathBuf>,
 | 失敗 | 対応 |
 |---|---|
 | `.bin.tmp` 書き込み失敗 | zeroize 上書き → 削除、vault.pqd 無変更 |
-| vault.pqd 更新失敗 | `.bin.tmp` zeroize 削除、attachment レコード未追加 |
+| vault.pqd 更新失敗 | 直前に rename 済みの `.bin` を zeroize 削除、attachment レコード未追加 |
 | extract 失敗 | `--out` tmp ファイル削除 |
 | delete 失敗 | attachment レコードはそのまま、ユーザーに警告 |
 | legacy-access 失敗 | 新 vault.pqd.tmp + 新規 .attachments/ tmp dir を削除 |
+
+クラッシュ等で vault.pqd に参照されない `.attachments/*.bin` が残った場合は、
+次回の attachment 操作または `pq-diary verify --repair` で全 AttachmentRecord を復号し、
+未参照 blob を zeroize 削除する。
 
 ## 関連文書
 

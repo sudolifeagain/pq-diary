@@ -26,18 +26,21 @@ AttachmentCommands::Add {
 3. ファイルサイズチェック (`size <= 1GB`、超過なら `InvalidArgument`)
 4. master password 取得 + unlock
 5. ID プレフィックスでエントリ検索
-6. 1 エントリの attachment_count が 255 → `InvalidArgument` (上限)
+6. 1 エントリの attachment_count が 256 以上 → `InvalidArgument` (上限)
 7. 同名ファイル既存チェック:
-   - SHA-256 一致 → 重複排除、`.bin` 書き込みスキップ、メタデータレコードのみ追加
+   - SHA-256 一致 → 既存 `blob_uuid` + FileKey を共有し、メタデータレコードのみ追加
    - SHA-256 不一致 → `InvalidArgument` (rename を促す)
-8. `<vault_dir>/.attachments/<file_uuid>.bin.tmp` を作成
-9. `streaming::encrypt_stream(K_master, file_uuid, src, tmp)` で chunk 暗号化
+8. 新規 blob の場合のみ `<vault_dir>/.attachments/<blob_uuid>.bin.tmp` を作成
+9. OsRng 生成の FileKey で `streaming::encrypt_stream(file_key, blob_uuid, src, tmp)` を実行
    - 同時に SHA-256 計算
 10. MIME type を `mime_guess` で判定
-11. `AttachmentRecord` を組み立て、HMAC + ML-DSA 署名
-12. vault.pqd に attachment レコード追加、entry の `attachment_count++`
-13. アトミック書き込み → `.bin.tmp` を `.bin` に rename
-14. メッセージ: `Added: <filename> (size_kb KB, mime <type>) → <entry_prefix>`
+11. ファイル名・MIME・サイズ・SHA-256・FileKey を `AttachmentPlaintext` に入れて K_master で暗号化
+12. `AttachmentRecord` を組み立て、ciphertext に HMAC + ML-DSA 署名
+13. 新規 blob の場合は `.bin.tmp` を `.bin` に rename
+14. vault.pqd に attachment レコード追加、entry の `attachment_count++`
+    - vault 更新失敗時は rename 済み `.bin` を zeroize 削除
+    - クラッシュで orphan blob が残った場合は verify/repair で削除
+15. メッセージ: `Added: <filename> (size_kb KB, mime <type>) → <entry_prefix>`
 
 **出力サンプル**:
 ```
@@ -51,7 +54,7 @@ Added: photo.jpg (1024 KB, mime image/jpeg) → 3c6b775f
 - ファイル不存在: `Error: file not found: ~/photo.jpg`
 - 1GB 超: `Error: file size 1.2 GB exceeds the 1 GB limit`
 - ID 不一致: `Error: no entry matches prefix '3c6b'`
-- 256 個目: `Error: maximum 256 attachments per entry`
+- 257 個目: `Error: maximum 256 attachments per entry`
 
 ---
 
@@ -111,9 +114,10 @@ AttachmentCommands::Extract {
 1. `--claude` チェック → ブロック
 2. master + unlock
 3. entry + filename で AttachmentRecord 検索 (unique 前提)
-4. `<vault_dir>/.attachments/<file_uuid>.bin` を開く
+4. `<vault_dir>/.attachments/<blob_uuid>.bin` を開く
 5. `<out>.tmp` を作成
-6. `streaming::decrypt_stream(K_master, file_uuid, size, sha256, src, tmp)` で復号
+6. AttachmentPlaintext から FileKey / blob_uuid / size / sha256 を取り出し、
+   `streaming::decrypt_stream(file_key, blob_uuid, size, sha256, src, tmp)` で復号
    - chunk ごとの AAD 検証
    - 全 chunk 完了後の SHA-256 検証
 7. `<out>.tmp` を `<out>` に rename (アトミック)
@@ -154,7 +158,9 @@ AttachmentCommands::Delete {
 2. `--force` でなければ確認 prompt (`Delete 'photo.jpg' from entry 3c6b? [y/N]:`)
 3. master + unlock
 4. AttachmentRecord 検索
-5. `.attachments/<uuid>.bin` を zeroize 上書き → ファイル削除
+5. 削除予定レコードを除いた後も同じ `blob_uuid` を参照するレコードが残るか確認
+   - 残る場合: 本体ファイルは維持
+   - 残らない場合: `.attachments/<blob_uuid>.bin` を zeroize 上書き → ファイル削除
 6. vault.pqd から AttachmentRecord を削除、entry の `attachment_count--`
 7. アトミック書き込み
 8. メッセージ: `Deleted: photo.jpg (size_kb KB)`
@@ -184,7 +190,7 @@ AttachmentCommands::Set {
 4. `--inherit` なら legacy code も取得
 5. AttachmentRecord 検索
 6. flag 変更:
-   - `--inherit`: legacy_flag = 0x01、legacy_key_block = AES-GCM(K_legacy, K_master_subkey)
+   - `--inherit`: legacy_flag = 0x01、legacy_key_block = AES-GCM(K_legacy, AttachmentLegacyPlaintext)
    - `--destroy`: legacy_flag = 0x00、legacy_key_block = empty
 7. アトミック書き戻し
 8. メッセージ: `Attachment <FILE_NAME> set to INHERIT/DESTROY`

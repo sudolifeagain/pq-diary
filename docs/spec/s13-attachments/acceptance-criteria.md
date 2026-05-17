@@ -16,7 +16,7 @@
 - **When**: `pq-diary attachment add 3c6b ~/bug.png` を実行
 - **Then**:
   - exit 0
-  - `<vault_dir>/.attachments/<uuid>.bin` が生成 (暗号化済み)
+  - `<vault_dir>/.attachments/<blob_uuid>.bin` が生成 (暗号化済み)
   - vault.pqd の attachment レコードに `bug.png` のメタデータが追加
   - 元ファイル `~/bug.png` は無変更
 
@@ -37,7 +37,7 @@
 - **Given**: 50MB のテストファイル (1MB chunk なら 50 chunks)
 - **When**: `pq-diary attachment add` 実行
 - **Then**:
-  - `.attachments/<uuid>.bin` のサイズ ≈ 50MB + (12 + 16) * 50 (IV + GCM tag overhead)
+  - `.attachments/<blob_uuid>.bin` のサイズ ≈ 50MB + (12 + 16) * 50 (IV + GCM tag overhead)
   - 各 chunk が独立した IV を持つ (バイナリ先頭 12B 比較で確認)
 
 ### TC-S13-101-E01: メモリピーク確認 🟡
@@ -78,7 +78,7 @@
 
 ### TC-S13-202-02: 改ざんされた `.bin` で extract エラー 🔵
 
-- **Given**: add 後に `.attachments/<uuid>.bin` の任意の byte を flip
+- **Given**: add 後に `.attachments/<blob_uuid>.bin` の任意の byte を flip
 - **When**: extract 実行
 - **Then**: `Err(DiaryError::Crypto(_))` (AEAD tag mismatch)、`--out` ファイル無生成
 
@@ -98,7 +98,7 @@
 - **When**: `pq-diary attachment delete 3c6b a.bin`
 - **Then**:
   - exit 0
-  - `.attachments/<uuid>.bin` が存在しない
+  - `.attachments/<blob_uuid>.bin` が存在しない
   - 削除前に zeroize 上書きされた痕跡 (削除前バイトは vault からも完全に取り出せない)
 
 ### TC-S13-301-02: 添付メタデータも vault.pqd から削除 🟡
@@ -152,7 +152,7 @@
 - **Then**:
   - exit 0
   - attachment レコードの legacy_flag = 0x01
-  - legacy_key_block が生成 (K_legacy 暗号化)
+  - legacy_key_block が生成 (K_legacy で AttachmentLegacyPlaintext を暗号化)
 
 ### TC-S13-503-01: legacy-access で INHERIT 添付が継承 🟡
 
@@ -160,7 +160,7 @@
 - **When**: `pq-diary legacy-access` (timer30 → y)
 - **Then**:
   - 新 vault に a.png 残る (extract で復元可)
-  - `.attachments/<b.pdf uuid>.bin` が zeroize 削除済み
+  - `.attachments/<b.pdf blob_uuid>.bin` が、他参照がなければ zeroize 削除済み
   - 新 vault unlock は legacy code で成功
 
 ### TC-S13-503-02: legacy-access の report 🟡
@@ -205,7 +205,9 @@
 - **When**: 別エントリ B に同じ a.png を add (`import` 経由)
 - **Then**:
   - 新 attachment レコードは生成
-  - `.attachments/` に新 `.bin` は作られない (既存を共有)
+  - 新 record の AttachmentPlaintext は既存 blob_uuid + FileKey を参照
+  - `.attachments/` に新 `.bin` は作られない (既存 blob を共有)
+  - 片方の attachment を delete しても、もう片方から extract できる
 
 ---
 
@@ -234,7 +236,7 @@
 
 - **Given**: 添付済 vault
 - **When**: change-password 実行 → 新パスワードで extract
-- **Then**: extract が新パスワードで成功 (`.bin` 本体は変更不要、メタデータは再暗号化)
+- **Then**: extract が新パスワードで成功 (`.bin` 本体は変更不要、AttachmentPlaintext は再暗号化)
 
 ---
 
@@ -248,10 +250,10 @@
   - add 成功、attachment レコード生成
   - extract 後 `--out` ファイルが 0 byte で存在
 
-### TC-S13-EDGE-02: 256 個目の添付 🟡
+### TC-S13-EDGE-02: 257 個目の添付 🟡
 
-- **Given**: 1 エントリで添付 255 個既存
-- **When**: 256 個目を add
+- **Given**: 1 エントリで添付 256 個既存
+- **When**: 257 個目を add
 - **Then**: `Err(DiaryError::InvalidArgument(_))`
 
 ### TC-S13-EDGE-03: 同名追加 (異 SHA-256) は拒否 🟡
@@ -265,6 +267,12 @@
 - **Given**: S12 で生成された vault (attachment_count = 0)
 - **When**: S13 クライアントで `pq-diary list`
 - **Then**: 既存エントリが全て表示、attachment セクションは空
+
+### TC-S13-EDGE-06: S13 vault は旧 client で拒否 🟡
+
+- **Given**: S13 で `schema_version = 5` に migration 済み vault
+- **When**: S12 以前のクライアントで open
+- **Then**: unsupported schema エラーで停止し、unknown record を entry として parse しない
 
 ---
 

@@ -66,7 +66,7 @@
 **詳細シナリオ**:
 1. `pq-diary attachment list <ENTRY_ID>` で削除対象を確認
 2. `pq-diary attachment delete <ENTRY_ID> video.mp4 --force`
-3. `.attachments/<uuid>.bin` が zeroize 後に削除されていることを確認
+3. `.attachments/<blob_uuid>.bin` が最後の参照なら zeroize 後に削除されていることを確認
 
 **前提**: master password 既知
 **優先度**: Should Have
@@ -156,7 +156,7 @@
 3. 新端末: `pq-diary init` で vault 作成
 4. 新端末: `pq-diary import ~/migrate/` → MD + attachments 取り込み
 
-**前提**: vault.pqd 内容は同じになることを SHA-256 比較で検証可能
+**前提**: export/import 後に list/extract した論理内容と添付 SHA-256 が一致する
 **優先度**: Must Have
 
 ---

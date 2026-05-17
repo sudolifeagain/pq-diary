@@ -115,9 +115,9 @@
 - マージ後 hardening (PR #6 review fix): rotate / legacy-access を 2-file アトミック (sidecar tmp + replace + backup)
 
 ### S13: 添付ファイル (attachments) — 設計フェーズ
-- vault.pqd v4 の予約済み `attachment_count` (u16) / `attachment_offset` (u64) を本実装
-- ストレージ分離: vault.pqd (メタデータ `RECORD_TYPE_ATTACHMENT=0x03`) + `.attachments/<uuid>.bin` (本体)
-- chunk 暗号化: 1MB chunk + AES-GCM、AAD に chunk_index + total + file_uuid で改ざん検出
+- vault.pqd v4 の予約済み `attachment_count` (u16) / `attachment_offset` (u64) を活用し、S13 は schema_version v5 へ更新
+- ストレージ分離: vault.pqd (暗号化 AttachmentPlaintext を持つ `RECORD_TYPE_ATTACHMENT=0x03`) + `.attachments/<blob_uuid>.bin` (本体)
+- chunk 暗号化: 1MB chunk + FileKey + AES-GCM、AAD に chunk_index + total + blob_uuid で改ざん検出
 - サイズ上限: 1 ファイル 1GB (ストリーミング処理)
 - legacy 連動 (S12 拡張): ファイル個別 INHERIT/DESTROY フラグ、エントリ DESTROY 時は添付も自動連動
 - 双方向 Obsidian 互換: export で `![[FILE]]` 埋め込み + `attachments/` 別ディレクトリ、import で同形式読み取り

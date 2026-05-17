@@ -27,30 +27,39 @@ pub const RECORD_TYPE_ATTACHMENT: u8 = 0x03;
 
 /// vault.pqd 内の添付メタデータレコード。
 ///
-/// 本体 (バイナリ) は別ファイル `<vault_dir>/.attachments/<uuid>.bin` に
+/// 本体 (バイナリ) は別ファイル `<vault_dir>/.attachments/<blob_uuid>.bin` に
 /// 1MB chunk の AES-256-GCM で保存される。このレコードは:
-/// - 添付の同定情報 (uuid, entry_uuid, filename)
-/// - 整合性検証 (sha256, content_hmac, signature)
-/// - サイズ情報 (size_bytes, chunk_count)
-/// - 表示メタデータ (mime_type, created_at)
+/// - attachment record UUID
+/// - K_master で暗号化した AttachmentPlaintext
+/// - ciphertext の整合性検証 (content_hmac, signature)
 /// - S12 legacy 連動 (legacy_flag, legacy_key_block)
 /// を保持する。
 #[derive(Debug, Clone)]
 pub struct AttachmentRecord {
     pub record_type: u8,           // 0x03
-    pub uuid: [u8; 16],            // attachment UUID
-    pub entry_uuid: [u8; 16],      // 紐付くエントリ UUID
-    pub created_at: u64,           // Unix seconds
-    pub filename: String,          // 元ファイル名 (extension 含む)
-    pub mime_type: String,         // 例: "image/jpeg"、"application/pdf"
-    pub size_bytes: u64,           // plaintext サイズ
-    pub chunk_count: u32,          // ceil(size_bytes / 1MB)
-    pub sha256: [u8; 32],          // plaintext の SHA-256
-    pub content_hmac: [u8; 32],    // メタデータ全体の HMAC-SHA256
-    pub signature: Vec<u8>,        // ML-DSA-65 over (sha256 || filename || size)
+    pub uuid: [u8; 16],            // attachment record UUID
+    pub iv: [u8; 12],
+    pub ciphertext: Vec<u8>,       // AES-256-GCM(K_master, AttachmentPlaintext)
+    pub content_hmac: [u8; 32],    // HMAC-SHA256 over ciphertext
+    pub signature: Vec<u8>,        // ML-DSA-65 over ciphertext
     pub legacy_flag: u8,           // S12 連動: 0x00 = Destroy, 0x01 = Inherit
-    pub legacy_key_block: Vec<u8>, // S12 連動: K_legacy で暗号化されたアクセス情報
+    pub legacy_key_block: Vec<u8>, // AES-GCM(K_legacy, AttachmentLegacyPlaintext)
     pub padding: Vec<u8>,          // 0-255B のランダムパディング
+}
+
+/// K_master で暗号化して AttachmentRecord.ciphertext に入れる平文。
+/// filename / MIME / size / sha256 / FileKey は vault.pqd に平文露出しない。
+#[derive(Debug, Clone)]
+pub struct AttachmentPlaintext {
+    pub entry_uuid: [u8; 16],
+    pub blob_uuid: [u8; 16],
+    pub created_at: u64,
+    pub filename: String,
+    pub mime_type: String,
+    pub size_bytes: u64,
+    pub chunk_count: u32,
+    pub sha256: [u8; 32],
+    pub file_key: [u8; 32],        // implementation uses Zeroizing / SecretBytes
 }
 
 // ============================================================================
@@ -66,9 +75,8 @@ pub struct AttachmentRecord {
 //   0 なら添付なし、最大 65535 (Phase 1 では 256 に制限)。
 //
 // pub attachment_offset: u64,
-//   vault.pqd 内の attachment レコード群の起点バイトオフセット (LE)。
-//   実装上は不要 (record_type で線形スキャン可能) だが、将来の
-//   ランダムアクセス最適化のため予約継続。Phase 1 ではゼロでも可。
+//   v5 では 0 固定。AttachmentPlaintext.entry_uuid 復号後の線形スキャンで
+//   紐付ける。将来のランダムアクセス最適化のため予約継続。
 
 // ============================================================================
 // 3. streaming AES-256-GCM
@@ -83,12 +91,12 @@ pub const CHUNK_SIZE: usize = 1024 * 1024;
 ///
 ///   [chunk_iv: 12B][chunk_ciphertext_with_tag: chunk_len + 16B]
 ///
-/// AAD = chunk_index (LE u32) || total_chunks (LE u32) || file_uuid (16B)
+/// AAD = chunk_index (LE u32) || total_chunks (LE u32) || blob_uuid (16B)
 ///
 /// reader は plaintext を `writer` に書き出し、(total_bytes_read, sha256) を返す。
 pub fn encrypt_stream<R: std::io::Read, W: std::io::Write>(
     key: &[u8; 32],
-    file_uuid: &[u8; 16],
+    blob_uuid: &[u8; 16],
     reader: &mut R,
     writer: &mut W,
 ) -> Result<(u64, [u8; 32]), DiaryError> {
@@ -98,7 +106,7 @@ pub fn encrypt_stream<R: std::io::Read, W: std::io::Write>(
 /// 復号は逆順に chunk を読み、AAD 一致と SHA-256 一致を検証。
 pub fn decrypt_stream<R: std::io::Read, W: std::io::Write>(
     key: &[u8; 32],
-    file_uuid: &[u8; 16],
+    blob_uuid: &[u8; 16],
     expected_size: u64,
     expected_sha256: &[u8; 32],
     reader: &mut R,
@@ -167,7 +175,7 @@ pub fn extract_attachment(
 }
 
 /// `pq-diary attachment delete <ENTRY_ID> <FILE>` 相当。
-/// メタデータ削除 + `.attachments/<uuid>.bin` を zeroize 上書きして物理削除。
+/// メタデータ削除 + `.attachments/<blob_uuid>.bin` を、最後の参照なら zeroize 上書きして物理削除。
 ///
 /// 🟡 REQ-301, REQ-302
 pub fn delete_attachment(
@@ -269,16 +277,16 @@ pub enum AttachmentCommands {
 //     inherited_entries++
 //     for each attachment in entry's attachments:
 //       if attachment.legacy_flag == INHERIT:
-//         decrypt with K_legacy + AAD
-//         move .attachments/<uuid>.bin to new vault
+//         decrypt AttachmentLegacyPlaintext with K_legacy
+//         copy .attachments/<blob_uuid>.bin to new vault
 //         inherited_attachments++
 //       else:  // DESTROY
-//         zeroize + delete .attachments/<uuid>.bin
+//         zeroize + delete .attachments/<blob_uuid>.bin if last reference
 //         destroyed_attachments++
 //   else:  // DESTROY entry → 全 attachment も DESTROY (REQ-504)
 //     destroyed_entries++
 //     for each attachment in entry's attachments:
-//       zeroize + delete .attachments/<uuid>.bin
+//       zeroize + delete .attachments/<blob_uuid>.bin if last reference
 //       destroyed_attachments++
 
 // ============================================================================

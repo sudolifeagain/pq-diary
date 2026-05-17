@@ -34,26 +34,31 @@ sequenceDiagram
         alt エントリ不存在 / 複数マッチ
             ATT-->>CMD: Entry error
         else 一致
-            ATT->>ATT: generate file_uuid
-            ATT->>FS: create .attachments/<uuid>.bin.tmp
-            ATT->>STR: encrypt_stream(K_master, file_uuid, src, tmp)
-            loop chunk
-                STR->>STR: read 1MB
-                STR->>STR: AES-GCM encrypt with AAD (chunk_idx, total, file_uuid)
-                STR->>STR: SHA-256 update
-                STR->>FS: write chunk to .bin.tmp
+            ATT->>ATT: compute sha256_plain + size / find duplicate blob
+            alt duplicate sha256
+                ATT->>ATT: reuse existing blob_uuid + FileKey
+            else new blob
+                ATT->>ATT: generate blob_uuid + FileKey
+                ATT->>FS: create .attachments/<blob_uuid>.bin.tmp
+                ATT->>STR: encrypt_stream(FileKey, blob_uuid, src, tmp)
+                loop chunk
+                    STR->>STR: read 1MB
+                    STR->>STR: AES-GCM encrypt with AAD (chunk_idx, total, blob_uuid)
+                    STR->>STR: SHA-256 update
+                    STR->>FS: write chunk to .bin.tmp
+                end
+                STR-->>ATT: (size, sha256)
+                ATT->>FS: rename .bin.tmp → .bin
             end
-            STR-->>ATT: (size, sha256)
             ATT->>ATT: detect MIME (mime_guess)
-            ATT->>ATT: build AttachmentRecord (ml-dsa sign)
-            ATT->>V: append AttachmentRecord, update entry.attachment_count/offset
+            ATT->>ATT: encrypt AttachmentPlaintext; build AttachmentRecord (ml-dsa sign ciphertext)
+            ATT->>V: append AttachmentRecord, update entry.attachment_count
             V->>V: write vault.pqd.tmp + rename (atomic)
             alt success
-                ATT->>FS: rename .bin.tmp → .bin
-                ATT-->>CMD: file_uuid
+                ATT-->>CMD: attachment_uuid
                 CMD-->>U: Added: photo.jpg (1.5MB, mime image/jpeg)
             else fail
-                ATT->>FS: zeroize + delete .bin.tmp
+                ATT->>FS: zeroize + delete newly-created .bin if any
                 ATT-->>CMD: Io error
             end
         end
@@ -89,7 +94,7 @@ sequenceDiagram
     participant CMD as cmd_attachment_extract
     participant ATT as attachment::extract_attachment
     participant STR as streaming::decrypt_stream
-    participant FS_in as .attachments/<uuid>.bin
+    participant FS_in as .attachments/<blob_uuid>.bin
     participant FS_out as --out path
 
     U->>CMD: attachment extract 3c6b photo.jpg --out /tmp/p.jpg
@@ -100,8 +105,8 @@ sequenceDiagram
         ATT-->>CMD: Entry error
     else found
         ATT->>FS_out: create /tmp/p.jpg.tmp
-        ATT->>FS_in: open .attachments/<uuid>.bin
-        ATT->>STR: decrypt_stream(K_master, file_uuid, size, sha256, src, dst)
+        ATT->>FS_in: open .attachments/<blob_uuid>.bin
+        ATT->>STR: decrypt_stream(FileKey, blob_uuid, size, sha256, src, dst)
         loop chunk
             STR->>FS_in: read [chunk_iv | chunk_ct + tag]
             STR->>STR: AES-GCM decrypt with AAD
@@ -137,12 +142,17 @@ sequenceDiagram
     U->>CMD: attachment delete 3c6b photo.jpg --force
     CMD->>CMD: master + unlock
     CMD->>ATT: delete_attachment(entry, filename)
-    ATT->>ATT: locate AttachmentRecord
-    ATT->>FS: zeroize overwrite .attachments/<uuid>.bin
-    ATT->>FS: remove .attachments/<uuid>.bin
+    ATT->>ATT: locate AttachmentRecord and decrypt blob_uuid
+    ATT->>ATT: compute remaining references to blob_uuid
     ATT->>V: remove AttachmentRecord from vault.pqd
     V->>V: decrement entry.attachment_count
     V->>V: write atomic
+    alt no remaining refs
+        ATT->>FS: zeroize overwrite .attachments/<blob_uuid>.bin
+        ATT->>FS: remove .attachments/<blob_uuid>.bin
+    else shared blob
+        ATT->>FS: keep shared .bin
+    end
     ATT-->>CMD: Ok
     CMD-->>U: Deleted photo.jpg
 ```
@@ -173,15 +183,15 @@ sequenceDiagram
                 alt INHERIT
                     LEG->>LEG: decrypt attachment legacy block (K_legacy)
                     LEG->>LEG: 新 vault に AttachmentRecord 追加
-                    LEG->>FS: .attachments/<uuid>.bin を新 vault dir に移動
+                    LEG->>FS: .attachments/<blob_uuid>.bin を新 vault dir にコピー
                 else DESTROY
-                    LEG->>FS: zeroize + delete .attachments/<uuid>.bin
+                    LEG->>FS: zeroize + delete .attachments/<blob_uuid>.bin if last reference
                 end
             end
         else DESTROY
             LEG->>LEG: エントリ + 紐付く全 attachment を destroy
             loop 紐付く各 attachment
-                LEG->>FS: zeroize + delete .attachments/<uuid>.bin
+                LEG->>FS: zeroize + delete .attachments/<blob_uuid>.bin if last reference
             end
         end
     end
@@ -240,7 +250,7 @@ sequenceDiagram
             IMP->>FS_in: check ~/in/attachments/FILE 存在
             alt found
                 IMP->>ATT: add_attachment(entry, ~/in/attachments/FILE)
-                Note over ATT: sha256 重複は本体書き込みスキップ
+                Note over ATT: sha256 重複は既存 blob_uuid + FileKey を共有
             else not found
                 IMP->>IMP: warning, leave link as-is
             end
@@ -259,6 +269,7 @@ sequenceDiagram
 | chunk decrypt | chunk_plaintext (1MB) | `Zeroizing<Vec<u8>>` |
 | sha256 hasher | Sha256 state | non-secret |
 | K_master | 32B | SecretBox / ZeroizeOnDrop |
+| FileKey | 32B | Zeroizing<[u8; 32]> / SecretBytes |
 | File handles | Read/Write trait objects | Drop closes |
 
 ## エラーフロー (共通)
@@ -294,13 +305,13 @@ flowchart TD
 
 | コマンド | header | entry records | attachment records | .attachments/ |
 |---|---|---|---|---|
-| `attachment add` | (no change) | 1 entry: attachment_count++, attachment_offset 更新 | 1 record 追加 | 1 .bin 追加 |
+| `attachment add` | (no change) | 1 entry: attachment_count++ | 1 record 追加 | 新規 blob のみ 1 .bin 追加 |
 | `attachment list` | (no change) | (no change) | (read) | (no change) |
 | `attachment extract` | (no change) | (no change) | (read) | (read) |
-| `attachment delete` | (no change) | 1 entry: attachment_count-- | 1 record 削除 | 1 .bin 削除 (zeroize) |
+| `attachment delete` | (no change) | 1 entry: attachment_count-- | 1 record 削除 | 最後の blob 参照なら .bin 削除 (zeroize) |
 | `attachment set` | (no change) | (no change) | 1 record: legacy_flag / legacy_key_block | (no change) |
-| `legacy-access` | 完全再構築 | INHERIT のみ保持 | INHERIT のみ保持 | DESTROY .bin 削除 |
-| `change-password` | kdf_salt / verification 更新 | 全 re-encrypt | 全 re-encrypt | (no change, K_master 共用しない) |
+| `legacy-access` | 完全再構築 | INHERIT のみ保持 | INHERIT のみ保持 | INHERIT blob を新 vault にコピー後、旧 .bin を zeroize |
+| `change-password` | kdf_salt / verification 更新 | 全 re-encrypt | AttachmentPlaintext を再暗号化 | (no change, FileKey 維持) |
 
 ## 関連
 

@@ -6,14 +6,15 @@
 ## スプリントの目的
 
 vault.pqd v4 で予約済みの `attachment_count` (u16) / `attachment_offset` (u64)
-を本実装し、画像・PDF・小〜中サイズのバイナリをエントリに紐付けて
+を活用し、新 record type 導入に合わせて schema_version を v5 に上げる。
+画像・PDF・小〜中サイズのバイナリをエントリに紐付けて
 暗号化保存できるようにする。Obsidian の attachments フォルダ運用との
 往復インポート/エクスポートをサポート。
 
 ## 技術スタック (既存基盤を流用)
 
 - **暗号**: AES-256-GCM (chunk 単位) + ML-DSA-65 (全体署名) + HMAC-SHA256 (整合性)
-- **ストレージ**: `<vault_dir>/.attachments/<file_uuid>.bin` (本体)
+- **ストレージ**: `<vault_dir>/.attachments/<blob_uuid>.bin` (本体)
   + vault.pqd 内の attachment レコード (メタデータ)
 - **エディタ統合**: `pq-diary new --attach FILE` で新規エントリと同時添付、
   `pq-diary attachment add ENTRY_ID FILE` で既存エントリに追加
@@ -35,16 +36,17 @@ vault.pqd v4 で予約済みの `attachment_count` (u16) / `attachment_offset` (
 
 ### 確定 (ヒアリング)
 1. **サイズ上限**: 1 ファイル 1GB (1MB chunk のストリーミング暗号化)
-2. **ストレージ**: vault.pqd は メタデータのみ、本体は `.attachments/<uuid>.bin`
+2. **ストレージ**: vault.pqd は暗号化メタデータのみ、本体は `.attachments/<blob_uuid>.bin`
 3. **legacy 連動**: ファイル個別の INHERIT/DESTROY フラグ
 4. **export/import**: 双方向 Obsidian 互換 (`![[file.png]]` リンク復元)
 
 ### 仮確定 (設計で🟡として明示、PR review で確認)
 5. **chunk size**: 1MB (AES-GCM の IV 衝突確率と 1 chunk RAM 使用量のバランス)
-6. **レコードタイプ**: `RECORD_TYPE_ATTACHMENT = 0x03` を新設 (entry/template と並列)
-7. **chunk IV 衝突回避**: chunk index を AAD に含める (chunk 0..N で IV 再利用しても安全)
-8. **アトミック書き込み**: `.bin.tmp` → rename。失敗時 zeroize 上書き → 削除
-9. **添付メタデータの保存場所**: vault.pqd の attachment レコード (新タイプ 0x03)、entry record の `attachment_offset` がレコード群の起点を指す
+6. **レコードタイプ**: `RECORD_TYPE_ATTACHMENT = 0x03` を新設 (schema_version は v5)
+7. **chunk IV 衝突回避**: chunk index + total + blob_uuid を AAD に含める
+8. **アトミック書き込み**: `.bin.tmp` → rename → vault.pqd 更新。orphan blob は repair で削除
+9. **添付メタデータの保存場所**: vault.pqd の attachment レコード (新タイプ 0x03)。
+   filename/MIME/size/SHA-256/FileKey は K_master で暗号化した AttachmentPlaintext に保存
 
 ## 開発ルール (CLAUDE.md より)
 
@@ -58,11 +60,11 @@ vault.pqd v4 で予約済みの `attachment_count` (u16) / `attachment_offset` (
 ## 注意事項
 
 - **1GB chunk 処理**: メモリに全体を載せない設計 (Read trait + Write trait のストリーム)
-- **ML-DSA-65 署名対象**: 添付全体の SHA-256 (chunk ごとに署名するとサイズ爆発)
+- **ML-DSA-65 署名対象**: AttachmentRecord.ciphertext (chunk ごとに署名するとサイズ爆発)
 - **legacy 連動**: attachment レコードも `legacy_flag` + `legacy_key_block`
-  を持つ。S12 と同じパターン。
+  を持つ。legacy_key_block は K_legacy で AttachmentLegacyPlaintext を暗号化する。
 - **テンプレートには添付不可**: テンプレートは構造化テキスト、添付は entry 限定
-- **import の挙動**: 同名ファイル既存時の処理 (rename / skip / overwrite) を要設計
+- **import の挙動**: 同名ファイルは SHA-256 一致なら blob 共有、不一致なら reject
 - **.attachments/ ディレクトリの git 同期**: git add 対象、暗号化済みなので問題なし
 
 ## Tsumiki ワークフロー位置
@@ -88,6 +90,6 @@ vault.pqd v4 で予約済みの `attachment_count` (u16) / `attachment_offset` (
 
 - 🔵: 既存予約フィールド (`attachment_count` / `attachment_offset`) 活用、
        Obsidian `![[file.png]]` 記法、AES-256-GCM 流用
-- 🟡: chunk size 1MB、RECORD_TYPE_ATTACHMENT=0x03、.attachments/ ディレクトリ構造、
-       添付メタデータ構造 (filename/MIME/sha256/size)
+- 🟡: chunk size 1MB、RECORD_TYPE_ATTACHMENT=0x03、schema_version v5、
+       .attachments/ ディレクトリ構造、暗号化 AttachmentPlaintext 構造
 - 🔴: なし

@@ -1,6 +1,6 @@
 # Sprint Status
 
-## Current: Sprint 11 — クロスプラットフォーム検証 + toolchain 固定 (in_progress)
+## Current: Sprint 11 — クロスプラットフォーム検証 + toolchain 固定 (completed)
 
 ## Progress
 
@@ -16,7 +16,7 @@
 | S8 | Git連携 | completed (s8-done) | 8 |
 | S9 | セキュリティ硬化 + 統合テスト + 技術的負債 | completed (s9-done) | 9 |
 | S10 | 運用機能 + CLI整合性 | completed (s10-done) | 10 |
-| S11 | クロスプラットフォーム検証 + toolchain 固定 | in_progress | 11 |
+| S11 | クロスプラットフォーム検証 + toolchain 固定 | completed (s11-done) | 11 |
 
 ## Sprint Scope
 

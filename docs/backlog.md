@@ -96,7 +96,7 @@
 - [x] PR_SET_DUMPABLE=0 — cli/src/security.rs harden_process()
 - [x] setrlimit(RLIMIT_CORE, 0, 0) — cli/src/security.rs harden_process()
 - [x] デバッガ接続検知 (警告) — cli/src/security.rs check_debugger()
-- [ ] クロスプラットフォームビルド (Linux x86_64/aarch64, macOS aarch64, Windows x86_64) — Windows確認済、Linux/macOSは未確認
+- [x] クロスプラットフォームビルド (Linux x86_64/aarch64, macOS aarch64, Windows x86_64) — **S11 で CI matrix 化により完了** (全 8 ジョブ green)
 - [x] 統合テスト (全コマンドのE2Eテスト)
 - [x] パフォーマンス検証 (init<3s, unlock 1-3s, new/edit<200ms, list<500ms, lock<50ms) — #[ignore]で分離、単独実行で検証
 - [x] **[H-1]** Cli.password を SecretString 化 (S1) — Option<SecretString> + parse_secret_string
@@ -122,6 +122,16 @@
 - [x] DoD 強化「CLI 整合性」セクション追加 — definition-of-done.md
 - [x] dirs クレート依存追加 — cli/Cargo.toml + core/Cargo.toml
 - [x] password.rs read_password_tty(prompt) パラメータ化 — change-password の echo OFF 対応 (PRD §4.2 第3項遵守)
+
+### S11: クロスプラットフォーム検証 + toolchain 固定
+- [x] `rust-toolchain.toml` 固定 (channel = "1.95.0", components = clippy/rustfmt, profile = minimal) — CI と local の rustc 同期恒久化
+- [x] CI check ジョブを 3 OS matrix 化 (ubuntu/macos/windows, fail-fast: false)
+- [x] CI smoke ジョブを 4 OS matrix 化 (+ macos-latest + ubuntu-24.04-arm preview)
+- [x] cargo audit を独立ジョブに分離 (ubuntu のみ、重複排除)
+- [x] **Phase 1 取りこぼし「クロスプラットフォームビルド」完了** (S9 セクション参照)
+- [x] **発覚バグ修正**: `cli/src/security.rs` の `prctl(PR_SET_DUMPABLE)` を `#[cfg(target_os = "linux")]` でガード (macOS libc に prctl 不在のため) — S9 で書かれた荒い `#[cfg(unix)]` 分岐の修正
+- [x] hotfix branch も CI trigger 対象に追加 (`branches: [main, "sprint/**", "hotfix/**"]`)
+- [x] S10 hotfix (PR #3) の Cargo.lock コミット + --locked 強制と組み合わせて、ローカル/CI 完全同期環境を達成
 
 ---
 

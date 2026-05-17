@@ -445,6 +445,7 @@ fn create_tmpfile(path: &Path) -> Result<std::fs::File, DiaryError> {
         std::fs::OpenOptions::new()
             .write(true)
             .create(true)
+            .truncate(true) // overwrite existing file entirely (clippy::suspicious_open_options, Rust 1.95)
             .mode(0o600)
             .open(path)
             .map_err(DiaryError::from)

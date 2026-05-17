@@ -154,11 +154,9 @@ pub fn collect_stats(vault_path: &Path, engine: &CryptoEngine) -> Result<VaultSt
         });
     }
 
-    let average_chars = if entry_count > 0 {
-        total_chars / entry_count
-    } else {
-        0
-    };
+    // checked_div returns None when entry_count is 0 (clippy::manual_checked_ops,
+    // new in Rust 1.95).
+    let average_chars = total_chars.checked_div(entry_count).unwrap_or(0);
     let tag_count = tag_counts.len();
 
     // Tag distribution: descending by count, tie-break ascending by tag name;

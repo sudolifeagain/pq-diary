@@ -1,7 +1,10 @@
 # Rust
 /target/
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock is intentionally committed: pq-diary is a binary application
+# (cli/), so locking dependency versions is required for reproducible
+# builds and to prevent CI from drifting against upstream breakage
+# (see ml-dsa/pkcs8 incident discovered after S10 merge).
 
 # pq-diary: plaintext cache (NEVER commit)
 entries/

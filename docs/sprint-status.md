@@ -1,6 +1,6 @@
 # Sprint Status
 
-## Current: Sprint 11 — クロスプラットフォーム検証 + toolchain 固定 (completed)
+## Current: Sprint 12 — デジタル遺言 (legacy) — 設計フェーズ進行中
 
 ## Progress
 
@@ -17,6 +17,7 @@
 | S9 | セキュリティ硬化 + 統合テスト + 技術的負債 | completed (s9-done) | 9 |
 | S10 | 運用機能 + CLI整合性 | completed (s10-done) | 10 |
 | S11 | クロスプラットフォーム検証 + toolchain 固定 | completed (s11-done) | 11 |
+| S12 | デジタル遺言 (legacy) | in_progress (design phase) | 12 |
 
 ## Sprint Scope
 

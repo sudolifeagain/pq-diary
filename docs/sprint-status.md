@@ -1,6 +1,6 @@
 # Sprint Status
 
-## Current: Sprint 10 — 運用機能 + CLI整合性 (completed)
+## Current: Sprint 11 — クロスプラットフォーム検証 + toolchain 固定 (in_progress)
 
 ## Progress
 
@@ -16,6 +16,7 @@
 | S8 | Git連携 | completed (s8-done) | 8 |
 | S9 | セキュリティ硬化 + 統合テスト + 技術的負債 | completed (s9-done) | 9 |
 | S10 | 運用機能 + CLI整合性 | completed (s10-done) | 10 |
+| S11 | クロスプラットフォーム検証 + toolchain 固定 | in_progress | 11 |
 
 ## Sprint Scope
 
@@ -90,3 +91,11 @@
 - export [DIR] (全エントリ復号して MD 書き出し、--claude ブロック対象)
 - DoD 強化: CLI ヘルプと実装の整合性チェック追加 (smoke test)
 - 未実装スケルトン整理: legacy/daemon を `#[command(hide = true)]` でヘルプから除外
+
+### S11: クロスプラットフォーム検証 + toolchain 固定
+- Phase 1 取りこぼし: Linux x86_64 / aarch64, macOS aarch64 の CI matrix 拡張
+- check ジョブを matrix 化 (現在 ubuntu のみ → ubuntu + macos + windows)
+- smoke ジョブに macos-latest 追加 (現在 ubuntu + windows)
+- `rust-toolchain.toml` で toolchain 固定 (CI と local の同期維持、hotfix follow-up)
+- 各プラットフォームの実機検証で発覚したバグ修正 (出たらタスク追加)
+- backlog の Phase 1「クロスプラットフォームビルド」項目を完了マーク

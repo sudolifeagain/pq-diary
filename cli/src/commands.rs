@@ -2252,6 +2252,476 @@ pub fn cmd_git_status(cli: &Cli) -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// S10 Phase 2: init / sync / info / change-password / export
+// ---------------------------------------------------------------------------
+
+/// Execute the `pq-diary init` command.
+///
+/// Initialises `~/.pq-diary/config.toml` plus a default vault at
+/// `~/.pq-diary/vaults/default/`. Refuses to run if `config.toml` already
+/// exists; on vault-creation failure both the partial vault directory and
+/// the freshly written `config.toml` are best-effort removed.
+pub fn cmd_init(cli: &Cli) -> anyhow::Result<()> {
+    use pq_diary_core::policy::AccessPolicy;
+    use pq_diary_core::vault::config::AppConfig;
+    use pq_diary_core::vault::init::VaultManager;
+    use secrecy::ExposeSecret as _;
+
+    let config_path = AppConfig::default_path().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let parent_dir = config_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("config path has no parent directory"))?
+        .to_path_buf();
+
+    if config_path.exists() {
+        anyhow::bail!("Already initialized at {}", parent_dir.display());
+    }
+
+    let password_source =
+        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    if password_source.secret().expose_secret().is_empty() {
+        anyhow::bail!("New password must not be empty");
+    }
+
+    std::fs::create_dir_all(&parent_dir)
+        .map_err(|e| anyhow::anyhow!("Cannot create config directory: {e}"))?;
+
+    AppConfig::default()
+        .to_file(&config_path)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let vaults_dir = parent_dir.join("vaults");
+    // Rollback policy on failure: remove ONLY the freshly-created `config.toml`
+    // and the new `vaults/default/` directory (the only artifacts we created
+    // in this run). We must NOT remove the entire `vaults/` directory, because
+    // a user may already have other vaults sitting there from a prior
+    // partial init or manual setup (avoiding data loss is a hard constraint
+    // — see TASK-0089 review M-1).
+    let default_vault_dir = vaults_dir.join("default");
+    let mgr = match VaultManager::new(vaults_dir.clone()) {
+        Ok(m) => m,
+        Err(e) => {
+            let _ = std::fs::remove_file(&config_path);
+            let _ = std::fs::remove_dir_all(&default_vault_dir);
+            return Err(anyhow::anyhow!("Vault creation failed: {e}"));
+        }
+    };
+
+    let create_result = mgr.create_vault(
+        "default",
+        password_source.secret().expose_secret().as_bytes(),
+        AccessPolicy::None,
+    );
+
+    if let Err(e) = create_result {
+        let _ = std::fs::remove_file(&config_path);
+        let _ = std::fs::remove_dir_all(&default_vault_dir);
+        return Err(anyhow::anyhow!("Vault creation failed: {e}"));
+    }
+
+    println!("Initialized pq-diary at {}", parent_dir.display());
+    Ok(())
+}
+
+/// Execute the `pq-diary sync` command.
+pub fn cmd_sync(cli: &Cli) -> anyhow::Result<()> {
+    use pq_diary_core::vault::config::AppConfig;
+
+    let config_path = AppConfig::default_path().map_err(|e| anyhow::anyhow!("{e}"))?;
+    if !config_path.exists() {
+        anyhow::bail!(
+            "pq-diary init を先に実行してください (~/.pq-diary/config.toml が見つかりません)"
+        );
+    }
+
+    let config = AppConfig::from_file(&config_path)
+        .map_err(|e| anyhow::anyhow!("Invalid config.toml: {e}"))?;
+
+    match config.app.sync_backend.as_str() {
+        "git" => cmd_git_sync(cli),
+        other => anyhow::bail!("Unknown sync backend: {other}"),
+    }
+}
+
+/// Execute the `pq-diary change-password` command (public entry point).
+pub fn cmd_change_password(cli: &Cli) -> anyhow::Result<()> {
+    use secrecy::{ExposeSecret as _, SecretBox, SecretString};
+
+    if cli.claude {
+        anyhow::bail!("change-password is not permitted with --claude");
+    }
+
+    let old_source = get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let old_pwd: SecretString = SecretBox::new(Box::from(old_source.secret().expose_secret()));
+    drop(old_source);
+
+    let new_pwd1 = crate::password::prompt_password("New password: ")
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let new_pwd2 = crate::password::prompt_password("Confirm new password: ")
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    cmd_change_password_impl(cli, old_pwd, new_pwd1, new_pwd2)
+}
+
+/// Testable implementation of `cmd_change_password`.
+fn cmd_change_password_impl(
+    cli: &Cli,
+    old_pwd: secrecy::SecretString,
+    new_pwd1: secrecy::SecretString,
+    new_pwd2: secrecy::SecretString,
+) -> anyhow::Result<()> {
+    use pq_diary_core::vault::change_password::re_encrypt_vault;
+    use secrecy::ExposeSecret as _;
+
+    if cli.claude {
+        anyhow::bail!("change-password is not permitted with --claude");
+    }
+
+    if new_pwd1.expose_secret() != new_pwd2.expose_secret() {
+        anyhow::bail!("Passwords do not match");
+    }
+    if new_pwd1.expose_secret().is_empty() {
+        anyhow::bail!("New password must not be empty");
+    }
+    if old_pwd.expose_secret() == new_pwd1.expose_secret() {
+        eprintln!("Warning: New password is identical to old password.");
+    }
+
+    let vault_dir = resolve_change_password_vault_dir(cli)?;
+    {
+        let vault_pqd = vault_dir.join("vault.pqd");
+        let vault_pqd_str = vault_pqd
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("vault path contains non-UTF-8 characters"))?;
+        let mut core = DiaryCore::new(vault_pqd_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let attempt: secrecy::SecretString =
+            secrecy::SecretBox::new(Box::from(old_pwd.expose_secret()));
+        core.unlock(attempt)
+            .map_err(|_| anyhow::anyhow!("Old password is incorrect"))?;
+    }
+
+    re_encrypt_vault(&vault_dir, &old_pwd, &new_pwd1).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    println!("Password changed successfully");
+    Ok(())
+}
+
+fn resolve_change_password_vault_dir(cli: &Cli) -> anyhow::Result<PathBuf> {
+    if let Some(v) = &cli.vault {
+        let p = PathBuf::from(v);
+        let dir = if p.extension().is_some_and(|e| e == "pqd") {
+            p.parent()
+                .ok_or_else(|| anyhow::anyhow!("vault path has no parent directory"))?
+                .to_path_buf()
+        } else {
+            p
+        };
+        return Ok(dir);
+    }
+    resolve_default_vault_dir()
+}
+
+fn resolve_default_vault_dir() -> anyhow::Result<PathBuf> {
+    use pq_diary_core::vault::config::AppConfig;
+    let config_path = AppConfig::default_path().map_err(|e| anyhow::anyhow!("{e}"))?;
+    if !config_path.exists() {
+        anyhow::bail!(
+            "pq-diary init を先に実行してください (~/.pq-diary/config.toml が見つかりません)"
+        );
+    }
+    let config = AppConfig::from_file(&config_path)
+        .map_err(|e| anyhow::anyhow!("Invalid config.toml: {e}"))?;
+    let vaults_dir = AppConfig::default_vaults_dir().map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(vaults_dir.join(&config.app.default_vault))
+}
+
+/// Execute the `pq-diary info [--security]` command.
+pub fn cmd_info(cli: &Cli, security: bool) -> anyhow::Result<()> {
+    use pq_diary_core::vault::config::VaultConfig;
+    use secrecy::{ExposeSecret as _, SecretBox};
+
+    let vault_dir = resolve_info_vault_dir(cli)?;
+    let vault_pqd = vault_dir.join("vault.pqd");
+    let vault_toml = vault_dir.join("vault.toml");
+    let vault_pqd_str = vault_pqd
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("vault path contains non-UTF-8 characters"))?;
+
+    let vault_config = VaultConfig::from_file(&vault_toml)
+        .map_err(|e| anyhow::anyhow!("Invalid vault.toml: {e}"))?;
+
+    let password_source =
+        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut core = DiaryCore::new(vault_pqd_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let secret_password: secrecy::SecretString =
+        SecretBox::new(Box::from(password_source.secret().expose_secret()));
+    core.unlock(secret_password)
+        .map_err(|_| anyhow::anyhow!("Vault unlock failed"))?;
+    let guard = VaultGuard::new(&mut core);
+
+    let entries = guard
+        .list_entries(None)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let entry_count = entries.len();
+    drop(entries);
+
+    let meta =
+        std::fs::metadata(&vault_pqd).map_err(|e| anyhow::anyhow!("Cannot stat vault.pqd: {e}"))?;
+    let created_str = match meta.created() {
+        Ok(t) => format_system_time(t),
+        Err(_) => "unknown".to_string(),
+    };
+    let modified_str = match meta.modified() {
+        Ok(t) => format_system_time(t),
+        Err(_) => "unknown".to_string(),
+    };
+
+    println!("=== Vault Info ===");
+    println!("{:<16}{}", "Name:", vault_config.vault.name);
+    println!("{:<16}{}", "Policy:", vault_config.access.policy);
+    println!("{:<16}{}", "Entries:", entry_count);
+    println!("{:<16}{}", "Created:", created_str);
+    println!("{:<16}{}", "Last updated:", modified_str);
+
+    if security {
+        let status = crate::security::HardenStatus::current();
+        println!();
+        println!("=== Security ===");
+        println!("{:<22}ML-KEM-768", "KEM algorithm:");
+        println!("{:<22}ML-DSA-65", "Signature algorithm:");
+        println!(
+            "{:<22}{} KB",
+            "Argon2 memory:", vault_config.argon2.memory_cost_kb
+        );
+        println!(
+            "{:<22}{}",
+            "Argon2 time cost:", vault_config.argon2.time_cost
+        );
+        println!(
+            "{:<22}{}",
+            "Argon2 parallelism:", vault_config.argon2.parallelism
+        );
+        println!("{:<22}{}", "mlock active:", yes_no(status.mlock_active));
+        println!(
+            "{:<22}{}",
+            "Coredump disabled:",
+            yes_no(status.coredump_disabled)
+        );
+        println!(
+            "{:<22}{}",
+            "Debugger detected:",
+            yes_no(status.debugger_detected)
+        );
+    }
+
+    Ok(())
+}
+
+fn resolve_info_vault_dir(cli: &Cli) -> anyhow::Result<PathBuf> {
+    if let Some(v) = &cli.vault {
+        let p = PathBuf::from(v);
+        let dir = if p.extension().is_some_and(|e| e == "pqd") {
+            p.parent()
+                .ok_or_else(|| anyhow::anyhow!("vault path has no parent directory"))?
+                .to_path_buf()
+        } else {
+            p
+        };
+        return Ok(dir);
+    }
+    resolve_default_vault_dir()
+}
+
+fn format_system_time(t: std::time::SystemTime) -> String {
+    let secs = t
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn yes_no(b: bool) -> &'static str {
+    if b {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// export command
+// ---------------------------------------------------------------------------
+
+/// Execute the `pq-diary export <DIR>` command.
+pub fn cmd_export(cli: &Cli, dir: PathBuf) -> anyhow::Result<()> {
+    cmd_export_impl(cli, dir, &mut std::io::BufReader::new(std::io::stdin()))
+}
+
+fn cmd_export_impl(
+    cli: &Cli,
+    dir: PathBuf,
+    reader: &mut impl std::io::BufRead,
+) -> anyhow::Result<()> {
+    use secrecy::{ExposeSecret as _, SecretBox};
+    use std::io::Write as _;
+
+    if cli.claude {
+        anyhow::bail!("export is not permitted with --claude");
+    }
+
+    if !dir.exists() {
+        anyhow::bail!("Directory does not exist: {}", dir.display());
+    }
+
+    eprint!(
+        "平文を {} に書き出します。続行しますか? [y/N]: ",
+        dir.display()
+    );
+    std::io::stderr()
+        .flush()
+        .map_err(|e| anyhow::anyhow!("Failed to flush stderr: {e}"))?;
+    let mut answer = String::new();
+    reader
+        .read_line(&mut answer)
+        .map_err(|e| anyhow::anyhow!("Failed to read confirmation: {e}"))?;
+    let trimmed = answer.trim();
+    if !trimmed.eq_ignore_ascii_case("y") {
+        println!("キャンセルしました");
+        return Ok(());
+    }
+
+    let password_source =
+        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let vault_dir = resolve_info_vault_dir(cli)?;
+    let vault_pqd = vault_dir.join("vault.pqd");
+    let vault_pqd_str = vault_pqd
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("vault path contains non-UTF-8 characters"))?;
+
+    let mut core = DiaryCore::new(vault_pqd_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let secret_password: secrecy::SecretString =
+        SecretBox::new(Box::from(password_source.secret().expose_secret()));
+    core.unlock(secret_password)
+        .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+    let guard = VaultGuard::new(&mut core);
+
+    let metas = guard
+        .list_entries(None)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if metas.is_empty() {
+        println!("No entries to export");
+        return Ok(());
+    }
+
+    let mut targets: Vec<(pq_diary_core::EntryMeta, std::path::PathBuf)> =
+        Vec::with_capacity(metas.len());
+    for meta in metas {
+        let filename = build_export_filename(&meta);
+        let path = dir.join(&filename);
+        if path.exists() {
+            anyhow::bail!("File exists: {}", path.display());
+        }
+        targets.push((meta, path));
+    }
+
+    let count = targets.len();
+    for (meta, path) in &targets {
+        let id_hex = meta.uuid_hex.clone();
+        let (_, plaintext) = guard
+            .get_entry(&id_hex)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let content = build_export_content(meta, &plaintext.body);
+        std::fs::write(path, content)
+            .map_err(|e| anyhow::anyhow!("Failed to write {}: {e}", path.display()))?;
+    }
+
+    println!("Exported {} entries to {}", count, dir.display());
+    Ok(())
+}
+
+fn build_export_filename(meta: &pq_diary_core::EntryMeta) -> String {
+    let date = chrono::DateTime::<chrono::Utc>::from_timestamp(meta.created_at as i64, 0)
+        .map(|dt| dt.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "0000-00-00".to_string());
+    let slug = slugify(&meta.title);
+    let id8 = &meta.uuid_hex[..meta.uuid_hex.len().min(8)];
+    format!("{date}-{slug}-{id8}.md")
+}
+
+fn build_export_content(meta: &pq_diary_core::EntryMeta, body: &str) -> String {
+    let mut out = String::new();
+    out.push_str("---\n");
+    out.push_str(&format!("id: {}\n", meta.uuid_hex));
+    out.push_str(&format!("title: \"{}\"\n", yaml_escape(&meta.title)));
+    if meta.tags.is_empty() {
+        out.push_str("tags: []\n");
+    } else {
+        out.push_str("tags:\n");
+        for tag in &meta.tags {
+            out.push_str(&format!("  - \"{}\"\n", yaml_escape(tag)));
+        }
+    }
+    let created = chrono::DateTime::<chrono::Utc>::from_timestamp(meta.created_at as i64, 0)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_else(|| "1970-01-01T00:00:00+00:00".to_string());
+    let updated = chrono::DateTime::<chrono::Utc>::from_timestamp(meta.updated_at as i64, 0)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_else(|| "1970-01-01T00:00:00+00:00".to_string());
+    out.push_str(&format!("created: {created}\n"));
+    out.push_str(&format!("updated: {updated}\n"));
+    out.push_str("---\n\n");
+    out.push_str(body);
+    out
+}
+
+fn slugify(title: &str) -> String {
+    let mut s = String::with_capacity(title.len());
+    let mut prev_dash = false;
+    for c in title.chars() {
+        if c.is_control() {
+            continue;
+        }
+        let mapped = match c {
+            ' ' | '\t' => '-',
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            other => other,
+        };
+        if mapped == '-' {
+            if prev_dash {
+                continue;
+            }
+            prev_dash = true;
+        } else {
+            prev_dash = false;
+        }
+        s.push(mapped);
+    }
+    let trimmed = s.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "untitled".to_string()
+    } else {
+        trimmed
+    }
+}
+
+fn yaml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            c if c.is_control() => continue,
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -7760,7 +8230,11 @@ parallelism = 1
         core.delete_template("daily").expect("delete_template");
 
         let templates2 = core.list_templates().expect("list_templates after delete");
-        assert_eq!(templates2.len(), 0, "template list must be empty after delete");
+        assert_eq!(
+            templates2.len(),
+            0,
+            "template list must be empty after delete"
+        );
 
         core.lock();
     }
@@ -7787,8 +8261,7 @@ parallelism = 1
             This note links to [[Another Note]].\n\
             Tags: #日記/旅行 #tech\n\n\
             Body of the imported note.\n";
-        std::fs::write(src_dir.path().join("obsidian_note.md"), md_content)
-            .expect("write md file");
+        std::fs::write(src_dir.path().join("obsidian_note.md"), md_content).expect("write md file");
 
         // Import via CLI command.
         let cli = parse_import_cli(vault_dir_str, src_dir.path().to_str().expect("utf8"), &[]);
@@ -7805,7 +8278,11 @@ parallelism = 1
 
         // Verify the entry is accessible in the vault.
         let entries = read_vault_entries(&vault_dir);
-        assert_eq!(entries.len(), 1, "vault must contain exactly 1 imported entry");
+        assert_eq!(
+            entries.len(),
+            1,
+            "vault must contain exactly 1 imported entry"
+        );
         assert_eq!(
             entries[0].title, "Obsidian Note",
             "imported entry title must match frontmatter title"
@@ -7827,18 +8304,17 @@ parallelism = 1
         // create vault
         let cli_create = make_vault_mgmt_cli(base_dir_str, Some("testpw"), &["create", "e2evault"]);
         let mut reader = std::io::Cursor::new("");
-        let result = cmd_vault_create_impl(
-            &cli_create,
-            "e2evault",
-            None,
-            &mut reader,
-            |base_dir| {
+        let result =
+            cmd_vault_create_impl(&cli_create, "e2evault", None, &mut reader, |base_dir| {
                 pq_diary_core::vault::init::VaultManager::new(base_dir)
                     .map(|m| m.with_kdf_params(fast_params()))
                     .map_err(|e| anyhow::anyhow!("{e}"))
-            },
+            });
+        assert!(
+            result.is_ok(),
+            "vault create must succeed: {:?}",
+            result.err()
         );
-        assert!(result.is_ok(), "vault create must succeed: {:?}", result.err());
         assert!(
             dir.path().join("e2evault").exists(),
             "vault directory must exist after create"
@@ -7847,13 +8323,23 @@ parallelism = 1
         // list vaults
         let cli_list = make_vault_mgmt_cli(base_dir_str, None, &["list"]);
         let result_list = cmd_vault_list(&cli_list);
-        assert!(result_list.is_ok(), "vault list must succeed: {:?}", result_list.err());
+        assert!(
+            result_list.is_ok(),
+            "vault list must succeed: {:?}",
+            result_list.err()
+        );
 
         // policy change to write_only
-        let cli_policy = make_vault_mgmt_cli(base_dir_str, None, &["policy", "e2evault", "write_only"]);
+        let cli_policy =
+            make_vault_mgmt_cli(base_dir_str, None, &["policy", "e2evault", "write_only"]);
         let mut reader2 = std::io::Cursor::new("");
-        let result_policy = cmd_vault_policy_impl(&cli_policy, "e2evault", "write_only", &mut reader2);
-        assert!(result_policy.is_ok(), "vault policy must succeed: {:?}", result_policy.err());
+        let result_policy =
+            cmd_vault_policy_impl(&cli_policy, "e2evault", "write_only", &mut reader2);
+        assert!(
+            result_policy.is_ok(),
+            "vault policy must succeed: {:?}",
+            result_policy.err()
+        );
 
         // verify policy was applied
         let toml_path = dir.path().join("e2evault").join("vault.toml");
@@ -7869,7 +8355,11 @@ parallelism = 1
         let cli_delete = make_vault_mgmt_cli(base_dir_str, None, &["delete", "e2evault"]);
         let mut reader3 = std::io::Cursor::new("y\n");
         let result_delete = cmd_vault_delete_impl(&cli_delete, "e2evault", false, &mut reader3);
-        assert!(result_delete.is_ok(), "vault delete must succeed: {:?}", result_delete.err());
+        assert!(
+            result_delete.is_ok(),
+            "vault delete must succeed: {:?}",
+            result_delete.err()
+        );
         assert!(
             !dir.path().join("e2evault").exists(),
             "vault directory must not exist after delete"
@@ -7906,7 +8396,11 @@ parallelism = 1
         let bare_url = bare_dir.to_str().expect("bare utf8");
         let cli_init = make_git_cli(&["pq-diary", "-v", vault_dir_str, "git-init"]);
         let result_init = cmd_git_init(&cli_init, Some(bare_url));
-        assert!(result_init.is_ok(), "git-init must succeed: {:?}", result_init.err());
+        assert!(
+            result_init.is_ok(),
+            "git-init must succeed: {:?}",
+            result_init.err()
+        );
 
         // Verify .git directory was created.
         assert!(
@@ -7924,7 +8418,11 @@ parallelism = 1
             "git-push",
         ]);
         let result_push = cmd_git_push(&cli_push);
-        assert!(result_push.is_ok(), "git-push must succeed: {:?}", result_push.err());
+        assert!(
+            result_push.is_ok(),
+            "git-push must succeed: {:?}",
+            result_push.err()
+        );
 
         // Verify commit was created.
         let log_out = std::process::Command::new("git")
@@ -7941,7 +8439,11 @@ parallelism = 1
         // Step 5: git-status (cmd_git_status) to verify status output.
         let cli_status = make_git_cli(&["pq-diary", "-v", vault_dir_str, "git-status"]);
         let result_status = cmd_git_status(&cli_status);
-        assert!(result_status.is_ok(), "git-status must succeed: {:?}", result_status.err());
+        assert!(
+            result_status.is_ok(),
+            "git-status must succeed: {:?}",
+            result_status.err()
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -7961,8 +8463,7 @@ parallelism = 1
         // --- none policy: read denied ---
         {
             let dir = tempfile::tempdir().expect("tempdir none");
-            let vault_dir =
-                setup_vault_with_policy(&dir, AccessPolicy::None);
+            let vault_dir = setup_vault_with_policy(&dir, AccessPolicy::None);
             let vault_dir_str = vault_dir.to_str().expect("utf8");
             let cli = make_cli_claude(vault_dir_str, Some("password"));
             let result = cmd_list(&cli, None, None, 20);
@@ -7975,8 +8476,7 @@ parallelism = 1
         // --- write_only policy: write allowed, read denied ---
         {
             let dir = tempfile::tempdir().expect("tempdir write_only");
-            let vault_dir =
-                setup_vault_with_policy(&dir, AccessPolicy::WriteOnly);
+            let vault_dir = setup_vault_with_policy(&dir, AccessPolicy::WriteOnly);
             let vault_dir_str = vault_dir.to_str().expect("utf8");
 
             // read (list) must be denied
@@ -8001,8 +8501,13 @@ parallelism = 1
                 ])
                 .expect("parse CLI for write_only write")
             };
-            let result_write =
-                cmd_new(&cli_write, Some("WriteOnly Test".to_string()), Some("body".to_string()), vec![], None);
+            let result_write = cmd_new(
+                &cli_write,
+                Some("WriteOnly Test".to_string()),
+                Some("body".to_string()),
+                vec![],
+                None,
+            );
             assert!(
                 result_write.is_ok(),
                 "--claude + WriteOnly policy must allow new (write): {:?}",
@@ -8013,8 +8518,7 @@ parallelism = 1
         // --- full policy: read allowed ---
         {
             let dir = tempfile::tempdir().expect("tempdir full");
-            let vault_dir =
-                setup_vault_with_policy(&dir, AccessPolicy::Full);
+            let vault_dir = setup_vault_with_policy(&dir, AccessPolicy::Full);
             let vault_dir_str = vault_dir.to_str().expect("utf8");
             let cli = make_cli_claude(vault_dir_str, Some("password"));
             let result = cmd_list(&cli, None, None, 20);
@@ -8040,15 +8544,16 @@ parallelism = 1
     #[test]
     #[ignore]
     fn tc_s9_perf_01_init_under_5s() {
-        use std::time::Instant;
         use pq_diary_core::vault::init::VaultManager;
+        use std::time::Instant;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let start = Instant::now();
         let mgr = VaultManager::new(dir.path().to_path_buf())
             .expect("VaultManager::new")
             .with_kdf_params(fast_params());
-        mgr.init_vault("perf_vault", b"password").expect("init_vault");
+        mgr.init_vault("perf_vault", b"password")
+            .expect("init_vault");
         let elapsed = start.elapsed();
 
         assert!(
@@ -8222,11 +8727,9 @@ parallelism = 1
         let mac = hmac_util::compute(key, data).expect("compute");
 
         // Type annotation proves the return type at compile time.
-        let result: Result<bool, pq_diary_core::DiaryError> = hmac_util::verify_hmac(key, data, &mac);
-        assert!(
-            result.is_ok(),
-            "verify_hmac must return Ok for a valid MAC"
-        );
+        let result: Result<bool, pq_diary_core::DiaryError> =
+            hmac_util::verify_hmac(key, data, &mac);
+        assert!(result.is_ok(), "verify_hmac must return Ok for a valid MAC");
         assert!(
             result.unwrap(),
             "verify_hmac must return Ok(true) for the correct MAC"
@@ -8237,7 +8740,10 @@ parallelism = 1
         bad_mac[0] ^= 0xff;
         let result_bad: Result<bool, pq_diary_core::DiaryError> =
             hmac_util::verify_hmac(key, data, &bad_mac);
-        assert!(result_bad.is_ok(), "verify_hmac must return Ok even for wrong MAC");
+        assert!(
+            result_bad.is_ok(),
+            "verify_hmac must return Ok even for wrong MAC"
+        );
         assert!(
             !result_bad.unwrap(),
             "verify_hmac must return Ok(false) for a tampered MAC"
@@ -8387,5 +8893,627 @@ parallelism = 1
             !debug_repr.contains("s3cr3t"),
             "Debug output must not contain plaintext password; got: {debug_repr}"
         );
+    }
+
+    // =========================================================================
+    // S10 Phase 2 tests — init / sync / info / change-password / export
+    // =========================================================================
+
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_home() -> std::sync::MutexGuard<'static, ()> {
+        match HOME_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
+
+    struct HomeOverride {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl HomeOverride {
+        fn new(new_home: &std::path::Path) -> Self {
+            let previous = std::env::var_os("PQ_DIARY_HOME");
+            let root = new_home.join(".pq-diary");
+            std::env::set_var("PQ_DIARY_HOME", &root);
+            Self { previous }
+        }
+    }
+
+    impl Drop for HomeOverride {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(v) => std::env::set_var("PQ_DIARY_HOME", v),
+                None => std::env::remove_var("PQ_DIARY_HOME"),
+            }
+        }
+    }
+
+    fn make_cli_plain(args: &[&str]) -> crate::Cli {
+        let mut full: Vec<&str> = vec!["pq-diary"];
+        full.extend_from_slice(args);
+        crate::Cli::try_parse_from(&full).expect("parse cli")
+    }
+
+    fn setup_s10_vault(dir: &tempfile::TempDir, name: &str, password: &[u8]) -> std::path::PathBuf {
+        use pq_diary_core::vault::init::VaultManager;
+        let mgr = VaultManager::new(dir.path().to_path_buf())
+            .expect("VaultManager::new")
+            .with_kdf_params(fast_params());
+        mgr.init_vault(name, password).expect("init_vault");
+        dir.path().join(name)
+    }
+
+    // -------------------------------------------------------------------------
+    // TASK-0089: init tests
+    // -------------------------------------------------------------------------
+
+    /// TC-101-01: clean environment → config.toml and default vault are created.
+    #[test]
+    fn tc_101_01_init_creates_config_and_vault() {
+        use pq_diary_core::vault::config::AppConfig;
+
+        let _lock = lock_home();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = HomeOverride::new(dir.path());
+
+        let cli = make_cli_plain(&["--password", "Test123!", "init"]);
+        let result = cmd_init(&cli);
+        assert!(result.is_ok(), "cmd_init failed: {:?}", result.err());
+
+        let pq_root = dir.path().join(".pq-diary");
+        assert!(pq_root.join("config.toml").exists(), "config.toml exists");
+        assert!(
+            pq_root
+                .join("vaults")
+                .join("default")
+                .join("vault.pqd")
+                .exists(),
+            "default vault.pqd exists"
+        );
+        assert!(
+            pq_root
+                .join("vaults")
+                .join("default")
+                .join("vault.toml")
+                .exists(),
+            "default vault.toml exists"
+        );
+
+        let cfg = AppConfig::from_file(&pq_root.join("config.toml")).expect("read config");
+        assert_eq!(cfg.app.default_vault, "default");
+        assert_eq!(cfg.app.sync_backend, "git");
+    }
+
+    /// TC-101-E01: existing config.toml → init refuses to run.
+    #[test]
+    fn tc_101_e01_init_refuses_when_already_initialized() {
+        let _lock = lock_home();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = HomeOverride::new(dir.path());
+
+        let pq_root = dir.path().join(".pq-diary");
+        std::fs::create_dir_all(&pq_root).expect("mkdir");
+        std::fs::write(pq_root.join("config.toml"), b"# existing").expect("write");
+        let bytes_before = std::fs::read(pq_root.join("config.toml")).expect("read");
+
+        let cli = make_cli_plain(&["--password", "Test123!", "init"]);
+        let err = cmd_init(&cli).expect_err("must fail");
+        assert!(
+            format!("{err:#}").contains("Already initialized"),
+            "got: {err:#}"
+        );
+
+        let bytes_after = std::fs::read(pq_root.join("config.toml")).expect("read");
+        assert_eq!(bytes_before, bytes_after);
+    }
+
+    /// TC-101-E02: empty password → init rejected and no files created.
+    #[test]
+    fn tc_101_e02_init_rejects_empty_password() {
+        let _lock = lock_home();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = HomeOverride::new(dir.path());
+
+        let cli = make_cli_plain(&["--password", "", "init"]);
+        let err = cmd_init(&cli).expect_err("must fail");
+        assert!(
+            format!("{err:#}").contains("must not be empty"),
+            "got: {err:#}"
+        );
+
+        let pq_root = dir.path().join(".pq-diary");
+        assert!(!pq_root.join("config.toml").exists());
+        assert!(!pq_root.join("vaults").exists());
+    }
+
+    // -------------------------------------------------------------------------
+    // TASK-0090: sync tests
+    // -------------------------------------------------------------------------
+
+    /// TC-201-E01: unknown sync_backend → error.
+    #[test]
+    fn tc_201_e01_sync_unknown_backend_errors() {
+        let _lock = lock_home();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = HomeOverride::new(dir.path());
+
+        let pq_root = dir.path().join(".pq-diary");
+        std::fs::create_dir_all(&pq_root).expect("mkdir");
+        std::fs::write(
+            pq_root.join("config.toml"),
+            b"[app]\ndefault_vault = \"default\"\nsync_backend = \"github\"\n",
+        )
+        .expect("write config");
+
+        let cli = make_cli_plain(&["sync"]);
+        let err = cmd_sync(&cli).expect_err("must fail");
+        assert!(
+            format!("{err:#}").contains("Unknown sync backend: github"),
+            "got: {err:#}"
+        );
+    }
+
+    /// TC-201-E02: AppConfig missing → init guidance error.
+    #[test]
+    fn tc_201_e02_sync_without_config_returns_init_guidance() {
+        let _lock = lock_home();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = HomeOverride::new(dir.path());
+
+        let cli = make_cli_plain(&["sync"]);
+        let err = cmd_sync(&cli).expect_err("must fail");
+        assert!(format!("{err:#}").contains("pq-diary init"), "got: {err:#}");
+    }
+
+    /// TC-201-E03: malformed config.toml → Invalid config.toml error.
+    #[test]
+    fn tc_201_e03_sync_invalid_toml_errors() {
+        let _lock = lock_home();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = HomeOverride::new(dir.path());
+
+        let pq_root = dir.path().join(".pq-diary");
+        std::fs::create_dir_all(&pq_root).expect("mkdir");
+        std::fs::write(pq_root.join("config.toml"), b"this is not valid = toml [").expect("write");
+
+        let cli = make_cli_plain(&["sync"]);
+        let err = cmd_sync(&cli).expect_err("must fail");
+        assert!(
+            format!("{err:#}").contains("Invalid config.toml"),
+            "got: {err:#}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TASK-0092: change-password tests
+    // -------------------------------------------------------------------------
+
+    /// TC-NFR-103-02: change-password is blocked under --claude.
+    #[test]
+    fn tc_nfr_103_02_change_password_blocked_with_claude() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_s10_vault(&dir, "v", b"Old123!");
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let cli = make_cli_plain(&["--claude", "-v", vault_dir_str, "change-password"]);
+        let err = cmd_change_password_impl(
+            &cli,
+            secrecy::SecretBox::new(Box::from("Old123!")),
+            secrecy::SecretBox::new(Box::from("New456!")),
+            secrecy::SecretBox::new(Box::from("New456!")),
+        )
+        .expect_err("must fail");
+        assert!(
+            format!("{err:#}").contains("not permitted with --claude"),
+            "got: {err:#}"
+        );
+
+        assert!(vault_dir.join("vault.pqd").exists());
+    }
+
+    /// TC-301-E01: wrong old password → vault untouched.
+    #[test]
+    fn tc_301_e01_wrong_old_password_keeps_vault() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_s10_vault(&dir, "v", b"Old123!");
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+        let pqd = vault_dir.join("vault.pqd");
+        let bytes_before = std::fs::read(&pqd).expect("read");
+
+        let cli = make_cli_plain(&["-v", vault_dir_str, "change-password"]);
+        let err = cmd_change_password_impl(
+            &cli,
+            secrecy::SecretBox::new(Box::from("Wrong")),
+            secrecy::SecretBox::new(Box::from("New456!")),
+            secrecy::SecretBox::new(Box::from("New456!")),
+        )
+        .expect_err("must fail");
+        assert!(
+            format!("{err:#}").contains("Old password is incorrect"),
+            "got: {err:#}"
+        );
+
+        let bytes_after = std::fs::read(&pqd).expect("read");
+        assert_eq!(bytes_before, bytes_after, "vault unchanged");
+    }
+
+    /// TC-301-E02: empty new password → rejected.
+    #[test]
+    fn tc_301_e02_empty_new_password_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_s10_vault(&dir, "v", b"Old123!");
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let cli = make_cli_plain(&["-v", vault_dir_str, "change-password"]);
+        let err = cmd_change_password_impl(
+            &cli,
+            secrecy::SecretBox::new(Box::from("Old123!")),
+            secrecy::SecretBox::new(Box::from("")),
+            secrecy::SecretBox::new(Box::from("")),
+        )
+        .expect_err("must fail");
+        assert!(
+            format!("{err:#}").contains("must not be empty"),
+            "got: {err:#}"
+        );
+    }
+
+    /// TC-301-E03: new password mismatch → rejected.
+    #[test]
+    fn tc_301_e03_new_password_mismatch_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_s10_vault(&dir, "v", b"Old123!");
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let cli = make_cli_plain(&["-v", vault_dir_str, "change-password"]);
+        let err = cmd_change_password_impl(
+            &cli,
+            secrecy::SecretBox::new(Box::from("Old123!")),
+            secrecy::SecretBox::new(Box::from("New456!")),
+            secrecy::SecretBox::new(Box::from("Different!")),
+        )
+        .expect_err("must fail");
+        assert!(
+            format!("{err:#}").contains("Passwords do not match"),
+            "got: {err:#}"
+        );
+    }
+
+    /// TC-301-01: successful change-password — old fails, new succeeds.
+    #[test]
+    fn tc_301_01_successful_change_password() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_s10_vault(&dir, "v", b"Old123!");
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let cli = make_cli_plain(&["-v", vault_dir_str, "change-password"]);
+        cmd_change_password_impl(
+            &cli,
+            secrecy::SecretBox::new(Box::from("Old123!")),
+            secrecy::SecretBox::new(Box::from("New456!")),
+            secrecy::SecretBox::new(Box::from("New456!")),
+        )
+        .expect("change_password must succeed");
+
+        let pqd = vault_dir.join("vault.pqd");
+        let pqd_str = pqd.to_str().expect("utf8");
+
+        let mut core = DiaryCore::new(pqd_str).expect("DiaryCore::new");
+        assert!(
+            core.unlock(secrecy::SecretBox::new(Box::from("Old123!")))
+                .is_err(),
+            "old password must fail"
+        );
+
+        let mut core2 = DiaryCore::new(pqd_str).expect("DiaryCore::new");
+        core2
+            .unlock(secrecy::SecretBox::new(Box::from("New456!")))
+            .expect("unlock new");
+    }
+
+    /// TC-301-B01: same old/new password → warning but processing continues.
+    #[test]
+    fn tc_301_b01_same_password_continues_with_warning() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_s10_vault(&dir, "v", b"Same123!");
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let cli = make_cli_plain(&["-v", vault_dir_str, "change-password"]);
+        cmd_change_password_impl(
+            &cli,
+            secrecy::SecretBox::new(Box::from("Same123!")),
+            secrecy::SecretBox::new(Box::from("Same123!")),
+            secrecy::SecretBox::new(Box::from("Same123!")),
+        )
+        .expect("same password must succeed");
+
+        let pqd = vault_dir.join("vault.pqd");
+        let mut core = DiaryCore::new(pqd.to_str().unwrap()).expect("DiaryCore::new");
+        core.unlock(secrecy::SecretBox::new(Box::from("Same123!")))
+            .expect("re-unlock with same password");
+    }
+
+    // -------------------------------------------------------------------------
+    // TASK-0093: info tests
+    // -------------------------------------------------------------------------
+
+    /// TC-401-01: basic info path runs end-to-end with a populated vault.
+    #[test]
+    fn tc_401_01_info_basic_runs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_s10_vault(&dir, "v", b"password");
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let pqd = vault_dir.join("vault.pqd");
+        {
+            let mut core = DiaryCore::new(pqd.to_str().unwrap()).expect("DiaryCore::new");
+            core.unlock(secrecy::SecretBox::new(Box::from("password")))
+                .expect("unlock");
+            core.new_entry("a", "body-a", vec![]).expect("a");
+            core.new_entry("b", "body-b", vec![]).expect("b");
+            core.new_entry("c", "body-c", vec![]).expect("c");
+        }
+
+        let cli = make_cli_plain(&["-v", vault_dir_str, "--password", "password", "info"]);
+        cmd_info(&cli, false).expect("cmd_info must succeed");
+    }
+
+    /// TC-401-E01: wrong password → "Vault unlock failed".
+    #[test]
+    fn tc_401_e01_info_wrong_password() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_s10_vault(&dir, "v", b"password");
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let cli = make_cli_plain(&["-v", vault_dir_str, "--password", "wrong", "info"]);
+        let err = cmd_info(&cli, false).expect_err("must fail");
+        assert!(
+            format!("{err:#}").contains("Vault unlock failed"),
+            "got: {err:#}"
+        );
+    }
+
+    /// TC-401-E02: corrupt vault.toml → Invalid vault.toml.
+    #[test]
+    fn tc_401_e02_info_corrupt_vault_toml() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_s10_vault(&dir, "v", b"password");
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        std::fs::write(vault_dir.join("vault.toml"), b"not valid = [toml").expect("write");
+
+        let cli = make_cli_plain(&["-v", vault_dir_str, "--password", "password", "info"]);
+        let err = cmd_info(&cli, false).expect_err("must fail");
+        assert!(
+            format!("{err:#}").contains("Invalid vault.toml"),
+            "got: {err:#}"
+        );
+    }
+
+    /// TC-411-01: --security path runs and yields Ok.
+    #[test]
+    fn tc_411_01_info_security_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_s10_vault(&dir, "v", b"password");
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let cli = make_cli_plain(&[
+            "-v",
+            vault_dir_str,
+            "--password",
+            "password",
+            "info",
+            "--security",
+        ]);
+        cmd_info(&cli, true).expect("cmd_info --security must succeed");
+    }
+
+    // -------------------------------------------------------------------------
+    // TASK-0094: export tests (helpers + impl)
+    // -------------------------------------------------------------------------
+
+    /// TC-501-Slug: slugify handles common cases.
+    #[test]
+    fn tc_501_slug_handles_common_cases() {
+        assert_eq!(slugify("hello"), "hello");
+        assert_eq!(slugify(""), "untitled");
+        assert_eq!(slugify("   "), "untitled");
+        assert_eq!(slugify("foo bar"), "foo-bar");
+        assert_eq!(slugify("foo/bar"), "foo_bar");
+        assert_eq!(slugify("a\\b:c*d?e\"f<g>h|i"), "a_b_c_d_e_f_g_h_i");
+        assert_eq!(slugify("a  b"), "a-b");
+    }
+
+    /// TC-501-Yaml: yaml_escape handles quotes / backslashes / newlines.
+    #[test]
+    fn tc_501_yaml_escape() {
+        assert_eq!(yaml_escape("hello"), "hello");
+        assert_eq!(yaml_escape("a\"b"), "a\\\"b");
+        assert_eq!(yaml_escape("a\\b"), "a\\\\b");
+        assert_eq!(yaml_escape("a\nb"), "a\\nb");
+        assert_eq!(yaml_escape("a\x07b"), "ab");
+    }
+
+    /// TC-501-Fname: build_export_filename produces YYYY-MM-DD-slug-id8.md.
+    #[test]
+    fn tc_501_filename_format() {
+        let meta = EntryMeta {
+            uuid_hex: "3c6b775f4d8e4c2b9a1f8d5e1f0a2b3c".to_string(),
+            title: "Hello World".to_string(),
+            tags: vec![],
+            created_at: 1_747_440_000,
+            updated_at: 1_747_440_000,
+        };
+        let name = build_export_filename(&meta);
+        assert!(name.starts_with("2025-05-17-Hello-World-3c6b775f"));
+        assert!(name.ends_with(".md"));
+    }
+
+    /// TC-503-01: build_export_content emits expected YAML keys.
+    #[test]
+    fn tc_503_01_content_has_yaml_keys() {
+        let meta = EntryMeta {
+            uuid_hex: "3c6b775f4d8e4c2b9a1f8d5e1f0a2b3c".to_string(),
+            title: "T".to_string(),
+            tags: vec!["x".to_string()],
+            created_at: 1_747_440_000,
+            updated_at: 1_747_440_000,
+        };
+        let body = "Hello!\n";
+        let content = build_export_content(&meta, body);
+        assert!(content.starts_with("---\n"));
+        assert!(content.contains("id: 3c6b775f4d8e4c2b9a1f8d5e1f0a2b3c"));
+        assert!(content.contains("title: \"T\""));
+        assert!(content.contains("tags:\n  - \"x\""));
+        assert!(content.contains("created: "));
+        assert!(content.contains("updated: "));
+        assert!(content.ends_with("Hello!\n"));
+    }
+
+    /// TC-511-01: --claude blocks export.
+    #[test]
+    fn tc_511_01_export_blocked_with_claude() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out_dir = dir.path().join("out");
+        std::fs::create_dir_all(&out_dir).expect("mkdir out");
+
+        let cli = make_cli_plain(&["--claude", "export", out_dir.to_str().unwrap()]);
+        let mut stdin = std::io::Cursor::new(b"y\n".to_vec());
+        let err = cmd_export_impl(&cli, out_dir.clone(), &mut stdin).expect_err("must fail");
+        assert!(
+            format!("{err:#}").contains("not permitted with --claude"),
+            "got: {err:#}"
+        );
+
+        let count = std::fs::read_dir(&out_dir).unwrap().count();
+        assert_eq!(count, 0);
+    }
+
+    /// TC-512-01: nonexistent dir errors.
+    #[test]
+    fn tc_512_01_export_missing_dir_errors() {
+        let cli = make_cli_plain(&["export", "/no/such/dir"]);
+        let mut stdin = std::io::Cursor::new(b"y\n".to_vec());
+        let err = cmd_export_impl(&cli, PathBuf::from("/no/such/dir"), &mut stdin)
+            .expect_err("must fail");
+        assert!(
+            format!("{err:#}").contains("Directory does not exist"),
+            "got: {err:#}"
+        );
+    }
+
+    /// TC-513-01: empty input cancels.
+    #[test]
+    fn tc_513_01_export_cancel_on_empty_input() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_s10_vault(&dir, "v", b"password");
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+        let out_dir = dir.path().join("out");
+        std::fs::create_dir_all(&out_dir).expect("mkdir out");
+
+        let cli = make_cli_plain(&[
+            "-v",
+            vault_dir_str,
+            "--password",
+            "password",
+            "export",
+            out_dir.to_str().unwrap(),
+        ]);
+        let mut stdin = std::io::Cursor::new(b"\n".to_vec());
+        cmd_export_impl(&cli, out_dir.clone(), &mut stdin).expect("cancel is Ok");
+        assert_eq!(std::fs::read_dir(&out_dir).unwrap().count(), 0);
+    }
+
+    /// TC-513-02: 'n' input cancels.
+    #[test]
+    fn tc_513_02_export_cancel_on_n() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_s10_vault(&dir, "v", b"password");
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+        let out_dir = dir.path().join("out");
+        std::fs::create_dir_all(&out_dir).expect("mkdir out");
+
+        let cli = make_cli_plain(&[
+            "-v",
+            vault_dir_str,
+            "--password",
+            "password",
+            "export",
+            out_dir.to_str().unwrap(),
+        ]);
+        let mut stdin = std::io::Cursor::new(b"n\n".to_vec());
+        cmd_export_impl(&cli, out_dir.clone(), &mut stdin).expect("cancel is Ok");
+        assert_eq!(std::fs::read_dir(&out_dir).unwrap().count(), 0);
+    }
+
+    /// TC-501-B01: empty vault → "No entries to export".
+    #[test]
+    fn tc_501_b01_empty_vault() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_s10_vault(&dir, "v", b"password");
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+        let out_dir = dir.path().join("out");
+        std::fs::create_dir_all(&out_dir).expect("mkdir out");
+
+        let cli = make_cli_plain(&[
+            "-v",
+            vault_dir_str,
+            "--password",
+            "password",
+            "export",
+            out_dir.to_str().unwrap(),
+        ]);
+        let mut stdin = std::io::Cursor::new(b"y\n".to_vec());
+        cmd_export_impl(&cli, out_dir.clone(), &mut stdin).expect("ok");
+        assert_eq!(std::fs::read_dir(&out_dir).unwrap().count(), 0);
+    }
+
+    /// TC-501-01: 3 entries export → 3 well-named files.
+    #[test]
+    fn tc_501_01_export_three_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_s10_vault(&dir, "v", b"password");
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+        let out_dir = dir.path().join("out");
+        std::fs::create_dir_all(&out_dir).expect("mkdir out");
+
+        let pqd = vault_dir.join("vault.pqd");
+        {
+            let mut core = DiaryCore::new(pqd.to_str().unwrap()).expect("DiaryCore::new");
+            core.unlock(secrecy::SecretBox::new(Box::from("password")))
+                .expect("unlock");
+            core.new_entry("first", "body1", vec!["t".into()])
+                .expect("e1");
+            core.new_entry("second", "body2", vec![]).expect("e2");
+            core.new_entry("third", "body3", vec![]).expect("e3");
+        }
+
+        let cli = make_cli_plain(&[
+            "-v",
+            vault_dir_str,
+            "--password",
+            "password",
+            "export",
+            out_dir.to_str().unwrap(),
+        ]);
+        let mut stdin = std::io::Cursor::new(b"y\n".to_vec());
+        cmd_export_impl(&cli, out_dir.clone(), &mut stdin).expect("export ok");
+
+        let files: Vec<_> = std::fs::read_dir(&out_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(files.len(), 3, "must export 3 files");
+        for entry in files {
+            let name = entry.file_name();
+            let s = name.to_string_lossy();
+            assert!(s.ends_with(".md"), "extension .md: {s}");
+            assert!(
+                s.chars().nth(4) == Some('-') && s.chars().nth(7) == Some('-'),
+                "expected date prefix in {s}"
+            );
+        }
     }
 }

@@ -1853,8 +1853,10 @@ mod tests {
         let uuid_d_local = make_entry(0xD0, 0x10, 100); // local updated_at=100
         let uuid_d_remote = make_entry(0xD0, 0x20, 200); // remote updated_at=200 (newer)
 
-        let (_tmp_a, vault_dir_a, vault_path_a, config_a) =
-            setup_pull_test(std::slice::from_ref(&uuid_d_remote), std::slice::from_ref(&uuid_d_local));
+        let (_tmp_a, vault_dir_a, vault_path_a, config_a) = setup_pull_test(
+            std::slice::from_ref(&uuid_d_remote),
+            std::slice::from_ref(&uuid_d_local),
+        );
 
         let result_a = git_pull_merge(&vault_dir_a, &config_a, &vault_path_a, false);
         assert!(result_a.is_ok(), "subcase A failed: {:?}", result_a);
@@ -1876,8 +1878,10 @@ mod tests {
         let uuid_d_local2 = make_entry(0xD0, 0x10, 200); // local updated_at=200 (newer)
         let uuid_d_remote2 = make_entry(0xD0, 0x20, 100); // remote updated_at=100
 
-        let (_tmp_b, vault_dir_b, vault_path_b, config_b) =
-            setup_pull_test(std::slice::from_ref(&uuid_d_remote2), std::slice::from_ref(&uuid_d_local2));
+        let (_tmp_b, vault_dir_b, vault_path_b, config_b) = setup_pull_test(
+            std::slice::from_ref(&uuid_d_remote2),
+            std::slice::from_ref(&uuid_d_local2),
+        );
 
         let result_b = git_pull_merge(&vault_dir_b, &config_b, &vault_path_b, false);
         assert!(result_b.is_ok(), "subcase B failed: {:?}", result_b);
@@ -1904,8 +1908,10 @@ mod tests {
         let uuid_e_local = make_entry(0xE0, 0x10, 100); // local version
         let uuid_e_remote = make_entry(0xE0, 0x20, 100); // remote version (same updated_at)
 
-        let (_tmp, vault_dir, vault_path, config) =
-            setup_pull_test(std::slice::from_ref(&uuid_e_remote), std::slice::from_ref(&uuid_e_local));
+        let (_tmp, vault_dir, vault_path, config) = setup_pull_test(
+            std::slice::from_ref(&uuid_e_remote),
+            std::slice::from_ref(&uuid_e_local),
+        );
 
         // claude_mode = true → auto-resolve with local-wins.
         let result = git_pull_merge(&vault_dir, &config, &vault_path, true);

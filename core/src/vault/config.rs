@@ -172,30 +172,47 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
+    /// Resolve the directory that contains `config.toml` and `vaults/`.
+    ///
+    /// When the `PQ_DIARY_HOME` environment variable is set its value is
+    /// returned as the configuration root verbatim (so tests can redirect
+    /// the layout to a temporary directory). Otherwise the function falls
+    /// back to `<home>/.pq-diary` via [`dirs::home_dir`].
+    fn config_root() -> Result<PathBuf, DiaryError> {
+        if let Some(override_root) = std::env::var_os("PQ_DIARY_HOME") {
+            return Ok(PathBuf::from(override_root));
+        }
+        let home = dirs::home_dir()
+            .ok_or_else(|| DiaryError::Config("Cannot determine home directory".to_string()))?;
+        Ok(home.join(".pq-diary"))
+    }
+
     /// Absolute path to the default application config file
     /// (`~/.pq-diary/config.toml`).
+    ///
+    /// `PQ_DIARY_HOME` overrides the `~/.pq-diary` prefix when set; the
+    /// `config.toml` file name is always appended.
     ///
     /// # Errors
     ///
     /// Returns [`DiaryError::Config`] when the user's home directory cannot
     /// be determined (i.e. [`dirs::home_dir`] returns `None`).
     pub fn default_path() -> Result<PathBuf, DiaryError> {
-        let home = dirs::home_dir()
-            .ok_or_else(|| DiaryError::Config("Cannot determine home directory".to_string()))?;
-        Ok(home.join(".pq-diary").join("config.toml"))
+        Ok(Self::config_root()?.join("config.toml"))
     }
 
     /// Absolute path to the directory that holds individual vaults
     /// (`~/.pq-diary/vaults/`).
+    ///
+    /// `PQ_DIARY_HOME` overrides the `~/.pq-diary` prefix when set; the
+    /// `vaults` subdirectory is always appended.
     ///
     /// # Errors
     ///
     /// Returns [`DiaryError::Config`] when the user's home directory cannot
     /// be determined.
     pub fn default_vaults_dir() -> Result<PathBuf, DiaryError> {
-        let home = dirs::home_dir()
-            .ok_or_else(|| DiaryError::Config("Cannot determine home directory".to_string()))?;
-        Ok(home.join(".pq-diary").join("vaults"))
+        Ok(Self::config_root()?.join("vaults"))
     }
 
     /// Read and deserialise an [`AppConfig`] from a TOML file at `path`.

@@ -77,12 +77,37 @@ pub fn get_password(flag_value: Option<&SecretString>) -> Result<PasswordSource,
     // Stage 3: interactive TTY prompt
     use std::io::IsTerminal as _;
     if std::io::stdin().is_terminal() {
-        return read_password_tty().map(PasswordSource::Tty);
+        return read_password_tty("Password: ").map(PasswordSource::Tty);
     }
 
     Err(DiaryError::Password(
         "No password provided and stdin is not a terminal".to_string(),
     ))
+}
+
+/// Read a password from the controlling TTY with echo disabled, using a
+/// caller-supplied prompt.
+///
+/// This is the public entry point for commands that need to prompt for an
+/// additional password beyond the default `"Password: "` (e.g. `change-password`
+/// requires `"Old password: "`, `"New password: "`, `"Confirm new password: "`).
+///
+/// Returns `DiaryError::Password` if stdin is not a terminal — non-interactive
+/// callers must use the `cmd_*_impl` helper variants that take `SecretString`
+/// directly.
+///
+/// # Errors
+///
+/// Returns [`DiaryError::Password`] when stdin is not a terminal or the TTY
+/// I/O fails.
+pub fn prompt_password(prompt: &str) -> Result<SecretString, DiaryError> {
+    use std::io::IsTerminal as _;
+    if !std::io::stdin().is_terminal() {
+        return Err(DiaryError::Password(format!(
+            "Cannot prompt '{prompt}' — stdin is not a terminal"
+        )));
+    }
+    read_password_tty(prompt)
 }
 
 // =============================================================================
@@ -94,8 +119,9 @@ pub fn get_password(flag_value: Option<&SecretString>) -> Result<PasswordSource,
 /// Opens `/dev/tty` directly so that reading works even when stdin is
 /// redirected.  Terminal echo flags (`ECHO`, `ECHOE`, `ECHOK`, `ECHONL`) are
 /// disabled via `termios` and restored on return through a RAII guard.
+/// The caller supplies the prompt string written to the TTY.
 #[cfg(unix)]
-fn read_password_tty() -> Result<SecretString, DiaryError> {
+fn read_password_tty(prompt: &str) -> Result<SecretString, DiaryError> {
     use nix::sys::termios::{self, LocalFlags, SetArg};
     use std::io::{Read, Write};
     use zeroize::Zeroizing;
@@ -143,7 +169,7 @@ fn read_password_tty() -> Result<SecretString, DiaryError> {
     };
 
     // Print the password prompt.
-    write!(guard.file, "Password: ")
+    write!(guard.file, "{prompt}")
         .map_err(|e| DiaryError::Password(format!("Cannot write prompt: {e}")))?;
     guard
         .file
@@ -185,9 +211,10 @@ fn read_password_tty() -> Result<SecretString, DiaryError> {
 ///
 /// Uses `GetConsoleMode` / `SetConsoleMode` to disable `ENABLE_ECHO_INPUT` and
 /// `ReadConsoleW` to read Unicode input.  The original console mode is always
-/// restored before the function returns.
+/// restored before the function returns. The caller supplies the prompt
+/// string written to stderr.
 #[cfg(windows)]
-fn read_password_tty() -> Result<SecretString, DiaryError> {
+fn read_password_tty(prompt: &str) -> Result<SecretString, DiaryError> {
     use windows_sys::Win32::System::Console::{
         GetConsoleMode, GetStdHandle, ReadConsoleW, SetConsoleMode, ENABLE_ECHO_INPUT,
         STD_INPUT_HANDLE,
@@ -234,7 +261,7 @@ fn read_password_tty() -> Result<SecretString, DiaryError> {
         }
 
         // Print the prompt to stderr so it is always visible.
-        eprint!("Password: ");
+        eprint!("{prompt}");
 
         // Read up to 256 UTF-16 code units from the console.
         let mut buf: Zeroizing<[u16; 256]> = Zeroizing::new([0u16; 256]);
@@ -276,7 +303,7 @@ fn read_password_tty() -> Result<SecretString, DiaryError> {
 
 /// Fallback for platforms that support neither Unix termios nor Win32 console.
 #[cfg(not(any(unix, windows)))]
-fn read_password_tty() -> Result<SecretString, DiaryError> {
+fn read_password_tty(_prompt: &str) -> Result<SecretString, DiaryError> {
     Err(DiaryError::Password(
         "Interactive TTY password input is not supported on this platform".to_string(),
     ))

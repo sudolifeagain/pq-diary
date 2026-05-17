@@ -66,6 +66,13 @@ pub struct ImportArgs {
     pub dry_run: bool,
 }
 
+/// Arguments for the `export` subcommand.
+#[derive(Debug, Args)]
+pub struct ExportArgs {
+    /// Output directory (must already exist).
+    pub dir: std::path::PathBuf,
+}
+
 /// Arguments for the `search` subcommand.
 #[derive(Debug, Args)]
 pub struct SearchArgs {
@@ -164,7 +171,7 @@ pub enum Commands {
     Sync,
 
     /// Export diary entries to an external format
-    Export,
+    Export(ExportArgs),
 
     /// Change the vault master password
     ChangePassword,
@@ -336,7 +343,7 @@ fn dispatch(cli: &Cli) -> anyhow::Result<()> {
             tag.clone(),
             template.clone(),
         ),
-        Commands::Init => not_implemented("init", "Sprint 2"),
+        Commands::Init => commands::cmd_init(cli),
         Commands::Vault { subcommand } => match subcommand {
             VaultCommands::Create { name, policy } => {
                 commands::cmd_vault_create(cli, name, policy.as_deref())
@@ -364,10 +371,10 @@ fn dispatch(cli: &Cli) -> anyhow::Result<()> {
             remove_tag.clone(),
         ),
         Commands::Delete { id, force } => commands::cmd_delete(cli, id.clone(), *force),
-        Commands::Sync => not_implemented("sync", "Sprint 8"),
-        Commands::Export => not_implemented("export", "Sprint 5"),
-        Commands::ChangePassword => not_implemented("change-password", "Sprint 3"),
-        Commands::Info { .. } => not_implemented("info", "Sprint 2"),
+        Commands::Sync => commands::cmd_sync(cli),
+        Commands::Export(args) => commands::cmd_export(cli, args.dir.clone()),
+        Commands::ChangePassword => commands::cmd_change_password(cli),
+        Commands::Info { security } => commands::cmd_info(cli, *security),
         Commands::GitInit { remote } => commands::cmd_git_init(cli, remote.as_deref()),
         Commands::GitPush => commands::cmd_git_push(cli),
         Commands::GitPull => commands::cmd_git_pull(cli),

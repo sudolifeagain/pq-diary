@@ -7,6 +7,8 @@
 //! - `reader`: vault.pqd deserialisation (header and entry-record parsing)
 //! - `writer`: vault.pqd serialisation (header and entry-record writing)
 
+/// Master-password change: re-encrypt all entries with a new symmetric key.
+pub mod change_password;
 /// Per-vault and application-wide TOML configuration (`vault.toml`, `config.toml`).
 pub mod config;
 /// vault.pqd v4 binary format constants and structures.

@@ -246,8 +246,7 @@ fn query_debugger_detected() -> bool {
 fn query_debugger_detected() -> bool {
     // SAFETY: IsDebuggerPresent() is a nullary Win32 API that is always safe to call.
     // Listed in CLAUDE.md's allowed unsafe scope (same as check_debugger above).
-    let attached =
-        unsafe { windows_sys::Win32::System::Diagnostics::Debug::IsDebuggerPresent() };
+    let attached = unsafe { windows_sys::Win32::System::Diagnostics::Debug::IsDebuggerPresent() };
     attached != 0
 }
 

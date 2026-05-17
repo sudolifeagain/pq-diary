@@ -108,9 +108,24 @@
 - [x] **[M-5]** verify_hmac を Result<bool, DiaryError> 返却に変更 (S2/S6)
 - [x] 読み取り時の署名/HMAC 検証 (S4/S6) — entry.rs get_entry/list_entries_with_body
 
+### S10: 運用機能 + CLI整合性
+- [x] init コマンド実装 (新規、PRD L218) — cmd_init: config.toml + default vault
+- [x] sync コマンド実装 (新規、config 駆動ディスパッチャ) — cmd_sync: cmd_git_sync を委譲
+- [x] change-password (全エントリ再暗号化、Phase 2 から繰上げ) — core/src/vault/change_password.rs + cmd_change_password (TTY 2回入力 echo OFF)
+- [x] info / info --security (Phase 2 から繰上げ) — cmd_info: Vault Info + Security ブロック (harden_status())
+- [x] export [DIR] (Phase 2 から繰上げ) — cmd_export: YAML フロントマター手書き、`YYYY-MM-DD-{slug}-{id8}.md`、--claude ブロック
+- [x] AppConfig (~/.pq-diary/config.toml) 新規実装 — core/src/vault/config.rs::AppConfig (default_vault + sync_backend)
+- [x] harden_status() API + HardenStatus 構造体 — cli/src/security.rs (mlock/coredump/debugger 実プロセス状態)
+- [x] legacy*/legacy-access/daemon* を hide 化 — `#[command(hide = true)]` でヘルプから除外
+- [x] not_implemented メッセージを "Planned for Phase 2" に統一 (9 箇所)
+- [x] CI smoke test スクリプト追加 — ci/smoke-test.sh + ci/smoke-test.ps1 + .github/workflows/ci.yml smoke ジョブ
+- [x] DoD 強化「CLI 整合性」セクション追加 — definition-of-done.md
+- [x] dirs クレート依存追加 — cli/Cargo.toml + core/Cargo.toml
+- [x] password.rs read_password_tty(prompt) パラメータ化 — change-password の echo OFF 対応 (PRD §4.2 第3項遵守)
+
 ---
 
-## Phase 2 (未スケジュール)
+## Phase 2 (未スケジュール、change-password / info --security / export は S10 で完了)
 
 - [ ] デジタル遺言 (K_legacy, INHERIT/DESTROY, legacy-access)
 - [ ] Unixソケット + ロックデーモン (V-1〜V-8対策)
@@ -119,9 +134,9 @@
 - [ ] 添付ファイル (バイナリ暗号化, v4予約フィールド使用)
 - [ ] Web Clipper連携 (clip --url / パイプ入力)
 - [ ] Basesライクビュー (list拡張: 複合フィルタ・ソート・JSON出力)
-- [ ] change-password (全エントリ再暗号化)
-- [ ] info --security
-- [ ] export [DIR]
+- [x] change-password (全エントリ再暗号化) — S10 で完了
+- [x] info --security — S10 で完了
+- [x] export [DIR] — S10 で完了
 
 ## Phase 3 (モバイル・将来)
 

@@ -1,6 +1,6 @@
 # Sprint Status
 
-## Current: Sprint 10 — 運用機能 + CLI整合性 (in_progress)
+## Current: Sprint 10 — 運用機能 + CLI整合性 (completed)
 
 ## Progress
 
@@ -15,7 +15,7 @@
 | S7 | アクセス制御 + Claude連携 | completed (s7-done) | 7 |
 | S8 | Git連携 | completed (s8-done) | 8 |
 | S9 | セキュリティ硬化 + 統合テスト + 技術的負債 | completed (s9-done) | 9 |
-| S10 | 運用機能 + CLI整合性 | in_progress | 10 |
+| S10 | 運用機能 + CLI整合性 | completed (s10-done) | 10 |
 
 ## Sprint Scope
 

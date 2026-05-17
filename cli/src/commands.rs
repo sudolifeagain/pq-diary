@@ -2355,8 +2355,8 @@ pub fn cmd_change_password(cli: &Cli) -> anyhow::Result<()> {
     let old_pwd: SecretString = SecretBox::new(Box::from(old_source.secret().expose_secret()));
     drop(old_source);
 
-    let new_pwd1 = crate::password::prompt_password("New password: ")
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let new_pwd1 =
+        crate::password::prompt_password("New password: ").map_err(|e| anyhow::anyhow!("{e}"))?;
     let new_pwd2 = crate::password::prompt_password("Confirm new password: ")
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -2719,6 +2719,345 @@ fn yaml_escape(s: &str) -> String {
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Digital-legacy commands (S12)
+// ---------------------------------------------------------------------------
+
+/// Resolve the vault directory for legacy commands — same rules as
+/// `resolve_change_password_vault_dir` (the `--vault` flag may name either a
+/// directory or a `*.pqd` file).
+fn resolve_legacy_vault_dir(cli: &Cli) -> anyhow::Result<PathBuf> {
+    resolve_change_password_vault_dir(cli)
+}
+
+fn argon2_params_from_vault(
+    vault_dir: &std::path::Path,
+) -> anyhow::Result<pq_diary_core::crypto::kdf::Argon2Params> {
+    use pq_diary_core::vault::config::VaultConfig;
+    let config = VaultConfig::from_file(&vault_dir.join("vault.toml"))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(pq_diary_core::crypto::kdf::Argon2Params {
+        memory_cost_kb: config.argon2.memory_cost_kb,
+        time_cost: config.argon2.time_cost,
+        parallelism: config.argon2.parallelism,
+    })
+}
+
+/// Prompt for a confirmation-mode choice during `legacy init`. Reads a line
+/// from stdin; `1`/empty selects Timer30, `2` selects Yn, `3` selects Phrase.
+fn prompt_confirmation_mode<R: std::io::BufRead>(
+    reader: &mut R,
+) -> anyhow::Result<pq_diary_core::vault::config::ConfirmationMode> {
+    use pq_diary_core::vault::config::ConfirmationMode;
+    println!("Choose confirmation mode for legacy-access:");
+    println!("  [1] timer30 (default) — 30-second timer + y/N");
+    println!("  [2] yn               — immediate y/N");
+    println!("  [3] phrase           — type 'DESTROY ALL' to confirm");
+    print!("Selection [1]: ");
+    use std::io::Write as _;
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let choice = line.trim();
+    match choice {
+        "" | "1" | "timer30" => Ok(ConfirmationMode::Timer30),
+        "2" | "yn" => Ok(ConfirmationMode::Yn),
+        "3" | "phrase" => Ok(ConfirmationMode::Phrase),
+        other => anyhow::bail!("Invalid selection '{other}' — choose 1, 2, or 3"),
+    }
+}
+
+/// Execute the `pq-diary legacy init` command.
+pub fn cmd_legacy_init(cli: &Cli) -> anyhow::Result<()> {
+    if cli.claude {
+        anyhow::bail!("legacy init is not permitted with --claude");
+    }
+    let mut stdin = std::io::stdin().lock();
+    cmd_legacy_init_impl(cli, &mut stdin)
+}
+
+fn cmd_legacy_init_impl<R: std::io::BufRead>(cli: &Cli, reader: &mut R) -> anyhow::Result<()> {
+    use pq_diary_core::legacy::{initialize_legacy, Argon2LegacyDeriver};
+    use secrecy::{ExposeSecret as _, SecretBox, SecretString};
+
+    let vault_dir = resolve_legacy_vault_dir(cli)?;
+    let master_source = get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let master_pwd: SecretString =
+        SecretBox::new(Box::from(master_source.secret().expose_secret()));
+    drop(master_source);
+
+    let legacy_code1 =
+        crate::password::prompt_password("Legacy code: ").map_err(|e| anyhow::anyhow!("{e}"))?;
+    let legacy_code2 = crate::password::prompt_password("Confirm legacy code: ")
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if legacy_code1.expose_secret() != legacy_code2.expose_secret() {
+        anyhow::bail!("Legacy codes do not match");
+    }
+    if legacy_code1.expose_secret().is_empty() {
+        anyhow::bail!("Legacy code must not be empty");
+    }
+    if legacy_code1.expose_secret() == master_pwd.expose_secret() {
+        eprintln!("Warning: legacy code is identical to the master password.");
+    }
+
+    let mode = prompt_confirmation_mode(reader)?;
+    let params = argon2_params_from_vault(&vault_dir)?;
+    let deriver = Argon2LegacyDeriver::new(params);
+
+    initialize_legacy(&vault_dir, &master_pwd, &legacy_code1, mode, &deriver)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!(
+        "Legacy code initialized. Confirmation mode: {}",
+        mode_label(mode)
+    );
+    Ok(())
+}
+
+fn mode_label(mode: pq_diary_core::vault::config::ConfirmationMode) -> &'static str {
+    use pq_diary_core::vault::config::ConfirmationMode;
+    match mode {
+        ConfirmationMode::Timer30 => "timer30",
+        ConfirmationMode::Yn => "yn",
+        ConfirmationMode::Phrase => "phrase",
+    }
+}
+
+/// Execute the `pq-diary legacy set <ID> --inherit | --destroy` command.
+pub fn cmd_legacy_set(
+    cli: &Cli,
+    id_prefix: String,
+    inherit: bool,
+    destroy: bool,
+) -> anyhow::Result<()> {
+    use pq_diary_core::legacy::{set_entry_flag, Argon2LegacyDeriver, LegacyFlag};
+    use secrecy::{ExposeSecret as _, SecretBox, SecretString};
+
+    if cli.claude {
+        anyhow::bail!("legacy set is not permitted with --claude");
+    }
+    let flag = match (inherit, destroy) {
+        (true, false) => LegacyFlag::Inherit,
+        (false, true) => LegacyFlag::Destroy,
+        (false, false) => anyhow::bail!("--inherit or --destroy is required"),
+        (true, true) => anyhow::bail!("--inherit cannot be used with --destroy"),
+    };
+
+    let vault_dir = resolve_legacy_vault_dir(cli)?;
+    let master_source = get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let master_pwd: SecretString =
+        SecretBox::new(Box::from(master_source.secret().expose_secret()));
+    drop(master_source);
+
+    let legacy_code_opt = if flag == LegacyFlag::Inherit {
+        let code = crate::password::prompt_password("Legacy code: ")
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Some(code)
+    } else {
+        None
+    };
+
+    let params = argon2_params_from_vault(&vault_dir)?;
+    let deriver = Argon2LegacyDeriver::new(params);
+    set_entry_flag(
+        &vault_dir,
+        &master_pwd,
+        legacy_code_opt.as_ref(),
+        &id_prefix,
+        flag,
+        &deriver,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    match flag {
+        LegacyFlag::Inherit => println!("Entry {id_prefix} set to INHERIT"),
+        LegacyFlag::Destroy => println!("Entry {id_prefix} set to DESTROY"),
+    }
+    Ok(())
+}
+
+/// Execute the `pq-diary legacy list` command.
+pub fn cmd_legacy_list(cli: &Cli) -> anyhow::Result<()> {
+    use pq_diary_core::legacy::{list_legacy_status, LegacyFlag};
+    use secrecy::{ExposeSecret as _, SecretBox, SecretString};
+
+    if cli.claude {
+        anyhow::bail!("legacy list is not permitted with --claude");
+    }
+
+    let vault_dir = resolve_legacy_vault_dir(cli)?;
+    let master_source = get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let master_pwd: SecretString =
+        SecretBox::new(Box::from(master_source.secret().expose_secret()));
+    drop(master_source);
+
+    let statuses =
+        list_legacy_status(&vault_dir, &master_pwd).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut inherits: Vec<_> = statuses
+        .iter()
+        .filter(|s| s.flag == LegacyFlag::Inherit)
+        .collect();
+    let mut destroys: Vec<_> = statuses
+        .iter()
+        .filter(|s| s.flag == LegacyFlag::Destroy)
+        .collect();
+    inherits.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
+    destroys.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
+
+    println!("=== INHERIT ({} entries) ===", inherits.len());
+    for s in &inherits {
+        println!(
+            "{}  {}  {}",
+            s.uuid_prefix,
+            format_timestamp(s.updated_at),
+            s.title
+        );
+    }
+    println!();
+    println!("=== DESTROY ({} entries) ===", destroys.len());
+    for s in &destroys {
+        println!(
+            "{}  {}  {}",
+            s.uuid_prefix,
+            format_timestamp(s.updated_at),
+            s.title
+        );
+    }
+    println!();
+    println!(
+        "Summary: INHERIT {} entries / DESTROY {} entries / Total {}",
+        inherits.len(),
+        destroys.len(),
+        statuses.len()
+    );
+    Ok(())
+}
+
+/// Execute the `pq-diary legacy rotate` command.
+pub fn cmd_legacy_rotate(cli: &Cli) -> anyhow::Result<()> {
+    use pq_diary_core::legacy::{rotate_legacy_code, Argon2LegacyDeriver};
+    use secrecy::{ExposeSecret as _, SecretBox, SecretString};
+
+    if cli.claude {
+        anyhow::bail!("legacy rotate is not permitted with --claude");
+    }
+
+    let vault_dir = resolve_legacy_vault_dir(cli)?;
+    let master_source = get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let master_pwd: SecretString =
+        SecretBox::new(Box::from(master_source.secret().expose_secret()));
+    drop(master_source);
+
+    let old_code = crate::password::prompt_password("Old legacy code: ")
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let new_code1 = crate::password::prompt_password("New legacy code: ")
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let new_code2 = crate::password::prompt_password("Confirm new legacy code: ")
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if new_code1.expose_secret() != new_code2.expose_secret() {
+        anyhow::bail!("New legacy codes do not match");
+    }
+    if new_code1.expose_secret().is_empty() {
+        anyhow::bail!("New legacy code must not be empty");
+    }
+    if old_code.expose_secret() == new_code1.expose_secret() {
+        eprintln!("Warning: new legacy code is identical to the old one.");
+    }
+
+    let params = argon2_params_from_vault(&vault_dir)?;
+    let deriver = Argon2LegacyDeriver::new(params);
+    let rotated = rotate_legacy_code(&vault_dir, &master_pwd, &old_code, &new_code1, &deriver)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!("Legacy code rotated successfully ({rotated} INHERIT entries re-encrypted)");
+    Ok(())
+}
+
+/// Execute the `pq-diary legacy-access` command (irreversible).
+pub fn cmd_legacy_access(cli: &Cli) -> anyhow::Result<()> {
+    use pq_diary_core::legacy::{execute_legacy_access, Argon2LegacyDeriver};
+
+    // Refuse --claude *before* spending any Argon2 cycles (NFR-104).
+    if cli.claude {
+        anyhow::bail!("legacy-access is not permitted with --claude");
+    }
+
+    let vault_dir = resolve_legacy_vault_dir(cli)?;
+
+    let legacy_code =
+        crate::password::prompt_password("Legacy code: ").map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let params = argon2_params_from_vault(&vault_dir)?;
+    let deriver = Argon2LegacyDeriver::new(params);
+
+    let report = execute_legacy_access(&vault_dir, &legacy_code, &deriver, |mode| {
+        run_destroy_confirmation(mode)
+    })
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    println!(
+        "Legacy access complete. {} entries inherited, {} entries destroyed.",
+        report.inherited, report.destroyed
+    );
+    Ok(())
+}
+
+/// Render the confirmation UX selected during `legacy init` and return
+/// whether the user opted to proceed. Returning `Ok(false)` aborts the
+/// operation without modifying the vault.
+fn run_destroy_confirmation(
+    mode: pq_diary_core::vault::config::ConfirmationMode,
+) -> Result<bool, pq_diary_core::error::DiaryError> {
+    use pq_diary_core::vault::config::ConfirmationMode;
+
+    println!();
+    println!("============================================================");
+    println!("  WARNING: THIS OPERATION IS IRREVERSIBLE");
+    println!("  - All INHERIT entries will be inherited.");
+    println!("  - All DESTROY entries (and unconfigured entries) will be");
+    println!("    PERMANENTLY ERASED with zeroize-overwrite.");
+    println!("============================================================");
+
+    match mode {
+        ConfirmationMode::Timer30 => {
+            for remaining in (1..=30).rev() {
+                print!("\r  {remaining:>2} seconds remaining...");
+                use std::io::Write as _;
+                std::io::stdout().flush().ok();
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+            println!("\r   0 seconds remaining.            ");
+            prompt_yn("Proceed? [y/N]: ")
+        }
+        ConfirmationMode::Yn => prompt_yn("Proceed? [y/N]: "),
+        ConfirmationMode::Phrase => prompt_phrase("DESTROY ALL"),
+    }
+}
+
+fn prompt_yn(prompt: &str) -> Result<bool, pq_diary_core::error::DiaryError> {
+    print!("{prompt}");
+    use std::io::{BufRead as _, Write as _};
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .map_err(pq_diary_core::error::DiaryError::Io)?;
+    Ok(matches!(line.trim(), "y" | "Y" | "yes" | "YES"))
+}
+
+fn prompt_phrase(expected: &str) -> Result<bool, pq_diary_core::error::DiaryError> {
+    println!("Type the phrase '{expected}' to confirm:");
+    print!("> ");
+    use std::io::{BufRead as _, Write as _};
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .map_err(pq_diary_core::error::DiaryError::Io)?;
+    Ok(line.trim() == expected)
 }
 
 // ---------------------------------------------------------------------------

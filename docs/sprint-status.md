@@ -1,6 +1,6 @@
 # Sprint Status
 
-## Current: Sprint 12 — デジタル遺言 (legacy) — 設計フェーズ進行中
+## Current: Sprint 12 — デジタル遺言 (legacy) — 実装フェーズ進行中
 
 ## Progress
 
@@ -17,7 +17,7 @@
 | S9 | セキュリティ硬化 + 統合テスト + 技術的負債 | completed (s9-done) | 9 |
 | S10 | 運用機能 + CLI整合性 | completed (s10-done) | 10 |
 | S11 | クロスプラットフォーム検証 + toolchain 固定 | completed (s11-done) | 11 |
-| S12 | デジタル遺言 (legacy) | in_progress (design phase) | 12 |
+| S12 | デジタル遺言 (legacy) | in_progress (implementation phase) | 12 |
 
 ## Sprint Scope
 
@@ -100,3 +100,14 @@
 - `rust-toolchain.toml` で toolchain 固定 (CI と local の同期維持、hotfix follow-up)
 - 各プラットフォームの実機検証で発覚したバグ修正 (出たらタスク追加)
 - backlog の Phase 1「クロスプラットフォームビルド」項目を完了マーク
+
+### S12: デジタル遺言 (legacy)
+- `core/src/legacy.rs` 新規モジュール: `LegacyKeyDeriver` trait, `Argon2LegacyDeriver`, `LegacyFlag`, `LegacyEntryStatus`, `LegacyAccessReport`
+- 5 つの core API: `initialize_legacy`, `set_entry_flag`, `list_legacy_status`, `rotate_legacy_code`, `execute_legacy_access`
+- `vault.toml [legacy]` セクション追加 (initialized, destroy_confirmation, verification_iv_b64, verification_ct_b64) — `#[serde(default)]` で後方互換性
+- CLI: `pq-diary legacy init/set/list/rotate` + `pq-diary legacy-access` 実装
+- 確認 UI (timer30 / yn / phrase) を core から CLI に委譲する callback パターン
+- legacy/legacy-access の hide 解除 — Phase 1 完了
+- smoke-test で legacy --help / legacy-access --help / legacy subcommand 一覧をカバー
+- 23 のユニットテスト (TC-S12-001 〜 TC-S12-007) + 既存 388 テスト + 271 CLI テストすべて通過
+- 設計 (PR #5): 信頼性 🔵 100%

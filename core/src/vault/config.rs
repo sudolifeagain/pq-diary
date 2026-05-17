@@ -28,6 +28,9 @@ pub struct VaultConfig {
     pub git: GitSection,
     /// Argon2id KDF parameters.
     pub argon2: Argon2Section,
+    /// Digital-legacy (S12) section. Absent in pre-S12 vault.toml files.
+    #[serde(default)]
+    pub legacy: LegacySection,
 }
 
 /// `[vault]` section of `vault.toml`.
@@ -79,6 +82,45 @@ pub struct Argon2Section {
     pub parallelism: u32,
 }
 
+/// `[legacy]` section of `vault.toml` (S12).
+///
+/// Tracks digital-legacy bootstrap state and the verification token used to
+/// validate the post-mortem access code during `legacy-access`. Absent in
+/// pre-S12 vault.toml files; deserialises to all-default values when missing,
+/// preserving backward compatibility.
+#[derive(Debug, PartialEq, Serialize, Deserialize, Default)]
+pub struct LegacySection {
+    /// `true` once `pq-diary legacy init` has been run.
+    #[serde(default)]
+    pub initialized: bool,
+    /// Confirmation UX selected during `legacy init`.
+    #[serde(default)]
+    pub destroy_confirmation: ConfirmationMode,
+    /// Base64-encoded AES-256-GCM IV (12 bytes) for the legacy verification token.
+    #[serde(default)]
+    pub verification_iv_b64: Option<String>,
+    /// Base64-encoded AES-256-GCM ciphertext (48 bytes) of the legacy verification token.
+    #[serde(default)]
+    pub verification_ct_b64: Option<String>,
+}
+
+/// Choice presented to the heir when running `legacy-access`.
+///
+/// The default is [`ConfirmationMode::Timer30`], chosen during `legacy init`
+/// because the 30-second countdown is hard to mis-fire while still being
+/// approachable.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, Clone, Copy, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfirmationMode {
+    /// 30-second countdown followed by a `y/N` prompt.
+    #[default]
+    Timer30,
+    /// Immediate `y/N` prompt (no timer).
+    Yn,
+    /// User must type the literal phrase `DESTROY ALL`.
+    Phrase,
+}
+
 impl Default for VaultConfig {
     fn default() -> Self {
         Self {
@@ -103,6 +145,7 @@ impl Default for VaultConfig {
                 time_cost: 3,
                 parallelism: 1,
             },
+            legacy: LegacySection::default(),
         }
     }
 }
@@ -437,6 +480,131 @@ parallelism = 1
             "expected DiaryError::Config, got {:?}",
             result
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // S12: LegacySection + ConfirmationMode tests
+    // -------------------------------------------------------------------------
+
+    /// TC-S12-001-01: VaultConfig with a populated [legacy] section round-trips through TOML.
+    #[test]
+    fn tc_s12_001_01_legacy_section_round_trip() {
+        let mut config = VaultConfig::default();
+        config.legacy.initialized = true;
+        config.legacy.destroy_confirmation = ConfirmationMode::Phrase;
+        config.legacy.verification_iv_b64 = Some("AAAAAAAAAAAAAAAA".to_string());
+        config.legacy.verification_ct_b64 =
+            Some("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".to_string());
+
+        let toml_str = toml::to_string_pretty(&config).expect("serialise");
+        let restored: VaultConfig = toml::from_str(&toml_str).expect("deserialise");
+        assert_eq!(config, restored);
+    }
+
+    /// TC-S12-001-02: Pre-S12 vault.toml without `[legacy]` deserialises to defaults.
+    ///
+    /// REQ-704 / EDGE-201: backward compatibility for vaults created before S12.
+    #[test]
+    fn tc_s12_001_02_legacy_section_missing_uses_defaults() {
+        let toml_pre_s12 = r#"
+[vault]
+name = "default"
+schema_version = 4
+
+[access]
+policy = "none"
+
+[git]
+author_name = ""
+author_email = ""
+commit_message = "Update vault"
+
+[git.privacy]
+timestamp_fuzz_hours = 0
+extra_padding_bytes_max = 0
+
+[argon2]
+memory_cost_kb = 65536
+time_cost = 3
+parallelism = 1
+"#;
+        let config: VaultConfig = toml::from_str(toml_pre_s12).expect("parse pre-S12 vault.toml");
+        assert!(!config.legacy.initialized);
+        assert_eq!(
+            config.legacy.destroy_confirmation,
+            ConfirmationMode::Timer30
+        );
+        assert!(config.legacy.verification_iv_b64.is_none());
+        assert!(config.legacy.verification_ct_b64.is_none());
+    }
+
+    /// TC-S12-001-03: ConfirmationMode serde uses snake_case identifiers.
+    #[test]
+    fn tc_s12_001_03_confirmation_mode_serde_snake_case() {
+        // TOML cannot serialise a bare enum, so wrap the value in LegacySection
+        // and inspect the emitted table.
+        let with_timer = LegacySection {
+            destroy_confirmation: ConfirmationMode::Timer30,
+            ..Default::default()
+        };
+        let with_yn = LegacySection {
+            destroy_confirmation: ConfirmationMode::Yn,
+            ..Default::default()
+        };
+        let with_phrase = LegacySection {
+            destroy_confirmation: ConfirmationMode::Phrase,
+            ..Default::default()
+        };
+        assert!(toml::to_string(&with_timer)
+            .expect("serialise timer30")
+            .contains("\"timer30\""));
+        assert!(toml::to_string(&with_yn)
+            .expect("serialise yn")
+            .contains("\"yn\""));
+        assert!(toml::to_string(&with_phrase)
+            .expect("serialise phrase")
+            .contains("\"phrase\""));
+    }
+
+    /// TC-S12-001-04: An unknown destroy_confirmation value is rejected as DiaryError::Config.
+    ///
+    /// EDGE-004 (design schema.md §1): invalid values must not silently default.
+    #[test]
+    fn tc_s12_001_04_invalid_destroy_confirmation_rejected() {
+        let toml_bad = r#"
+[vault]
+name = "default"
+schema_version = 4
+
+[access]
+policy = "none"
+
+[git]
+author_name = ""
+author_email = ""
+commit_message = "Update vault"
+
+[git.privacy]
+timestamp_fuzz_hours = 0
+extra_padding_bytes_max = 0
+
+[argon2]
+memory_cost_kb = 65536
+time_cost = 3
+parallelism = 1
+
+[legacy]
+initialized = true
+destroy_confirmation = "timer60"
+"#;
+        let result: Result<VaultConfig, _> = toml::from_str(toml_bad);
+        assert!(result.is_err(), "unknown ConfirmationMode must be rejected");
+    }
+
+    /// TC-S12-001-05: ConfirmationMode::default() is Timer30.
+    #[test]
+    fn tc_s12_001_05_confirmation_mode_default_is_timer30() {
+        assert_eq!(ConfirmationMode::default(), ConfirmationMode::Timer30);
     }
 
     /// TC-S10-087-06: to_file on Unix sets file permission to 0o600.

@@ -1,6 +1,6 @@
 # Sprint Status
 
-## Current: Sprint 12 — デジタル遺言 (legacy) — 実装フェーズ進行中
+## Current: Sprint 13 — 添付ファイル (attachments) — 設計フェーズ進行中
 
 ## Progress
 
@@ -17,7 +17,8 @@
 | S9 | セキュリティ硬化 + 統合テスト + 技術的負債 | completed (s9-done) | 9 |
 | S10 | 運用機能 + CLI整合性 | completed (s10-done) | 10 |
 | S11 | クロスプラットフォーム検証 + toolchain 固定 | completed (s11-done) | 11 |
-| S12 | デジタル遺言 (legacy) | in_progress (implementation phase) | 12 |
+| S12 | デジタル遺言 (legacy) | completed (s12-done) | 12 |
+| S13 | 添付ファイル (attachments) | in_progress (design phase) | 13 |
 
 ## Sprint Scope
 
@@ -111,3 +112,14 @@
 - smoke-test で legacy --help / legacy-access --help / legacy subcommand 一覧をカバー
 - 23 のユニットテスト (TC-S12-001 〜 TC-S12-007) + 既存 388 テスト + 271 CLI テストすべて通過
 - 設計 (PR #5): 信頼性 🔵 100%
+- マージ後 hardening (PR #6 review fix): rotate / legacy-access を 2-file アトミック (sidecar tmp + replace + backup)
+
+### S13: 添付ファイル (attachments) — 設計フェーズ
+- vault.pqd v4 の予約済み `attachment_count` (u16) / `attachment_offset` (u64) を活用し、S13 は schema_version v5 へ更新
+- ストレージ分離: vault.pqd (暗号化 AttachmentPlaintext を持つ `RECORD_TYPE_ATTACHMENT=0x03`) + `.attachments/<blob_uuid>.bin` (本体)
+- chunk 暗号化: 1MB chunk + FileKey + AES-GCM、AAD に chunk_index + total + blob_uuid で改ざん検出
+- サイズ上限: 1 ファイル 1GB (ストリーミング処理)
+- legacy 連動 (S12 拡張): ファイル個別 INHERIT/DESTROY フラグ、エントリ DESTROY 時は添付も自動連動
+- 双方向 Obsidian 互換: export で `![[FILE]]` 埋め込み + `attachments/` 別ディレクトリ、import で同形式読み取り
+- CLI 5 コマンド: `attachment add/list/extract/delete/set` + `new --attach` + `show` 拡張
+- 設計 spike (本 PR): 信頼性 🟡 100% (PRD §10 明示なし、PR review で 🔵 昇格を狙う)

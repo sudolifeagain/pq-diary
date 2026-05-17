@@ -18,7 +18,11 @@
 /// All failures are emitted as warnings to stderr; the process continues
 /// regardless (REQ-013).
 pub fn harden_process() {
-    #[cfg(unix)]
+    // PR_SET_DUMPABLE is a Linux-specific prctl operation; libc on macOS does
+    // not expose `prctl` or `PR_SET_DUMPABLE` at all. Gate this branch to
+    // target_os = "linux" so the macOS build compiles. RLIMIT_CORE is POSIX
+    // and available on all Unix-likes (handled separately below).
+    #[cfg(target_os = "linux")]
     {
         // PR_SET_DUMPABLE=0: blocks /proc/pid/mem reads and ptrace attach.
         // nix 0.29 does not expose a prctl feature, so we call libc::prctl directly.
@@ -30,7 +34,11 @@ pub fn harden_process() {
                 std::io::Error::last_os_error()
             );
         }
-        // RLIMIT_CORE=0: disables core dump files to prevent key material leakage
+    }
+    #[cfg(unix)]
+    {
+        // RLIMIT_CORE=0: disables core dump files to prevent key material leakage.
+        // Available on Linux, macOS, BSDs (any POSIX-like).
         use nix::sys::resource::{setrlimit, Resource};
         if let Err(e) = setrlimit(Resource::RLIMIT_CORE, 0, 0) {
             eprintln!("Warning: setrlimit(RLIMIT_CORE, 0) failed: {e}");

@@ -10,18 +10,21 @@
 ## システム概要
 
 デジタル遺言は **二重暗号化方式** を採用する:
-- 全 INHERIT エントリの K_entry は **K_master + K_legacy 両方** で暗号化保存される
-- `legacy-access` 時、K_master 不要で K_legacy のみで INHERIT エントリを復号可能
-- DESTROY エントリは K_master でしか復号できないため、legacy-access 時に消去される
+- 通常の entry ciphertext は従来どおり K_master で暗号化される
+- INHERIT エントリだけ、エントリ平文 JSON を K_legacy で暗号化した legacy ブロックを追加保存する
+- `legacy-access` 時、K_master 不要で legacy ブロックから INHERIT エントリを復号可能
+- DESTROY エントリは legacy ブロックを持たないため、legacy-access 時に消去される
+
+現行 v4 実装はエントリごとの DEK (`K_entry`) を持たない。S12 では vault.pqd フォーマットを変更せず、予約済みの `legacy_key_block` フィールドを「K_legacy で暗号化した平文 payload ブロック」として使う。
 
 ```
 通常時:
   master pwd → K_master → 全 entry 復号 OK
 
 legacy-access:
-  legacy code → K_legacy → INHERIT entry のみ復号 OK
+  legacy code → K_legacy → INHERIT legacy block のみ復号 OK
                                   ↓
-                       新 vault.pqd 生成 (K_legacy で再暗号化)
+                       新 vault.pqd 生成 (K_legacy + 新 KEM/DSA 鍵)
                        DESTROY entry は zeroize 削除
 ```
 
@@ -55,6 +58,8 @@ legacy-access:
 │    struct LegacySection {                                │
 │        initialized: bool,                                │
 │        destroy_confirmation: ConfirmationMode,           │
+│        verification_iv_b64: Option<String>,              │
+│        verification_ct_b64: Option<String>,              │
 │    }                                                     │
 │    enum ConfirmationMode { Timer30, Yn, Phrase }         │
 │                                                          │
@@ -64,7 +69,7 @@ legacy-access:
 │                                                          │
 │  core/src/entry.rs (改訂):                              │
 │    update_entry_legacy_block(uuid, K_legacy?, flag)     │
-│      (legacy 鍵ブロックの追加/削除)                     │
+│      (legacy ブロックの追加/削除)                       │
 └────────────────────────┬────────────────────────────────┘
                          │
 ┌────────────────────────▼────────────────────────────────┐
@@ -74,11 +79,13 @@ legacy-access:
 │  entry record:                                          │
 │    legacy_flag: u8 (S3 で予約)                          │
 │    legacy_key_block_len: u32 (S3 で予約)                │
-│    legacy_key_block: Vec<u8> (S3 で予約)                │
+│    legacy_key_block: Vec<u8> (legacy payload block)      │
 │  vault.toml (S12 拡張):                                 │
 │    [legacy]                                             │
 │    initialized = true                                    │
 │    destroy_confirmation = "timer30"                      │
+│    verification_iv_b64 = "..."                           │
+│    verification_ct_b64 = "..."                           │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -192,6 +199,10 @@ pub struct LegacySection {
     pub initialized: bool,
     #[serde(default = "default_confirmation")]
     pub destroy_confirmation: ConfirmationMode,
+    #[serde(default)]
+    pub verification_iv_b64: Option<String>,
+    #[serde(default)]
+    pub verification_ct_b64: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize, Clone, Copy)]
@@ -257,9 +268,10 @@ fn prompt_phrase(expected: &str) -> anyhow::Result<bool>;
 |---|---|---|
 | K_legacy 導出 | `core/src/crypto/kdf.rs::derive_key` | 既存関数を Argon2LegacyDeriver から呼び出す |
 | legacy_salt 取得 | `vault.pqd` ヘッダー | 既に S3 で生成済み、reader.rs から読み出すだけ |
-| legacy 鍵ブロック書き込み | `core/src/vault/writer.rs` | エントリレコードの予約フィールドへ書き込む経路を有効化 |
-| 全エントリスキャン | `core/src/entry.rs::list_entries_with_body` | 既存 API 流用 |
-| 新 vault 生成 | `core/src/vault/init.rs::init_vault` | 改造または専用 `init_vault_with_legacy_key` を追加 |
+| legacy ブロック書き込み | `core/src/vault/writer.rs` | エントリレコードの予約フィールドへ平文 JSON の K_legacy 暗号化コピーを書き込む |
+| 通常時の全エントリスキャン | `core/src/entry.rs::list_entries_with_body` | master unlock 済みの `legacy list` / `legacy set` で流用 |
+| legacy-access スキャン | `core/src/vault/reader.rs::read_vault` | K_master なしで record を読み、INHERIT の legacy ブロックだけ復号 |
+| 新 vault 生成 | `core/src/vault/init.rs` + `writer.rs` | K_legacy を新 master key とし、新 KEM/DSA 鍵を生成して専用 write helper で構築 |
 | password 入力 | `cli/src/password.rs::prompt_password` | S10 hotfix で追加した API を再利用 |
 
 ## 非機能要件の実現
@@ -269,7 +281,7 @@ fn prompt_phrase(expected: &str) -> anyhow::Result<bool>;
 | NFR-001 (init < 5 秒) | K_master + K_legacy の Argon2 2 回 (各 1〜3 秒) で達成 |
 | NFR-002 (set < 500ms) | 1 エントリ AES-GCM 復号 + 再暗号化のみ |
 | NFR-003 (rotate < 30 秒/100 件) | change-password と同等の規模 |
-| NFR-004 (access < 60 秒/1000 件) | Argon2 + 1000 件 AES-GCM 復号 + 新 vault 書き出し |
+| NFR-004 (access < 60 秒/1000 件) | Argon2 + INHERIT 件数分の legacy ブロック復号 + 新 vault 書き出し |
 | NFR-101 (zeroize) | Zeroizing / SecretString / SecretBytes 徹底 |
 | NFR-102 (Shamir 拡張可能) | `trait LegacyKeyDeriver` で抽象化 |
 | NFR-103 (DESTROY 物理消去) | tmp + rename + 旧 vault.pqd を zeroize 上書き |

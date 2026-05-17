@@ -12,7 +12,7 @@
 | DESTROY | 死後アクセスコード実行時に即座に消去されるエントリ (フラグ 0x00、デフォルト) |
 | K_master | マスターパスワード → Argon2id → 対称鍵 |
 | K_legacy | 死後アクセスコード → Argon2id (Legacy ソルト) → 対称鍵 |
-| K_entry | 各エントリのランダム対称鍵 (vault.pqd ペイロード内に暗号化保存) |
+| legacyブロック | INHERIT エントリの平文 JSON を K_legacy で暗号化した追加ブロック |
 
 ## 既存実装の土台 (S3 で予約済み)
 
@@ -24,7 +24,7 @@
 ```
 [1B: legacyフラグ  0x00=DESTROY / 0x01=INHERIT]   ← S3 予約、Phase 1 では常に 0x00
 [4B: legacy鍵ブロック長 (0ならDESTROY)]            ← S3 予約
-[legacy鍵ブロック (INHERITの場合のみ)]            ← S3 予約、INHERIT 時は K_entry を K_legacy で暗号化
+[legacyブロック (INHERITの場合のみ)]              ← S3 予約、INHERIT 時はエントリ平文 JSON を K_legacy で暗号化
 [1B: パディング長]
 [パディング]
 ```
@@ -41,7 +41,7 @@ S3 で予約済みなので、S12 ではフォーマット変更不要 (Phase 1 
 
 | # | 項目 | 確定内容 |
 |---|---|---|
-| 1 | **OQ-18** legacy-access 後の新 vault 暗号鍵 | K_legacy をそのまま残留 (重複アクセス可、シンプル) |
+| 1 | **OQ-18** legacy-access 後の新 vault 暗号鍵 | K_legacy を通常 master key として残留 (骨梧者が継続利用可、シンプル) |
 | 2 | **legacy rotate** の挙動 | 全 INHERIT エントリを即時再暗号化 (vault.pqd アトミック書き換え) |
 | 3 | **死後アクセスコード強度** | K_master と同じ Argon2 パラメータ + TTY 2 回入力 |
 | 4 | **legacy-access 確認方式** | ユーザー選択可能 (timer30 / yn / phrase)、`legacy init` で設定し `vault.toml [legacy]` に保存 |
@@ -57,7 +57,7 @@ S3 で予約済みなので、S12 ではフォーマット変更不要 (Phase 1 
 - `core/src/vault/init.rs::VaultManager::init_vault`: legacy_salt をランダム生成済み
 - `core/src/vault/config.rs::VaultConfig`: `[legacy]` セクション追加先
 - `core/src/crypto/kdf.rs`: Argon2id 共通 (K_legacy 導出に再利用)
-- `core/src/crypto/aead.rs`: AES-GCM (legacy 鍵ブロック暗号化に再利用)
+- `core/src/crypto/aead.rs`: AES-GCM (legacy ブロック暗号化に再利用)
 - `core/src/entry.rs`: entry CRUD (legacy フラグ書き込みパス追加先)
 - `cli/src/main.rs`: Commands::Legacy / LegacyAccess (S10 で hide 化済み、S12 で unhide)
 - `cli/src/commands.rs`: cmd_legacy_* 実装先
@@ -66,7 +66,7 @@ S3 で予約済みなので、S12 ではフォーマット変更不要 (Phase 1 
 ## 開発ルール (CLAUDE.md)
 
 - `unsafe` 新規追加禁止 (既存許可リストのみ)
-- 秘密データ (K_legacy, 死後アクセスコード, K_entry) は `Zeroizing` / `SecretString` / `SecretBytes`
+- 秘密データ (K_legacy, 死後アクセスコード, legacy ブロック復号後のエントリ平文) は `Zeroizing` / `SecretString` / `SecretBytes`
 - core/ にプラットフォーム依存 UI コード禁止
 - エラーは `thiserror::DiaryError`
 

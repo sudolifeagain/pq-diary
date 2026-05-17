@@ -46,7 +46,7 @@
 **詳細シナリオ**:
 1. ユーザーが `pq-diary legacy list` で現状確認 (デフォルト全て DESTROY)
 2. ユーザーが `pq-diary legacy set 3c6b --inherit` で個別エントリを INHERIT に
-3. システムが master unlock → 該当エントリの legacy 鍵ブロックを K_legacy で追加 → アトミック書き戻し
+3. システムが master unlock → 該当エントリの legacy ブロック (平文 JSON の K_legacy 暗号化コピー) を追加 → アトミック書き戻し
 4. `Entry 3c6b775f set to INHERIT` 表示
 
 **前提条件**: `legacy init` 完了
@@ -88,7 +88,7 @@
 **詳細シナリオ**:
 1. ユーザーが `pq-diary legacy rotate` 実行
 2. master + 旧 legacy code 取得 → 新 legacy code 2 回入力
-3. 全 INHERIT エントリの legacy 鍵ブロックを K_legacy_new で再暗号化
+3. 全 INHERIT エントリの legacy ブロックと検証 token を K_legacy_new で再暗号化
 4. vault.pqd.tmp → rename でアトミック差し替え
 5. `Legacy code rotated successfully (N entries re-encrypted)` 表示
 

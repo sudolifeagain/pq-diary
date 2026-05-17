@@ -45,8 +45,8 @@ sequenceDiagram
                 CMD->>DV: derive(legacy_code, legacy_salt)
                 Note over DV: K_legacy = Argon2id(code, salt)
                 DV-->>CMD: K_legacy (Zeroizing)
-                Note over CMD: K_legacy は生成するが<br/>ここでは使用しない<br/>(verification token 生成のみで参照)
-                CMD->>CFG: [legacy] initialized=true,<br/>destroy_confirmation=mode
+                CMD->>CMD: K_legacy 用 verification token 生成
+                CMD->>CFG: [legacy] initialized=true,<br/>destroy_confirmation=mode,<br/>verification_iv/ct
                 CFG->>CFG: vault.toml.tmp + rename (atomic)
                 CMD-->>U: Initialized. Mode: {mode}
             end
@@ -67,10 +67,11 @@ sequenceDiagram
 
     U->>CMD: legacy set 3c6b --inherit
     CMD->>CMD: master + legacy code 取得 + unlock
-    CMD->>E: get_entry(3c6b) → EntryPlaintext + K_entry
+    CMD->>E: get_entry(3c6b) → EntryPlaintext
     CMD->>DV: derive(legacy_code, legacy_salt)
     DV-->>CMD: K_legacy
-    CMD->>CMD: encrypt K_entry with K_legacy → legacy_key_block
+    CMD->>CMD: serialize EntryPlaintext JSON
+    CMD->>CMD: encrypt JSON with K_legacy → legacy_key_block
     CMD->>V: update_entry(uuid, flag=0x01, legacy_key_block)
     V->>V: read existing, replace record, write tmp, rename
     V-->>CMD: Ok
@@ -102,6 +103,7 @@ sequenceDiagram
     participant DC as DiaryCore
     participant DV_old as Argon2LegacyDeriver(old)
     participant DV_new as Argon2LegacyDeriver(new)
+    participant CFG as VaultConfig
     participant E as entry module
     participant W as vault writer
 
@@ -109,16 +111,17 @@ sequenceDiagram
     CMD->>CMD: master, old_legacy, new_legacy×2 取得
     CMD->>DC: unlock(master)
     CMD->>DV_old: derive(old_code, salt) → K_legacy_old
-    Note over CMD: verification token 検証で<br/>old code 正当性確認
+    Note over CMD: vault.toml [legacy] の<br/>verification token で<br/>old code 正当性確認
     alt old code 不正
         CMD-->>U: Invalid old legacy code
     else OK
         CMD->>DV_new: derive(new_code, salt) → K_legacy_new
         CMD->>E: list_entries_with_body() → 全エントリ
         loop 各 INHERIT エントリ
-            CMD->>CMD: decrypt legacy_key_block with K_legacy_old → K_entry
-            CMD->>CMD: encrypt K_entry with K_legacy_new → new_legacy_key_block
+            CMD->>CMD: decrypt legacy_key_block with K_legacy_old → EntryPlaintext JSON
+            CMD->>CMD: encrypt JSON with K_legacy_new → new_legacy_key_block
         end
+        CMD->>CFG: update verification token with K_legacy_new
         CMD->>W: write vault.pqd.tmp with new_legacy_key_blocks
         W->>W: rename(tmp, vault.pqd) atomic
         alt 書き込み失敗
@@ -156,8 +159,8 @@ sequenceDiagram
         else OK
             CMD->>CMD: prompt_password("Legacy code: ")
             CMD->>DV: derive(code, legacy_salt) → K_legacy
-            CMD->>V: verify K_legacy with verification token
-            Note over V: 検証 token は vault.toml の<br/>destroy_confirmation 設定取得とは別経路で<br/>vault.pqd ヘッダーから K_legacy 専用 token を確認
+            CMD->>CFG: verify K_legacy with [legacy] verification token
+            Note over CFG: vault.pqd ヘッダーの token は<br/>K_master 用なので使わない
             alt 不正
                 CMD-->>H: Invalid legacy code
             else OK
@@ -167,18 +170,19 @@ sequenceDiagram
                 alt false (cancel)
                     CMD-->>H: キャンセルしました
                 else true (proceed)
-                    CMD->>V: list_entries_with_body
+                    CMD->>V: read_vault records
                     loop 各エントリ
                         alt legacy_flag = INHERIT
-                            CMD->>CMD: decrypt legacy_key_block → K_entry
-                            CMD->>CMD: decrypt entry body with K_entry
+                            CMD->>CMD: decrypt legacy_key_block → EntryPlaintext JSON
+                            CMD->>CMD: deserialize EntryPlaintext
                             CMD->>CMD: 新vault 用に保存
                         else DESTROY
                             CMD->>CMD: zeroize entry record buffer
                         end
                     end
                     CMD->>W: write vault.pqd.tmp encrypted with K_legacy
-                    Note over W: new header: kdf_salt は元と同じ<br/>legacy_salt 不要 (将来 rotate 時もう一度 init 推奨)<br/>verification_token は K_legacy で再生成
+                    Note over W: new header: kdf_salt は元 legacy_salt<br/>新 KEM/DSA 鍵を生成<br/>verification_token は K_legacy で再生成
+                    CMD->>CFG: [legacy] initialized=false, token clear
                     W->>W: rename(tmp, vault.pqd) atomic
                     CMD-->>H: Legacy access complete.<br/>N inherited, M destroyed.
                 end
@@ -227,7 +231,7 @@ flowchart TD
 | `legacy set --inherit` | (no change) | 1 entry: flag 0x00→0x01, legacy_key_block 追加 |
 | `legacy set --destroy` | (no change) | 1 entry: flag 0x01→0x00, legacy_key_block 削除 |
 | `legacy rotate` | (no change) | 全 INHERIT: legacy_key_block 再暗号化 |
-| `legacy-access` | kdf_salt 維持、verification_token を K_legacy で再生成 | DESTROY 削除、INHERIT を K_legacy で再構築 |
+| `legacy-access` | kdf_salt = 元 legacy_salt、verification_token を K_legacy で再生成 | DESTROY 削除、INHERIT を K_legacy で再構築 |
 
 ## 関連
 

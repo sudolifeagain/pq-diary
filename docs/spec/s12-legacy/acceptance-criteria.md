@@ -10,7 +10,7 @@
 ## REQ-101〜111: `legacy init` 🔵
 
 ### 正常系
-- [ ] **TC-101-01**: クリーンな vault (`legacy init` 未実行) で実行 → vault.toml `[legacy] initialized=true`、`destroy_confirmation="timer30"` (デフォルト) 🔵
+- [ ] **TC-101-01**: クリーンな vault (`legacy init` 未実行) で実行 → vault.toml `[legacy] initialized=true`、`destroy_confirmation="timer30"`、K_legacy 検証 token が保存される (デフォルト) 🔵
 - [ ] **TC-101-02**: `timer30` 選択時、vault.toml に `destroy_confirmation="timer30"` 保存 🔵
 - [ ] **TC-101-03**: `yn` 選択時、`destroy_confirmation="yn"` 保存 🔵
 - [ ] **TC-101-04**: `phrase` 選択時、`destroy_confirmation="phrase"` 保存 🔵
@@ -32,10 +32,10 @@
 ## REQ-201〜205: `legacy set` 🔵
 
 ### 正常系
-- [ ] **TC-201-01**: 既存 entry に `--inherit` → legacy フラグ 0x00 → 0x01、legacy 鍵ブロック追加 (K_entry を K_legacy で AES-GCM 暗号化) 🔵
-- [ ] **TC-201-02**: INHERIT エントリに `--destroy` → フラグ 0x01 → 0x00、legacy 鍵ブロック削除 (長さ 0) 🔵
+- [ ] **TC-201-01**: 既存 entry に `--inherit` → legacy フラグ 0x00 → 0x01、legacy ブロック追加 (エントリ平文 JSON を K_legacy で AES-GCM 暗号化) 🔵
+- [ ] **TC-201-02**: INHERIT エントリに `--destroy` → フラグ 0x01 → 0x00、legacy ブロック削除 (長さ 0) 🔵
 - [ ] **TC-201-03**: `--inherit` 後、entry を再度 show/edit/list で読める (K_master で復号できる経路は影響なし) 🔵
-- [ ] **TC-201-04**: `--inherit` 後、別の死後アクセスコード (誤) で legacy 鍵ブロックを復号試行 → AEAD タグ失敗 (秘匿性) 🔵
+- [ ] **TC-201-04**: `--inherit` 後、別の死後アクセスコード (誤) で legacy ブロックを復号試行 → AEAD タグ失敗 (秘匿性) 🔵
 
 ### 異常系
 - [ ] **TC-201-E01**: `--inherit` と `--destroy` 同時指定 → clap conflict エラー (REQ-205) 🔵
@@ -66,7 +66,7 @@
 ## REQ-401〜405: `legacy rotate` 🔵
 
 ### 正常系
-- [ ] **TC-401-01**: 5 INHERIT エントリで rotate → 5 件全ての legacy 鍵ブロックが K_legacy_new で暗号化 (旧 K_legacy では復号失敗) 🔵
+- [ ] **TC-401-01**: 5 INHERIT エントリで rotate → 5 件全ての legacy ブロックと `[legacy]` 検証 token が K_legacy_new で暗号化 (旧 K_legacy では復号失敗) 🔵
 - [ ] **TC-401-02**: rotate 後、master password で全 entry が読める (K_master 系は影響なし) 🔵
 - [ ] **TC-401-03**: rotate 後、新 legacy code で `legacy-access` 実行成功、旧 legacy code では `Invalid legacy code` 🔵
 - [ ] **TC-401-04**: 完了メッセージ `Legacy code rotated successfully (5 INHERIT entries re-encrypted)` 表示 🔵
@@ -89,9 +89,9 @@
 ### 正常系
 - [ ] **TC-501-01**: INHERIT 3 + DESTROY 2 vault で実行、確認 y 入力 → 新 vault に INHERIT 3 件のみ、DESTROY 2 件は zeroize 削除 🔵
 - [ ] **TC-501-02**: 新 vault は K_legacy で再暗号化、`legacy-access` 後の vault unlock は legacy code で可能 🔵
-- [ ] **TC-501-03**: 新 vault.pqd ヘッダーの kdf_salt は元のまま (K_legacy 導出用)、verification_token は K_legacy で再生成 🔵
+- [ ] **TC-501-03**: 新 vault.pqd ヘッダーの kdf_salt は元の legacy_salt、verification_token は K_legacy で再生成、新規 KEM/DSA 鍵が K_legacy で暗号化される 🔵
 - [ ] **TC-501-04**: 完了メッセージ `Legacy access complete. 3 entries inherited, 2 entries destroyed.` 表示 🔵
-- [ ] **TC-501-05**: legacy-access 後、骨梧者が同じ legacy code で再度 `legacy-access` 実行 → 元 INHERIT のみが見え、destroy は 0 件 (冪等、EDGE-104) 🔵
+- [ ] **TC-501-05**: legacy-access 後、骨梧者が同じ legacy code を master password として通常 unlock できる。再度 `legacy-access` 実行は `[legacy] initialized=false` のため `Legacy not initialized` で停止 (EDGE-104) 🔵
 
 ### 異常系
 - [ ] **TC-501-E01**: legacy code 不正 → `Invalid legacy code`、vault.pqd 無変更 (REQ-503) 🔵
@@ -127,6 +127,8 @@
 - [ ] **TC-702-01**: `initialized: true` 値設定 🔵
 - [ ] **TC-703-01**: `destroy_confirmation` 値が選択値と一致 🔵
 - [ ] **TC-704-01**: 既存 Phase 1 vault (`[legacy]` セクション無し) で `legacy list` 実行 → `initialized=false` 扱い (EDGE-201) 🔵
+- [ ] **TC-705-01**: `legacy init` 後、`verification_iv_b64` / `verification_ct_b64` が存在し、正しい legacy code だけ検証成功 🔵
+- [ ] **TC-706-01**: `initialized=true` で検証 token 欠落・Base64 不正・長さ不正 → `DiaryError::Config` 🔵
 
 ---
 
@@ -148,11 +150,11 @@
 | access (REQ-5xx) | 5 | 6 | 4 | 15 |
 | 確認方式 (REQ-504) | 3 | 0 | 0 | 3 |
 | --claude (REQ-6xx) | 5 | 1 | 0 | 6 |
-| vault.toml (REQ-7xx) | 3 | 1 | 0 | 4 |
+| vault.toml (REQ-7xx) | 4 | 2 | 0 | 6 |
 | unhide (REQ-8xx) | 3 | 0 | 0 | 3 |
-| **合計** | **36** | **25** | **9** | **70** |
+| **合計** | **37** | **26** | **9** | **72** |
 
 ### 信頼性
-- 🔵: 70 件 (100%)
+- 🔵: 72 件 (100%)
 - 🟡: 0
 - 🔴: 0

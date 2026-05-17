@@ -31,8 +31,8 @@ LegacyCommands::Init
      [3] phrase           — type 'DESTROY ALL' to confirm
    Selection [1]:
    ```
-7. K_legacy 導出 (検証 token 生成のため)
-8. vault.toml に `[legacy] initialized=true, destroy_confirmation=<mode>` 書き込み (アトミック)
+7. K_legacy 導出、K_legacy 用 verification token を生成
+8. vault.toml に `[legacy] initialized=true, destroy_confirmation=<mode>, verification_iv_b64, verification_ct_b64` 書き込み (アトミック)
 9. `Legacy code initialized. Confirmation mode: {mode}` 表示
 
 **出力サンプル**:
@@ -73,7 +73,7 @@ LegacyCommands::Set {
 4. `--inherit` の場合は legacy code も取得
 5. ID プレフィックスでエントリ検索
 6. 該当エントリの legacy フラグを変更:
-   - `--inherit`: legacy_flag=0x01、K_entry を K_legacy で AES-GCM 暗号化 → legacy_key_block 追加
+   - `--inherit`: legacy_flag=0x01、エントリ平文 JSON を K_legacy で AES-GCM 暗号化 → legacy_key_block 追加
    - `--destroy`: legacy_flag=0x00、legacy_key_block 削除 (長さ 0)
 7. エントリレコードをアトミック書き戻し (既存 update_entry パターン)
 8. メッセージ表示:
@@ -135,11 +135,11 @@ LegacyCommands::Rotate
 **動作** (change-password と同パターン):
 1. `--claude` チェック
 2. `[legacy] initialized` チェック
-3. master + old legacy code 取得 → 両方検証 (master で unlock + old legacy で verification token 突合)
+3. master + old legacy code 取得 → 両方検証 (master で unlock + old legacy で `[legacy]` verification token 突合)
 4. new legacy code TTY 取得 × 2 → 確認入力
 5. 不一致 / 空 / 旧と同一 (警告のみ) チェック
 6. K_legacy_new 導出
-7. 全 INHERIT エントリの legacy_key_block を K_legacy_new で再暗号化
+7. 全 INHERIT エントリの legacy_key_block と `[legacy]` verification token を K_legacy_new で再暗号化
 8. vault.pqd.tmp + rename でアトミック差し替え
 9. `Legacy code rotated successfully ({N} INHERIT entries re-encrypted)` 表示
 
@@ -158,7 +158,7 @@ Commands::LegacyAccess
 1. `--claude` チェック → ブロック (Argon2 導出より前、NFR-104)
 2. vault.toml `[legacy] initialized = true` チェック → false なら `Legacy not initialized`
 3. legacy code TTY 取得 ("Legacy code: ")
-4. K_legacy 導出 + 検証 (vault.pqd ヘッダーの token 突合 or 試し復号)
+4. K_legacy 導出 + 検証 (`vault.toml [legacy]` の verification token 突合)
 5. 不正なら `Invalid legacy code` で停止、vault.pqd 無変更
 6. vault.toml `[legacy] destroy_confirmation` の値に従って確認 UI:
    - `timer30`: 警告 + 30 秒タイマー (残り秒数リアルタイム表示) + y/N
@@ -166,11 +166,12 @@ Commands::LegacyAccess
    - `phrase`: 警告 + コンフィルフレーズ入力 (`DESTROY ALL`)
 7. ユーザーキャンセル → `キャンセルしました` で停止
 8. 確認通過 → 全エントリスキャン:
-   - INHERIT → K_legacy で K_entry を復号 → エントリ平文を新 vault バッファに保持
+   - INHERIT → K_legacy で legacy_key_block を復号 → エントリ平文を新 vault バッファに保持
    - DESTROY → エントリレコードを zeroize (旧 vault.pqd 上は最終的に消える)
 9. 新 vault.pqd を K_legacy で再構築:
-   - ヘッダー: kdf_salt = 元の legacy_salt、verification_token = K_legacy で再生成、KEM/DSA seed = K_legacy で再暗号化
+   - ヘッダー: kdf_salt = 元の legacy_salt、verification_token = K_legacy で再生成、新規 KEM/DSA seed = K_legacy で暗号化
    - エントリ: INHERIT のみ、各エントリの legacy_flag = 0x00 にリセット (新 vault では K_legacy がマスター鍵)
+   - vault.toml: `[legacy] initialized=false` に戻し、verification token を削除 (以後は通常 vault として扱う)
 10. vault.pqd.tmp + rename でアトミック差し替え
 11. `Legacy access complete. {N} entries inherited, {M} entries destroyed.` 表示
 

@@ -88,7 +88,7 @@ impl LegacyFlag {
 // ============================================================================
 
 /// vault.toml の `[legacy]` セクション。
-/// 🔵 REQ-701〜704
+/// 🔵 REQ-701〜706
 #[derive(Debug, PartialEq, Serialize, Deserialize, Default)]
 pub struct LegacySection {
     /// `legacy init` 完了したら true。
@@ -98,6 +98,14 @@ pub struct LegacySection {
     /// `legacy-access` 実行時の確認 UI 方式。デフォルト `Timer30`。
     #[serde(default = "default_confirmation")]
     pub destroy_confirmation: ConfirmationMode,
+
+    /// K_legacy 検証 token の IV (12B, Base64)。initialized=true の場合は必須。
+    #[serde(default)]
+    pub verification_iv_b64: Option<String>,
+
+    /// K_legacy 検証 token の ciphertext (48B, Base64)。initialized=true の場合は必須。
+    #[serde(default)]
+    pub verification_ct_b64: Option<String>,
 }
 
 /// 確認方式の選択肢。

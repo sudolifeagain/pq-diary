@@ -15,14 +15,14 @@ PRD §7 の仕様を実装する S12 のスコープと、未確定だった OQ-
 
 **回答**: 「K_legacy をそのまま残留」を選択。
 
-**設計影響**: 骨梧者は同じ death-access code で vault を継続利用可能。重複アクセス可。設計シンプル。デメリットは「コード漏洩時の継続的リスク」だが、本人がコードを家族にしか教えない前提で許容。
+**設計影響**: 骨梧者は同じ death-access code を通常の master password として vault を継続利用可能。`legacy-access` 自体は新 vault 化後に `[legacy] initialized=false` となるため再実行対象ではない。デメリットは「コード漏洩時の継続的リスク」だが、本人がコードを家族にしか教えない前提で許容。
 
 ---
 
 ### Q2: `legacy rotate` の振る舞いは?
 
 **カテゴリ**: 設計判断
-**背景**: 死後アクセスコード変更時、既存 INHERIT エントリの legacy 鍵ブロックをどう扱うか。
+**背景**: 死後アクセスコード変更時、既存 INHERIT エントリの legacy ブロックをどう扱うか。
 
 **回答**: 「全 INHERIT エントリを即時再暗号化」を選択。
 
@@ -85,7 +85,7 @@ PRD §7 の仕様を実装する S12 のスコープと、未確定だった OQ-
 ## ヒアリング結果サマリー
 
 ### 確認できた事項
-1. legacy-access 後は K_legacy 残留 (骨梧者が継続利用可)
+1. legacy-access 後は K_legacy 残留 (骨梧者が通常 unlock で継続利用可)
 2. legacy rotate は全 INHERIT 即時再暗号化
 3. 死後アクセスコードは K_master と同じ Argon2 強度
 4. 確認方式は `legacy init` で選択可能 (vault.toml に保存)
@@ -95,7 +95,7 @@ PRD §7 の仕様を実装する S12 のスコープと、未確定だった OQ-
 
 ### 追加された要件
 - REQ-107 (確認方式選択)
-- REQ-701〜704 (vault.toml [legacy] セクション)
+- REQ-701〜706 (vault.toml [legacy] セクション + K_legacy 検証 token)
 - NFR-102 (LegacyKeyDeriver trait)
 - NFR-104 (--claude タイミングサイドチャネル回避)
 
@@ -103,7 +103,7 @@ PRD §7 の仕様を実装する S12 のスコープと、未確定だった OQ-
 - なし。実装スプリント (kairo-tasks → kairo-implement) で詳細化のみ。
 
 ### 信頼性レベル分布
-全 51 要件 + 7 ストーリー + 70 TC = **128 項目すべて🔵**。
+全要件 + 7 ストーリー + 追加 TC = **すべて🔵**。
 
 ## 関連文書
 

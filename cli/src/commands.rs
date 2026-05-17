@@ -82,7 +82,7 @@ fn filter_and_sort(
     }
 
     // Sort by updated_at descending (newest first)
-    entries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    entries.sort_by_key(|e| std::cmp::Reverse(e.updated_at));
 
     // Limit to requested number
     entries.truncate(number);
@@ -501,7 +501,7 @@ fn cmd_show_impl(cli: &Cli, id: String, out: &mut dyn std::io::Write) -> anyhow:
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     if !backlinks.is_empty() {
-        backlinks.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        backlinks.sort_by_key(|b| std::cmp::Reverse(b.created_at));
 
         writeln!(out).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
         writeln!(out, "--- Backlinks ---").map_err(|e| anyhow::anyhow!("Write error: {e}"))?;

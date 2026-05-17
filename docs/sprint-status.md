@@ -124,7 +124,7 @@
 - SHA-256 重複排除 + 参照カウント方式の delete
 - legacy 連動 (S12 拡張): ファイル個別 INHERIT/DESTROY フラグ、エントリ DESTROY 時は添付も自動連動 (REQ-504)
 - export で `attachments/` 別ディレクトリ + `![[FILE]]` 埋め込み
-- importer に `parse_obsidian_attachment_links()` 追加 (cmd_import 統合は follow-up)
+- importer に `parse_obsidian_attachment_links()` 追加 + cmd_import で `attachments/` 自動解決 (S13.1 follow-up)
 - CLI 5 コマンド: `attachment add/list/extract/delete/set` + `new --attach` + `show` 拡張
 - LegacyAccessReport を attachment 統計まで拡張
 - 設計 (PR #7) + 実装 (本 PR): 信頼性 🟡 → 🔵 (R1〜R5 を実装で確定)

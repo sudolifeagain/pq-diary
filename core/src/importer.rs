@@ -37,39 +37,18 @@ static ATTACHMENT_LINK_RE: LazyLock<Regex> =
 /// the CLI import path to walk source `attachments/<filename>` files and
 /// attach them to the freshly-imported entry (S13).
 ///
-/// Captured names are filtered through [`is_safe_attachment_name`] so a
-/// malicious vault embedding `![[../../etc/passwd]]`, `![[C:\secret]]`, or an
-/// NTFS alternate-data-stream like `![[file.txt:stream]]` cannot cause the CLI
-/// to read a file outside the source `attachments/` directory (audit M7). This
-/// is defense-in-depth alongside the CLI's canonicalise + `starts_with` check.
+/// Names are returned verbatim (including any `../`, absolute, or
+/// alternate-data-stream forms). Path-escape safety is enforced one layer up by
+/// the CLI's `resolve_import_attachment_source`, which canonicalises the
+/// resolved path and verifies it stays within `<source>/attachments/`, then
+/// reports anything outside as an *unresolved* reference (audit M7 — verified
+/// by `tc_s13_110_03_import_rejects_attachment_path_escape`). Filtering here
+/// instead would silently drop such references and hide them from that report.
 pub fn parse_obsidian_attachment_links(body: &str) -> Vec<String> {
     ATTACHMENT_LINK_RE
         .captures_iter(body)
         .map(|c| c[1].trim().to_string())
-        .filter(|name| is_safe_attachment_name(name))
         .collect()
-}
-
-/// Return `true` only when `name` is a single, ordinary path component safe to
-/// join onto the source `attachments/` directory.
-///
-/// Rejects path separators (`/` or `\`), parent/current-dir components (`..`,
-/// `.`), absolute paths and drive/UNC prefixes, NTFS alternate-data-stream
-/// markers (`:`), and embedded NUL bytes (audit M7).
-fn is_safe_attachment_name(name: &str) -> bool {
-    if name.is_empty() {
-        return false;
-    }
-    if name.contains('/') || name.contains('\\') || name.contains(':') || name.contains('\0') {
-        return false;
-    }
-    // Must resolve to exactly one Normal component equal to the original string
-    // (rejects "..", ".", absolute paths, and anything the OS would re-interpret).
-    let mut components = Path::new(name).components();
-    matches!(
-        (components.next(), components.next()),
-        (Some(std::path::Component::Normal(c)), None) if c == std::ffi::OsStr::new(name)
-    )
 }
 
 #[cfg(test)]
@@ -107,19 +86,6 @@ mod attachment_link_tests {
     #[test]
     fn tc_s13_010_04_empty_body() {
         assert!(parse_obsidian_attachment_links("").is_empty());
-    }
-
-    /// TC-M7-01: path-traversal / absolute / ADS embeds are dropped, while a
-    /// safe sibling filename in the same body is still returned (audit M7).
-    #[test]
-    fn tc_m7_01_traversal_names_rejected() {
-        let body = "![[../../etc/passwd]] ![[sub/dir/x.png]] ![[C:\\secret.txt]] \
-                    ![[notes.txt:hidden]] ![[ok.png]] ![[..]]";
-        assert_eq!(
-            parse_obsidian_attachment_links(body),
-            vec!["ok.png"],
-            "only the safe single-component filename must survive"
-        );
     }
 }
 

@@ -18,6 +18,8 @@ pub mod hmac_util;
 pub mod kdf;
 /// ML-KEM-768 key encapsulation mechanism (FIPS 203).
 pub mod kem;
+/// Password strength policy (minimum length + common-password rejection).
+pub mod password_policy;
 /// Secure memory types: `SecureBuffer`, `ZeroizingKey`, `MasterKey`, `CryptoEngine`.
 pub mod secure_mem;
 /// Streaming AES-256-GCM for attachment payloads (S13, chunked).

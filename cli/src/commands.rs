@@ -1899,6 +1899,7 @@ fn cmd_vault_create_impl(
     // Step 3: Get password.
     let password_source =
         get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    enforce_password_strength(password_source.secret().expose_secret())?;
 
     // Step 4: Create vault.
     let base_dir = resolve_vaults_base_dir(cli)?;
@@ -1913,6 +1914,25 @@ fn cmd_vault_create_impl(
         "Created vault '{name}' at {} (policy: {policy})",
         vault_dir.display()
     );
+    Ok(())
+}
+
+/// Enforce the password-strength policy at password-choice time (audit High-2).
+///
+/// Prints every advisory to stderr, then returns an error when the password
+/// fails the hard floor (too short, or a known trivially-guessable password).
+/// Only newly *chosen* passwords are checked — existing vaults are never
+/// re-evaluated — so upgrading the binary never locks anyone out.
+fn enforce_password_strength(password: &str) -> anyhow::Result<()> {
+    let assessment = pq_diary_core::crypto::password_policy::assess(password);
+    for warning in &assessment.warnings {
+        eprintln!("Warning: password {warning}");
+    }
+    if !assessment.acceptable {
+        anyhow::bail!(
+            "password does not meet the minimum strength policy; choose a stronger password"
+        );
+    }
     Ok(())
 }
 
@@ -2478,6 +2498,7 @@ pub fn cmd_init(cli: &Cli) -> anyhow::Result<()> {
     if password_source.secret().expose_secret().is_empty() {
         anyhow::bail!("New password must not be empty");
     }
+    enforce_password_strength(password_source.secret().expose_secret())?;
 
     std::fs::create_dir_all(&parent_dir)
         .map_err(|e| anyhow::anyhow!("Cannot create config directory: {e}"))?;
@@ -2579,6 +2600,7 @@ fn cmd_change_password_impl(
     if new_pwd1.expose_secret().is_empty() {
         anyhow::bail!("New password must not be empty");
     }
+    enforce_password_strength(new_pwd1.expose_secret())?;
     if old_pwd.expose_secret() == new_pwd1.expose_secret() {
         eprintln!("Warning: New password is identical to old password.");
     }
@@ -9404,7 +9426,8 @@ parallelism = 1
         let base_dir_str = dir.path().to_str().expect("utf8");
 
         // create vault
-        let cli_create = make_vault_mgmt_cli(base_dir_str, Some("testpw"), &["create", "e2evault"]);
+        let cli_create =
+            make_vault_mgmt_cli(base_dir_str, Some("testpassw0rd"), &["create", "e2evault"]);
         let mut reader = std::io::Cursor::new("");
         let result =
             cmd_vault_create_impl(&cli_create, "e2evault", None, &mut reader, |base_dir| {
@@ -10228,8 +10251,8 @@ parallelism = 1
         let err = cmd_change_password_impl(
             &cli,
             secrecy::SecretBox::new(Box::from("Wrong")),
-            secrecy::SecretBox::new(Box::from("New456!")),
-            secrecy::SecretBox::new(Box::from("New456!")),
+            secrecy::SecretBox::new(Box::from("NewPass456!")),
+            secrecy::SecretBox::new(Box::from("NewPass456!")),
         )
         .expect_err("must fail");
         assert!(
@@ -10294,8 +10317,8 @@ parallelism = 1
         cmd_change_password_impl(
             &cli,
             secrecy::SecretBox::new(Box::from("Old123!")),
-            secrecy::SecretBox::new(Box::from("New456!")),
-            secrecy::SecretBox::new(Box::from("New456!")),
+            secrecy::SecretBox::new(Box::from("NewPass456!")),
+            secrecy::SecretBox::new(Box::from("NewPass456!")),
         )
         .expect("change_password must succeed");
 
@@ -10311,8 +10334,36 @@ parallelism = 1
 
         let mut core2 = DiaryCore::new(pqd_str).expect("DiaryCore::new");
         core2
-            .unlock(secrecy::SecretBox::new(Box::from("New456!")))
+            .unlock(secrecy::SecretBox::new(Box::from("NewPass456!")))
             .expect("unlock new");
+    }
+
+    /// TC-PWSTR-01: change-password rejects a new password below the strength
+    /// floor (audit High-2) and leaves the vault untouched.
+    #[test]
+    fn tc_pwstr_01_change_password_rejects_weak_new() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_s10_vault(&dir, "v", b"Old123!");
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+        let pqd = vault_dir.join("vault.pqd");
+        let bytes_before = std::fs::read(&pqd).expect("read");
+
+        let cli = make_cli_plain(&["-v", vault_dir_str, "change-password"]);
+        let err = cmd_change_password_impl(
+            &cli,
+            secrecy::SecretBox::new(Box::from("Old123!")),
+            secrecy::SecretBox::new(Box::from("weak")),
+            secrecy::SecretBox::new(Box::from("weak")),
+        )
+        .expect_err("weak new password must be rejected");
+        assert!(
+            format!("{err:#}").contains("strength policy"),
+            "got: {err:#}"
+        );
+
+        // The strength check fires before re-encryption, so the vault is intact.
+        let bytes_after = std::fs::read(&pqd).expect("read");
+        assert_eq!(bytes_before, bytes_after, "vault must be unchanged");
     }
 
     /// TC-301-B01: same old/new password → warning but processing continues.

@@ -278,16 +278,23 @@ impl CryptoEngine {
     /// Derives the verifying (public) key from the signing key seed stored in
     /// `MasterKey.dsa_sk`.  This avoids storing the public key separately in the vault.
     ///
-    /// If `dsa_sk` is empty (e.g. vault entries created before Phase 3 key generation),
-    /// returns `Ok(true)` so that legacy entries without a valid signing key are not
-    /// rejected outright.
+    /// Signatures are only ever produced when a signing seed is loaded (see
+    /// [`dsa_sign`](CryptoEngine::dsa_sign)), and `unlock_with_vault` always
+    /// loads the seed, so a *present* signature paired with an *empty* seed
+    /// indicates an inconsistent or tampered vault. In that case this returns
+    /// `Ok(false)` (verification fails) rather than silently accepting — i.e.
+    /// it does **not** fail open (audit Low-2). Callers only invoke this when a
+    /// signature is present, so a legacy entry with no signature is unaffected
+    /// (the caller skips the check entirely).
     ///
     /// Returns [`DiaryError::NotUnlocked`] if the engine has not been unlocked.
     /// Returns [`DiaryError::Crypto`] if the signing key seed has an invalid length.
     pub fn dsa_verify_entry(&self, message: &[u8], signature: &[u8]) -> Result<bool, DiaryError> {
         let mk = self.expose_master_key()?;
         if mk.dsa_sk.is_empty() {
-            return Ok(true);
+            // No signing identity is loaded, so the signature cannot be
+            // verified. Treat it as invalid instead of accepting it blindly.
+            return Ok(false);
         }
         let sk = SecureBuffer::new(mk.dsa_sk.to_vec());
         dsa::verify_from_seed(&sk, message, signature)
@@ -554,6 +561,34 @@ mod tests {
         let valid = engine.dsa_verify(&vk_bytes, message, &sig).unwrap();
 
         assert!(valid, "signature produced by dsa_sign must verify as true");
+    }
+
+    /// TC-LOW2-01: with no signing key loaded, `dsa_verify_entry` must NOT fail
+    /// open — a present signature that cannot be verified is rejected (audit Low-2).
+    #[test]
+    fn tc_low2_01_dsa_verify_entry_no_key_is_rejected() {
+        let engine = CryptoEngine::new_for_testing([0x11u8; 32], vec![]);
+        let result = engine
+            .dsa_verify_entry(b"message", b"some-signature")
+            .expect("verify must not error");
+        assert!(
+            !result,
+            "empty signing seed must not be treated as a valid signature"
+        );
+    }
+
+    /// TC-LOW2-02: a signature produced by the loaded seed still verifies as valid.
+    #[test]
+    fn tc_low2_02_dsa_verify_entry_valid_signature_accepted() {
+        let kp = dsa::keygen().unwrap();
+        let seed = kp.signing_key.as_ref().to_vec();
+        let sig = dsa::sign(&kp.signing_key, b"entry-bytes").unwrap();
+
+        let engine = CryptoEngine::new_for_testing([0x22u8; 32], seed);
+        assert!(
+            engine.dsa_verify_entry(b"entry-bytes", &sig).unwrap(),
+            "a signature made by the loaded seed must verify as valid"
+        );
     }
 
     /// TC-016-04: unlock → hmac / hmac_verify succeed.

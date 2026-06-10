@@ -1,7 +1,13 @@
 # ADR-0008: vault.pqd の vault レベル整合性 MAC (schema v0x06)
 
-Status: 提案
+Status: accepted (S15 で実装済み)
 Date: 2026-06-10
+
+> **Note (2026-06-11)**: 本 ADR は S15 (`feat(s15): add vault-level integrity
+> MAC`, commit 478ed43〜) で **schema v0x06 として実装・プッシュ済み**。
+> 将来 ADR-0009 (キースロット封筒 + MDK, v0x07) を導入する際、本 MAC の鍵は
+> `derive_vault_mac_key(sym_key)` から `HKDF(MDK, "pq-diary/vault-integrity/v1")`
+> へ移行する (v0x06 → v0x07 昇格時)。本 ADR の決定自体は維持される。
 
 ## Context
 

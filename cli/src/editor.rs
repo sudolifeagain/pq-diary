@@ -113,6 +113,17 @@ pub fn secure_tmpdir() -> Result<PathBuf, DiaryError> {
 /// 4. Zeroize the buffer.
 /// 5. Remove the file with `remove_file`.
 ///
+/// # Durability limitation (audit M4)
+///
+/// A single in-place overwrite is **best-effort only**. On modern storage —
+/// SSDs/flash (wear-levelling remaps writes), copy-on-write filesystems
+/// (APFS, Btrfs, ZFS), and journaling filesystems — the original bytes may
+/// survive in unmapped blocks and are not reliably destroyed. The primary
+/// defence remains keeping the plaintext in a RAM-backed directory
+/// ([`secure_tmpdir`] prefers `/dev/shm` / `/run/user` on Linux); where only
+/// an on-disk directory is available (Windows, macOS), callers should treat
+/// erasure as unguaranteed.
+///
 /// # Errors
 ///
 /// Returns [`DiaryError::Io`] if any I/O operation fails (file not found,
@@ -137,6 +148,64 @@ pub fn secure_delete(path: &Path) -> Result<(), DiaryError> {
     std::fs::remove_file(path)?;
 
     Ok(())
+}
+
+/// Securely delete `tmpfile` together with any editor-generated backup, swap,
+/// or undo siblings sharing its name in the same directory (audit M5).
+///
+/// `$EDITOR` programs other than vim/nvim — which we already launch with
+/// `noswapfile`/`nobackup` — may write sibling files next to the file we hand
+/// them: `foo.md~` (emacs/nano), `.foo.md.swp` (vim), `#foo.md#` (emacs
+/// auto-save), etc. Each can hold the full decrypted entry, leaving plaintext
+/// on disk after the edit. This sweeps the known patterns for `tmpfile`'s name
+/// and securely deletes each regular-file match.
+///
+/// Symlinks are skipped (never followed) so a planted link cannot redirect the
+/// overwrite onto an unrelated file. Sibling-cleanup failures are logged as
+/// warnings; the returned `Result` reflects only the primary `tmpfile`.
+///
+/// # Errors
+///
+/// Returns [`DiaryError::Io`] if `tmpfile` itself cannot be securely deleted.
+pub fn cleanup_tmpfile(tmpfile: &Path) -> Result<(), DiaryError> {
+    if let (Some(dir), Some(name)) = (
+        tmpfile.parent(),
+        tmpfile.file_name().and_then(|n| n.to_str()),
+    ) {
+        for candidate in backup_sibling_names(name) {
+            let p = dir.join(&candidate);
+            // Only touch regular files; never follow a symlink (symlink_metadata
+            // does not traverse), so a planted link can't redirect the overwrite.
+            match std::fs::symlink_metadata(&p) {
+                Ok(meta) if meta.file_type().is_file() => {
+                    if let Err(e) = secure_delete(&p) {
+                        eprintln!(
+                            "Warning: failed to securely delete editor backup '{}': {e}",
+                            p.display()
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    secure_delete(tmpfile)
+}
+
+/// Candidate backup/swap/undo filenames an external editor may create next to a
+/// file named `name`.
+fn backup_sibling_names(name: &str) -> Vec<String> {
+    vec![
+        format!("{name}~"),     // emacs / nano / joe backup
+        format!("{name}.bak"),  // generic backup
+        format!(".{name}.swp"), // vim swap
+        format!(".{name}.swo"), // vim swap (recovered)
+        format!(".{name}.swn"), // vim swap (further)
+        format!("{name}.swp"),  // vim swap (some configs omit the dot)
+        format!(".{name}.un~"), // vim persistent undo
+        format!("{name}.un~"),  // vim persistent undo (alt)
+        format!("#{name}#"),    // emacs auto-save
+    ]
 }
 
 /// Write an [`EntryPlaintext`] to a header-comment formatted temporary file.
@@ -588,6 +657,31 @@ mod tests {
         assert!(
             !file_path.exists(),
             "File must not exist after secure_delete"
+        );
+    }
+
+    /// TC-M5-01: cleanup_tmpfile removes the temp file AND editor backup/swap
+    /// siblings (`foo.md~`, `.foo.md.swp`), while leaving unrelated files alone.
+    #[test]
+    fn tc_m5_01_cleanup_sweeps_editor_backups() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tmp = dir.path().join("entry.md");
+        let backup = dir.path().join("entry.md~");
+        let swap = dir.path().join(".entry.md.swp");
+        let unrelated = dir.path().join("keep.txt");
+        std::fs::write(&tmp, b"decrypted body").expect("write tmp");
+        std::fs::write(&backup, b"decrypted body (emacs backup)").expect("write backup");
+        std::fs::write(&swap, b"vim swap with body").expect("write swap");
+        std::fs::write(&unrelated, b"unrelated").expect("write unrelated");
+
+        cleanup_tmpfile(&tmp).expect("cleanup_tmpfile");
+
+        assert!(!tmp.exists(), "temp file must be removed");
+        assert!(!backup.exists(), "emacs backup sibling must be removed");
+        assert!(!swap.exists(), "vim swap sibling must be removed");
+        assert!(
+            unrelated.exists(),
+            "unrelated file must be left untouched by the sweep"
         );
     }
 

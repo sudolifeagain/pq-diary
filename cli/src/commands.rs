@@ -348,7 +348,7 @@ pub fn cmd_new_with_attach(
         // Launch editor and read result; always delete temp files afterward.
         let edit_result = editor::launch_editor(&tmpfile, &config);
         let read_result = editor::read_header_file(&tmpfile);
-        if let Err(e) = editor::secure_delete(&tmpfile) {
+        if let Err(e) = editor::cleanup_tmpfile(&tmpfile) {
             eprintln!("Warning: failed to securely delete temp file: {e}");
         }
         if let Some(cp) = completion_file {
@@ -749,7 +749,7 @@ where
         // Always delete temp files regardless of editor/read success.
         let edit_result = launch_fn(&tmpfile, &config);
         let read_result = editor::read_header_file(&tmpfile);
-        if let Err(e) = editor::secure_delete(&tmpfile) {
+        if let Err(e) = editor::cleanup_tmpfile(&tmpfile) {
             eprintln!("Warning: failed to securely delete temp file: {e}");
         }
         if let Some(cp) = completion_file {
@@ -998,7 +998,7 @@ where
 
     let edit_result = launch_fn(&tmpfile, &config);
     let read_result = editor::read_template_file(&tmpfile);
-    if let Err(e) = editor::secure_delete(&tmpfile) {
+    if let Err(e) = editor::cleanup_tmpfile(&tmpfile) {
         eprintln!("Warning: failed to securely delete temp file: {e}");
     }
 
@@ -1293,7 +1293,7 @@ where
 
     let edit_result = launch_fn(&tmpfile, &config);
     let read_result = editor::read_header_file(&tmpfile);
-    if let Err(e) = editor::secure_delete(&tmpfile) {
+    if let Err(e) = editor::cleanup_tmpfile(&tmpfile) {
         eprintln!("Warning: failed to securely delete temp file: {e}");
     }
     if let Some(cp) = completion_file {

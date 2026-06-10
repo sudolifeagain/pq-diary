@@ -138,6 +138,16 @@ impl DiaryCore {
             &header.dsa_encrypted_sk,
         )?;
 
+        // S15 (audit H1/H2): verify the vault-level integrity MAC before
+        // trusting any record. On a v0x06 vault this detects tampering,
+        // truncation, record reordering, and plaintext-metadata edits; for
+        // legacy v0x04/v0x05 vaults (no MAC) it is a no-op. Verified here, the
+        // single unlock chokepoint, before any record is read or decrypted.
+        {
+            let mac_key = engine.vault_mac_key()?;
+            vault::reader::verify_vault_integrity(&self.vault_path, &mac_key)?;
+        }
+
         self.engine = Some(engine);
 
         // Build the link index from all current entries.
@@ -850,5 +860,40 @@ mod tests {
         let backlinks = core.backlinks_for("B").expect("backlinks_for");
         assert_eq!(backlinks.len(), 1, "B must have 1 backlink");
         assert_eq!(backlinks[0].source_title, "A", "source must be entry A");
+    }
+
+    // =========================================================================
+    // TC-S15-UNLOCK-TAMPER: audit H1/H2 — unlock rejects a tampered vault
+    // =========================================================================
+
+    /// After writing an entry (authenticated v0x06), flipping a byte in the
+    /// padding region — which the per-record HMAC/signature do NOT cover —
+    /// must make the next unlock fail with a crypto error, proving the
+    /// vault-level MAC closes the metadata/truncation/rollback gap.
+    #[test]
+    fn tc_s15_unlock_detects_tampering() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_pqd = setup_test_vault(&dir);
+        {
+            let mut core = DiaryCore::new(vault_pqd.to_str().expect("utf8")).expect("new");
+            core.unlock(secret("password")).expect("unlock");
+            core.new_entry("t", "body", vec![]).expect("new_entry");
+            core.lock();
+        }
+
+        // Flip a byte in the trailing region (padding / MAC-covered tail).
+        let mut bytes = std::fs::read(&vault_pqd).expect("read vault");
+        let idx = bytes.len() - 40;
+        bytes[idx] ^= 0xFF;
+        std::fs::write(&vault_pqd, &bytes).expect("write tampered vault");
+
+        let mut core = DiaryCore::new(vault_pqd.to_str().expect("utf8")).expect("new");
+        let err = core
+            .unlock(secret("password"))
+            .expect_err("unlock of a tampered vault must fail");
+        assert!(
+            matches!(err, DiaryError::Crypto(_)),
+            "expected DiaryError::Crypto from integrity check, got {err:?}"
+        );
     }
 }

@@ -12,8 +12,11 @@ use std::path::Path;
 
 use rand::Rng;
 
+use crate::crypto::hmac_util;
 use crate::error::DiaryError;
-use crate::vault::format::{AttachmentRecord, EntryRecord, VaultHeader, MAGIC, SCHEMA_VERSION};
+use crate::vault::format::{
+    AttachmentRecord, EntryRecord, VaultHeader, FLAG_INTEGRITY, MAGIC, SCHEMA_VERSION,
+};
 
 // Fixed size of the on-disk verification-token ciphertext field (bytes 92-140).
 const VERIFICATION_CT_LEN: usize = 48;
@@ -219,12 +222,35 @@ pub fn write_attachments<W: Write>(
     Ok(())
 }
 
-/// Write a complete vault to `path`.
+/// Create the `.tmp` file for an atomic vault write, applying owner-only
+/// (`0o600`) permissions on Unix at creation time so the encrypted vault and
+/// its key blobs are never briefly world-readable (REQ-611 / audit M1).
 ///
-/// Computes the serialised size of `entries`, sets `header.payload_size`
-/// accordingly, writes the header followed by the entry section, then
-/// appends a random padding block of 512–4 096 bytes to make file-size
-/// analysis harder for an attacker.
+/// On non-Unix platforms the file is created normally; directory-level ACLs
+/// (applied elsewhere) provide the equivalent restriction on Windows.
+fn create_temp_file(temp_path: &Path) -> Result<std::fs::File, DiaryError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(temp_path)
+            .map_err(DiaryError::Io)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::File::create(temp_path).map_err(DiaryError::Io)
+    }
+}
+
+/// Write a complete vault to `path` *without* a vault-level integrity MAC.
+///
+/// Retained for test fixtures and the legacy v0x04/v0x05 layout. Production
+/// code MUST use [`write_vault_authenticated`] so the resulting file is
+/// tamper-evident; this entry point leaves the vault unauthenticated.
 ///
 /// # Errors
 ///
@@ -234,25 +260,92 @@ pub fn write_vault(
     header: VaultHeader,
     entries: &[EntryRecord],
 ) -> Result<(), DiaryError> {
+    write_vault_dispatch(path, header, entries, None)
+}
+
+/// Write a complete vault to `path` with a trailing vault-level MAC.
+///
+/// `mac_key` is the vault integrity subkey (see
+/// [`crate::crypto::derive_vault_mac_key`]). The file is stamped
+/// [`SCHEMA_VERSION`] with [`FLAG_INTEGRITY`] set, and a
+/// [`crate::vault::format::VAULT_MAC_LEN`]-byte HMAC-SHA256 over
+/// `header || records || sentinel || padding` is appended so that any later
+/// tampering (record edit, reorder, truncation, metadata flip) is detected by
+/// [`crate::vault::reader::verify_vault_integrity`] on unlock.
+///
+/// # Errors
+///
+/// Returns [`DiaryError::Io`] on I/O failure or [`DiaryError::Crypto`] on MAC
+/// computation failure.
+pub fn write_vault_authenticated(
+    path: &Path,
+    header: VaultHeader,
+    entries: &[EntryRecord],
+    mac_key: &[u8; 32],
+) -> Result<(), DiaryError> {
+    write_vault_dispatch(path, header, entries, Some(mac_key))
+}
+
+/// Shared body for [`write_vault`] / [`write_vault_authenticated`]: preserves
+/// any existing attachment records, then delegates to the with-attachments path.
+fn write_vault_dispatch(
+    path: &Path,
+    header: VaultHeader,
+    entries: &[EntryRecord],
+    mac_key: Option<&[u8; 32]>,
+) -> Result<(), DiaryError> {
     let attachments = match crate::vault::reader::read_vault_with_attachments(path) {
         Ok((_existing_header, _existing_entries, attachments)) => attachments,
         Err(DiaryError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(e) => return Err(e),
     };
-    write_vault_with_attachments(path, header, entries, &attachments)
+    write_vault_inner(path, header, entries, &attachments, mac_key)
 }
 
-/// Write a complete vault containing entries + attachments (S13). The
-/// attachment records are appended after the entry records in the same
-/// length-prefixed payload section, and the zero sentinel terminates both.
+/// Write a complete vault containing entries + attachments (S13), *without* a
+/// vault-level MAC. Retained for tests/legacy; production uses
+/// [`write_vault_with_attachments_authenticated`].
 pub fn write_vault_with_attachments(
+    path: &Path,
+    header: VaultHeader,
+    entries: &[EntryRecord],
+    attachments: &[AttachmentRecord],
+) -> Result<(), DiaryError> {
+    write_vault_inner(path, header, entries, attachments, None)
+}
+
+/// Write a complete vault containing entries + attachments with a trailing
+/// vault-level MAC. See [`write_vault_authenticated`] for the integrity model.
+pub fn write_vault_with_attachments_authenticated(
+    path: &Path,
+    header: VaultHeader,
+    entries: &[EntryRecord],
+    attachments: &[AttachmentRecord],
+    mac_key: &[u8; 32],
+) -> Result<(), DiaryError> {
+    write_vault_inner(path, header, entries, attachments, Some(mac_key))
+}
+
+/// Core vault writer. The attachment records are appended after the entry
+/// records in the same length-prefixed payload section, and the zero sentinel
+/// terminates both. When `mac_key` is `Some`, [`FLAG_INTEGRITY`] is set and an
+/// HMAC-SHA256 trailer authenticating the whole serialised file is appended.
+fn write_vault_inner(
     path: &Path,
     mut header: VaultHeader,
     entries: &[EntryRecord],
     attachments: &[AttachmentRecord],
+    mac_key: Option<&[u8; 32]>,
 ) -> Result<(), DiaryError> {
     // All writes migrate accepted older vaults to the current schema.
     header.schema_version = SCHEMA_VERSION;
+    // The integrity flag must reflect whether a MAC trailer is actually written
+    // so the reader knows whether to require one.
+    if mac_key.is_some() {
+        header.flags |= FLAG_INTEGRITY;
+    } else {
+        header.flags &= !FLAG_INTEGRITY;
+    }
 
     // Serialise records first to measure the exact payload size.
     // Entries first, then attachments, then the single zero sentinel —
@@ -270,6 +363,20 @@ pub fn write_vault_with_attachments(
     let mut padding = vec![0u8; pad_size];
     rng.fill(padding.as_mut_slice());
 
+    // Assemble the authenticated region: header || records || padding. The
+    // vault MAC (when present) is computed over exactly these bytes, so a flip
+    // of any metadata byte, a dropped/reordered record, or a truncated tail is
+    // detected on the next unlock.
+    let mut body: Vec<u8> = Vec::with_capacity(entry_buf.len() + pad_size + 256);
+    write_header(&mut body, &header)?;
+    body.extend_from_slice(&entry_buf);
+    body.extend_from_slice(&padding);
+
+    let mac = match mac_key {
+        Some(key) => Some(hmac_util::compute(key, &body)?),
+        None => None,
+    };
+
     // Derive the temporary file path (same directory, same name with ".tmp" appended).
     let mut temp_name = path
         .file_name()
@@ -278,12 +385,13 @@ pub fn write_vault_with_attachments(
     temp_name.push(".tmp");
     let temp_path = path.with_file_name(temp_name);
 
-    // Write header → entries → padding to the temporary file.
+    // Write body (+ optional MAC trailer) to the temporary file.
     let write_result = (|| -> Result<(), DiaryError> {
-        let mut file = std::fs::File::create(&temp_path)?;
-        write_header(&mut file, &header)?;
-        file.write_all(&entry_buf)?;
-        file.write_all(&padding)?;
+        let mut file = create_temp_file(&temp_path)?;
+        file.write_all(&body)?;
+        if let Some(mac) = mac.as_ref() {
+            file.write_all(mac)?;
+        }
         file.sync_all()?;
         Ok(())
     })();

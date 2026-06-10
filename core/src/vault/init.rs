@@ -15,7 +15,7 @@ use crate::{
     vault::{
         config::{AppConfig, VaultConfig},
         format::{generate_verification_token, VaultHeader, SCHEMA_VERSION},
-        writer::write_vault,
+        writer::write_vault_authenticated,
     },
 };
 
@@ -192,7 +192,8 @@ impl VaultManager {
         };
 
         let vault_pqd = vault_dir.join("vault.pqd");
-        write_vault(&vault_pqd, header, &[])?;
+        let mac_key = crate::crypto::derive_vault_mac_key(sym_key.as_ref())?;
+        write_vault_authenticated(&vault_pqd, header, &[], &mac_key)?;
 
         // ── Write vault.toml ──────────────────────────────────────────────────
 

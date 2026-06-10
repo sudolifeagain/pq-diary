@@ -21,13 +21,30 @@ pub const MAGIC: &[u8; 8] = b"PQDIARY\0";
 ///
 /// Pre-S13 vaults are stamped 0x04 — they're still readable because they
 /// contain only [`RECORD_TYPE_ENTRY`] and [`RECORD_TYPE_TEMPLATE`] records and
-/// the binary layout is unchanged. The bump to 0x05 advertises the optional
+/// the binary layout is unchanged. The bump to 0x05 advertised the optional
 /// presence of [`RECORD_TYPE_ATTACHMENT`] records so a hypothetical
-/// strict v4 reader can refuse a vault that may contain them.
-pub const SCHEMA_VERSION: u8 = 0x05;
+/// strict v4 reader could refuse a vault that may contain them.
+///
+/// S15 bumps to 0x06: when [`FLAG_INTEGRITY`] is set in the header `flags`
+/// byte, the file carries a trailing [`VAULT_MAC_LEN`]-byte HMAC-SHA256 that
+/// authenticates the entire serialised vault (header + every record, in order,
+/// including all plaintext metadata + the end-of-records sentinel + padding).
+/// This makes the vault *tamper-evident*: truncation, record reordering,
+/// metadata edits, and rollback of individual records are all detectable on
+/// unlock. v0x04/v0x05 vaults have no MAC and are migrated to v0x06 on the
+/// next authenticated write.
+pub const SCHEMA_VERSION: u8 = 0x06;
 
 /// Earliest schema version a current reader still accepts.
 pub const SCHEMA_VERSION_MIN: u8 = 0x04;
+
+/// Header `flags` bit indicating the file carries a trailing vault-level MAC
+/// (see [`SCHEMA_VERSION`]). When set, readers with the master key MUST verify
+/// the [`VAULT_MAC_LEN`]-byte trailer before trusting any record.
+pub const FLAG_INTEGRITY: u8 = 0x01;
+
+/// Length in bytes of the trailing vault-level HMAC-SHA256 authentication tag.
+pub const VAULT_MAC_LEN: usize = 32;
 
 /// Size in bytes of the fixed portion of the vault.pqd header.
 ///
@@ -398,16 +415,19 @@ mod tests {
         assert_eq!(MAGIC.len(), 8);
     }
 
-    /// TC-020-02: SCHEMA_VERSION equals 0x05 (S13).
+    /// TC-020-02: SCHEMA_VERSION equals 0x06 (S15).
     ///
-    /// Pre-S13 vaults were stamped 0x04. Bumping to 0x05 advertises that the
-    /// vault MAY contain RECORD_TYPE_ATTACHMENT records. The reader still
-    /// accepts SCHEMA_VERSION_MIN (0x04) for backwards compatibility.
+    /// Pre-S13 vaults were stamped 0x04, S13 stamped 0x05. S15 bumps to 0x06 to
+    /// advertise the optional trailing vault-level MAC (FLAG_INTEGRITY). The
+    /// reader still accepts SCHEMA_VERSION_MIN (0x04) for backwards compat.
     #[test]
     fn test_schema_version_value() {
-        // S13: writes are stamped 0x05, reads accept SCHEMA_VERSION_MIN..=SCHEMA_VERSION.
-        assert_eq!(SCHEMA_VERSION, 0x05);
+        // S15: writes are stamped 0x06, reads accept SCHEMA_VERSION_MIN..=SCHEMA_VERSION.
+        assert_eq!(SCHEMA_VERSION, 0x06);
         assert_eq!(SCHEMA_VERSION_MIN, 0x04);
+        // Integrity flag and MAC length are stable wire constants.
+        assert_eq!(FLAG_INTEGRITY, 0x01);
+        assert_eq!(VAULT_MAC_LEN, 32);
     }
 
     /// TC-S13-001-01: RECORD_TYPE_ATTACHMENT constant equals 0x03 and is

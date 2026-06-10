@@ -13,7 +13,7 @@ use crate::{
     vault::{
         format::{generate_entry_padding, EntryRecord, RECORD_TYPE_TEMPLATE},
         reader::read_vault,
-        writer::write_vault,
+        writer::write_vault_authenticated,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -156,7 +156,8 @@ pub fn create_template(
 
     let (header, mut records) = read_vault(vault_path)?;
     records.push(record);
-    write_vault(vault_path, header, &records)?;
+    let mac_key = engine.vault_mac_key()?;
+    write_vault_authenticated(vault_path, header, &records, &mac_key)?;
 
     Ok(uuid)
 }
@@ -261,7 +262,8 @@ pub fn delete_template(
 
     let uuid = target_uuid.ok_or_else(|| DiaryError::TemplateNotFound(name.to_string()))?;
     records.retain(|r| r.uuid != uuid);
-    write_vault(vault_path, header, &records)?;
+    let mac_key = engine.vault_mac_key()?;
+    write_vault_authenticated(vault_path, header, &records, &mac_key)?;
     Ok(())
 }
 

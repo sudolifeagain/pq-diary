@@ -34,7 +34,7 @@ use crate::vault::format::{
     RECORD_TYPE_ENTRY, RECORD_TYPE_TEMPLATE, SCHEMA_VERSION,
 };
 use crate::vault::reader::read_vault;
-use crate::vault::writer::write_vault;
+use crate::vault::writer::write_vault_authenticated;
 
 // ============================================================================
 // LegacyKeyDeriver trait + default Argon2 implementation
@@ -277,7 +277,9 @@ pub fn set_entry_flag(
         }
     }
 
-    write_vault(&vault_pqd, header, &entries)?;
+    // Vault stays encrypted under the master key, so the integrity MAC keys on it.
+    let mac_key = crate::crypto::derive_vault_mac_key(&k_master)?;
+    write_vault_authenticated(&vault_pqd, header, &entries, &mac_key)?;
     Ok(())
 }
 
@@ -391,11 +393,15 @@ pub fn rotate_legacy_code(
     cleanup_sensitive_file(&writer_tmp_path(&vault_tmp));
     cleanup_sensitive_file(&toml_tmp);
 
-    if let Err(e) = crate::vault::writer::write_vault_with_attachments(
+    // Master ciphertext is unchanged (only legacy_key_blocks rotate), so the
+    // integrity MAC keys on the existing master key.
+    let mac_key = crate::crypto::derive_vault_mac_key(&_k_master)?;
+    if let Err(e) = crate::vault::writer::write_vault_with_attachments_authenticated(
         &vault_tmp,
         header,
         &entries,
         &attachments,
+        &mac_key,
     ) {
         cleanup_sensitive_file(&vault_tmp);
         cleanup_sensitive_file(&writer_tmp_path(&vault_tmp));
@@ -580,11 +586,15 @@ where
     cleanup_sensitive_file(&writer_tmp_path(&vault_tmp));
     cleanup_sensitive_file(&toml_tmp);
 
-    if let Err(e) = crate::vault::writer::write_vault_with_attachments(
+    // The heir's vault is encrypted under K_legacy (now its master key), so the
+    // integrity MAC must key on K_legacy for a later `unlock(legacy_code)` to verify.
+    let mac_key = crate::crypto::derive_vault_mac_key(&k_legacy)?;
+    if let Err(e) = crate::vault::writer::write_vault_with_attachments_authenticated(
         &vault_tmp,
         new_header,
         &new_entries,
         &new_attachments,
+        &mac_key,
     ) {
         cleanup_sensitive_file(&vault_tmp);
         cleanup_sensitive_file(&writer_tmp_path(&vault_tmp));

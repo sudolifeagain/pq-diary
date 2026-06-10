@@ -93,7 +93,7 @@ use crate::{
     vault::{
         format::{generate_entry_padding, EntryRecord, RECORD_TYPE_ENTRY},
         reader::read_vault,
-        writer::write_vault,
+        writer::write_vault_authenticated,
     },
 };
 
@@ -302,7 +302,8 @@ pub fn batch_create_entries(
         records.push(record);
     }
 
-    write_vault(vault_path, header, &records)?;
+    let mac_key = engine.vault_mac_key()?;
+    write_vault_authenticated(vault_path, header, &records, &mac_key)?;
 
     Ok(ImportResult {
         imported,

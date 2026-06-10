@@ -10,10 +10,11 @@
 use std::io::{self, Read};
 use std::path::Path;
 
+use crate::crypto::hmac_util;
 use crate::error::DiaryError;
 use crate::vault::format::{
-    AttachmentRecord, EntryRecord, VaultHeader, MAGIC, RECORD_TYPE_ATTACHMENT, SCHEMA_VERSION,
-    SCHEMA_VERSION_MIN,
+    AttachmentRecord, EntryRecord, VaultHeader, FLAG_INTEGRITY, MAGIC, RECORD_TYPE_ATTACHMENT,
+    SCHEMA_VERSION, SCHEMA_VERSION_MIN, VAULT_MAC_LEN,
 };
 
 /// Fixed size of the on-disk verification-token ciphertext field (bytes 92–140).
@@ -141,6 +142,67 @@ pub fn read_header(reader: &mut impl Read) -> Result<VaultHeader, DiaryError> {
         kem_encrypted_sk,
         dsa_encrypted_sk,
     })
+}
+
+/// Verify the trailing vault-level integrity MAC on `path` using `mac_key`.
+///
+/// If the header `flags` byte does not have [`FLAG_INTEGRITY`] set — a legacy
+/// v0x04/v0x05 vault, or one written without a key — this is a no-op returning
+/// `Ok(())`. Such vaults predate the MAC and are migrated to the authenticated
+/// layout on the next write. (The residual downgrade exposure — an attacker who
+/// can rewrite `vault.pqd` clearing the flag and stripping the trailer — is
+/// documented in `docs/adr` and cannot be closed without external trusted
+/// state.)
+///
+/// When the flag is set, the last [`VAULT_MAC_LEN`] bytes of the file are the
+/// HMAC-SHA256 over everything preceding them. The MAC is recomputed with
+/// `mac_key` and compared in constant time; a mismatch — caused by any record
+/// edit, reordering, truncation, metadata flip, or partial rollback — yields
+/// [`DiaryError::Crypto`].
+///
+/// # Errors
+///
+/// - [`DiaryError::Vault`] if the file is too short or not a pq-diary vault.
+/// - [`DiaryError::Crypto`] if the MAC does not verify.
+/// - [`DiaryError::Io`] on read failure.
+pub fn verify_vault_integrity(path: &Path, mac_key: &[u8; 32]) -> Result<(), DiaryError> {
+    let data = std::fs::read(path)?;
+
+    // Need at least magic(8) + version(1) + flags(1) to inspect the header.
+    if data.len() < 10 {
+        return Err(DiaryError::Vault(
+            "vault file is too small to contain a header".into(),
+        ));
+    }
+    if data[..8] != *MAGIC {
+        return Err(DiaryError::Vault(
+            "invalid magic bytes: not a pq-diary vault file".into(),
+        ));
+    }
+
+    if data[9] & FLAG_INTEGRITY == 0 {
+        // Legacy / unauthenticated vault: nothing to verify.
+        return Ok(());
+    }
+
+    if data.len() < VAULT_MAC_LEN {
+        return Err(DiaryError::Vault(
+            "integrity flag set but file is shorter than the MAC trailer".into(),
+        ));
+    }
+    let (body, trailer) = data.split_at(data.len() - VAULT_MAC_LEN);
+    let expected: [u8; VAULT_MAC_LEN] = trailer
+        .try_into()
+        .map_err(|_| DiaryError::Vault("malformed vault MAC trailer".into()))?;
+
+    if hmac_util::verify_hmac(mac_key, body, &expected)? {
+        Ok(())
+    } else {
+        Err(DiaryError::Crypto(
+            "vault integrity verification failed: vault.pqd has been tampered with or corrupted"
+                .into(),
+        ))
+    }
 }
 
 /// Read all entry-shaped records (entries + templates) from `reader`,
@@ -556,6 +618,125 @@ mod tests {
         assert_eq!(entries.len(), 1, "legacy read_vault keeps entries");
     }
 
+    // -------------------------------------------------------------------------
+    // S15 (audit H1/H2): vault-level integrity MAC
+    // -------------------------------------------------------------------------
+
+    /// The vault MAC subkey derived from a fixed non-zero test master key.
+    fn test_mac_key() -> [u8; 32] {
+        *crate::crypto::derive_vault_mac_key(&[0x5Au8; 32]).expect("derive mac key")
+    }
+
+    /// TC-S15-INTEG-01: an authenticated vault verifies, and read_vault still
+    /// parses it — the MAC trailer is transparent to record parsing.
+    #[test]
+    fn tc_s15_integ_01_authenticated_vault_verifies_and_reads() {
+        use crate::vault::writer::write_vault_authenticated;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault.pqd");
+        let mac = test_mac_key();
+        write_vault_authenticated(&path, VaultHeader::new(), &[make_test_entry()], &mac)
+            .expect("write authenticated");
+        verify_vault_integrity(&path, &mac).expect("untampered vault must verify");
+        let (_h, entries) = read_vault(&path).expect("read_vault");
+        assert_eq!(entries.len(), 1);
+    }
+
+    /// TC-S15-INTEG-02: flipping any byte of the file (here, record metadata
+    /// past the header — the H2 malleability surface) is detected.
+    #[test]
+    fn tc_s15_integ_02_byte_flip_detected() {
+        use crate::vault::writer::write_vault_authenticated;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault.pqd");
+        let mac = test_mac_key();
+        write_vault_authenticated(&path, make_test_header(), &[make_test_entry()], &mac)
+            .expect("write authenticated");
+
+        let mut bytes = std::fs::read(&path).expect("read bytes");
+        let idx = 220.min(bytes.len() - 1); // inside the first record, past the 204-byte header
+        bytes[idx] ^= 0xFF;
+        std::fs::write(&path, &bytes).expect("write tampered");
+
+        let err = verify_vault_integrity(&path, &mac).expect_err("tamper must be detected");
+        assert!(matches!(err, DiaryError::Crypto(_)), "got {err:?}");
+    }
+
+    /// TC-S15-INTEG-03: truncating the tail (the H1 truncation attack) is detected.
+    #[test]
+    fn tc_s15_integ_03_truncation_detected() {
+        use crate::vault::writer::write_vault_authenticated;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault.pqd");
+        let mac = test_mac_key();
+        write_vault_authenticated(
+            &path,
+            VaultHeader::new(),
+            &[make_test_entry(), make_test_template()],
+            &mac,
+        )
+        .expect("write authenticated");
+
+        let mut bytes = std::fs::read(&path).expect("read bytes");
+        bytes.truncate(bytes.len() - 64); // shears off padding + part of the trailer
+        std::fs::write(&path, &bytes).expect("write truncated");
+
+        let err = verify_vault_integrity(&path, &mac).expect_err("truncation must be detected");
+        assert!(matches!(err, DiaryError::Crypto(_)), "got {err:?}");
+    }
+
+    /// TC-S15-INTEG-04: an attacker who reorders records cannot reuse the keyed
+    /// MAC — splicing the old trailer onto a modified body fails (H1 reorder).
+    #[test]
+    fn tc_s15_integ_04_reorder_with_stale_mac_detected() {
+        use crate::vault::writer::write_vault_authenticated;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault.pqd");
+        let mac = test_mac_key();
+        let a = make_test_entry();
+        let b = make_test_template();
+        write_vault_authenticated(&path, VaultHeader::new(), &[a.clone(), b.clone()], &mac)
+            .expect("write original");
+        let original = std::fs::read(&path).expect("read original");
+
+        // Re-serialise with records swapped, then graft the ORIGINAL trailer back
+        // on (an attacker has no key to recompute it).
+        write_vault_authenticated(&path, VaultHeader::new(), &[b, a], &mac).expect("write swapped");
+        let mut spliced = std::fs::read(&path).expect("read swapped");
+        let orig_trailer = original[original.len() - VAULT_MAC_LEN..].to_vec();
+        let body_len = spliced.len() - VAULT_MAC_LEN;
+        spliced.truncate(body_len);
+        spliced.extend_from_slice(&orig_trailer);
+        std::fs::write(&path, &spliced).expect("write spliced");
+
+        let err = verify_vault_integrity(&path, &mac).expect_err("reorder must be detected");
+        assert!(matches!(err, DiaryError::Crypto(_)), "got {err:?}");
+    }
+
+    /// TC-S15-INTEG-05: a legacy (unauthenticated) vault has no MAC, so
+    /// verification is a no-op rather than an error (migrate-on-write policy).
+    #[test]
+    fn tc_s15_integ_05_legacy_vault_skips_verification() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault.pqd");
+        write_vault(&path, VaultHeader::new(), &[make_test_entry()]).expect("write legacy");
+        verify_vault_integrity(&path, &[0u8; 32]).expect("legacy vault must skip verification");
+    }
+
+    /// TC-S15-INTEG-06: the wrong MAC key (i.e. wrong password) fails verification.
+    #[test]
+    fn tc_s15_integ_06_wrong_key_detected() {
+        use crate::vault::writer::write_vault_authenticated;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault.pqd");
+        let mac = test_mac_key();
+        write_vault_authenticated(&path, VaultHeader::new(), &[make_test_entry()], &mac)
+            .expect("write authenticated");
+        let wrong = *crate::crypto::derive_vault_mac_key(&[0x11u8; 32]).expect("derive");
+        let err = verify_vault_integrity(&path, &wrong).expect_err("wrong key must fail");
+        assert!(matches!(err, DiaryError::Crypto(_)), "got {err:?}");
+    }
+
     /// TC-S13-002-03: read_header accepts pre-S13 vaults stamped 0x04
     /// (backwards compatibility — REQ-EDGE-301).
     #[test]
@@ -575,13 +756,13 @@ mod tests {
     }
 
     /// TC-S13-002-04: read_header rejects unknown schema versions
-    /// (e.g. a hypothetical v6 vault we don't understand yet).
+    /// (e.g. a hypothetical v7 vault we don't understand yet).
     #[test]
     fn tc_s13_002_04_read_unknown_schema_version() {
         use crate::vault::writer::write_header;
         let mut buf: Vec<u8> = Vec::new();
         write_header(&mut buf, &VaultHeader::new()).expect("write_header");
-        buf[8] = 0x06; // future schema we don't support yet
+        buf[8] = 0x07; // future schema we don't support yet (current max is 0x06)
 
         let mut cursor = io::Cursor::new(&buf);
         let result = read_header(&mut cursor);

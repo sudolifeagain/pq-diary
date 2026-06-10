@@ -208,6 +208,14 @@ pub fn git_init(vault_dir: &Path, remote: Option<&str>) -> Result<(), DiaryError
             file.sync_all()
                 .map_err(|e| DiaryError::Git(format!("failed to sync temp file: {e}")))?;
         }
+        // Owner-only on Unix so the rename does not re-expose vault.toml at 0644
+        // (audit M1; mirrors VaultConfig::to_file and set_policy).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| DiaryError::Git(format!("failed to set vault.toml permissions: {e}")))?;
+        }
         if let Err(e) = std::fs::rename(&tmp_path, &toml_path) {
             let _ = std::fs::remove_file(&tmp_path);
             return Err(DiaryError::Io(e));

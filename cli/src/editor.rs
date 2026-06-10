@@ -685,6 +685,36 @@ mod tests {
         );
     }
 
+    /// TC-M5-02 (Unix): cleanup_tmpfile must NOT follow a symlink planted as a
+    /// backup sibling — it skips it, leaving the link's target intact.
+    #[cfg(unix)]
+    #[test]
+    fn tc_m5_02_cleanup_skips_symlink_sibling() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tmp = dir.path().join("entry.md");
+        std::fs::write(&tmp, b"body").expect("write tmp");
+
+        // A file a malicious symlink would try to redirect the overwrite onto.
+        let outside = dir.path().join("outside.secret");
+        std::fs::write(&outside, b"important").expect("write outside");
+
+        // Plant `entry.md~` as a symlink to the outside file.
+        let link = dir.path().join("entry.md~");
+        std::os::unix::fs::symlink(&outside, &link).expect("symlink");
+
+        cleanup_tmpfile(&tmp).expect("cleanup_tmpfile");
+
+        assert!(!tmp.exists(), "temp file must be removed");
+        assert!(
+            outside.exists() && std::fs::read(&outside).expect("read") == b"important",
+            "symlink target must not be followed or overwritten"
+        );
+        assert!(
+            std::fs::symlink_metadata(&link).is_ok(),
+            "the symlink itself is skipped (left in place), never followed"
+        );
+    }
+
     /// TC-0035-02: secure_delete on a nonexistent file returns an error.
     #[test]
     fn tc_0035_02_secure_delete_nonexistent_returns_error() {

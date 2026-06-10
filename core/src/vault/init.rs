@@ -397,6 +397,14 @@ impl VaultManager {
             file.write_all(new_content.as_bytes())?;
             file.sync_all()?;
         }
+        // Match VaultConfig::to_file: restrict to owner-only on Unix so the
+        // atomic rename does not replace the 0600 original with a 0644 file,
+        // re-exposing Argon2 params / git identity / legacy token (audit M1).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))?;
+        }
         if let Err(e) = std::fs::rename(&tmp_path, &toml_path) {
             let _ = std::fs::remove_file(&tmp_path);
             return Err(DiaryError::Io(e));
@@ -461,6 +469,29 @@ mod tests {
             time_cost: 1,
             parallelism: 1,
         }
+    }
+
+    /// TC-M1-01 (Unix): set_policy must keep vault.toml owner-only (0600) — the
+    /// atomic rename must not re-expose it at 0644 (audit M1 regression).
+    #[cfg(unix)]
+    #[test]
+    fn tc_m1_01_set_policy_keeps_vault_toml_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempdir().expect("tempdir");
+        let mgr = VaultManager::new(dir.path().to_path_buf())
+            .expect("VaultManager::new")
+            .with_kdf_params(fast_params());
+        mgr.init_vault("v", b"password").expect("init_vault");
+        let toml = dir.path().join("v").join("vault.toml");
+
+        mgr.set_policy("v", AccessPolicy::WriteOnly).expect("set_policy");
+
+        let mode = std::fs::metadata(&toml)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "vault.toml must remain 0600 after set_policy");
     }
 
     /// TC-006-01: init_vault creates the full directory + file structure.

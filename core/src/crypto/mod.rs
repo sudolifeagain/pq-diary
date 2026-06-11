@@ -12,12 +12,16 @@
 pub mod aead;
 /// ML-DSA-65 digital signature algorithm (FIPS 204).
 pub mod dsa;
+/// HKDF-SHA256 key derivation helper.
+pub mod hkdf;
 /// HMAC-SHA256 message authentication code.
 pub mod hmac_util;
 /// Argon2id key derivation.
 pub mod kdf;
 /// ML-KEM-768 key encapsulation mechanism (FIPS 203).
 pub mod kem;
+/// Master Data Key and S16 subkey hierarchy.
+pub mod mdk;
 /// Password strength assessment for newly chosen passwords.
 pub mod password_policy;
 /// Secure memory types: `SecureBuffer`, `ZeroizingKey`, `MasterKey`, `CryptoEngine`.
@@ -44,7 +48,10 @@ const VAULT_MAC_CONTEXT: &[u8] = b"pq-diary/vault-integrity/v1";
 /// hold the raw `sym_key` directly (vault init, password rotation) before an
 /// engine is constructed. The returned key zeroizes on drop.
 pub fn derive_vault_mac_key(sym_key: &[u8; 32]) -> Result<Zeroizing<[u8; 32]>, DiaryError> {
-    Ok(Zeroizing::new(hmac_util::compute(sym_key, VAULT_MAC_CONTEXT)?))
+    Ok(Zeroizing::new(hmac_util::compute(
+        sym_key,
+        VAULT_MAC_CONTEXT,
+    )?))
 }
 
 impl CryptoEngine {

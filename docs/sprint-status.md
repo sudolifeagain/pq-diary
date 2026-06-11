@@ -1,6 +1,6 @@
 # Sprint Status
 
-## Current: Phase 2 中核完了 — 次スプリント未定 (棚卸し済み)
+## Current: S15 セキュリティ硬化 完了 → S16 キースロット/MDK 要件定義済 (実装は下位モデルへ委譲)
 
 Phase 1 全完了 + Phase 2 で legacy (S12) / 添付ファイル (S13 + S13.1) / change-password / info --security / export を完了。
 
@@ -25,6 +25,8 @@ Phase 1 全完了 + Phase 2 で legacy (S12) / 添付ファイル (S13 + S13.1) 
 | S13 | 添付ファイル (attachments) | completed (s13-done) | 13 |
 | S13.1 | cmd_import の `![[FILE]]` 統合 (S13 follow-up) | completed (PR #9) | 13 |
 | S14 | Phase 2 棚卸し + CHANGELOG.md 新規作成 | in_progress (housekeeping) | 14 |
+| S15 | セキュリティ硬化 (整合性MAC v0x06・WER抑止・監査M系修正) | completed (PR #11) | 15 |
+| S16 | キースロット封筒 + MDK (ML-KEM load-bearing 化, v0x07) | spec整備済 / 実装委譲 | 16 |
 
 ## Sprint Scope
 
@@ -142,3 +144,15 @@ Phase 1 全完了 + Phase 2 で legacy (S12) / 添付ファイル (S13 + S13.1) 
 - `requirements.md` v4 → v5 migration ノート追加 (vault.pqd format §6 と Phase 4 §15)
 - 棚卸し範囲: S10〜S13.1 で蓄積された大変更 (5 スプリント連続) を一度整理
 - 動作確認: manual E2E (init → new → attachment add/list/extract → SHA-256 検証 OK) + smoke-test 34/34
+
+### S15: セキュリティ硬化
+- 監査 (S15) 指摘の H1/H2 (vault 整合性 MAC, schema v0x06)・M1/M4/M5/M6/M7 を解消 (PR #11)
+- 後続の監査未対応項目: High-2 パスワード強度 (PR #13)・Low-2 署名 fail-open (PR #14)・
+  Medium-1 サプライチェーン CI・High-1 ML-KEM load-bearing 化 (S16)
+
+### S16: キースロット封筒 + MDK (要件定義済・実装は下位モデルへ委譲)
+- 監査 High-1 (ML-KEM 未使用) を解消。MDK を per-credential キースロットで封筒化 (v0x07)
+- 設計: ADR-0009 + `docs/design/vault-v6-keyslot-format.md`
+- 要件/受け入れ: `docs/spec/s16-keyslot/{requirements,acceptance-criteria,note}.md`
+- 実装は GitHub issue (S16-1〜S16-5) に分割。FIPS 203 / SP 800-227 / SP 800-56C /
+  IETF KEM-combiners / RFC 5869 / LUKS2 を参照根拠とする

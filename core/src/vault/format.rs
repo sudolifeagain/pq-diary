@@ -46,6 +46,12 @@ pub const FLAG_INTEGRITY: u8 = 0x01;
 /// Length in bytes of the trailing vault-level HMAC-SHA256 authentication tag.
 pub const VAULT_MAC_LEN: usize = 32;
 
+/// Maximum allowed byte length for any variable-length vault field.
+///
+/// Used by readers and S16 keyslot parsers to reject malicious/corrupt files
+/// before allocating large buffers.
+pub const MAX_FIELD_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
+
 /// Size in bytes of the fixed portion of the vault.pqd header.
 ///
 /// Layout (offsets are from byte 0):

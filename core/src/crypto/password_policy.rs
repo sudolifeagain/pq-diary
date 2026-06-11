@@ -91,9 +91,7 @@ pub fn assess(password: &str) -> Assessment {
     // Trivially-guessable passwords are marked weak regardless of length.
     let lowered = password.to_lowercase();
     if COMMON_PASSWORDS.contains(&lowered.as_str()) {
-        warnings.push(
-            "this is a commonly-used password and is trivially guessable".to_string(),
-        );
+        warnings.push("this is a commonly-used password and is trivially guessable".to_string());
     }
 
     let strength = if warnings.is_empty() {
@@ -102,10 +100,7 @@ pub fn assess(password: &str) -> Assessment {
         Strength::Weak
     };
 
-    Assessment {
-        strength,
-        warnings,
-    }
+    Assessment { strength, warnings }
 }
 
 #[cfg(test)]
@@ -118,7 +113,9 @@ mod tests {
         let a = assess("FourteenChars!"); // 14 chars
         assert_eq!(a.strength, Strength::Weak, "14-char password is weak");
         assert!(
-            a.warnings.iter().any(|w| w.contains("shorter than recommended")),
+            a.warnings
+                .iter()
+                .any(|w| w.contains("shorter than recommended")),
             "expected a length advisory, got {:?}",
             a.warnings
         );

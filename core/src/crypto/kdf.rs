@@ -17,6 +17,7 @@ use zeroize::Zeroize;
 /// Minimum security thresholds (below → warning):
 /// - `memory_cost_kb` >= 19456
 /// - `time_cost` >= 2
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Argon2Params {
     /// Memory cost in KiB (default: 65536 = 64 MiB).
     pub memory_cost_kb: u32,

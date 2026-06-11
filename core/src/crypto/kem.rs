@@ -9,14 +9,23 @@ use ml_kem::{
     KeyExport, MlKem768,
 };
 
+/// Serialized ML-KEM-768 encapsulation (public) key length.
+pub const ENCAPSULATION_KEY_SIZE: usize = 1184;
+/// Serialized ML-KEM-768 decapsulation key seed length.
+pub const DECAPSULATION_KEY_SEED_SIZE: usize = 64;
+/// Serialized ML-KEM-768 ciphertext length.
+pub const CIPHERTEXT_SIZE: usize = 1088;
+/// ML-KEM shared secret length.
+pub const SHARED_SECRET_SIZE: usize = 32;
+
 /// ML-KEM-768 key pair.
 ///
 /// `encapsulation_key` (public) is safe to share freely.
 /// `decapsulation_key` (private) is stored in a [`SecureBuffer`] that zeroes its memory on drop.
 pub struct KemKeyPair {
-    /// Serialized ML-KEM-768 encapsulation (public) key (1184 bytes).
+    /// Serialized ML-KEM-768 encapsulation (public) key.
     pub encapsulation_key: Vec<u8>,
-    /// Serialized ML-KEM-768 decapsulation (private) key seed (64 bytes), zeroed on drop.
+    /// Serialized ML-KEM-768 decapsulation (private) key seed, zeroed on drop.
     pub decapsulation_key: SecureBuffer,
 }
 
@@ -103,8 +112,8 @@ mod tests {
     #[test]
     fn tc_004_01_keygen_returns_nonempty_keypair() {
         let kp = keygen().unwrap();
-        assert!(!kp.encapsulation_key.is_empty());
-        assert!(!kp.decapsulation_key.is_empty());
+        assert_eq!(kp.encapsulation_key.len(), ENCAPSULATION_KEY_SIZE);
+        assert_eq!(kp.decapsulation_key.len(), DECAPSULATION_KEY_SEED_SIZE);
     }
 
     /// TC-004-02: encapsulate followed by decapsulate produces identical shared secrets.
@@ -115,6 +124,9 @@ mod tests {
         let (ct, ss_sender) = encapsulate(&kp.encapsulation_key).unwrap();
         let ss_receiver = decapsulate(&kp.decapsulation_key, &ct).unwrap();
 
+        assert_eq!(ct.len(), CIPHERTEXT_SIZE);
+        assert_eq!(ss_sender.len(), SHARED_SECRET_SIZE);
+        assert_eq!(ss_receiver.len(), SHARED_SECRET_SIZE);
         assert_eq!(ss_sender.as_ref(), ss_receiver.as_ref());
     }
 

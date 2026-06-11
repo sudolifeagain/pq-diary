@@ -26,13 +26,24 @@ use crate::{
 
 const PASSWORD_KEYFILE_INFO: &[u8] = b"pq-diary/keyslot/keyfile/v1";
 const RECIPIENT_INFO: &[u8] = b"pq-diary/keyslot/recipient/v1";
+const MDK_SIZE: usize = 32;
+const WRAPPED_MDK_SIZE: usize = MDK_SIZE + aead::TAG_SIZE;
 
 /// Keyfile magic bytes (`PQDKEYF\0`).
 pub const KEYFILE_MAGIC: &[u8; 8] = b"PQDKEYF\0";
 /// Current keyfile version.
 pub const KEYFILE_VERSION: u8 = 0x01;
+const KEYFILE_VERSION_OFFSET: usize = KEYFILE_MAGIC.len();
+const KEYFILE_RESERVED_OFFSET: usize = KEYFILE_VERSION_OFFSET + 1;
+const KEYFILE_RESERVED_LEN: usize = 2;
+const KEYFILE_SEED_OFFSET: usize = KEYFILE_RESERVED_OFFSET + KEYFILE_RESERVED_LEN;
+const KEYFILE_PUBLIC_KEY_HASH_SIZE: usize = 32;
+const KEYFILE_PUBLIC_KEY_HASH_OFFSET: usize =
+    KEYFILE_SEED_OFFSET + kem::DECAPSULATION_KEY_SEED_SIZE;
+const KEYFILE_CRC_OFFSET: usize = KEYFILE_PUBLIC_KEY_HASH_OFFSET + KEYFILE_PUBLIC_KEY_HASH_SIZE;
+const KEYFILE_CRC_SIZE: usize = 4;
 /// Serialized keyfile length.
-pub const KEYFILE_SIZE: usize = 111;
+pub const KEYFILE_SIZE: usize = KEYFILE_CRC_OFFSET + KEYFILE_CRC_SIZE;
 
 /// Keyslot type byte in the v0x07 keyslot section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,9 +191,10 @@ impl KeyfileMaterial {
 
     /// Serialize this keyfile as magic + version + seed + public-key hash + CRC32.
     pub fn serialize(&self) -> Result<Zeroizing<Vec<u8>>, DiaryError> {
-        if self.decapsulation_key.len() != 64 {
+        if self.decapsulation_key.len() != kem::DECAPSULATION_KEY_SEED_SIZE {
             return Err(DiaryError::Crypto(format!(
-                "invalid keyfile decapsulation key length: expected 64 bytes, got {}",
+                "invalid keyfile decapsulation key length: expected {} bytes, got {}",
+                kem::DECAPSULATION_KEY_SEED_SIZE,
                 self.decapsulation_key.len()
             )));
         }
@@ -327,6 +339,7 @@ impl Keyslot {
         {
             return Err(DiaryError::Crypto("invalid credentials".into()));
         }
+        validate_slot_invariants(self)?;
 
         let slot_key = derive_password_slot_key(password, &self.salt, &self.kdf_params)?;
         unwrap_mdk(self, &slot_key)
@@ -340,9 +353,14 @@ impl Keyslot {
     ) -> Result<MasterDataKey, DiaryError> {
         if self.slot_type != KeyslotType::PasswordKeyfile
             || self.kdf_algorithm != KdfAlgorithm::Argon2id
-            || self.kem_algorithm != KemAlgorithm::MlKem768
         {
             return Err(DiaryError::Crypto("invalid credentials".into()));
+        }
+        validate_slot_invariants(self)?;
+        if self.kem_algorithm != KemAlgorithm::MlKem768 {
+            return Err(DiaryError::Vault(
+                "unsupported password+keyfile KEM algorithm".into(),
+            ));
         }
 
         let shared_secret = kem::decapsulate(keyfile.decapsulation_key(), &self.kem_ct)?;
@@ -361,9 +379,14 @@ impl Keyslot {
         &self,
         decapsulation_key: &SecureBuffer,
     ) -> Result<MasterDataKey, DiaryError> {
-        if self.slot_type != KeyslotType::Recipient || self.kem_algorithm != KemAlgorithm::MlKem768
-        {
+        if self.slot_type != KeyslotType::Recipient {
             return Err(DiaryError::Crypto("invalid credentials".into()));
+        }
+        validate_slot_invariants(self)?;
+        if self.kem_algorithm != KemAlgorithm::MlKem768 {
+            return Err(DiaryError::Vault(
+                "unsupported recipient KEM algorithm".into(),
+            ));
         }
 
         let shared_secret = kem::decapsulate(decapsulation_key, &self.kem_ct)?;
@@ -484,33 +507,36 @@ pub fn parse_keyfile(bytes: &[u8]) -> Result<KeyfileMaterial, DiaryError> {
     if &bytes[0..8] != KEYFILE_MAGIC {
         return Err(DiaryError::Vault("invalid keyfile magic".into()));
     }
-    if bytes[8] != KEYFILE_VERSION {
+    if bytes[KEYFILE_VERSION_OFFSET] != KEYFILE_VERSION {
         return Err(DiaryError::Vault(format!(
             "unsupported keyfile version 0x{:02x}",
-            bytes[8]
+            bytes[KEYFILE_VERSION_OFFSET]
         )));
     }
-    if bytes[9] != 0 || bytes[10] != 0 {
+    if bytes[KEYFILE_RESERVED_OFFSET..KEYFILE_SEED_OFFSET]
+        .iter()
+        .any(|&byte| byte != 0)
+    {
         return Err(DiaryError::Vault(
             "keyfile reserved bytes must be zero".into(),
         ));
     }
 
     let expected_crc = u32::from_le_bytes(
-        bytes[107..111]
+        bytes[KEYFILE_CRC_OFFSET..KEYFILE_SIZE]
             .try_into()
             .map_err(|_| DiaryError::Vault("malformed keyfile CRC".into()))?,
     );
-    let actual_crc = crc32_ieee(&bytes[..107]);
+    let actual_crc = crc32_ieee(&bytes[..KEYFILE_CRC_OFFSET]);
     if expected_crc != actual_crc {
         return Err(DiaryError::Vault("keyfile CRC verification failed".into()));
     }
 
-    let mut seed = Zeroizing::new([0u8; 64]);
-    seed.copy_from_slice(&bytes[11..75]);
+    let mut seed = Zeroizing::new([0u8; kem::DECAPSULATION_KEY_SEED_SIZE]);
+    seed.copy_from_slice(&bytes[KEYFILE_SEED_OFFSET..KEYFILE_PUBLIC_KEY_HASH_OFFSET]);
 
-    let mut pk_hash = [0u8; 32];
-    pk_hash.copy_from_slice(&bytes[75..107]);
+    let mut pk_hash = [0u8; KEYFILE_PUBLIC_KEY_HASH_SIZE];
+    pk_hash.copy_from_slice(&bytes[KEYFILE_PUBLIC_KEY_HASH_OFFSET..KEYFILE_CRC_OFFSET]);
 
     Ok(KeyfileMaterial::new(
         SecureBuffer::new(seed.to_vec()),
@@ -534,6 +560,7 @@ fn no_kdf_params() -> Argon2Params {
 }
 
 fn serialize_slot_payload(slot: &Keyslot) -> Result<Vec<u8>, DiaryError> {
+    validate_slot_invariants(slot)?;
     check_field_size("kem_ct", slot.kem_ct.len())?;
     check_field_size("wrapped_mdk", slot.wrapped_mdk.len())?;
     check_field_size("label", slot.label.len())?;
@@ -597,7 +624,7 @@ fn parse_slot_payload(payload: &[u8]) -> Result<Keyslot, DiaryError> {
         ));
     }
 
-    Ok(Keyslot {
+    let slot = Keyslot {
         slot_type,
         slot_id,
         kdf_algorithm,
@@ -608,7 +635,97 @@ fn parse_slot_payload(payload: &[u8]) -> Result<Keyslot, DiaryError> {
         wrap_iv,
         wrapped_mdk,
         label,
-    })
+    };
+    validate_slot_invariants(&slot)?;
+    Ok(slot)
+}
+
+fn validate_slot_invariants(slot: &Keyslot) -> Result<(), DiaryError> {
+    if slot.wrapped_mdk.len() != WRAPPED_MDK_SIZE {
+        return Err(DiaryError::Vault(format!(
+            "wrapped_mdk length must be 48 bytes, got {}",
+            slot.wrapped_mdk.len()
+        )));
+    }
+
+    match slot.slot_type {
+        KeyslotType::Password | KeyslotType::Recovery => {
+            require_argon2_kdf(slot)?;
+            if slot.kem_algorithm != KemAlgorithm::None {
+                return Err(DiaryError::Vault(
+                    "password/recovery keyslots must not declare a KEM algorithm".into(),
+                ));
+            }
+            if !slot.kem_ct.is_empty() {
+                return Err(DiaryError::Vault(
+                    "password/recovery keyslots must not carry a KEM ciphertext".into(),
+                ));
+            }
+        }
+        KeyslotType::PasswordKeyfile => {
+            require_argon2_kdf(slot)?;
+            require_kem_ciphertext(slot.kem_algorithm, slot.kem_ct.len(), "password+keyfile")?;
+        }
+        KeyslotType::Recipient => {
+            if slot.kdf_algorithm != KdfAlgorithm::None {
+                return Err(DiaryError::Vault(
+                    "recipient keyslots must not declare a password KDF".into(),
+                ));
+            }
+            if slot.kdf_params != no_kdf_params() {
+                return Err(DiaryError::Vault(
+                    "recipient keyslot KDF parameters must be zero".into(),
+                ));
+            }
+            if slot.salt != [0u8; 32] {
+                return Err(DiaryError::Vault(
+                    "recipient keyslot salt must be zero".into(),
+                ));
+            }
+            require_kem_ciphertext(slot.kem_algorithm, slot.kem_ct.len(), "recipient")?;
+        }
+    }
+
+    Ok(())
+}
+
+fn require_argon2_kdf(slot: &Keyslot) -> Result<(), DiaryError> {
+    if slot.kdf_algorithm != KdfAlgorithm::Argon2id {
+        return Err(DiaryError::Vault(format!(
+            "{:?} keyslots must use Argon2id",
+            slot.slot_type
+        )));
+    }
+    Ok(())
+}
+
+fn require_kem_ciphertext(
+    algorithm: KemAlgorithm,
+    ciphertext_len: usize,
+    slot_kind: &str,
+) -> Result<(), DiaryError> {
+    match algorithm {
+        KemAlgorithm::None => Err(DiaryError::Vault(format!(
+            "{slot_kind} keyslots must declare a KEM algorithm"
+        ))),
+        KemAlgorithm::MlKem768 => {
+            if ciphertext_len != kem::CIPHERTEXT_SIZE {
+                return Err(DiaryError::Vault(format!(
+                    "{slot_kind} ML-KEM-768 ciphertext length must be {}, got {ciphertext_len}",
+                    kem::CIPHERTEXT_SIZE
+                )));
+            }
+            Ok(())
+        }
+        KemAlgorithm::MlKem768Hqc => {
+            if ciphertext_len == 0 {
+                return Err(DiaryError::Vault(format!(
+                    "{slot_kind} hybrid KEM ciphertext must not be empty"
+                )));
+            }
+            Ok(())
+        }
+    }
 }
 
 fn derive_password_slot_key(
@@ -627,17 +744,18 @@ fn derive_keyfile_slot_key(
     shared_secret: &[u8],
     slot_id: &[u8; 16],
 ) -> Result<Zeroizing<[u8; 32]>, DiaryError> {
-    if shared_secret.len() != 32 {
+    if shared_secret.len() != kem::SHARED_SECRET_SIZE {
         return Err(DiaryError::Crypto(format!(
-            "ML-KEM shared secret must be 32 bytes, got {}",
+            "ML-KEM shared secret must be {} bytes, got {}",
+            kem::SHARED_SECRET_SIZE,
             shared_secret.len()
         )));
     }
 
     let password_key = kdf::derive_key(password, salt, params)?;
-    let mut ikm = Zeroizing::new([0u8; 64]);
-    ikm[..32].copy_from_slice(password_key.as_ref());
-    ikm[32..].copy_from_slice(shared_secret);
+    let mut ikm = Zeroizing::new([0u8; 2 * kem::SHARED_SECRET_SIZE]);
+    ikm[..kem::SHARED_SECRET_SIZE].copy_from_slice(password_key.as_ref());
+    ikm[kem::SHARED_SECRET_SIZE..].copy_from_slice(shared_secret);
     derive_hkdf_slot_key(ikm.as_ref(), PASSWORD_KEYFILE_INFO, slot_id)
 }
 
@@ -645,9 +763,10 @@ fn derive_recipient_slot_key(
     shared_secret: &[u8],
     slot_id: &[u8; 16],
 ) -> Result<Zeroizing<[u8; 32]>, DiaryError> {
-    if shared_secret.len() != 32 {
+    if shared_secret.len() != kem::SHARED_SECRET_SIZE {
         return Err(DiaryError::Crypto(format!(
-            "ML-KEM shared secret must be 32 bytes, got {}",
+            "ML-KEM shared secret must be {} bytes, got {}",
+            kem::SHARED_SECRET_SIZE,
             shared_secret.len()
         )));
     }
@@ -681,14 +800,14 @@ fn unwrap_mdk(slot: &Keyslot, slot_key: &[u8; 32]) -> Result<MasterDataKey, Diar
         Err(e) => return Err(e),
     };
 
-    if plaintext.len() != 32 {
+    if plaintext.len() != MDK_SIZE {
         return Err(DiaryError::Crypto(format!(
-            "wrapped MDK decrypted to {} bytes, expected 32",
-            plaintext.len()
+            "wrapped MDK decrypted to {} bytes, expected {MDK_SIZE}",
+            plaintext.len(),
         )));
     }
 
-    let mut bytes = Zeroizing::new([0u8; 32]);
+    let mut bytes = Zeroizing::new([0u8; MDK_SIZE]);
     bytes.copy_from_slice(plaintext.as_ref());
     Ok(MasterDataKey::from_bytes(*bytes))
 }
@@ -864,6 +983,31 @@ mod tests {
     }
 
     #[test]
+    fn tc_s16_slot_e03_rejects_password_slot_with_kem_algorithm() {
+        let mdk = test_mdk();
+        let slot = Keyslot::password(&mdk, b"pw", fast_params(), "owner").expect("slot");
+        let mut encoded = serialize_keyslots(&[slot]).expect("serialize");
+
+        let kem_alg_offset = 4 + 1 + 16 + 1 + 4 + 4 + 4 + 32;
+        encoded[kem_alg_offset] = KemAlgorithm::MlKem768.to_u8();
+
+        let result = parse_keyslots(&encoded);
+
+        assert!(matches!(result, Err(DiaryError::Vault(_))));
+    }
+
+    #[test]
+    fn tc_s16_slot_e04_rejects_wrong_wrapped_mdk_length() {
+        let mdk = test_mdk();
+        let mut slot = Keyslot::password(&mdk, b"pw", fast_params(), "owner").expect("slot");
+        slot.wrapped_mdk.pop();
+
+        let result = serialize_keyslots(&[slot]);
+
+        assert!(matches!(result, Err(DiaryError::Vault(_))));
+    }
+
+    #[test]
     fn tc_s16_pw_01_password_slot_recovers_mdk() {
         let mdk = test_mdk();
         let slot = Keyslot::password(&mdk, b"passphrase", fast_params(), "").expect("slot");
@@ -1006,7 +1150,9 @@ mod tests {
     #[test]
     fn tc_s16_hqc_01_hybrid_kem_tag_is_parseable() {
         let mdk = test_mdk();
-        let slot = Keyslot::password(&mdk, b"pw", fast_params(), "future").expect("slot");
+        let recipient_kp = kem::keygen().expect("recipient keygen");
+        let slot = Keyslot::recipient(&mdk, &recipient_kp.encapsulation_key, "future")
+            .expect("recipient slot");
         let mut encoded = serialize_keyslots(&[slot]).expect("serialize");
 
         let kem_alg_offset = 4 + 1 + 16 + 1 + 4 + 4 + 4 + 32;
@@ -1015,5 +1161,8 @@ mod tests {
         let decoded = parse_keyslots(&encoded).expect("parse");
 
         assert_eq!(decoded[0].kem_algorithm, KemAlgorithm::MlKem768Hqc);
+
+        let result = decoded[0].unwrap_with_recipient_key(&recipient_kp.decapsulation_key);
+        assert!(matches!(result, Err(DiaryError::Vault(_))));
     }
 }

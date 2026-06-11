@@ -19,6 +19,7 @@ all-features = true
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+required-git-spec = "rev"
 # Pinned RustCrypto forks (ADR-0001). Revisions are pinned in the Cargo.toml /
 # Cargo.lock; this list only authorises the *origin*. Any other git source,
 # or a change of these origins, fails CI.
@@ -49,6 +50,12 @@ allow = [
   "0BSD",
 ]
 confidence-threshold = 0.8
+# The project itself is GPL-3.0-or-later; keep that license scoped to the
+# workspace crates so GPL dependencies still require explicit review.
+exceptions = [
+  { name = "pq-diary", allow = ["GPL-3.0-or-later"] },
+  { name = "pq-diary-core", allow = ["GPL-3.0-or-later"] },
+]
 
 # ---------------------------------------------------------------------------
 # Bans — surface duplicate versions and wildcard deps (warn, not block).

@@ -29,7 +29,7 @@ use crate::vault::format::{
     MAX_ATTACHMENT_SIZE_BYTES, RECORD_TYPE_ATTACHMENT, RECORD_TYPE_ENTRY,
 };
 use crate::vault::reader::read_vault_with_attachments;
-use crate::vault::writer::write_vault_with_attachments;
+use crate::vault::writer::write_vault_with_attachments_authenticated;
 
 // ============================================================================
 // Public types
@@ -346,7 +346,14 @@ pub fn add_attachment(
 
     // Header is touched only via payload_size recalculation inside writer.
     header.payload_size = 0;
-    write_vault_with_attachments(&vault_pqd, header, &entries, &attachments)?;
+    let mac_key = crate::crypto::derive_vault_mac_key(&k_master)?;
+    write_vault_with_attachments_authenticated(
+        &vault_pqd,
+        header,
+        &entries,
+        &attachments,
+        &mac_key,
+    )?;
 
     Ok(Uuid::from_bytes(record_uuid_bytes))
 }
@@ -489,7 +496,14 @@ pub fn delete_attachment(
         .filter(|b| *b)
         .count();
 
-    write_vault_with_attachments(&vault_pqd, header, &entries, &attachments)?;
+    let mac_key = crate::crypto::derive_vault_mac_key(&k_master)?;
+    write_vault_with_attachments_authenticated(
+        &vault_pqd,
+        header,
+        &entries,
+        &attachments,
+        &mac_key,
+    )?;
 
     if remaining_refs == 0 {
         let bin_path = blob_path(vault_dir, &decoded.plaintext.blob_uuid);
@@ -565,7 +579,14 @@ pub fn set_attachment_legacy_flag(
         }
     }
 
-    write_vault_with_attachments(&vault_pqd, header, &entries, &attachments)?;
+    let mac_key = crate::crypto::derive_vault_mac_key(&_k_master)?;
+    write_vault_with_attachments_authenticated(
+        &vault_pqd,
+        header,
+        &entries,
+        &attachments,
+        &mac_key,
+    )?;
     Ok(())
 }
 

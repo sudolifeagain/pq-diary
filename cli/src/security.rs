@@ -3,6 +3,9 @@
 //! Applies OS-level security mitigations at process startup:
 //! - Unix: `PR_SET_DUMPABLE=0` prevents `/proc/{pid}/mem` access and ptrace attach.
 //! - Unix: `RLIMIT_CORE=0` disables core dump file generation on crash.
+//! - Windows: `SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX)`
+//!   suppresses the Windows Error Reporting crash dialog and WER dump
+//!   collection, so a crash cannot write process memory (key material) to disk.
 //! - Unix/Windows: Detects an attached debugger and emits a warning.
 
 /// Apply OS-level process hardening at startup.
@@ -13,7 +16,11 @@
 /// 2. Sets `RLIMIT_CORE=0` to suppress core dump files on crash,
 ///    preventing key material from leaking to disk.
 ///
-/// On Windows: no-op (these concepts do not exist on Windows).
+/// On Windows (audit M6): merges `SEM_FAILCRITICALERRORS` and
+/// `SEM_NOGPFAULTERRORBOX` into the process error mode so an unhandled
+/// exception does not trigger Windows Error Reporting / Dr. Watson, which would
+/// otherwise be able to write a crash dump containing the master key, derived
+/// keys, or decrypted entries to `%LOCALAPPDATA%\CrashDumps`.
 ///
 /// All failures are emitted as warnings to stderr; the process continues
 /// regardless (REQ-013).
@@ -42,6 +49,24 @@ pub fn harden_process() {
         use nix::sys::resource::{setrlimit, Resource};
         if let Err(e) = setrlimit(Resource::RLIMIT_CORE, 0, 0) {
             eprintln!("Warning: setrlimit(RLIMIT_CORE, 0) failed: {e}");
+        }
+    }
+    #[cfg(windows)]
+    {
+        // Suppress Windows Error Reporting so a crash cannot dump process memory
+        // (key material) to disk. We OR our flags into the existing error mode
+        // rather than replacing it, preserving any flags the runtime already set
+        // (e.g. SEM_NOALIGNMENTFAULTEXCEPT).
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            GetErrorMode, SetErrorMode, SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX,
+        };
+        // SAFETY: GetErrorMode/SetErrorMode are process-global Win32 calls that
+        // take/return a plain bit-flag integer and have no pointer arguments, so
+        // they cannot violate memory safety. They fall within the CLAUDE.md
+        // allowed unsafe scope for Win32 security-hardening APIs (audit M6).
+        unsafe {
+            let prev = GetErrorMode();
+            SetErrorMode(prev | SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
         }
     }
 }
@@ -340,6 +365,29 @@ mod tests {
         assert_eq!(
             result, 0,
             "IsDebuggerPresent must return 0 during normal test execution (no debugger attached)"
+        );
+    }
+
+    /// TC-M6-01 (Windows): after harden_process(), the process error mode has
+    /// the WER-suppressing flags set, so a crash cannot dump key material to disk.
+    #[cfg(windows)]
+    #[test]
+    fn tc_m6_01_windows_error_mode_suppresses_wer() {
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            GetErrorMode, SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX,
+        };
+        harden_process();
+        // SAFETY: GetErrorMode is a nullary Win32 call returning a bit-flag integer.
+        let mode = unsafe { GetErrorMode() };
+        assert_ne!(
+            mode & SEM_FAILCRITICALERRORS,
+            0,
+            "SEM_FAILCRITICALERRORS must be set after harden_process()"
+        );
+        assert_ne!(
+            mode & SEM_NOGPFAULTERRORBOX,
+            0,
+            "SEM_NOGPFAULTERRORBOX must be set after harden_process()"
         );
     }
 

@@ -142,11 +142,13 @@ pub fn re_encrypt_vault(
     // until the very last fs::rename, and the temporary file is cleaned up on
     // failure.
     let final_tmp = vault_dir.join("vault.pqd.tmp.new");
-    let write_result = crate::vault::writer::write_vault_with_attachments(
+    let mac_key = crate::crypto::derive_vault_mac_key(new_key.as_ref())?;
+    let write_result = crate::vault::writer::write_vault_with_attachments_authenticated(
         &final_tmp,
         new_header,
         &new_entries,
         &new_attachments,
+        &mac_key,
     );
     if let Err(e) = write_result {
         cleanup_tmp(&final_tmp);

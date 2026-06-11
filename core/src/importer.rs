@@ -36,6 +36,14 @@ static ATTACHMENT_LINK_RE: LazyLock<Regex> =
 /// the captured filenames in document order (duplicates preserved). Used by
 /// the CLI import path to walk source `attachments/<filename>` files and
 /// attach them to the freshly-imported entry (S13).
+///
+/// Names are returned verbatim (including any `../`, absolute, or
+/// alternate-data-stream forms). Path-escape safety is enforced one layer up by
+/// the CLI's `resolve_import_attachment_source`, which canonicalises the
+/// resolved path and verifies it stays within `<source>/attachments/`, then
+/// reports anything outside as an *unresolved* reference (audit M7 — verified
+/// by `tc_s13_110_03_import_rejects_attachment_path_escape`). Filtering here
+/// instead would silently drop such references and hide them from that report.
 pub fn parse_obsidian_attachment_links(body: &str) -> Vec<String> {
     ATTACHMENT_LINK_RE
         .captures_iter(body)
@@ -93,7 +101,7 @@ use crate::{
     vault::{
         format::{generate_entry_padding, EntryRecord, RECORD_TYPE_ENTRY},
         reader::read_vault,
-        writer::write_vault,
+        writer::write_vault_authenticated,
     },
 };
 
@@ -302,7 +310,8 @@ pub fn batch_create_entries(
         records.push(record);
     }
 
-    write_vault(vault_path, header, &records)?;
+    let mac_key = engine.vault_mac_key()?;
+    write_vault_authenticated(vault_path, header, &records, &mac_key)?;
 
     Ok(ImportResult {
         imported,

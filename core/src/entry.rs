@@ -9,7 +9,7 @@ use crate::{
     vault::{
         format::{generate_entry_padding, EntryRecord, RECORD_TYPE_ENTRY},
         reader::{read_vault, read_vault_with_attachments},
-        writer::{write_vault, write_vault_with_attachments},
+        writer::{write_vault_authenticated, write_vault_with_attachments_authenticated},
     },
 };
 use serde::{Deserialize, Serialize};
@@ -366,7 +366,8 @@ pub fn create_entry(
     // Step 8: read-modify-write vault.
     let (header, mut entries) = read_vault(vault_path)?;
     entries.push(record);
-    write_vault(vault_path, header, &entries)?;
+    let mac_key = engine.vault_mac_key()?;
+    write_vault_authenticated(vault_path, header, &entries, &mac_key)?;
 
     Ok(uuid)
 }
@@ -498,7 +499,8 @@ pub fn update_entry(
     record.content_hmac = content_hmac;
     record.updated_at = now;
 
-    write_vault(vault_path, header, &entries)?;
+    let mac_key = engine.vault_mac_key()?;
+    write_vault_authenticated(vault_path, header, &entries, &mac_key)?;
     Ok(())
 }
 
@@ -539,7 +541,14 @@ pub fn delete_entry(
         }
     }
 
-    write_vault_with_attachments(vault_path, header, &entries, &kept_attachments)?;
+    let mac_key = engine.vault_mac_key()?;
+    write_vault_with_attachments_authenticated(
+        vault_path,
+        header,
+        &entries,
+        &kept_attachments,
+        &mac_key,
+    )?;
 
     if let Some(vault_dir) = vault_path.parent() {
         for blob_uuid in removed_blobs.difference(&kept_blobs) {

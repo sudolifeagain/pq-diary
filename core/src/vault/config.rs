@@ -164,14 +164,25 @@ impl VaultConfig {
 
     /// Serialise this [`VaultConfig`] as pretty TOML and write it to `path`.
     ///
+    /// On Unix the file permission is set to `0o600` after writing so that other
+    /// local users cannot read the vault metadata — Argon2 parameters, vault
+    /// name, git author identity, and the base64 legacy verification token
+    /// (REQ-611, audit M1). This matches [`AppConfig::to_file`]. On Windows the
+    /// default ACL (owner-only inside the user profile) is left untouched.
+    ///
     /// # Errors
     ///
     /// Returns [`DiaryError::Config`] on serialisation failures and
-    /// [`DiaryError::Io`] on file-write failures.
+    /// [`DiaryError::Io`] on file-write or permission-set failures.
     pub fn to_file(&self, path: &Path) -> Result<(), DiaryError> {
         let content =
             toml::to_string_pretty(self).map_err(|e| DiaryError::Config(e.to_string()))?;
         std::fs::write(path, content)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
         Ok(())
     }
 }

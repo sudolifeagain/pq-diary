@@ -70,8 +70,13 @@ mod tests {
             "schema_version must equal SCHEMA_VERSION"
         );
 
-        // Flags are reserved and must be 0.
-        assert_eq!(header.flags, 0, "flags must be 0 (reserved)");
+        // S15: init_vault now writes an authenticated vault, so the integrity
+        // flag must be set (and no other flag bits).
+        assert_eq!(
+            header.flags,
+            crate::vault::format::FLAG_INTEGRITY,
+            "flags must have FLAG_INTEGRITY set after authenticated init_vault"
+        );
 
         // Salts are randomly generated — verify they are non-zero.
         assert_ne!(

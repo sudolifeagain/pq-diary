@@ -13,8 +13,10 @@ use rand::{Rng, RngCore};
 use crate::error::DiaryError;
 use crate::vault::config::VaultConfig;
 use crate::vault::format::EntryRecord;
-use crate::vault::reader::read_vault;
-use crate::vault::writer::write_vault;
+use crate::vault::reader::{read_vault, verify_vault_integrity};
+use crate::vault::writer::{
+    write_vault_authenticated, write_vault_authenticated_with_extra_padding,
+};
 
 // =============================================================================
 // Types
@@ -208,6 +210,15 @@ pub fn git_init(vault_dir: &Path, remote: Option<&str>) -> Result<(), DiaryError
             file.sync_all()
                 .map_err(|e| DiaryError::Git(format!("failed to sync temp file: {e}")))?;
         }
+        // Owner-only on Unix so the rename does not re-expose vault.toml at 0644
+        // (audit M1; mirrors VaultConfig::to_file and set_policy).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600)).map_err(
+                |e| DiaryError::Git(format!("failed to set vault.toml permissions: {e}")),
+            )?;
+        }
         if let Err(e) = std::fs::rename(&tmp_path, &toml_path) {
             let _ = std::fs::remove_file(&tmp_path);
             return Err(DiaryError::Io(e));
@@ -327,15 +338,16 @@ pub fn generate_extra_padding(max_bytes: usize) -> zeroize::Zeroizing<Vec<u8>> {
 ///
 /// 1. Verifies `.git` directory exists in `vault_dir` (`EDGE-003` if absent).
 /// 2. Verifies at least one remote is configured (`EDGE-002` if absent).
-/// 3. Re-writes `vault_path` with new random padding — makes binary diffs
-///    across commits unpredictable (REQ-013, REQ-016).
-/// 4. Optionally appends extra random bytes when
-///    `config.git.privacy.extra_padding_bytes_max > 0` (REQ-054).
-/// 5. Computes a fuzzed commit timestamp via [`fuzz_timestamp`] (REQ-014).
-/// 6. Stages only `vault.pqd`, `vault.toml`, and `.gitignore` (REQ-010).
-/// 7. Commits with the anonymous author from `config.git` and a fixed
+/// 3. Verifies the authenticated vault before parsing records.
+/// 4. Re-writes `vault_path` with new authenticated random padding — makes
+///    binary diffs across commits unpredictable (REQ-013, REQ-016).
+/// 5. Optionally adds extra random padding inside the authenticated region
+///    when `config.git.privacy.extra_padding_bytes_max > 0` (REQ-054).
+/// 6. Computes a fuzzed commit timestamp via [`fuzz_timestamp`] (REQ-014).
+/// 7. Stages only `vault.pqd`, `vault.toml`, and `.gitignore` (REQ-010).
+/// 8. Commits with the anonymous author from `config.git` and a fixed
 ///    commit message (REQ-011, REQ-012, REQ-017).
-/// 8. Pushes the current branch to `origin` (REQ-010).
+/// 9. Pushes the current branch to `origin` (REQ-010).
 ///
 /// # Errors
 ///
@@ -348,6 +360,7 @@ pub fn git_push(
     vault_dir: &Path,
     config: &VaultConfig,
     vault_path: &Path,
+    mac_key: &[u8; 32],
 ) -> Result<(), DiaryError> {
     // Step 1: .git directory must exist (EDGE-003).
     if !vault_dir.join(".git").exists() {
@@ -368,32 +381,16 @@ pub fn git_push(
         ));
     }
 
-    // Step 3: Re-write vault.pqd with new random padding (REQ-013, REQ-016).
-    // Decryption is not required — EntryRecords are passed through unchanged.
+    // Step 3: Verify then re-write vault.pqd with authenticated random padding
+    // (REQ-013, REQ-016). Decryption is not required — EntryRecords are passed
+    // through unchanged.
     {
+        verify_vault_integrity(vault_path, mac_key)?;
         let (header, entries) = read_vault(vault_path)?;
-        write_vault(vault_path, header, &entries)?;
-    }
-
-    // Step 3b: Append extra padding when configured (REQ-054).
-    let extra_max = config.git.privacy.extra_padding_bytes_max;
-    if extra_max > 0 {
-        let extra = generate_extra_padding(extra_max);
-        if !extra.is_empty() {
-            use std::io::Write as IoWrite;
-            let mut file = std::fs::OpenOptions::new()
-                .append(true)
-                .open(vault_path)
-                .map_err(|e| {
-                    DiaryError::Git(format!("failed to open vault.pqd for extra padding: {e}"))
-                })?;
-            file.write_all(&extra).map_err(|e| {
-                DiaryError::Git(format!("failed to append extra padding to vault.pqd: {e}"))
-            })?;
-            file.sync_all().map_err(|e| {
-                DiaryError::Git(format!("failed to flush extra padding to disk: {e}"))
-            })?;
-        }
+        let extra = generate_extra_padding(config.git.privacy.extra_padding_bytes_max);
+        write_vault_authenticated_with_extra_padding(
+            vault_path, header, &entries, mac_key, &extra,
+        )?;
     }
 
     // Step 4: Compute fuzzed author/committer timestamp (REQ-014).
@@ -463,9 +460,9 @@ pub fn git_push(
 /// 3. Count commits ahead on the remote tracking branch.
 ///    * If count == 0: delete backup and return a no-op [`MergeResult`].
 /// 4. `git checkout <tracking_ref> -- vault.pqd` to get the remote version.
-/// 5. Parse remote [`EntryRecord`]s from the overwritten `vault_path`.
+/// 5. Verify and parse remote [`EntryRecord`]s from the overwritten `vault_path`.
 /// 6. Restore `vault_path` from backup (local version).
-/// 7. Parse local [`EntryRecord`]s.
+/// 7. Verify and parse local [`EntryRecord`]s.
 /// 8. Merge by UUID:
 ///    - Local-only UUID → keep.
 ///    - Remote-only UUID → add (`MergeResult.added++`).
@@ -477,7 +474,7 @@ pub fn git_push(
 ///      → true conflict.  When `claude_mode` is `true`, local wins silently.
 ///      Otherwise the conflict is recorded in `MergeResult.conflicts` and
 ///      local is used as the provisional resolution.
-/// 9. Write merged records atomically via [`write_vault`].
+/// 9. Write merged records atomically with an authenticated vault MAC.
 /// 10. `git add vault.pqd` + `git commit` with the privacy pipeline from
 ///     `config.git`.
 /// 11. Delete backup on success; restore backup on error.
@@ -489,6 +486,7 @@ pub fn git_pull_merge(
     vault_dir: &Path,
     config: &VaultConfig,
     vault_path: &Path,
+    mac_key: &[u8; 32],
     claude_mode: bool,
 ) -> Result<MergeResult, DiaryError> {
     if !vault_dir.join(".git").exists() {
@@ -499,6 +497,7 @@ pub fn git_pull_merge(
     if !vault_path.exists() {
         return Err(DiaryError::Git("vault.pqd does not exist".to_string()));
     }
+    verify_vault_integrity(vault_path, mac_key)?;
 
     // Create backup: vault.pqd → vault.pqd.bak
     let bak_name = format!(
@@ -509,7 +508,14 @@ pub fn git_pull_merge(
     std::fs::copy(vault_path, &bak_path)
         .map_err(|e| DiaryError::Git(format!("failed to create vault backup: {e}")))?;
 
-    let result = git_pull_merge_inner(vault_dir, config, vault_path, &bak_path, claude_mode);
+    let result = git_pull_merge_inner(
+        vault_dir,
+        config,
+        vault_path,
+        &bak_path,
+        mac_key,
+        claude_mode,
+    );
 
     match &result {
         Ok(_) => {
@@ -540,6 +546,7 @@ fn git_pull_merge_inner(
     config: &VaultConfig,
     vault_path: &Path,
     bak_path: &Path,
+    mac_key: &[u8; 32],
     claude_mode: bool,
 ) -> Result<MergeResult, DiaryError> {
     // 1. Fetch from origin.
@@ -588,14 +595,18 @@ fn git_pull_merge_inner(
         )));
     }
 
-    // 5. Read remote entries.
+    // 5. Verify and read remote entries.
+    verify_vault_integrity(vault_path, mac_key)
+        .map_err(|e| DiaryError::Git(format!("remote vault.pqd failed integrity check: {e}")))?;
     let (_remote_header, remote_entries) = read_vault(vault_path)
         .map_err(|e| DiaryError::Git(format!("failed to read remote vault.pqd: {e}")))?;
 
     // 6. Restore the local vault.pqd from backup.
     std::fs::copy(bak_path, vault_path).map_err(DiaryError::Io)?;
 
-    // 7. Read local entries.
+    // 7. Verify and read local entries.
+    verify_vault_integrity(vault_path, mac_key)
+        .map_err(|e| DiaryError::Git(format!("local vault.pqd failed integrity check: {e}")))?;
     let (local_header, local_entries) = read_vault(vault_path)
         .map_err(|e| DiaryError::Git(format!("failed to read local vault.pqd: {e}")))?;
 
@@ -655,8 +666,8 @@ fn git_pull_merge_inner(
         }
     }
 
-    // 9. Atomically write merged entries (REQ-028).
-    write_vault(vault_path, local_header, &merged)?;
+    // 9. Atomically write merged entries with a vault-level MAC (REQ-028).
+    write_vault_authenticated(vault_path, local_header, &merged, mac_key)?;
 
     // 10. Stage and commit with the privacy pipeline.
     let add_out = run_git_command(vault_dir, &["add", "vault.pqd"])?;
@@ -787,6 +798,8 @@ fn run_git_command(vault_dir: &Path, args: &[&str]) -> Result<std::process::Outp
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    const TEST_MAC_KEY: [u8; 32] = [0x42; 32];
 
     /// TC-S8-074-01: check_git_available succeeds in a git-installed environment.
     #[test]
@@ -1300,7 +1313,7 @@ mod tests {
 
         let before = std::fs::read(&vault_path).expect("read vault before");
 
-        let result = git_push(&vault_dir, &config, &vault_path);
+        let result = git_push(&vault_dir, &config, &vault_path, &TEST_MAC_KEY);
         assert!(result.is_ok(), "git_push failed: {:?}", result);
 
         let after = std::fs::read(&vault_path).expect("read vault after");
@@ -1308,6 +1321,8 @@ mod tests {
             before, after,
             "vault.pqd must have different bytes after git_push (random padding regenerated)"
         );
+        verify_vault_integrity(&vault_path, &TEST_MAC_KEY)
+            .expect("git_push output must retain vault MAC integrity");
     }
 
     /// TC-S8-076-02: git_push() commits with the anonymous author from vault.toml.
@@ -1318,7 +1333,7 @@ mod tests {
         let config = make_git_push_config(anon_name, anon_email, "Update vault", 0, 0);
         let (_tmp, vault_dir, vault_path) = setup_vault_with_remote(&config);
 
-        let result = git_push(&vault_dir, &config, &vault_path);
+        let result = git_push(&vault_dir, &config, &vault_path, &TEST_MAC_KEY);
         assert!(result.is_ok(), "git_push failed: {:?}", result);
 
         let out = std::process::Command::new("git")
@@ -1348,7 +1363,7 @@ mod tests {
         let config = make_git_push_config("anon", "tc03@localhost", expected_msg, 0, 0);
         let (_tmp, vault_dir, vault_path) = setup_vault_with_remote(&config);
 
-        let result = git_push(&vault_dir, &config, &vault_path);
+        let result = git_push(&vault_dir, &config, &vault_path, &TEST_MAC_KEY);
         assert!(result.is_ok(), "git_push failed: {:?}", result);
 
         let out = std::process::Command::new("git")
@@ -1375,7 +1390,7 @@ mod tests {
 
         let before_push = Utc::now();
 
-        let result = git_push(&vault_dir, &config, &vault_path);
+        let result = git_push(&vault_dir, &config, &vault_path, &TEST_MAC_KEY);
         assert!(result.is_ok(), "git_push failed: {:?}", result);
         let after_push = Utc::now();
 
@@ -1408,7 +1423,7 @@ mod tests {
         let config0 = make_git_push_config("anon", "tc04b@localhost", "Update vault", 0, 0);
         let (_tmp2, vault_dir2, vault_path2) = setup_vault_with_remote(&config0);
         let t_before = Utc::now();
-        let result2 = git_push(&vault_dir2, &config0, &vault_path2);
+        let result2 = git_push(&vault_dir2, &config0, &vault_path2, &TEST_MAC_KEY);
         assert!(result2.is_ok(), "git_push (fuzz=0) failed: {:?}", result2);
         let t_after = Utc::now();
 
@@ -1438,7 +1453,7 @@ mod tests {
         let config = make_git_push_config("anon", "tc05@localhost", "Update vault", 0, 0);
         let (_tmp, vault_dir, vault_path) = setup_vault_with_remote(&config);
 
-        let result = git_push(&vault_dir, &config, &vault_path);
+        let result = git_push(&vault_dir, &config, &vault_path, &TEST_MAC_KEY);
         assert!(result.is_ok(), "git_push failed: {:?}", result);
 
         // vault.pqd must still be parseable (no format corruption from extra bytes).
@@ -1473,7 +1488,7 @@ mod tests {
 
         let config = make_git_push_config("anon", "tc06@localhost", "Update vault", 0, 0);
 
-        let result = git_push(&vault_dir, &config, &vault_path);
+        let result = git_push(&vault_dir, &config, &vault_path, &TEST_MAC_KEY);
         assert!(result.is_err(), "expected Err for missing .git, got Ok");
 
         match result {
@@ -1514,7 +1529,7 @@ mod tests {
             .expect("git init");
         assert!(out.status.success(), "git init failed");
 
-        let result = git_push(&vault_dir, &config, &vault_path);
+        let result = git_push(&vault_dir, &config, &vault_path, &TEST_MAC_KEY);
         assert!(result.is_err(), "expected Err for missing remote, got Ok");
 
         match result {
@@ -1544,7 +1559,7 @@ mod tests {
         std::fs::write(entries_dir.join("secret.txt"), b"should not be committed")
             .expect("write entries/secret.txt");
 
-        let result = git_push(&vault_dir, &config, &vault_path);
+        let result = git_push(&vault_dir, &config, &vault_path, &TEST_MAC_KEY);
         assert!(result.is_ok(), "git_push failed: {:?}", result);
 
         // Inspect which files appeared in the last commit.
@@ -1723,7 +1738,7 @@ mod tests {
 
         let before = std::fs::read(&vault_path).expect("read vault before");
 
-        let result = git_pull_merge(&vault_dir, &config, &vault_path, false);
+        let result = git_pull_merge(&vault_dir, &config, &vault_path, &TEST_MAC_KEY, false);
         assert!(result.is_ok(), "expected Ok, got: {:?}", result);
 
         let mr = result.unwrap();
@@ -1759,7 +1774,7 @@ mod tests {
         let (_tmp, vault_dir, vault_path, config) =
             setup_pull_test(&remote_entries, &[] /* local: empty */);
 
-        let result = git_pull_merge(&vault_dir, &config, &vault_path, false);
+        let result = git_pull_merge(&vault_dir, &config, &vault_path, &TEST_MAC_KEY, false);
         assert!(result.is_ok(), "expected Ok, got: {:?}", result);
 
         let mr = result.unwrap();
@@ -1784,7 +1799,7 @@ mod tests {
         let (_tmp, vault_dir, vault_path, config) =
             setup_pull_test(&[] /* remote: empty */, &local_entries);
 
-        let result = git_pull_merge(&vault_dir, &config, &vault_path, false);
+        let result = git_pull_merge(&vault_dir, &config, &vault_path, &TEST_MAC_KEY, false);
         assert!(result.is_ok(), "expected Ok, got: {:?}", result);
 
         let mr = result.unwrap();
@@ -1809,7 +1824,7 @@ mod tests {
         let (_tmp, vault_dir, vault_path, config) =
             setup_pull_test(&remote_entries, &[] /* local: empty */);
 
-        let result = git_pull_merge(&vault_dir, &config, &vault_path, false);
+        let result = git_pull_merge(&vault_dir, &config, &vault_path, &TEST_MAC_KEY, false);
         assert!(result.is_ok(), "expected Ok, got: {:?}", result);
 
         let mr = result.unwrap();
@@ -1833,7 +1848,7 @@ mod tests {
         let (_tmp, vault_dir, vault_path, config) =
             setup_pull_test(std::slice::from_ref(&uuid_c), std::slice::from_ref(&uuid_c));
 
-        let result = git_pull_merge(&vault_dir, &config, &vault_path, false);
+        let result = git_pull_merge(&vault_dir, &config, &vault_path, &TEST_MAC_KEY, false);
         assert!(result.is_ok(), "expected Ok, got: {:?}", result);
 
         let mr = result.unwrap();
@@ -1860,7 +1875,7 @@ mod tests {
             std::slice::from_ref(&uuid_d_local),
         );
 
-        let result_a = git_pull_merge(&vault_dir_a, &config_a, &vault_path_a, false);
+        let result_a = git_pull_merge(&vault_dir_a, &config_a, &vault_path_a, &TEST_MAC_KEY, false);
         assert!(result_a.is_ok(), "subcase A failed: {:?}", result_a);
         let mr_a = result_a.unwrap();
         assert_eq!(mr_a.updated, 1, "subcase A: updated must be 1");
@@ -1885,7 +1900,7 @@ mod tests {
             std::slice::from_ref(&uuid_d_local2),
         );
 
-        let result_b = git_pull_merge(&vault_dir_b, &config_b, &vault_path_b, false);
+        let result_b = git_pull_merge(&vault_dir_b, &config_b, &vault_path_b, &TEST_MAC_KEY, false);
         assert!(result_b.is_ok(), "subcase B failed: {:?}", result_b);
         let mr_b = result_b.unwrap();
         assert_eq!(mr_b.updated, 1, "subcase B: updated must be 1");
@@ -1916,7 +1931,7 @@ mod tests {
         );
 
         // claude_mode = true → auto-resolve with local-wins.
-        let result = git_pull_merge(&vault_dir, &config, &vault_path, true);
+        let result = git_pull_merge(&vault_dir, &config, &vault_path, &TEST_MAC_KEY, true);
         assert!(result.is_ok(), "expected Ok, got: {:?}", result);
 
         let mr = result.unwrap();
@@ -1941,7 +1956,10 @@ mod tests {
     /// TC-S8-077-08: merged vault.pqd is readable and valid after merge (REQ-028).
     #[test]
     fn tc_s8_077_08_merged_vault_is_readable() {
-        use crate::vault::reader::read_vault as rv;
+        use crate::vault::{
+            format::FLAG_INTEGRITY,
+            reader::{read_header, read_vault as rv},
+        };
 
         let uuid_a = make_entry(0xA0, 0x01, 100);
         let uuid_b = make_entry(0xB0, 0x02, 200);
@@ -1950,7 +1968,7 @@ mod tests {
         let (_tmp, vault_dir, vault_path, config) =
             setup_pull_test(std::slice::from_ref(&uuid_b), std::slice::from_ref(&uuid_a));
 
-        let result = git_pull_merge(&vault_dir, &config, &vault_path, false);
+        let result = git_pull_merge(&vault_dir, &config, &vault_path, &TEST_MAC_KEY, false);
         assert!(result.is_ok(), "expected Ok, got: {:?}", result);
 
         // vault.pqd must parse without errors (write_vault produced a valid file).
@@ -1963,6 +1981,17 @@ mod tests {
 
         let (_, entries) = parse_result.unwrap();
         assert_eq!(entries.len(), 2, "merged vault must have 2 entries");
+
+        verify_vault_integrity(&vault_path, &TEST_MAC_KEY)
+            .expect("git_pull_merge output must retain vault MAC integrity");
+
+        let mut file = std::fs::File::open(&vault_path).expect("open merged vault");
+        let header = read_header(&mut file).expect("read merged header");
+        assert_ne!(
+            header.flags & FLAG_INTEGRITY,
+            0,
+            "merged vault must set FLAG_INTEGRITY"
+        );
     }
 
     /// TC-S8-077-09: vault.pqd.bak is deleted after a successful merge.
@@ -1972,7 +2001,7 @@ mod tests {
 
         let (_tmp, vault_dir, vault_path, config) = setup_pull_test(&[uuid_b], &[]);
 
-        let result = git_pull_merge(&vault_dir, &config, &vault_path, false);
+        let result = git_pull_merge(&vault_dir, &config, &vault_path, &TEST_MAC_KEY, false);
         assert!(result.is_ok(), "expected Ok, got: {:?}", result);
 
         let bak_path = vault_path.with_file_name("vault.pqd.bak");

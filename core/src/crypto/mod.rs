@@ -27,6 +27,23 @@ pub use secure_mem::{CryptoEngine, MasterKey, SecureBuffer, ZeroizingKey};
 
 use crate::error::DiaryError;
 use secrecy::{ExposeSecret, SecretBox};
+use zeroize::Zeroizing;
+
+/// Domain-separation context for the vault-level integrity MAC subkey.
+///
+/// The subkey is `HMAC-SHA256(sym_key, VAULT_MAC_CONTEXT)`, kept distinct from
+/// the per-record `content_hmac` (which keys directly on `sym_key`) so the two
+/// MACs can never be confused or cross-replayed.
+const VAULT_MAC_CONTEXT: &[u8] = b"pq-diary/vault-integrity/v1";
+
+/// Derive the vault-level MAC subkey from a 32-byte symmetric master key.
+///
+/// Used by both [`CryptoEngine::vault_mac_key`] and the few write paths that
+/// hold the raw `sym_key` directly (vault init, password rotation) before an
+/// engine is constructed. The returned key zeroizes on drop.
+pub fn derive_vault_mac_key(sym_key: &[u8; 32]) -> Result<Zeroizing<[u8; 32]>, DiaryError> {
+    Ok(Zeroizing::new(hmac_util::compute(sym_key, VAULT_MAC_CONTEXT)?))
+}
 
 impl CryptoEngine {
     /// Unlock the engine using the given password.
@@ -294,6 +311,15 @@ impl CryptoEngine {
     pub fn hmac_verify(&self, data: &[u8], expected: &[u8; 32]) -> Result<bool, DiaryError> {
         let mk = self.expose_master_key()?;
         hmac_util::verify_hmac(&mk.sym_key, data, expected)
+    }
+
+    /// Derive the vault-level integrity MAC subkey from the engine's master key.
+    ///
+    /// Returns [`DiaryError::NotUnlocked`] if the engine has not been unlocked.
+    /// The returned key zeroizes on drop; callers must not persist it.
+    pub fn vault_mac_key(&self) -> Result<Zeroizing<[u8; 32]>, DiaryError> {
+        let mk = self.expose_master_key()?;
+        derive_vault_mac_key(&mk.sym_key)
     }
 
     /// Expose the master key for internal use, returning [`DiaryError::NotUnlocked`] if locked.

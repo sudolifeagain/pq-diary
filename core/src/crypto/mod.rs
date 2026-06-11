@@ -18,7 +18,7 @@ pub mod hmac_util;
 pub mod kdf;
 /// ML-KEM-768 key encapsulation mechanism (FIPS 203).
 pub mod kem;
-/// Password strength policy (minimum length + common-password rejection).
+/// Password strength assessment for newly chosen passwords.
 pub mod password_policy;
 /// Secure memory types: `SecureBuffer`, `ZeroizingKey`, `MasterKey`, `CryptoEngine`.
 pub mod secure_mem;

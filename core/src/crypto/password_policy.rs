@@ -3,26 +3,21 @@
 //! The whole vault's confidentiality rests on the master password feeding
 //! Argon2id, so a weak password defeats every other control regardless of how
 //! quantum-resistant the primitives are. This module provides a *pure*
-//! evaluation of a candidate password; the `cli/` crate enforces it at every
+//! evaluation of a candidate password; the `cli/` crate displays it at every
 //! point where a user *chooses* a password (`vault create`, `init`,
 //! `change-password`). Existing passwords are never re-evaluated — only newly
 //! chosen ones — so upgrading the binary never locks anyone out.
 //!
 //! The policy is intentionally minimal and offline (no breach-corpus lookup):
-//! a hard length floor plus a small list of trivially-guessable passwords are
-//! rejected outright; everything else short of the recommendation produces a
-//! non-fatal advisory the CLI prints to stderr.
+//! a recommended length floor plus a small list of trivially-guessable
+//! passwords are marked weak. It intentionally avoids composition rules.
 
-/// Minimum acceptable password length in Unicode scalar values (NIST SP
-/// 800-63B floor for user-chosen secrets).
-pub const MIN_LENGTH: usize = 8;
-
-/// Recommended minimum length. Passwords between [`MIN_LENGTH`] and this length
-/// are accepted but trigger an advisory.
-pub const RECOMMENDED_LENGTH: usize = 12;
+/// Recommended password length in Unicode scalar values (NIST SP 800-63B
+/// Rev.4 single-factor password floor for user-chosen secrets).
+pub const RECOMMENDED_MIN_LENGTH: usize = 15;
 
 /// A small blacklist of trivially-guessable passwords, compared
-/// case-insensitively. These are rejected outright (`acceptable == false`).
+/// case-insensitively. These are marked weak.
 const COMMON_PASSWORDS: &[&str] = &[
     "password",
     "password1",
@@ -40,16 +35,41 @@ const COMMON_PASSWORDS: &[&str] = &[
     "welcome1",
     "abc12345",
     "changeme",
+    "passwordpassword",
+    "qwertyqwertyqwerty",
 ];
+
+/// Coarse password strength displayed by the CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Strength {
+    /// The password is usable if the user explicitly accepts the risk, but it
+    /// is not recommended for a pq-diary vault.
+    Weak,
+    /// The password meets the local recommendation.
+    Recommended,
+}
+
+impl Strength {
+    /// User-facing label for CLI output.
+    pub fn label(self) -> &'static str {
+        match self {
+            Strength::Weak => "weak",
+            Strength::Recommended => "recommended",
+        }
+    }
+
+    /// Whether this strength needs a non-recommended warning.
+    pub fn is_weak(self) -> bool {
+        matches!(self, Strength::Weak)
+    }
+}
 
 /// Result of evaluating a candidate password against the policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Assessment {
-    /// `true` when the password clears the hard policy floor (length +
-    /// not-blacklisted). The CLI refuses to proceed when this is `false`.
-    pub acceptable: bool,
-    /// Non-fatal advisories. Present even when `acceptable` is `true` (e.g. a
-    /// 9-character all-lowercase password is accepted but advised against).
+    /// Coarse strength displayed by the CLI.
+    pub strength: Strength,
+    /// Non-fatal advisories explaining weak ratings.
     pub warnings: Vec<String>,
 }
 
@@ -61,118 +81,86 @@ pub struct Assessment {
 pub fn assess(password: &str) -> Assessment {
     let len = password.chars().count();
     let mut warnings = Vec::new();
-    let mut acceptable = true;
 
-    if len < MIN_LENGTH {
-        acceptable = false;
+    if len < RECOMMENDED_MIN_LENGTH {
         warnings.push(format!(
-            "too short — use at least {MIN_LENGTH} characters (got {len})"
-        ));
-    } else if len < RECOMMENDED_LENGTH {
-        warnings.push(format!(
-            "consider using at least {RECOMMENDED_LENGTH} characters for stronger protection"
+            "shorter than recommended — use at least {RECOMMENDED_MIN_LENGTH} characters (got {len})"
         ));
     }
 
-    // Character-class diversity is only advisory and only meaningful once the
-    // length floor is met (a short password is rejected on length alone).
-    if len >= MIN_LENGTH && character_classes(password) < 2 {
+    // Trivially-guessable passwords are marked weak regardless of length.
+    let lowered = password.to_lowercase();
+    if COMMON_PASSWORDS.contains(&lowered.as_str()) {
         warnings.push(
-            "mix character types (lowercase, uppercase, digits, symbols) for stronger protection"
-                .to_string(),
+            "this is a commonly-used password and is trivially guessable".to_string(),
         );
     }
 
-    // Trivially-guessable passwords are rejected regardless of length.
-    let lowered = password.to_lowercase();
-    if COMMON_PASSWORDS.contains(&lowered.as_str()) {
-        acceptable = false;
-        warnings.push("this is a commonly-used password and is trivially guessable".to_string());
-    }
+    let strength = if warnings.is_empty() {
+        Strength::Recommended
+    } else {
+        Strength::Weak
+    };
 
     Assessment {
-        acceptable,
+        strength,
         warnings,
     }
-}
-
-/// Count how many of {lowercase, uppercase, digit, other} appear in `s`.
-fn character_classes(s: &str) -> u8 {
-    let mut lower = false;
-    let mut upper = false;
-    let mut digit = false;
-    let mut other = false;
-    for c in s.chars() {
-        if c.is_ascii_digit() {
-            digit = true;
-        } else if c.is_lowercase() {
-            lower = true;
-        } else if c.is_uppercase() {
-            upper = true;
-        } else {
-            other = true;
-        }
-    }
-    u8::from(lower) + u8::from(upper) + u8::from(digit) + u8::from(other)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// TC-PWPOL-01: a password below the floor is rejected with a length warning.
+    /// TC-PWPOL-01: a password below the recommendation is marked weak.
     #[test]
-    fn tc_pwpol_01_short_password_rejected() {
-        let a = assess("New456!"); // 7 chars
-        assert!(!a.acceptable, "7-char password must be rejected");
+    fn tc_pwpol_01_short_password_is_weak() {
+        let a = assess("FourteenChars!"); // 14 chars
+        assert_eq!(a.strength, Strength::Weak, "14-char password is weak");
         assert!(
-            a.warnings.iter().any(|w| w.contains("too short")),
-            "expected a too-short advisory, got {:?}",
+            a.warnings.iter().any(|w| w.contains("shorter than recommended")),
+            "expected a length advisory, got {:?}",
             a.warnings
         );
     }
 
-    /// TC-PWPOL-02: exactly MIN_LENGTH clears the floor.
+    /// TC-PWPOL-02: exactly RECOMMENDED_MIN_LENGTH clears the recommendation.
     #[test]
-    fn tc_pwpol_02_min_length_accepted() {
-        let a = assess("Test123!"); // 8 chars, 4 classes
-        assert!(a.acceptable, "8-char strong password must be accepted");
+    fn tc_pwpol_02_recommended_min_length() {
+        let a = assess("FifteenChars!!?"); // 15 chars
+        assert_eq!(a.strength, Strength::Recommended);
         assert!(
-            a.warnings.is_empty() || !a.warnings.iter().any(|w| w.contains("too short")),
-            "must not warn about length at the floor: {:?}",
+            a.warnings.is_empty(),
+            "must not warn at the recommendation: {:?}",
             a.warnings
         );
     }
 
-    /// TC-PWPOL-03: an accepted-but-short password still advises a longer one.
+    /// TC-PWPOL-03: composition rules are not applied to accepted passwords.
     #[test]
-    fn tc_pwpol_03_below_recommended_warns_but_accepts() {
-        let a = assess("Ab3$xyzq"); // 8 chars, < RECOMMENDED_LENGTH
-        assert!(a.acceptable);
-        assert!(
-            a.warnings.iter().any(|w| w.contains("at least 12")),
-            "expected a recommend-12 advisory, got {:?}",
-            a.warnings
-        );
-    }
-
-    /// TC-PWPOL-04: a long single-class password is accepted but flagged for diversity.
-    #[test]
-    fn tc_pwpol_04_low_diversity_warns_but_accepts() {
+    fn tc_pwpol_03_single_class_accepted_without_advisory() {
         let a = assess("abcdefghijklmnop"); // 16 lowercase
-        assert!(a.acceptable, "long password must clear the floor");
+        assert_eq!(a.strength, Strength::Recommended);
         assert!(
-            a.warnings.iter().any(|w| w.contains("mix character types")),
-            "expected a diversity advisory, got {:?}",
+            a.warnings.is_empty(),
+            "composition rules must not produce advisories, got {:?}",
             a.warnings
         );
     }
 
-    /// TC-PWPOL-05: a strong long password produces no warnings.
+    /// TC-PWPOL-04: a passphrase longer than the recommendation is recommended.
+    #[test]
+    fn tc_pwpol_04_long_passphrase_accepted() {
+        let a = assess("correct horse staple phrase");
+        assert_eq!(a.strength, Strength::Recommended);
+        assert!(a.warnings.is_empty(), "got {:?}", a.warnings);
+    }
+
+    /// TC-PWPOL-05: a recommended long password produces no warnings.
     #[test]
     fn tc_pwpol_05_strong_password_no_warnings() {
         let a = assess("Tr0ub4dour&3xtra");
-        assert!(a.acceptable);
+        assert_eq!(a.strength, Strength::Recommended);
         assert!(
             a.warnings.is_empty(),
             "strong password must have no advisories, got {:?}",
@@ -180,31 +168,28 @@ mod tests {
         );
     }
 
-    /// TC-PWPOL-06: a blacklisted password is rejected even when long enough.
+    /// TC-PWPOL-06: a blacklisted password is weak even when long enough.
     #[test]
-    fn tc_pwpol_06_common_password_rejected() {
-        for pw in ["password", "PASSWORD", "Password1", "12345678", "changeme"] {
+    fn tc_pwpol_06_common_password_is_weak() {
+        for pw in ["password", "PASSWORDPASSWORD", "qwertyqwertyqwerty"] {
             let a = assess(pw);
-            assert!(!a.acceptable, "{pw:?} must be rejected as common");
+            assert_eq!(a.strength, Strength::Weak, "{pw:?} must be weak");
         }
     }
 
-    /// TC-PWPOL-07: empty password is rejected (length floor); callers may
+    /// TC-PWPOL-07: empty password is weak (callers still reject empty earlier).
     /// special-case empty earlier for a clearer message.
     #[test]
-    fn tc_pwpol_07_empty_rejected() {
+    fn tc_pwpol_07_empty_is_weak() {
         let a = assess("");
-        assert!(!a.acceptable);
+        assert_eq!(a.strength, Strength::Weak);
     }
 
     /// TC-PWPOL-08: a multibyte (Japanese) passphrase is measured by scalar
-    /// count, not bytes, so a 9-character phrase clears the 8-char floor.
+    /// count, not bytes, so a 15-character phrase clears the 15-char floor.
     #[test]
     fn tc_pwpol_08_multibyte_counts_by_char() {
-        let a = assess("パスワード強度試験"); // 9 scalar values
-        assert!(
-            a.acceptable,
-            "9-character multibyte passphrase must clear the floor"
-        );
+        let a = assess("安全な長いパスフレーズ試験用語"); // 15 scalar values
+        assert_eq!(a.strength, Strength::Recommended);
     }
 }

@@ -1,0 +1,65 @@
+# cargo-deny configuration — supply-chain gate for pq-diary.
+#
+# See ADR-0010. The primary control is `[sources]`: the post-quantum crates
+# `ml-kem` / `ml-dsa` are consumed as pinned forks (ADR-0001), and once the
+# keyslot work (S16) lands they become load-bearing for confidentiality. This
+# file pins exactly which git sources are allowed, so CI fails if either fork
+# is silently re-sourced or any other git dependency sneaks into the tree.
+#
+# `advisories` is covered by the separate `cargo audit` CI job; here we add
+# license, duplicate, and source-provenance gating.
+
+[graph]
+all-features = true
+
+# ---------------------------------------------------------------------------
+# Source provenance — the core supply-chain control (audit Medium-1).
+# ---------------------------------------------------------------------------
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+required-git-spec = "rev"
+# Pinned RustCrypto forks (ADR-0001). Revisions are pinned in the Cargo.toml /
+# Cargo.lock; this list only authorises the *origin*. Any other git source,
+# or a change of these origins, fails CI.
+allow-git = [
+  "https://github.com/sudolifeagain/ml-kem",
+  "https://github.com/sudolifeagain/ml-dsa",
+]
+
+# ---------------------------------------------------------------------------
+# Licenses — only permissive licenses common to the Rust ecosystem.
+# A dependency whose license is not listed here fails CI and must be reviewed
+# (add to `allow` with rationale, or add a scoped `exceptions` entry).
+# ---------------------------------------------------------------------------
+[licenses]
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "MPL-2.0",
+  "CC0-1.0",
+  "Unlicense",
+  "0BSD",
+]
+confidence-threshold = 0.8
+# The project itself is GPL-3.0-or-later; keep that license scoped to the
+# workspace crates so GPL dependencies still require explicit review.
+exceptions = [
+  { name = "pq-diary", allow = ["GPL-3.0-or-later"] },
+  { name = "pq-diary-core", allow = ["GPL-3.0-or-later"] },
+]
+
+# ---------------------------------------------------------------------------
+# Bans — surface duplicate versions and wildcard deps (warn, not block).
+# ---------------------------------------------------------------------------
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"

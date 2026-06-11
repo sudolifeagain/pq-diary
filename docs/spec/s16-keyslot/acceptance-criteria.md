@@ -22,6 +22,18 @@
 
 ---
 
+## REQ-105〜106: メタデータ機密化 🟡
+
+### 正常系
+- [ ] **TC-S16-META-01**: v0x07 vault に既知タイムスタンプのエントリを書き、vault.pqd を走査して `created_at`/`updated_at` に相当する平文 LE u64 が露出しない (暗号化ペイロード内のみに存在) 🟡
+- [ ] **TC-S16-META-02**: git pull merge が**復号後の `updated_at`** で last-write-wins を正しく判定する (同一 UUID・新しい updated_at が勝つ) 🟡
+- [ ] **TC-S16-META-03**: `content_hmac` が `K_content_hmac` (sym_key 直接でない) で計算・検証される (REQ-102 内包) 🔵
+
+### 境界値
+- [ ] **TC-S16-META-B01**: 平文に残す構造メタデータ (record_type/各長さ) の改ざんが整合性トレーラ検証で検知される (ADR-0008) 🔵
+
+---
+
 ## REQ-200: スロット共通 🔵
 
 ### 正常系

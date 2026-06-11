@@ -5,7 +5,7 @@
 //! arbitrary error sources can be propagated through the main entry-point.
 
 use crate::editor::{self, EditorConfig};
-use crate::password::get_password;
+use crate::password::{get_password, PasswordSource};
 use crate::Cli;
 use chrono::{DateTime, Local, Utc};
 use pq_diary_core::{DiaryCore, EntryMeta, EntryPlaintext, Tag};
@@ -1899,6 +1899,14 @@ fn cmd_vault_create_impl(
     // Step 3: Get password.
     let password_source =
         get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    if !review_password_choice(
+        password_source.secret().expose_secret(),
+        matches!(password_source, PasswordSource::Tty(_)),
+        reader,
+    )? {
+        println!("キャンセルしました");
+        return Ok(());
+    }
 
     // Step 4: Create vault.
     let base_dir = resolve_vaults_base_dir(cli)?;
@@ -1914,6 +1922,41 @@ fn cmd_vault_create_impl(
         vault_dir.display()
     );
     Ok(())
+}
+
+/// Display the password-strength assessment at password-choice time.
+///
+/// Weak passwords are allowed when the user explicitly chooses to continue.
+/// For non-interactive sources (`--password` / env var), the explicit value is
+/// treated as that choice and only warnings are printed.
+fn review_password_choice(
+    password: &str,
+    confirm_weak: bool,
+    reader: &mut impl std::io::BufRead,
+) -> anyhow::Result<bool> {
+    use std::io::Write as _;
+
+    let assessment = pq_diary_core::crypto::password_policy::assess(password);
+    eprintln!("Password strength: {}", assessment.strength.label());
+    for warning in &assessment.warnings {
+        eprintln!("Warning: password {warning}");
+    }
+    if assessment.strength.is_weak() {
+        eprintln!("Warning: weak passwords are not recommended for pq-diary vaults.");
+        if confirm_weak {
+            eprint!("Use this weak password anyway? [y/N]: ");
+            std::io::stderr()
+                .flush()
+                .map_err(|e| anyhow::anyhow!("Failed to flush stderr: {e}"))?;
+            let mut input = String::new();
+            reader
+                .read_line(&mut input)
+                .map_err(|e| anyhow::anyhow!("Failed to read input: {e}"))?;
+            let trimmed = input.trim();
+            return Ok(trimmed == "y" || trimmed == "Y");
+        }
+    }
+    Ok(true)
 }
 
 /// Execute the `pq-diary vault list` command.
@@ -2478,6 +2521,16 @@ pub fn cmd_init(cli: &Cli) -> anyhow::Result<()> {
     if password_source.secret().expose_secret().is_empty() {
         anyhow::bail!("New password must not be empty");
     }
+    if matches!(password_source, PasswordSource::Tty(_)) {
+        let mut reader = std::io::BufReader::new(std::io::stdin());
+        if !review_password_choice(password_source.secret().expose_secret(), true, &mut reader)? {
+            println!("キャンセルしました");
+            return Ok(());
+        }
+    } else {
+        let mut reader = std::io::Cursor::new(Vec::<u8>::new());
+        review_password_choice(password_source.secret().expose_secret(), false, &mut reader)?;
+    }
 
     std::fs::create_dir_all(&parent_dir)
         .map_err(|e| anyhow::anyhow!("Cannot create config directory: {e}"))?;
@@ -2556,7 +2609,13 @@ pub fn cmd_change_password(cli: &Cli) -> anyhow::Result<()> {
     let new_pwd2 = crate::password::prompt_password("Confirm new password: ")
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    cmd_change_password_impl(cli, old_pwd, new_pwd1, new_pwd2)
+    cmd_change_password_impl(
+        cli,
+        old_pwd,
+        new_pwd1,
+        new_pwd2,
+        &mut std::io::BufReader::new(std::io::stdin()),
+    )
 }
 
 /// Testable implementation of `cmd_change_password`.
@@ -2565,6 +2624,7 @@ fn cmd_change_password_impl(
     old_pwd: secrecy::SecretString,
     new_pwd1: secrecy::SecretString,
     new_pwd2: secrecy::SecretString,
+    reader: &mut impl std::io::BufRead,
 ) -> anyhow::Result<()> {
     use pq_diary_core::vault::change_password::re_encrypt_vault;
     use secrecy::ExposeSecret as _;
@@ -2578,6 +2638,10 @@ fn cmd_change_password_impl(
     }
     if new_pwd1.expose_secret().is_empty() {
         anyhow::bail!("New password must not be empty");
+    }
+    if !review_password_choice(new_pwd1.expose_secret(), true, reader)? {
+        println!("キャンセルしました");
+        return Ok(());
     }
     if old_pwd.expose_secret() == new_pwd1.expose_secret() {
         eprintln!("Warning: New password is identical to old password.");
@@ -9404,7 +9468,8 @@ parallelism = 1
         let base_dir_str = dir.path().to_str().expect("utf8");
 
         // create vault
-        let cli_create = make_vault_mgmt_cli(base_dir_str, Some("testpw"), &["create", "e2evault"]);
+        let cli_create =
+            make_vault_mgmt_cli(base_dir_str, Some("testpassw0rd"), &["create", "e2evault"]);
         let mut reader = std::io::Cursor::new("");
         let result =
             cmd_vault_create_impl(&cli_create, "e2evault", None, &mut reader, |base_dir| {
@@ -10200,11 +10265,13 @@ parallelism = 1
         let vault_dir_str = vault_dir.to_str().expect("utf8");
 
         let cli = make_cli_plain(&["--claude", "-v", vault_dir_str, "change-password"]);
+        let mut reader = std::io::Cursor::new("");
         let err = cmd_change_password_impl(
             &cli,
             secrecy::SecretBox::new(Box::from("Old123!")),
             secrecy::SecretBox::new(Box::from("New456!")),
             secrecy::SecretBox::new(Box::from("New456!")),
+            &mut reader,
         )
         .expect_err("must fail");
         assert!(
@@ -10225,11 +10292,13 @@ parallelism = 1
         let bytes_before = std::fs::read(&pqd).expect("read");
 
         let cli = make_cli_plain(&["-v", vault_dir_str, "change-password"]);
+        let mut reader = std::io::Cursor::new("");
         let err = cmd_change_password_impl(
             &cli,
             secrecy::SecretBox::new(Box::from("Wrong")),
-            secrecy::SecretBox::new(Box::from("New456!")),
-            secrecy::SecretBox::new(Box::from("New456!")),
+            secrecy::SecretBox::new(Box::from("NewPassphrase456!")),
+            secrecy::SecretBox::new(Box::from("NewPassphrase456!")),
+            &mut reader,
         )
         .expect_err("must fail");
         assert!(
@@ -10249,11 +10318,13 @@ parallelism = 1
         let vault_dir_str = vault_dir.to_str().expect("utf8");
 
         let cli = make_cli_plain(&["-v", vault_dir_str, "change-password"]);
+        let mut reader = std::io::Cursor::new("");
         let err = cmd_change_password_impl(
             &cli,
             secrecy::SecretBox::new(Box::from("Old123!")),
             secrecy::SecretBox::new(Box::from("")),
             secrecy::SecretBox::new(Box::from("")),
+            &mut reader,
         )
         .expect_err("must fail");
         assert!(
@@ -10270,11 +10341,13 @@ parallelism = 1
         let vault_dir_str = vault_dir.to_str().expect("utf8");
 
         let cli = make_cli_plain(&["-v", vault_dir_str, "change-password"]);
+        let mut reader = std::io::Cursor::new("");
         let err = cmd_change_password_impl(
             &cli,
             secrecy::SecretBox::new(Box::from("Old123!")),
             secrecy::SecretBox::new(Box::from("New456!")),
             secrecy::SecretBox::new(Box::from("Different!")),
+            &mut reader,
         )
         .expect_err("must fail");
         assert!(
@@ -10291,11 +10364,13 @@ parallelism = 1
         let vault_dir_str = vault_dir.to_str().expect("utf8");
 
         let cli = make_cli_plain(&["-v", vault_dir_str, "change-password"]);
+        let mut reader = std::io::Cursor::new("");
         cmd_change_password_impl(
             &cli,
             secrecy::SecretBox::new(Box::from("Old123!")),
-            secrecy::SecretBox::new(Box::from("New456!")),
-            secrecy::SecretBox::new(Box::from("New456!")),
+            secrecy::SecretBox::new(Box::from("NewPassphrase456!")),
+            secrecy::SecretBox::new(Box::from("NewPassphrase456!")),
+            &mut reader,
         )
         .expect("change_password must succeed");
 
@@ -10311,8 +10386,59 @@ parallelism = 1
 
         let mut core2 = DiaryCore::new(pqd_str).expect("DiaryCore::new");
         core2
-            .unlock(secrecy::SecretBox::new(Box::from("New456!")))
+            .unlock(secrecy::SecretBox::new(Box::from("NewPassphrase456!")))
             .expect("unlock new");
+    }
+
+    /// TC-PWSTR-01: change-password cancellation on a weak new password leaves
+    /// the vault untouched.
+    #[test]
+    fn tc_pwstr_01_change_password_declines_weak_new() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_s10_vault(&dir, "v", b"Old123!");
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+        let pqd = vault_dir.join("vault.pqd");
+        let bytes_before = std::fs::read(&pqd).expect("read");
+
+        let cli = make_cli_plain(&["-v", vault_dir_str, "change-password"]);
+        let mut reader = std::io::Cursor::new("n\n");
+        let result = cmd_change_password_impl(
+            &cli,
+            secrecy::SecretBox::new(Box::from("Old123!")),
+            secrecy::SecretBox::new(Box::from("weak")),
+            secrecy::SecretBox::new(Box::from("weak")),
+            &mut reader,
+        );
+        assert!(result.is_ok(), "weak decline cancels cleanly: {:?}", result);
+
+        // The user declined before re-encryption, so the vault is intact.
+        let bytes_after = std::fs::read(&pqd).expect("read");
+        assert_eq!(bytes_before, bytes_after, "vault must be unchanged");
+    }
+
+    /// TC-PWSTR-02: change-password allows a weak new password when the user
+    /// explicitly accepts the warning.
+    #[test]
+    fn tc_pwstr_02_change_password_allows_weak_new_when_confirmed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_s10_vault(&dir, "v", b"Old123!");
+        let vault_dir_str = vault_dir.to_str().expect("utf8");
+
+        let cli = make_cli_plain(&["-v", vault_dir_str, "change-password"]);
+        let mut reader = std::io::Cursor::new("y\n");
+        cmd_change_password_impl(
+            &cli,
+            secrecy::SecretBox::new(Box::from("Old123!")),
+            secrecy::SecretBox::new(Box::from("weak")),
+            secrecy::SecretBox::new(Box::from("weak")),
+            &mut reader,
+        )
+        .expect("weak new password should proceed when confirmed");
+
+        let pqd = vault_dir.join("vault.pqd");
+        let mut core = DiaryCore::new(pqd.to_str().unwrap()).expect("DiaryCore::new");
+        core.unlock(secrecy::SecretBox::new(Box::from("weak")))
+            .expect("weak password unlocks after explicit confirmation");
     }
 
     /// TC-301-B01: same old/new password → warning but processing continues.
@@ -10323,11 +10449,13 @@ parallelism = 1
         let vault_dir_str = vault_dir.to_str().expect("utf8");
 
         let cli = make_cli_plain(&["-v", vault_dir_str, "change-password"]);
+        let mut reader = std::io::Cursor::new("y\n");
         cmd_change_password_impl(
             &cli,
             secrecy::SecretBox::new(Box::from("Same123!")),
             secrecy::SecretBox::new(Box::from("Same123!")),
             secrecy::SecretBox::new(Box::from("Same123!")),
+            &mut reader,
         )
         .expect("same password must succeed");
 

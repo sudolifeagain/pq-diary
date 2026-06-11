@@ -19,6 +19,7 @@ Phase 2 中核 (legacy / attachments) を完了。残候補は Bases like ビュ
 - **添付ファイル (S13)**: `pq-diary attachment add/list/extract/delete/set` + `new --attach` + `show` 拡張。1MB chunk + AES-256-GCM ストリーミング暗号化、最大 1GB/ファイル。`core/src/attachment.rs` + `core/src/crypto/streaming.rs` 新規。
 - **export/import の双方向 Obsidian 互換 (S13 + S13.1)**: `export` で `attachments/` 別ディレクトリ + `![[FILE]]` 埋め込み、`import` で `![[FILE]]` の自動解決。
 - **運用コマンド (S10)**: `init` / `sync` / `change-password` / `info [--security]` / `export <DIR>`。`~/.pq-diary/config.toml` 導入、smoke-test スクリプト (`ci/smoke-test.{sh,ps1}`) 追加。
+- **S16 keyslot / MDK 基盤**: RFC 5869 HKDF-SHA256、ランダム MDK の用途別サブ鍵、password / password+keyfile / recipient / recovery keyslot の MDK wrap/unwrap、keyslot section と keyfile payload の parser/serializer を追加。
 
 #### Changed
 - vault.pqd `schema_version` を `0x04` → `0x05` に bump (S13)。reader は v4/v5 両方を受理 (`SCHEMA_VERSION_MIN = 0x04`)、writer は常に v5 を書き込み (v4 vault は次回 write で自動 v5 化)。
@@ -31,6 +32,7 @@ Phase 2 中核 (legacy / attachments) を完了。残候補は Bases like ビュ
 - chunk AAD = `chunk_index || total || blob_uuid` で reorder / truncation / file substitution を検出。
 - 添付・エントリで SHA-256 重複排除 + 参照カウント方式 delete。
 - legacy-access は `--claude` を Argon2 サイクル消費前にブロック (NFR-104)。
+- S16 keyslot 基盤では `wrapped_mdk = AES-256-GCM(slot_key, MDK)` の AEAD タグを資格情報確認として使い、ML-KEM-768 共有秘密は HKDF-SHA256 で slot_id に束縛してから MDK ラップ鍵にする。
 
 #### Documentation
 - `CHANGELOG.md` 新規 (S14 棚卸し)。

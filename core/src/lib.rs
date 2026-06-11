@@ -10,6 +10,7 @@
 use std::path::PathBuf;
 
 use secrecy::ExposeSecret;
+use zeroize::Zeroizing;
 
 /// Attachment CRUD + legacy integration (S13).
 pub mod attachment;
@@ -177,6 +178,14 @@ impl DiaryCore {
     pub fn lock(&mut self) {
         self.engine = None;
         self.link_index = None;
+    }
+
+    /// Derive the vault-level MAC key for authenticated vault rewrites.
+    ///
+    /// The vault must already be unlocked; callers should keep the returned
+    /// key scoped to the operation that needs it.
+    pub fn vault_mac_key(&self) -> Result<Zeroizing<[u8; 32]>, DiaryError> {
+        self.require_engine()?.vault_mac_key()
     }
 
     /// Returns a reference to the engine, or [`DiaryError::NotUnlocked`] if

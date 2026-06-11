@@ -260,7 +260,7 @@ pub fn write_vault(
     header: VaultHeader,
     entries: &[EntryRecord],
 ) -> Result<(), DiaryError> {
-    write_vault_dispatch(path, header, entries, None)
+    write_vault_dispatch(path, header, entries, None, &[])
 }
 
 /// Write a complete vault to `path` with a trailing vault-level MAC.
@@ -283,7 +283,21 @@ pub fn write_vault_authenticated(
     entries: &[EntryRecord],
     mac_key: &[u8; 32],
 ) -> Result<(), DiaryError> {
-    write_vault_dispatch(path, header, entries, Some(mac_key))
+    write_vault_dispatch(path, header, entries, Some(mac_key), &[])
+}
+
+/// Write an authenticated vault with caller-provided extra random padding.
+///
+/// The extra bytes are appended to the normal random tail padding before the
+/// vault-level MAC is computed, so privacy padding remains tamper-evident.
+pub fn write_vault_authenticated_with_extra_padding(
+    path: &Path,
+    header: VaultHeader,
+    entries: &[EntryRecord],
+    mac_key: &[u8; 32],
+    extra_padding: &[u8],
+) -> Result<(), DiaryError> {
+    write_vault_dispatch(path, header, entries, Some(mac_key), extra_padding)
 }
 
 /// Shared body for [`write_vault`] / [`write_vault_authenticated`]: preserves
@@ -293,13 +307,14 @@ fn write_vault_dispatch(
     header: VaultHeader,
     entries: &[EntryRecord],
     mac_key: Option<&[u8; 32]>,
+    extra_padding: &[u8],
 ) -> Result<(), DiaryError> {
     let attachments = match crate::vault::reader::read_vault_with_attachments(path) {
         Ok((_existing_header, _existing_entries, attachments)) => attachments,
         Err(DiaryError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(e) => return Err(e),
     };
-    write_vault_inner(path, header, entries, &attachments, mac_key)
+    write_vault_inner(path, header, entries, &attachments, mac_key, extra_padding)
 }
 
 /// Write a complete vault containing entries + attachments (S13), *without* a
@@ -311,7 +326,7 @@ pub fn write_vault_with_attachments(
     entries: &[EntryRecord],
     attachments: &[AttachmentRecord],
 ) -> Result<(), DiaryError> {
-    write_vault_inner(path, header, entries, attachments, None)
+    write_vault_inner(path, header, entries, attachments, None, &[])
 }
 
 /// Write a complete vault containing entries + attachments with a trailing
@@ -323,7 +338,7 @@ pub fn write_vault_with_attachments_authenticated(
     attachments: &[AttachmentRecord],
     mac_key: &[u8; 32],
 ) -> Result<(), DiaryError> {
-    write_vault_inner(path, header, entries, attachments, Some(mac_key))
+    write_vault_inner(path, header, entries, attachments, Some(mac_key), &[])
 }
 
 /// Core vault writer. The attachment records are appended after the entry
@@ -336,6 +351,7 @@ fn write_vault_inner(
     entries: &[EntryRecord],
     attachments: &[AttachmentRecord],
     mac_key: Option<&[u8; 32]>,
+    extra_padding: &[u8],
 ) -> Result<(), DiaryError> {
     // All writes migrate accepted older vaults to the current schema.
     header.schema_version = SCHEMA_VERSION;
@@ -362,6 +378,7 @@ fn write_vault_inner(
     let pad_size: usize = rng.gen_range(512..=4096);
     let mut padding = vec![0u8; pad_size];
     rng.fill(padding.as_mut_slice());
+    padding.extend_from_slice(extra_padding);
 
     // Assemble the authenticated region: header || records || padding. The
     // vault MAC (when present) is computed over exactly these bytes, so a flip

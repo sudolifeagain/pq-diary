@@ -2088,10 +2088,14 @@ fn resolve_conflicts_interactive(
     vault_dir: &std::path::Path,
     config: &pq_diary_core::vault::config::VaultConfig,
     vault_path: &std::path::Path,
+    mac_key: &[u8; 32],
     reader: &mut impl std::io::BufRead,
 ) -> anyhow::Result<()> {
     use pq_diary_core::git::{fuzz_timestamp, get_last_commit_timestamp};
-    use pq_diary_core::vault::{reader::read_vault, writer::write_vault};
+    use pq_diary_core::vault::{
+        reader::{read_vault, verify_vault_integrity},
+        writer::write_vault_authenticated,
+    };
     use std::io::Write as _;
 
     let mut remote_uuids: Vec<[u8; 16]> = Vec::new();
@@ -2122,6 +2126,7 @@ fn resolve_conflicts_interactive(
     }
 
     // Apply "keep remote" choices: swap entries in vault.pqd.
+    verify_vault_integrity(vault_path, mac_key).map_err(|e| anyhow::anyhow!("{e}"))?;
     let (header, mut entries) = read_vault(vault_path).map_err(|e| anyhow::anyhow!("{e}"))?;
     for uuid in &remote_uuids {
         if let Some(conflict) = conflicts.iter().find(|c| &c.uuid == uuid) {
@@ -2130,7 +2135,8 @@ fn resolve_conflicts_interactive(
             }
         }
     }
-    write_vault(vault_path, header, &entries).map_err(|e| anyhow::anyhow!("{e}"))?;
+    write_vault_authenticated(vault_path, header, &entries, mac_key)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // Commit the updated vault using the privacy pipeline.
     let prev_ts = get_last_commit_timestamp(vault_dir);
@@ -2256,9 +2262,11 @@ pub fn cmd_git_push(cli: &Cli) -> anyhow::Result<()> {
         SecretBox::new(Box::from(password_source.secret().expose_secret()));
     core.unlock(secret_password)
         .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+    let mac_key = core.vault_mac_key().map_err(|e| anyhow::anyhow!("{e}"))?;
     let _guard = VaultGuard::new(&mut core);
 
-    git::git_push(&vault_dir, &config, &vault_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    git::git_push(&vault_dir, &config, &vault_path, &mac_key)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     println!("Pushed vault to remote.");
     // _guard drops here → lock() called
@@ -2310,13 +2318,21 @@ fn cmd_git_pull_impl(cli: &Cli, reader: &mut impl std::io::BufRead) -> anyhow::R
         SecretBox::new(Box::from(password_source.secret().expose_secret()));
     core.unlock(secret_password)
         .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+    let mac_key = core.vault_mac_key().map_err(|e| anyhow::anyhow!("{e}"))?;
     let _guard = VaultGuard::new(&mut core);
 
-    let result = git::git_pull_merge(&vault_dir, &config, &vault_path, cli.claude)
+    let result = git::git_pull_merge(&vault_dir, &config, &vault_path, &mac_key, cli.claude)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     if !result.conflicts.is_empty() && !cli.claude {
-        resolve_conflicts_interactive(&result.conflicts, &vault_dir, &config, &vault_path, reader)?;
+        resolve_conflicts_interactive(
+            &result.conflicts,
+            &vault_dir,
+            &config,
+            &vault_path,
+            &mac_key,
+            reader,
+        )?;
     }
 
     println!(
@@ -2373,10 +2389,11 @@ fn cmd_git_sync_impl(cli: &Cli, reader: &mut impl std::io::BufRead) -> anyhow::R
         SecretBox::new(Box::from(password_source.secret().expose_secret()));
     core.unlock(secret_password)
         .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+    let mac_key = core.vault_mac_key().map_err(|e| anyhow::anyhow!("{e}"))?;
     let _guard = VaultGuard::new(&mut core);
 
     // Phase 1: Pull + merge.
-    let pull_result = git::git_pull_merge(&vault_dir, &config, &vault_path, cli.claude)
+    let pull_result = git::git_pull_merge(&vault_dir, &config, &vault_path, &mac_key, cli.claude)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     if !pull_result.conflicts.is_empty() && !cli.claude {
@@ -2385,12 +2402,14 @@ fn cmd_git_sync_impl(cli: &Cli, reader: &mut impl std::io::BufRead) -> anyhow::R
             &vault_dir,
             &config,
             &vault_path,
+            &mac_key,
             reader,
         )?;
     }
 
     // Phase 2: Push.
-    git::git_push(&vault_dir, &config, &vault_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    git::git_push(&vault_dir, &config, &vault_path, &mac_key)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     println!("Sync complete.");
     println!(

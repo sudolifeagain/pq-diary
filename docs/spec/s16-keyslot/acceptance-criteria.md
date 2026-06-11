@@ -40,6 +40,7 @@
 - [ ] **TC-S16-SLOT-01**: 1 つの MDK を複数スロット種別でラップし、いずれの資格情報でも同一 MDK を回復できる 🔵
 - [ ] **TC-S16-SLOT-02**: `wrapped_mdk` は 48B (MDK 32B + GCM tag 16B)。正しい slot_key で復号成功、誤 slot_key で AEAD タグ失敗 🔵
 - [ ] **TC-S16-SLOT-03**: スロットのラウンドトリップ (シリアライズ→パース) で `slot_id`/型/salt/kem_ct/wrapped_mdk/label が保存される 🔵
+- [ ] **TC-S16-SLOT-04**: 同一 `slot_key` で複数回 wrap/rewrap しても `wrap_iv` が再利用されない 🔵
 
 ### 異常系
 - [ ] **TC-S16-SLOT-E01**: `slot_len`/`kem_ct_len`/`wrapped_mdk_len`/`label_len` が 16 MiB 超 → `DiaryError::Vault` (DoS 防止) 🔵

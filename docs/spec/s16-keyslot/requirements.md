@@ -58,6 +58,8 @@ MDK を複数の**キースロット**で多重ラップする封筒方式 (age 
   - `K_data = HKDF(MDK, "pq-diary/data/v1")` — 本文/添付 AES-256-GCM
   - `K_content_hmac = HKDF(MDK, "pq-diary/content-hmac/v1")` — per-record `content_hmac`
   - `K_vault_integrity = HKDF(MDK, "pq-diary/vault-integrity/v1")` — vault 全体 MAC
+  - すべての HKDF は RFC 5869 の Extract → Expand、出力 32B とし、`info` には用途別
+    ASCII ラベル (スロット鍵ではさらに `slot_id`) を入れて鍵再利用を避ける。
 - REQ-103: MDK・全サブ鍵は `SecureBuffer`/`Zeroizing`/`SecretBox` で保持し、drop 時に
   zeroize されなければならない。生の `Vec<u8>`/`[u8;32]` を裸で保持してはならない 🔵
 - REQ-104: システムは MDK を平文でディスクに書いてはならない。MDK はキースロットで
@@ -83,11 +85,14 @@ MDK を複数の**キースロット**で多重ラップする封筒方式 (age 
 - REQ-202: システムは unlock 時、提示された資格情報で開けるスロットを順に試行し、
   最初に `wrapped_mdk` の AEAD 復号 (タグ照合) に成功したスロットの平文を MDK と
   しなければならない。これが暗黙の鍵確認 (SP 800-227) を兼ねる 🔵
-- REQ-203: スロットは自己記述的長さ・型タグ・`slot_id` (UUID v4) を持ち、フォーマットは
+- REQ-203: `wrapped_mdk` 用の `wrap_iv` は 96-bit の CSPRNG 乱数とし、同一
+  `slot_key` で再利用してはならない。スロット作成・再ラップ・MDK ローテーション時は
+  必ず新しい `wrap_iv` を生成しなければならない 🔵
+- REQ-204: スロットは自己記述的長さ・型タグ・`slot_id` (UUID v4) を持ち、フォーマットは
   `docs/design/vault-v6-keyslot-format.md` §1 に従わなければならない 🔵
-- REQ-204: **検証トークン (v4/v5) は廃止**し、パスワード等の正否はスロット復号の成否で
+- REQ-205: **検証トークン (v4/v5) は廃止**し、パスワード等の正否はスロット復号の成否で
   判定しなければならない 🔵
-- REQ-205: 全可変長フィールド (kem_ct/wrapped_mdk/label/slot_len) は既存 `MAX_FIELD_SIZE`
+- REQ-206: 全可変長フィールド (kem_ct/wrapped_mdk/label/slot_len) は既存 `MAX_FIELD_SIZE`
   (16 MiB) 上限を適用し、巨大 alloc DoS を防がなければならない 🔵
 
 ### REQ-210番台: slot① password
@@ -221,7 +226,9 @@ MDK を複数の**キースロット**で多重ラップする封筒方式 (age 
 - NFR-102: slot② は SP 800-56C/IETF コンバイナ形で `K_pw` と `ss` を固定長・固定順序・
   ドメイン束縛付きで結合し、片方のみでは復号不能でなければならない 🔵
 - NFR-103: 受信者公開鍵は FIPS 203 入力検証を通さなければ使用してはならない 🔵
-- NFR-104: スロット削除時は MDK ローテーションにより旧資格情報での復号を不能にしなければ
+- NFR-104: AES-256-GCM を使うすべての暗号化・ラップ経路は、同一鍵で nonce/IV を
+  再利用してはならない 🔵
+- NFR-105: スロット削除時は MDK ローテーションにより旧資格情報での復号を不能にしなければ
   ならない 🔵
 
 ### 互換性

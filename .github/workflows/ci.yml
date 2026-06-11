@@ -31,6 +31,17 @@ jobs:
       - run: cargo install cargo-audit --locked
       - run: cargo audit
 
+  deny:
+    name: cargo-deny (supply chain)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Gates the forked ml-kem / ml-dsa git sources, licenses, and duplicate
+      # crates (ADR-0010). Advisories are handled by the `audit` job above.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check bans licenses sources
+
   smoke:
     name: CLI smoke test
     strategy:

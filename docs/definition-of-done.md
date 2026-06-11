@@ -5,6 +5,7 @@
 - [ ] `cargo test --workspace` が全パス
 - [ ] `cargo clippy --workspace -- -D warnings` が通る
 - [ ] `cargo audit` で既知脆弱性なし
+- [ ] `cargo deny check bans licenses sources` が通る (フォーク git ソース許可リスト・ライセンス・重複検査; ADR-0010)
 
 ## セキュリティ不変条件
 - [ ] 秘密データに生の `String` / `Vec<u8>` を使っていない (zeroize/SecretString/SecretBytes)

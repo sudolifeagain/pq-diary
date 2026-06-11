@@ -15,6 +15,8 @@ pub mod config;
 pub mod format;
 /// Vault initialisation and `VaultManager` directory management.
 pub mod init;
+/// S16 keyslot envelope primitives.
+pub mod keyslot;
 /// vault.pqd deserialisation: header and entry-record parsing.
 pub mod reader;
 /// vault.pqd serialisation: header and entry-record writing.

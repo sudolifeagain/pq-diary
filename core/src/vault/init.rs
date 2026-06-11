@@ -484,7 +484,8 @@ mod tests {
         mgr.init_vault("v", b"password").expect("init_vault");
         let toml = dir.path().join("v").join("vault.toml");
 
-        mgr.set_policy("v", AccessPolicy::WriteOnly).expect("set_policy");
+        mgr.set_policy("v", AccessPolicy::WriteOnly)
+            .expect("set_policy");
 
         let mode = std::fs::metadata(&toml)
             .expect("metadata")

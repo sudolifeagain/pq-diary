@@ -164,6 +164,23 @@
 
 ## Open Questions
 
+### Git sync correctness debt
+
+- [ ] Record remote ancestry after a complete, validated merge. The current
+  entry-level merge makes a local-only commit, so pull followed by push after a
+  remote advance is rejected as non-fast-forward. Never work around this with
+  force-push
+- [ ] Reconcile deletions against a common base, plus same-HMAC record metadata
+  changes; the current UUID union and content-only comparison are insufficient
+- [ ] Sync attachment metadata and encrypted `.attachments` blobs together.
+  Until then, push/pull explicitly reject attachment-bearing vaults
+- [ ] Define header/key and configuration migration across devices. Until then,
+  pull rejects differing headers (except payload length) or `vault.toml` values.
+  This guard compares every TOML key/value, including unknown future fields
+  and all current sections (`vault`, `access`, `git`, `argon2`, `legacy`).
+  Comments, whitespace, and key/table ordering may differ; config values are
+  never merged automatically
+
 | # | 問題 | 状態 |
 |---|------|------|
 | OQ-1 | force push後のmerge-base失敗 | オープン |

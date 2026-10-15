@@ -27,7 +27,8 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 ///
 /// The struct derives `Zeroize` and `ZeroizeOnDrop` because entry content is
 /// secret data that must be erased from memory when no longer needed.
-#[derive(Debug, Serialize, Deserialize, PartialEq, Zeroize, ZeroizeOnDrop)]
+/// Debug output redacts all fields.
+#[derive(Serialize, Deserialize, PartialEq, Zeroize, ZeroizeOnDrop)]
 pub struct EntryPlaintext {
     /// Entry title.
     pub title: String,
@@ -35,6 +36,12 @@ pub struct EntryPlaintext {
     pub tags: Vec<String>,
     /// Body text (Markdown).
     pub body: String,
+}
+
+impl std::fmt::Debug for EntryPlaintext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("EntryPlaintext([REDACTED])")
+    }
 }
 
 /// Metadata for list display.
@@ -563,6 +570,32 @@ pub fn delete_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_entry_plaintext_debug_redacts_contents() {
+        let secrets = [
+            "ENTRY_TITLE_SENTINEL",
+            "ENTRY_TAG_ONE_SENTINEL",
+            "ENTRY_TAG_TWO_SENTINEL",
+            "ENTRY_BODY_SENTINEL",
+        ];
+        let plaintext = EntryPlaintext {
+            title: secrets[0].to_string(),
+            tags: vec![secrets[1].to_string(), secrets[2].to_string()],
+            body: secrets[3].to_string(),
+        };
+
+        for debug in [format!("{plaintext:?}"), format!("{plaintext:#?}")] {
+            for secret in secrets {
+                assert!(
+                    !debug.contains(secret),
+                    "Debug must redact plaintext fields"
+                );
+            }
+            assert!(debug.contains("EntryPlaintext"));
+            assert!(debug.contains("[REDACTED]"));
+        }
+    }
 
     // =========================================================================
     // TC-A10-01: EntryPlaintext ZeroizeOnDrop

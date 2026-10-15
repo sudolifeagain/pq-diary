@@ -33,7 +33,9 @@ fn noop_editor_preserves_stored_body_bytes() {
         .arg(&vault)
         .args(["edit", &id])
         .env("PQ_DIARY_PASSWORD", "test-password")
-        .env("EDITOR", "/bin/true")
+        // The POSIX utility is in /usr/bin on macOS. Resolve it through PATH,
+        // just as a configured editor name is resolved by the real CLI.
+        .env("EDITOR", "true")
         .output()
         .expect("run CLI");
     assert!(

@@ -46,11 +46,22 @@ pub const FLAG_INTEGRITY: u8 = 0x01;
 /// Length in bytes of the trailing vault-level HMAC-SHA256 authentication tag.
 pub const VAULT_MAC_LEN: usize = 32;
 
-/// Maximum allowed byte length for any variable-length vault field.
+/// Maximum allowed byte length for any variable-length vault field or record payload.
 ///
-/// Used by readers and S16 keyslot parsers to reject malicious/corrupt files
-/// before allocating large buffers.
+/// Shared by readers, writers, and S16 keyslot parsers. Writers must enforce
+/// this limit before emitting data so every accepted record remains readable.
+/// The limit applies per record/field, not to the combined vault payload.
 pub const MAX_FIELD_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
+
+/// Enforce the shared reader/writer limit before allocating or serialising.
+pub(super) fn check_field_size(len: usize) -> Result<(), DiaryError> {
+    if len > MAX_FIELD_SIZE {
+        return Err(DiaryError::Vault(format!(
+            "field size {len} exceeds 16MiB maximum"
+        )));
+    }
+    Ok(())
+}
 
 /// Size in bytes of the fixed portion of the vault.pqd header.
 ///

@@ -67,8 +67,9 @@ pub fn re_encrypt_vault(
     };
 
     // Step 1: read current vault (entries + attachments).
+    let vault_bytes = std::fs::read(&vault_pqd)?;
     let (header, entries, attachments) =
-        crate::vault::reader::read_vault_with_attachments(&vault_pqd)?;
+        crate::vault::reader::read_vault_with_attachments_from_bytes(&vault_bytes)?;
 
     // Step 2: derive OLD symmetric key from old password and stored salt.
     let old_key = kdf::derive_key(
@@ -88,7 +89,8 @@ pub fn re_encrypt_vault(
     // Authenticate metadata and record ordering before re-encryption can
     // endorse modified data with a fresh key and MAC.
     let old_mac_key = crate::crypto::derive_vault_mac_key(old_key.as_ref())?;
-    crate::vault::reader::verify_vault_integrity(&vault_pqd, &old_mac_key)?;
+    crate::vault::reader::verify_vault_integrity_bytes(&vault_bytes, &old_mac_key)?;
+    drop(vault_bytes);
 
     // Step 4: decrypt KEM and DSA seeds with the old key.
     let kem_seed = decrypt_blob(old_key.as_ref(), &header.kem_encrypted_sk, "KEM")?;
@@ -546,5 +548,49 @@ mod tests {
             "empty new password must return Err(Password), got {:?}",
             result
         );
+    }
+
+    #[test]
+    fn password_change_rejects_tampered_vault_without_side_effects() {
+        for tamper_timestamp in [false, true] {
+            let dir = tempdir().unwrap();
+            let vault_dir = setup_vault(&dir, b"Old123!");
+            let vault_path = vault_dir.join("vault.pqd");
+            let mut core = DiaryCore::new(vault_path.to_str().unwrap()).unwrap();
+            core.unlock(make_secret("Old123!")).unwrap();
+            core.new_entry("title", "body", vec![]).unwrap();
+            drop(core);
+
+            let config_before = std::fs::read(vault_dir.join("vault.toml")).unwrap();
+            let mut bytes = std::fs::read(&vault_path).unwrap();
+            let mut cursor = std::io::Cursor::new(&bytes);
+            let header = crate::vault::reader::read_header(&mut cursor).unwrap();
+            let key = kdf::derive_key(b"Old123!", &header.kdf_salt, &fast_params()).unwrap();
+            let mac_key = crate::crypto::derive_vault_mac_key(key.as_ref()).unwrap();
+            crate::vault::reader::verify_vault_integrity(&vault_path, &mac_key).unwrap();
+            let offset = if tamper_timestamp {
+                // First entry: length prefix + record type + UUID + created_at.
+                cursor.position() as usize + 4 + 1 + 16 + 8
+            } else {
+                bytes.len() - 1
+            };
+            bytes[offset] ^= 1;
+            std::fs::write(&vault_path, &bytes).unwrap();
+            assert!(crate::vault::reader::verify_vault_integrity(&vault_path, &mac_key).is_err());
+
+            let result =
+                re_encrypt_vault(&vault_dir, &make_secret("Old123!"), &make_secret("New456!"));
+            assert!(
+                matches!(&result, Err(DiaryError::Crypto(message)) if message.contains("vault integrity")),
+                "password change accepted or misclassified corruption: {result:?}"
+            );
+            assert_eq!(std::fs::read(&vault_path).unwrap(), bytes);
+            assert_eq!(
+                std::fs::read(vault_dir.join("vault.toml")).unwrap(),
+                config_before
+            );
+            assert!(!vault_dir.join("vault.pqd.tmp.new").exists());
+            assert!(!vault_dir.join("vault.pqd.tmp.new.tmp").exists());
+        }
     }
 }

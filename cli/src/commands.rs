@@ -2889,15 +2889,28 @@ fn cmd_export_impl(
         return Ok(());
     }
 
-    let mut targets: Vec<(pq_diary_core::EntryMeta, std::path::PathBuf)> =
-        Vec::with_capacity(metas.len());
+    // Validate every attachment listing before publishing any plaintext output.
+    let listing_pwd: secrecy::SecretString =
+        secrecy::SecretBox::new(Box::from(password_source.secret().expose_secret()));
+    let mut targets = Vec::with_capacity(metas.len());
     for meta in metas {
         let filename = build_export_filename(&meta);
         let path = dir.join(&filename);
         if path.exists() {
             anyhow::bail!("File exists: {}", path.display());
         }
-        targets.push((meta, path));
+        let attachments = pq_diary_core::attachment::list_attachments(
+            &vault_dir,
+            &listing_pwd,
+            Some(&meta.uuid_hex),
+        )
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to list attachments for entry {}: {e}",
+                meta.uuid_hex
+            )
+        })?;
+        targets.push((meta, path, attachments));
     }
 
     let count = targets.len();
@@ -2906,7 +2919,7 @@ fn cmd_export_impl(
     let mut attachment_count = 0_usize;
     let mut exported_attachment_files: std::collections::HashMap<String, [u8; 32]> =
         std::collections::HashMap::new();
-    for (meta, path) in &targets {
+    for (meta, path, attachments) in &targets {
         let id_hex = meta.uuid_hex.clone();
         let (_, plaintext) = guard
             .get_entry(&id_hex)
@@ -2916,36 +2929,22 @@ fn cmd_export_impl(
 
         // S13: append `![[filename]]` for each attachment, and extract the
         // decrypted file into `<dir>/attachments/`.
-        let listing_pwd: secrecy::SecretString =
-            secrecy::SecretBox::new(Box::from(password_source.secret().expose_secret()));
-        if let Ok(metas) =
-            pq_diary_core::attachment::list_attachments(&vault_dir, &listing_pwd, Some(&id_hex))
-        {
-            if !metas.is_empty() {
-                std::fs::create_dir_all(&attachments_dir).map_err(|e| {
-                    anyhow::anyhow!("Failed to create {}: {e}", attachments_dir.display())
-                })?;
-                if !body.is_empty() && !body.ends_with('\n') {
-                    body.push('\n');
-                }
-                for m in &metas {
-                    let mut export_filename = m.filename.clone();
-                    let mut out_path = attachments_dir.join(&export_filename);
-                    let mut already_exported = false;
+        if !attachments.is_empty() {
+            std::fs::create_dir_all(&attachments_dir).map_err(|e| {
+                anyhow::anyhow!("Failed to create {}: {e}", attachments_dir.display())
+            })?;
+            if !body.is_empty() && !body.ends_with('\n') {
+                body.push('\n');
+            }
+            for m in attachments {
+                let mut export_filename = m.filename.clone();
+                let mut out_path = attachments_dir.join(&export_filename);
+                let mut already_exported = false;
 
-                    if let Some(existing_sha) = exported_attachment_files.get(&export_filename) {
-                        if existing_sha == &m.sha256 {
-                            already_exported = true;
-                        } else {
-                            export_filename = disambiguate_attachment_export_filename(
-                                &m.filename,
-                                &m.sha256,
-                                &attachments_dir,
-                                &exported_attachment_files,
-                            );
-                            out_path = attachments_dir.join(&export_filename);
-                        }
-                    } else if out_path.exists() {
+                if let Some(existing_sha) = exported_attachment_files.get(&export_filename) {
+                    if existing_sha == &m.sha256 {
+                        already_exported = true;
+                    } else {
                         export_filename = disambiguate_attachment_export_filename(
                             &m.filename,
                             &m.sha256,
@@ -2954,27 +2953,35 @@ fn cmd_export_impl(
                         );
                         out_path = attachments_dir.join(&export_filename);
                     }
-                    if exported_attachment_files
-                        .get(&export_filename)
-                        .is_some_and(|existing_sha| existing_sha == &m.sha256)
-                    {
-                        already_exported = true;
-                    }
-
-                    if !already_exported {
-                        pq_diary_core::attachment::extract_attachment(
-                            &vault_dir,
-                            &listing_pwd,
-                            &id_hex,
-                            &m.filename,
-                            &out_path,
-                        )
-                        .map_err(|e| anyhow::anyhow!("attachment extract: {e}"))?;
-                        exported_attachment_files.insert(export_filename.clone(), m.sha256);
-                    }
-                    body.push_str(&format!("\n![[{}]]", export_filename));
-                    attachment_count += 1;
+                } else if out_path.exists() {
+                    export_filename = disambiguate_attachment_export_filename(
+                        &m.filename,
+                        &m.sha256,
+                        &attachments_dir,
+                        &exported_attachment_files,
+                    );
+                    out_path = attachments_dir.join(&export_filename);
                 }
+                if exported_attachment_files
+                    .get(&export_filename)
+                    .is_some_and(|existing_sha| existing_sha == &m.sha256)
+                {
+                    already_exported = true;
+                }
+
+                if !already_exported {
+                    pq_diary_core::attachment::extract_attachment(
+                        &vault_dir,
+                        &listing_pwd,
+                        &id_hex,
+                        &m.filename,
+                        &out_path,
+                    )
+                    .map_err(|e| anyhow::anyhow!("attachment extract: {e}"))?;
+                    exported_attachment_files.insert(export_filename.clone(), m.sha256);
+                }
+                body.push_str(&format!("\n![[{}]]", export_filename));
+                attachment_count += 1;
             }
         }
 
@@ -10862,6 +10869,99 @@ parallelism = 1
         let mut stdin = std::io::Cursor::new(b"y\n".to_vec());
         cmd_export_impl(&cli, out_dir.clone(), &mut stdin).expect("ok");
         assert_eq!(std::fs::read_dir(&out_dir).unwrap().count(), 0);
+    }
+
+    /// Attachment metadata errors must fail export before publishing any files.
+    #[test]
+    fn export_rejects_corrupt_attachment_metadata() {
+        export_attachment_fixture(true);
+    }
+
+    #[test]
+    fn export_preserves_attachment_content_and_links() {
+        export_attachment_fixture(false);
+    }
+
+    fn export_attachment_fixture(corrupt: bool) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_s10_vault(&dir, "v", b"password");
+        let pqd = vault_dir.join("vault.pqd");
+        let password = secrecy::SecretBox::new(Box::from("password"));
+        let id = {
+            let mut core = DiaryCore::new(pqd.to_str().unwrap()).expect("core");
+            core.unlock(secrecy::SecretBox::new(Box::from("password")))
+                .expect("unlock");
+            core.new_entry("without attachment", "first body", vec![])
+                .expect("first entry");
+            core.new_entry("with attachment", "second body", vec![])
+                .expect("second entry")
+        };
+        let source = dir.path().join("example.txt");
+        std::fs::write(&source, b"attachment contents").expect("source");
+        pq_diary_core::attachment::add_attachment(&vault_dir, &password, &id, &source)
+            .expect("add attachment");
+        if corrupt {
+            let (header, entries, mut attachments) =
+                pq_diary_core::vault::reader::read_vault_with_attachments(&pqd)
+                    .expect("read fixture");
+            attachments[0].content_hmac[0] ^= 1;
+            // The legacy/test writer omits the whole-vault MAC so unlock succeeds;
+            // attachment enumeration must still reject the invalid record HMAC.
+            pq_diary_core::vault::writer::write_vault_with_attachments(
+                &pqd,
+                header,
+                &entries,
+                &attachments,
+            )
+            .expect("write corrupt fixture");
+        }
+        let original = std::fs::read(&pqd).expect("vault bytes");
+        let original_config = std::fs::read(vault_dir.join("vault.toml")).expect("config bytes");
+        let out = dir.path().join("out");
+        std::fs::create_dir(&out).expect("output directory");
+        let cli = make_cli_plain(&[
+            "--vault",
+            vault_dir.to_str().unwrap(),
+            "--password",
+            "password",
+            "export",
+            out.to_str().unwrap(),
+        ]);
+        let result = cmd_export_impl(&cli, out.clone(), &mut std::io::Cursor::new(b"y\n"));
+        if corrupt {
+            let error = result
+                .expect_err("corrupt attachment must fail export")
+                .to_string();
+            assert!(
+                error.contains("Failed to list attachments for entry"),
+                "{error}"
+            );
+            assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0);
+        } else {
+            result.expect("export succeeds");
+            assert_eq!(
+                std::fs::read(out.join("attachments/example.txt")).unwrap(),
+                b"attachment contents"
+            );
+            let markdown: Vec<_> = std::fs::read_dir(&out)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
+                .collect();
+            assert_eq!(markdown.len(), 2);
+            assert!(markdown.iter().any(|path| std::fs::read_to_string(path)
+                .unwrap()
+                .contains("second body\n\n![[example.txt]]")));
+        }
+        assert_eq!(std::fs::read(&pqd).unwrap(), original);
+        assert_eq!(
+            std::fs::read(vault_dir.join("vault.toml")).unwrap(),
+            original_config
+        );
+        let mut core = DiaryCore::new(pqd.to_str().unwrap()).expect("reopen");
+        core.unlock(password).expect("unlock after export");
+        assert_eq!(core.list_entries(None).unwrap().len(), 2);
+        assert_eq!(core.get_entry(&id).unwrap().1.body, "second body");
     }
 
     /// TC-501-01: 3 entries export → 3 well-named files.

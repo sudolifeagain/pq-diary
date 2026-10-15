@@ -26,3 +26,6 @@ Thumbs.db
 
 # Automation logs
 logs/
+
+# Local agent worktrees must never become repository gitlinks.
+/.claude/worktrees/

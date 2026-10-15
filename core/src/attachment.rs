@@ -209,6 +209,19 @@ pub fn add_attachment(
     entry_id_prefix: &str,
     source_path: &Path,
 ) -> Result<Uuid, DiaryError> {
+    add_attachment_before_commit(vault_dir, master_pwd, entry_id_prefix, source_path, || {
+        Ok(())
+    })
+}
+
+// The hook keeps transaction-failure tests independent of writer staging names.
+fn add_attachment_before_commit(
+    vault_dir: &Path,
+    master_pwd: &SecretString,
+    entry_id_prefix: &str,
+    source_path: &Path,
+    before_commit: impl FnOnce() -> Result<(), DiaryError>,
+) -> Result<Uuid, DiaryError> {
     let vault_pqd = vault_dir.join("vault.pqd");
     let vault_toml = vault_dir.join("vault.toml");
     let config = VaultConfig::from_file(&vault_toml)?;
@@ -279,100 +292,99 @@ pub fn add_attachment(
         .iter()
         .find(|d| d.plaintext.sha256 == source_sha);
 
-    let (blob_uuid, file_key, size_bytes, chunk_count, sha256) = if let Some(d) = dedup {
-        // Reuse blob, reuse FileKey from the canonical decrypted plaintext.
-        (
-            d.plaintext.blob_uuid,
-            d.plaintext.file_key.clone(),
-            d.plaintext.size_bytes,
-            d.plaintext.chunk_count,
-            d.plaintext.sha256,
-        )
-    } else {
-        // Generate a fresh blob.
-        let mut new_blob = [0u8; 16];
-        OsRng.fill_bytes(&mut new_blob);
-        let mut new_key_bytes = [0u8; 32];
-        OsRng.fill_bytes(&mut new_key_bytes);
-        let new_key = Zeroizing::new(new_key_bytes);
+    // Only an exclusively created new blob is eligible for rollback. Reused
+    // blobs never enter this guard. Keep the handle for cleanup without reopening.
+    let mut owned_blob: Option<(std::fs::File, PathBuf)> = None;
+    let result = (|| {
+        let (blob_uuid, file_key, size_bytes, chunk_count, sha256) = if let Some(d) = dedup {
+            // Reuse blob, reuse FileKey from the canonical decrypted plaintext.
+            (
+                d.plaintext.blob_uuid,
+                d.plaintext.file_key.clone(),
+                d.plaintext.size_bytes,
+                d.plaintext.chunk_count,
+                d.plaintext.sha256,
+            )
+        } else {
+            // Generate a fresh blob.
+            let mut new_blob = [0u8; 16];
+            OsRng
+                .try_fill_bytes(&mut new_blob)
+                .map_err(std::io::Error::other)?;
+            let mut new_key = Zeroizing::new([0u8; 32]);
+            OsRng
+                .try_fill_bytes(new_key.as_mut())
+                .map_err(std::io::Error::other)?;
 
-        std::fs::create_dir_all(attachments_dir(vault_dir))?;
-        let bin_path = blob_path(vault_dir, &new_blob);
-        let bin_tmp_path = with_extension(&bin_path, "tmp");
-
-        let write_result = (|| -> Result<(u64, [u8; 32]), DiaryError> {
+            std::fs::create_dir_all(attachments_dir(vault_dir))?;
+            let bin_path = blob_path(vault_dir, &new_blob);
             let mut src = std::fs::File::open(source_path)?;
-            let mut tmp = std::fs::File::create(&bin_tmp_path)?;
-            let (size, sha) = streaming::encrypt_stream(&new_key, &new_blob, &mut src, &mut tmp)?;
-            tmp.sync_all()?;
-            Ok((size, sha))
-        })();
-
-        let (size, sha) = match write_result {
-            Ok(t) => t,
-            Err(e) => {
-                cleanup_sensitive_file(&bin_tmp_path);
-                return Err(e);
+            let bin = create_extraction_temp(&bin_path)?;
+            let (bin, _) = owned_blob.insert((bin, bin_path));
+            let (size, sha) = streaming::encrypt_stream(&new_key, &new_blob, &mut src, bin)?;
+            bin.sync_all()?;
+            if sha != source_sha {
+                return Err(DiaryError::Crypto(
+                    "internal sha256 mismatch during attachment write".to_string(),
+                ));
             }
+            let chunk_count = streaming::chunk_count_for_size(size);
+            (new_blob, new_key, size, chunk_count, sha)
         };
-        if sha != source_sha {
-            cleanup_sensitive_file(&bin_tmp_path);
-            return Err(DiaryError::Crypto(
-                "internal sha256 mismatch during attachment write".to_string(),
-            ));
-        }
-        if let Err(e) = std::fs::rename(&bin_tmp_path, &bin_path) {
-            cleanup_sensitive_file(&bin_tmp_path);
-            return Err(DiaryError::Io(e));
-        }
-        let chunk_count = streaming::chunk_count_for_size(size);
-        (new_blob, new_key, size, chunk_count, sha)
-    };
 
-    let now = unix_seconds()?;
-    let mime_type = guess_mime_type(&filename);
+        let now = unix_seconds()?;
+        let mime_type = guess_mime_type(&filename);
 
-    let record_uuid_bytes = *Uuid::new_v4().as_bytes();
-    let plaintext = AttachmentPlaintext {
-        entry_uuid,
-        blob_uuid,
-        created_at: now,
-        filename: filename.clone(),
-        mime_type,
-        size_bytes,
-        chunk_count,
-        sha256,
-        file_key,
-    };
-    let new_record = build_attachment_record(
-        record_uuid_bytes,
-        &plaintext,
-        LegacyFlag::Destroy,
-        Vec::new(),
-        &k_master,
-        &dsa_seed,
-    )?;
+        let record_uuid_bytes = *Uuid::new_v4().as_bytes();
+        let plaintext = AttachmentPlaintext {
+            entry_uuid,
+            blob_uuid,
+            created_at: now,
+            filename: filename.clone(),
+            mime_type,
+            size_bytes,
+            chunk_count,
+            sha256,
+            file_key,
+        };
+        let new_record = build_attachment_record(
+            record_uuid_bytes,
+            &plaintext,
+            LegacyFlag::Destroy,
+            Vec::new(),
+            &k_master,
+            &dsa_seed,
+        )?;
 
-    attachments.push(new_record);
-    let entry_record = &mut entries[entry_idx];
-    entry_record.attachment_count = entry_record
-        .attachment_count
-        .checked_add(1)
-        .ok_or_else(|| DiaryError::Vault("attachment_count overflow".to_string()))?;
-    entry_record.padding = generate_entry_padding();
+        attachments.push(new_record);
+        let entry_record = &mut entries[entry_idx];
+        entry_record.attachment_count = entry_record
+            .attachment_count
+            .checked_add(1)
+            .ok_or_else(|| DiaryError::Vault("attachment_count overflow".to_string()))?;
+        entry_record.padding = generate_entry_padding();
 
-    // Header is touched only via payload_size recalculation inside writer.
-    header.payload_size = 0;
-    let mac_key = crate::crypto::derive_vault_mac_key(&k_master)?;
-    write_vault_with_attachments_authenticated(
-        &vault_pqd,
-        header,
-        &entries,
-        &attachments,
-        &mac_key,
-    )?;
+        // Header is touched only via payload_size recalculation inside writer.
+        header.payload_size = 0;
+        let mac_key = crate::crypto::derive_vault_mac_key(&k_master)?;
+        before_commit()?;
+        // The writer returns errors only before its atomic rename commits.
+        // Do not add fallible work after this call: rollback would then erase
+        // a blob referenced by the successfully published vault.
+        write_vault_with_attachments_authenticated(
+            &vault_pqd,
+            header,
+            &entries,
+            &attachments,
+            &mac_key,
+        )?;
 
-    Ok(Uuid::from_bytes(record_uuid_bytes))
+        Ok(Uuid::from_bytes(record_uuid_bytes))
+    })();
+    match (result, owned_blob) {
+        (Err(primary), Some((file, path))) => Err(cleanup_extraction_temp(file, &path, primary)),
+        (result, _) => result,
+    }
 }
 
 /// List attachments for the entry whose UUID hex starts with `entry_id_prefix`
@@ -607,9 +619,24 @@ pub fn delete_attachment(
 
     if remaining_refs == 0 {
         let bin_path = blob_path(vault_dir, &decoded.plaintext.blob_uuid);
-        zeroize_and_delete(&bin_path)?;
+        zeroize_and_delete(&bin_path).map_err(|source| {
+            DiaryError::Io(std::io::Error::other(CommittedAttachmentCleanupError {
+                path: bin_path,
+                source,
+            }))
+        })?;
     }
     Ok(())
+}
+
+/// Metadata is already committed; retrying deletion by filename cannot retry
+/// this cleanup. Include the orphan's exact path for explicit recovery.
+#[derive(Debug, thiserror::Error)]
+#[error("attachment deletion committed to vault; blob cleanup failed for {}; the blob may remain and deletion by filename cannot retry cleanup: {source}", path.display())]
+struct CommittedAttachmentCleanupError {
+    path: PathBuf,
+    #[source]
+    source: DiaryError,
 }
 
 /// Set the legacy disposition (INHERIT / DESTROY) of an attachment. INHERIT
@@ -924,8 +951,7 @@ fn verify_master(
 }
 
 fn verify_hmac(expected: &[u8; 32], data: &[u8], key: &[u8; 32]) -> Result<(), DiaryError> {
-    let actual = hmac_util::compute(key, data)?;
-    if &actual != expected {
+    if !hmac_util::verify_hmac(key, data, expected)? {
         return Err(DiaryError::Crypto(
             "attachment content_hmac mismatch".to_string(),
         ));
@@ -960,6 +986,7 @@ pub(crate) fn blob_path(vault_dir: &Path, blob_uuid: &[u8; 16]) -> PathBuf {
     attachments_dir(vault_dir).join(format!("{}.bin", hex_lower(blob_uuid)))
 }
 
+#[cfg(test)]
 fn with_extension(path: &Path, ext: &str) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".");
@@ -994,21 +1021,31 @@ fn hex_lower(uuid: &[u8; 16]) -> String {
 
 /// Best-effort secure delete: overwrite with random bytes, fsync, unlink.
 pub(crate) fn zeroize_and_delete(path: &Path) -> Result<(), DiaryError> {
-    if let Ok(meta) = std::fs::metadata(path) {
-        let size = meta.len() as usize;
-        if size > 0 {
-            let mut buf = Zeroizing::new(vec![0u8; size.min(1024 * 1024)]);
-            if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(path) {
-                let mut remaining = size;
-                while remaining > 0 {
-                    let chunk = std::cmp::min(remaining, buf.len());
-                    OsRng.fill_bytes(&mut buf[..chunk]);
-                    f.write_all(&buf[..chunk])?;
-                    remaining -= chunk;
-                }
-                f.sync_all()?;
-            }
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    // Never follow a substituted symlink or overwrite a non-regular object.
+    if !meta.is_file() {
+        return Err(DiaryError::Io(std::io::Error::other(
+            "attachment blob is not a regular file",
+        )));
+    }
+    let size = meta.len();
+    if size > 0 {
+        let mut buf = Zeroizing::new(vec![0u8; size.min(1024 * 1024) as usize]);
+        let mut f = std::fs::OpenOptions::new().write(true).open(path)?;
+        let mut remaining = size;
+        while remaining > 0 {
+            let chunk = remaining.min(buf.len() as u64) as usize;
+            OsRng
+                .try_fill_bytes(&mut buf[..chunk])
+                .map_err(std::io::Error::other)?;
+            f.write_all(&buf[..chunk])?;
+            remaining -= chunk as u64;
         }
+        f.sync_all()?;
     }
     if let Err(e) = std::fs::remove_file(path) {
         if e.kind() != std::io::ErrorKind::NotFound {
@@ -1016,10 +1053,6 @@ pub(crate) fn zeroize_and_delete(path: &Path) -> Result<(), DiaryError> {
         }
     }
     Ok(())
-}
-
-fn cleanup_sensitive_file(path: &Path) {
-    let _ = zeroize_and_delete(path);
 }
 
 fn guess_mime_type(filename: &str) -> String {
@@ -1940,6 +1973,241 @@ mod tests {
             .downcast_ref::<DiaryError>()
             .unwrap();
         assert!(matches!(original, DiaryError::Crypto(_)));
+    }
+
+    #[test]
+    fn blob_cleanup_handles_missing_empty_and_regular_files() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("blob.bin");
+        zeroize_and_delete(&path).unwrap();
+        for bytes in [b"".as_slice(), b"encrypted blob".as_slice()] {
+            std::fs::write(&path, bytes).unwrap();
+            zeroize_and_delete(&path).unwrap();
+            assert!(!path.exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blob_cleanup_reports_permission_failure_without_unlinking() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let path = write_source(&dir, "blob.bin", b"retained encrypted blob");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        // Privileged runners may bypass Unix mode bits; exercise this on the
+        // ordinary-user CI path without pretending root enforces permissions.
+        if std::fs::OpenOptions::new().write(true).open(&path).is_ok() {
+            return;
+        }
+        let error = zeroize_and_delete(&path).unwrap_err();
+        assert!(
+            matches!(error, DiaryError::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied)
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"retained encrypted blob");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn add_blob_is_private_and_successful_commit_keeps_it_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let (vault_dir, entry_id) = vault_with_entry(&dir);
+        let source = write_source(&dir, "source.txt", b"committed attachment");
+        add_attachment(&vault_dir, &secret("master-pw"), &entry_id[..8], &source).unwrap();
+        let paths = directory_entries(&attachments_dir(&vault_dir));
+        assert_eq!(paths.len(), 1);
+        let blob = paths.iter().next().unwrap();
+        assert_eq!(
+            std::fs::metadata(blob).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let output = dir.path().join("output.txt");
+        extract_attachment(
+            &vault_dir,
+            &secret("master-pw"),
+            &entry_id[..8],
+            "source.txt",
+            &output,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(output).unwrap(), b"committed attachment");
+    }
+
+    #[test]
+    fn add_precommit_failure_rolls_back_only_new_blob() {
+        let dir = tempdir().unwrap();
+        let (vault_dir, entry_id) = vault_with_entry(&dir);
+        let first = write_source(&dir, "existing.txt", b"existing blob");
+        add_attachment(&vault_dir, &secret("master-pw"), &entry_id[..8], &first).unwrap();
+        let before = std::fs::read(vault_dir.join("vault.pqd")).unwrap();
+        let paths = directory_entries(&attachments_dir(&vault_dir));
+        let existing = paths.iter().next().unwrap();
+        let bytes = std::fs::read(existing).unwrap();
+        let source = write_source(&dir, "new.txt", b"new blob");
+        let error = add_attachment_before_commit(
+            &vault_dir,
+            &secret("master-pw"),
+            &entry_id[..8],
+            &source,
+            || {
+                assert_eq!(directory_entries(&attachments_dir(&vault_dir)).len(), 2);
+                Err(DiaryError::Io(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "injected vault write failure",
+                )))
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, DiaryError::Io(ref e) if e.kind() == std::io::ErrorKind::WriteZero)
+        );
+        assert_eq!(std::fs::read(vault_dir.join("vault.pqd")).unwrap(), before);
+        assert_eq!(directory_entries(&attachments_dir(&vault_dir)), paths);
+        assert_eq!(std::fs::read(existing).unwrap(), bytes);
+        assert_eq!(
+            list_attachments(&vault_dir, &secret("master-pw"), None)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Reuse the existing blob, but fail before metadata commit again.
+        std::fs::write(&source, b"existing blob").unwrap();
+        let error = add_attachment_before_commit(
+            &vault_dir,
+            &secret("master-pw"),
+            &entry_id[..8],
+            &source,
+            || Err(DiaryError::Vault("injected writer rejection".into())),
+        )
+        .unwrap_err();
+        assert!(matches!(error, DiaryError::Vault(_)));
+        assert_eq!(directory_entries(&attachments_dir(&vault_dir)), paths);
+        assert_eq!(std::fs::read(existing).unwrap(), bytes);
+        assert_eq!(std::fs::read(vault_dir.join("vault.pqd")).unwrap(), before);
+    }
+
+    #[test]
+    fn add_actual_writer_failure_rolls_back_blob_and_keeps_original_vault() {
+        let dir = tempdir().unwrap();
+        let (vault_dir, entry_id) = vault_with_entry(&dir);
+        let source = write_source(&dir, "new.txt", b"new blob");
+        let vault = vault_dir.join("vault.pqd");
+        let original = std::fs::read(&vault).unwrap();
+        let backup = vault_dir.join("original.pqd");
+        let error = add_attachment_before_commit(
+            &vault_dir,
+            &secret("master-pw"),
+            &entry_id[..8],
+            &source,
+            || {
+                // Block final publication, regardless of the writer's staging name.
+                std::fs::rename(&vault, &backup).unwrap();
+                std::fs::create_dir(&vault).unwrap();
+                std::fs::write(vault.join("sentinel"), b"foreign directory").unwrap();
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, DiaryError::Io(_)));
+        assert!(directory_entries(&attachments_dir(&vault_dir)).is_empty());
+        assert_eq!(std::fs::read(&backup).unwrap(), original);
+        assert_eq!(
+            std::fs::read(vault.join("sentinel")).unwrap(),
+            b"foreign directory"
+        );
+        std::fs::remove_file(vault.join("sentinel")).unwrap();
+        std::fs::remove_dir(&vault).unwrap();
+        std::fs::rename(&backup, &vault).unwrap();
+        assert!(list_attachments(&vault_dir, &secret("master-pw"), None)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blob_cleanup_rejects_symlink_without_wiping_foreign_target() {
+        let dir = tempdir().unwrap();
+        let target = write_source(&dir, "foreign.bin", b"foreign data");
+        let link = dir.path().join("blob.bin");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(zeroize_and_delete(&link).is_err());
+        assert_eq!(std::fs::read(target).unwrap(), b"foreign data");
+        assert!(std::fs::symlink_metadata(link).unwrap().is_symlink());
+    }
+
+    #[test]
+    fn add_rollback_failure_keeps_primary_error_and_reports_blob_path() {
+        let dir = tempdir().unwrap();
+        let (vault_dir, entry_id) = vault_with_entry(&dir);
+        let source = write_source(&dir, "new.txt", b"new blob");
+        let before = std::fs::read(vault_dir.join("vault.pqd")).unwrap();
+        let moved = dir.path().join("moved.bin");
+        let error = add_attachment_before_commit(
+            &vault_dir,
+            &secret("master-pw"),
+            &entry_id[..8],
+            &source,
+            || {
+                let path = directory_entries(&attachments_dir(&vault_dir))
+                    .into_iter()
+                    .next()
+                    .unwrap();
+                std::fs::rename(&path, &moved).unwrap();
+                std::fs::create_dir(&path).unwrap();
+                std::fs::write(path.join("sentinel"), b"foreign object").unwrap();
+                Err(DiaryError::Vault("injected metadata failure".into()))
+            },
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("injected metadata failure"));
+        assert!(message.contains("may remain"));
+        assert!(message.contains(".bin"));
+        assert_eq!(std::fs::read(vault_dir.join("vault.pqd")).unwrap(), before);
+        let path = directory_entries(&attachments_dir(&vault_dir))
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(
+            std::fs::read(path.join("sentinel")).unwrap(),
+            b"foreign object"
+        );
+        assert!(std::fs::read(moved).unwrap().iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn delete_cleanup_failure_reports_committed_metadata_and_preserves_foreign_object() {
+        let dir = tempdir().unwrap();
+        let (vault_dir, entry_id) = vault_with_entry(&dir);
+        let source = write_source(&dir, "new.txt", b"new blob");
+        add_attachment(&vault_dir, &secret("master-pw"), &entry_id[..8], &source).unwrap();
+        let meta = list_attachments(&vault_dir, &secret("master-pw"), None).unwrap();
+        let path = blob_path(&vault_dir, &meta[0].blob_uuid);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("sentinel"), b"foreign object").unwrap();
+        let error = delete_attachment(&vault_dir, &secret("master-pw"), &entry_id[..8], "new.txt")
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("deletion committed to vault"));
+        assert!(message.contains("cannot retry cleanup"));
+        assert!(message.contains(&path.display().to_string()));
+        assert!(list_attachments(&vault_dir, &secret("master-pw"), None)
+            .unwrap()
+            .is_empty());
+        let (_, entries, records) = read_vault_with_attachments_from_bytes(
+            &std::fs::read(vault_dir.join("vault.pqd")).unwrap(),
+        )
+        .unwrap();
+        assert!(records.is_empty());
+        assert_eq!(entries[0].attachment_count, 0);
+        assert_eq!(
+            std::fs::read(path.join("sentinel")).unwrap(),
+            b"foreign object"
+        );
     }
 
     /// TC-S13-004-13: 256 attachments per entry max.

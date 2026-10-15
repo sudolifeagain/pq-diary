@@ -6,3 +6,10 @@ resolver = "2"
 edition = "2021"
 rust-version = "1.94"
 license = "GPL-3.0-or-later"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"

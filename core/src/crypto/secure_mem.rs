@@ -234,6 +234,7 @@ pub fn munlock_master_key(mk: &MasterKey) -> Result<(), DiaryError> {
 // ---- Platform implementations ----
 
 #[cfg(unix)]
+#[allow(unsafe_code, reason = "OS memory-lock boundary: mlock")]
 fn mlock_buffer_platform(buf: &[u8]) -> Result<(), DiaryError> {
     // nix 0.29+ requires NonNull<c_void> instead of a raw pointer.
     let ptr = std::ptr::NonNull::new(buf.as_ptr() as *mut core::ffi::c_void)
@@ -246,6 +247,7 @@ fn mlock_buffer_platform(buf: &[u8]) -> Result<(), DiaryError> {
 }
 
 #[cfg(unix)]
+#[allow(unsafe_code, reason = "OS memory-lock boundary: munlock")]
 fn munlock_buffer_platform(buf: &[u8]) -> Result<(), DiaryError> {
     // nix 0.29+ requires NonNull<c_void> instead of a raw pointer.
     let ptr = std::ptr::NonNull::new(buf.as_ptr() as *mut core::ffi::c_void)
@@ -258,6 +260,7 @@ fn munlock_buffer_platform(buf: &[u8]) -> Result<(), DiaryError> {
 }
 
 #[cfg(windows)]
+#[allow(unsafe_code, reason = "OS memory-lock boundary: VirtualLock")]
 fn mlock_buffer_platform(buf: &[u8]) -> Result<(), DiaryError> {
     // SAFETY: `buf` is a valid, live, non-empty slice.
     // `VirtualLock` is in CLAUDE.md's allowed unsafe list.
@@ -278,6 +281,7 @@ fn mlock_buffer_platform(buf: &[u8]) -> Result<(), DiaryError> {
 }
 
 #[cfg(windows)]
+#[allow(unsafe_code, reason = "OS memory-lock boundary: VirtualUnlock")]
 fn munlock_buffer_platform(buf: &[u8]) -> Result<(), DiaryError> {
     // SAFETY: `buf` is a valid, live, non-empty slice.
     // `VirtualUnlock` is in CLAUDE.md's allowed unsafe list.
@@ -354,27 +358,18 @@ mod tests {
         assert_eq!(buf.as_ref(), &[0u8; 8]);
     }
 
-    /// TC-003-01: verify that data is zeroed when the buffer is dropped.
-    ///
-    /// Verifies that `SecureBuffer::zeroize()` (called by `Drop::drop`) clears all bytes.
-    ///
-    /// Uses `ManuallyDrop` to call `zeroize()` while the allocation is still live,
-    /// avoiding undefined behavior from reading freed memory.
+    /// TC-003-01: zeroize clears a live buffer and is safe to repeat.
+    /// The trait check guards the drop contract without reading freed memory.
     #[test]
-    fn secure_buffer_zeroize_on_scope_exit() {
-        use std::mem::ManuallyDrop;
-        let mut buf = ManuallyDrop::new(SecureBuffer::new(vec![0xAAu8; 32]));
-        let ptr = buf.as_ref().as_ptr();
-        let len = buf.len();
-        // Call zeroize (the same method Drop::drop invokes) while memory is still allocated.
+    fn secure_buffer_zeroize_clears_live_buffer() {
+        fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<SecureBuffer>();
+
+        let mut buf = SecureBuffer::new(vec![0xAAu8; 32]);
         buf.zeroize();
-        // SAFETY: the allocation is still live because ManuallyDrop suppresses deallocation.
-        unsafe {
-            for i in 0..len {
-                assert_eq!(*ptr.add(i), 0u8, "byte {i} not zeroed after zeroize");
-            }
-        }
-        // Intentional leak — the allocation is small and this is test code.
+        assert_eq!(buf.as_ref(), &[0u8; 32]);
+        buf.zeroize();
+        assert_eq!(buf.as_ref(), &[0u8; 32]);
     }
 
     /// TC-003-B02: 1 MiB buffer drops without panic and reports correct length.

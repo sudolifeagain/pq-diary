@@ -20,8 +20,9 @@ use zeroize::Zeroizing;
 use crate::crypto::{aead, kdf};
 use crate::entry::EntryPlaintext;
 use crate::error::DiaryError;
+use crate::template::TemplatePlaintext;
 use crate::vault::format::{
-    generate_verification_token, EntryRecord, VaultHeader, RECORD_TYPE_ENTRY,
+    generate_verification_token, EntryRecord, VaultHeader, RECORD_TYPE_ENTRY, RECORD_TYPE_TEMPLATE,
 };
 
 /// Re-encrypt the vault at `vault_dir` with a new master password.
@@ -83,6 +84,11 @@ pub fn re_encrypt_vault(
         &header.verification_ct,
     )
     .map_err(|_| DiaryError::Crypto("invalid password".to_string()))?;
+
+    // Authenticate metadata and record ordering before re-encryption can
+    // endorse modified data with a fresh key and MAC.
+    let old_mac_key = crate::crypto::derive_vault_mac_key(old_key.as_ref())?;
+    crate::vault::reader::verify_vault_integrity(&vault_pqd, &old_mac_key)?;
 
     // Step 4: decrypt KEM and DSA seeds with the old key.
     let kem_seed = decrypt_blob(old_key.as_ref(), &header.kem_encrypted_sk, "KEM")?;
@@ -210,19 +216,26 @@ fn re_encrypt_entry(
     use crate::crypto::secure_mem::SecureBuffer;
     use crate::crypto::{dsa, hmac_util};
 
-    if record.record_type != RECORD_TYPE_ENTRY {
-        // Template records (RECORD_TYPE_TEMPLATE) follow the same encrypt/decrypt
-        // primitives; treat them identically. Anything else is rejected.
-        // We allow them through the same code path for now.
-    }
-
     // Decrypt with old key.
     let plain = aead::decrypt(old_sym_key, record.iv, &record.ciphertext)?;
 
-    // Ensure the JSON parses back into a valid EntryPlaintext so that we
-    // detect truncation / corruption before writing the new vault.
-    let _check: EntryPlaintext = serde_json::from_slice(plain.as_ref())
-        .map_err(|e| DiaryError::Entry(format!("deserialization failed: {e}")))?;
+    // Entries and templates share encryption but have different payload schemas.
+    // Validate the appropriate schema before replacing any on-disk data.
+    match record.record_type {
+        RECORD_TYPE_ENTRY => {
+            let _check: EntryPlaintext = serde_json::from_slice(plain.as_ref())
+                .map_err(|e| DiaryError::Entry(format!("deserialization failed: {e}")))?;
+        }
+        RECORD_TYPE_TEMPLATE => {
+            let _check: TemplatePlaintext = serde_json::from_slice(plain.as_ref())
+                .map_err(|e| DiaryError::Template(format!("deserialization failed: {e}")))?;
+        }
+        other => {
+            return Err(DiaryError::Vault(format!(
+                "unsupported record type: {other}"
+            )))
+        }
+    }
 
     // Re-encrypt with the new symmetric key.
     let (new_ct, new_iv) = aead::encrypt(new_sym_key, plain.as_ref())?;
@@ -312,6 +325,65 @@ mod tests {
             .with_kdf_params(fast_params());
         mgr.init_vault("v", password).expect("init_vault");
         dir.path().join("v")
+    }
+
+    #[test]
+    fn password_rotation_preserves_templates_and_entries() {
+        let dir = tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir, b"Old123!");
+        let vault_path = vault_dir.join("vault.pqd");
+        let path = vault_path.to_str().expect("utf8");
+        let entry_id = {
+            let mut core = DiaryCore::new(path).expect("open");
+            core.unlock(make_secret("Old123!")).expect("unlock");
+            core.new_template("daily", "## {{date}}\n今日の日記")
+                .expect("template");
+            core.new_entry("日記", "本文", vec!["daily".into()])
+                .expect("entry")
+        };
+
+        re_encrypt_vault(&vault_dir, &make_secret("Old123!"), &make_secret("New456!"))
+            .expect("rotate mixed records");
+
+        let mut old = DiaryCore::new(path).expect("open old");
+        assert!(old.unlock(make_secret("Old123!")).is_err());
+        let mut core = DiaryCore::new(path).expect("reopen");
+        core.unlock(make_secret("New456!")).expect("unlock new");
+        let template = core.get_template("daily").expect("read template");
+        assert_eq!(template.name, "daily");
+        assert_eq!(template.body, "## {{date}}\n今日の日記");
+        let (_, entry) = core.get_entry(&entry_id).expect("read entry");
+        assert_eq!(entry.title, "日記");
+        assert_eq!(entry.body, "本文");
+        assert_eq!(entry.tags, vec!["daily"]);
+    }
+
+    #[test]
+    fn password_rotation_rejects_tampered_vault_without_rewriting() {
+        let dir = tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir, b"Old123!");
+        let vault_path = vault_dir.join("vault.pqd");
+        let path = vault_path.to_str().expect("utf8");
+        let mut core = DiaryCore::new(path).expect("open");
+        core.unlock(make_secret("Old123!")).expect("unlock");
+        core.new_entry("diary", "body", vec![]).expect("entry");
+        drop(core);
+
+        // A changed authenticated header field still parses and decrypts.
+        // Rotation must reject it rather than certify it with a fresh MAC.
+        let mut tampered = std::fs::read(&vault_path).expect("read");
+        tampered[140] ^= 1;
+        std::fs::write(&vault_path, &tampered).expect("tamper");
+        let config_before = std::fs::read(vault_dir.join("vault.toml")).expect("config");
+
+        let result = re_encrypt_vault(&vault_dir, &make_secret("Old123!"), &make_secret("New456!"));
+        assert!(matches!(result, Err(DiaryError::Crypto(_))));
+        assert_eq!(std::fs::read(&vault_path).expect("read again"), tampered);
+        assert_eq!(
+            std::fs::read(vault_dir.join("vault.toml")).expect("config again"),
+            config_before
+        );
+        assert!(!vault_dir.join("vault.pqd.tmp.new").exists());
     }
 
     /// TC-CP-CORE-01: empty vault re-encrypt; old password fails, new succeeds.

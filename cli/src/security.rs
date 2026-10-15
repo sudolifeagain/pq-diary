@@ -33,7 +33,9 @@ pub fn harden_process() {
     {
         // PR_SET_DUMPABLE=0: blocks /proc/pid/mem reads and ptrace attach.
         // nix 0.29 does not expose a prctl feature, so we call libc::prctl directly.
-        // SAFETY: prctl(PR_SET_DUMPABLE, 0) is listed in CLAUDE.md's allowed unsafe scope.
+        // SAFETY: PR_SET_DUMPABLE accepts the scalar value 0; unused variadic
+        // arguments are supplied as machine-word zeroes and no pointers escape.
+        #[allow(unsafe_code, reason = "OS process-hardening boundary: PR_SET_DUMPABLE")]
         let ret = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0_usize, 0_usize, 0_usize, 0_usize) };
         if ret != 0 {
             eprintln!(
@@ -58,14 +60,13 @@ pub fn harden_process() {
         // rather than replacing it, preserving any flags the runtime already set
         // (e.g. SEM_NOALIGNMENTFAULTEXCEPT).
         use windows_sys::Win32::System::Diagnostics::Debug::{
-            GetErrorMode, SetErrorMode, SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX,
+            SetErrorMode, SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX,
         };
-        // SAFETY: GetErrorMode/SetErrorMode are process-global Win32 calls that
-        // take/return a plain bit-flag integer and have no pointer arguments, so
-        // they cannot violate memory safety. They fall within the CLAUDE.md
-        // allowed unsafe scope for Win32 security-hardening APIs (audit M6).
+        let prev = windows_error_mode();
+        // SAFETY: SetErrorMode takes only documented integer flags, preserving
+        // the existing mode, and does not access caller-owned memory.
+        #[allow(unsafe_code, reason = "OS process-hardening boundary: SetErrorMode")]
         unsafe {
-            let prev = GetErrorMode();
             SetErrorMode(prev | SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
         }
     }
@@ -109,12 +110,7 @@ pub fn check_debugger() {
     }
     #[cfg(windows)]
     {
-        // SAFETY: IsDebuggerPresent() is a nullary Win32 API that is always safe to call.
-        // It requires no parameters and returns a BOOL (i32). This falls within the
-        // CLAUDE.md-permitted unsafe scope for Win32 system APIs used for security hardening.
-        let attached =
-            unsafe { windows_sys::Win32::System::Diagnostics::Debug::IsDebuggerPresent() };
-        if attached != 0 {
+        if query_debugger_detected() {
             eprintln!("Warning: debugger detected. Key material may be exposed.");
         }
     }
@@ -276,11 +272,23 @@ fn query_debugger_detected() -> bool {
 }
 
 #[cfg(windows)]
+#[allow(unsafe_code, reason = "OS debugger-query boundary: IsDebuggerPresent")]
 fn query_debugger_detected() -> bool {
     // SAFETY: IsDebuggerPresent() is a nullary Win32 API that is always safe to call.
     // Listed in CLAUDE.md's allowed unsafe scope (same as check_debugger above).
     let attached = unsafe { windows_sys::Win32::System::Diagnostics::Debug::IsDebuggerPresent() };
     attached != 0
+}
+
+#[cfg(windows)]
+#[allow(
+    unsafe_code,
+    reason = "OS process-hardening query boundary: GetErrorMode"
+)]
+fn windows_error_mode() -> u32 {
+    // SAFETY: GetErrorMode takes no arguments and returns scalar process state;
+    // it does not access caller-owned memory or retain any references.
+    unsafe { windows_sys::Win32::System::Diagnostics::Debug::GetErrorMode() }
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -360,10 +368,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn tc_s9_084_05_is_debugger_present_returns_zero() {
-        // SAFETY: IsDebuggerPresent() is a nullary Win32 API, always safe to call.
-        let result = unsafe { windows_sys::Win32::System::Diagnostics::Debug::IsDebuggerPresent() };
-        assert_eq!(
-            result, 0,
+        assert!(
+            !query_debugger_detected(),
             "IsDebuggerPresent must return 0 during normal test execution (no debugger attached)"
         );
     }
@@ -374,11 +380,10 @@ mod tests {
     #[test]
     fn tc_m6_01_windows_error_mode_suppresses_wer() {
         use windows_sys::Win32::System::Diagnostics::Debug::{
-            GetErrorMode, SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX,
+            SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX,
         };
         harden_process();
-        // SAFETY: GetErrorMode is a nullary Win32 call returning a bit-flag integer.
-        let mode = unsafe { GetErrorMode() };
+        let mode = windows_error_mode();
         assert_ne!(
             mode & SEM_FAILCRITICALERRORS,
             0,

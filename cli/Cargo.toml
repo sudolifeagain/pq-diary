@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 pq-diary-core = { path = "../core" }
 clap = { version = "4", features = ["derive"] }

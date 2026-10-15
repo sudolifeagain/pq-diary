@@ -8,7 +8,9 @@
 //! - `write_vault`: write a complete vault file to a `Path` with random tail padding
 
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+use super::atomic_file::write_atomic;
 
 use rand::Rng;
 
@@ -282,69 +284,6 @@ pub fn write_attachments<W: Write>(
     Ok(())
 }
 
-/// Owns only a sibling successfully created with exclusive creation. The file
-/// handle is closed before rename/removal, including on Windows. Cleanup is
-/// best effort; this is not a physical-erasure or crash-durability guarantee.
-struct VaultTemp {
-    path: PathBuf,
-    armed: bool,
-}
-
-impl VaultTemp {
-    fn create(path: PathBuf) -> Result<(Self, std::fs::File), DiaryError> {
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        // Apply permissions before any vault bytes reach the file. Windows
-        // continues to rely on the vault directory's ACLs.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let file = options.open(&path)?;
-        Ok((Self { path, armed: true }, file))
-    }
-}
-
-impl Drop for VaultTemp {
-    fn drop(&mut self) {
-        if self.armed {
-            if let Err(error) = std::fs::remove_file(&self.path) {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    // Drop must not panic if stderr is closed or broken,
-                    // especially while unwinding another failure.
-                    let _ = writeln!(
-                        std::io::stderr().lock(),
-                        "Warning: failed to remove temporary vault file: {error}"
-                    );
-                }
-            }
-        }
-    }
-}
-
-fn write_atomic(
-    path: &Path,
-    write_and_sync: impl FnOnce(&mut std::fs::File) -> Result<(), DiaryError>,
-) -> Result<(), DiaryError> {
-    let mut name = path
-        .file_name()
-        .ok_or_else(|| DiaryError::Vault("vault path has no file name".to_string()))?
-        .to_os_string();
-    name.push(format!(".tmp.{}", uuid::Uuid::new_v4()));
-    // A collision fails closed: no ownership guard exists until create_new
-    // succeeds, so an existing file, directory or symlink cannot be cleaned up.
-    let (mut temp, mut file) = VaultTemp::create(path.with_file_name(name))?;
-    let result = write_and_sync(&mut file);
-    drop(file);
-    result?;
-    // Keep the platform's existing atomic-replacement semantics. Do not delete
-    // the destination first or fall back to copying over it.
-    std::fs::rename(&temp.path, path)?;
-    temp.armed = false;
-    Ok(())
-}
-
 /// Write a complete vault to `path` *without* a vault-level integrity MAC.
 ///
 /// Retained for test fixtures and the legacy v0x04/v0x05 layout. Production
@@ -572,32 +511,6 @@ mod tests {
         assert_eq!(std::fs::read_link(&link).unwrap(), target);
         crate::vault::reader::read_vault(&path).unwrap();
         assert_no_owned_temps(&path);
-    }
-
-    #[test]
-    fn exclusive_collision_preserves_existing_paths() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("vault.pqd.tmp.collision");
-        std::fs::write(&path, b"existing file").unwrap();
-        assert!(VaultTemp::create(path.clone()).is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), b"existing file");
-        let directory = dir.path().join("directory");
-        std::fs::create_dir(&directory).unwrap();
-        assert!(VaultTemp::create(directory.clone()).is_err());
-        assert!(directory.is_dir());
-        #[cfg(unix)]
-        {
-            let link = dir.path().join("link");
-            std::os::unix::fs::symlink(&path, &link).unwrap();
-            assert!(VaultTemp::create(link.clone()).is_err());
-            assert_eq!(std::fs::read_link(&link).unwrap(), path);
-            assert_eq!(std::fs::read(&path).unwrap(), b"existing file");
-            let dangling = dir.path().join("dangling");
-            std::os::unix::fs::symlink(dir.path().join("absent"), &dangling).unwrap();
-            assert!(VaultTemp::create(dangling.clone()).is_err());
-            assert!(std::fs::symlink_metadata(dangling).unwrap().is_symlink());
-            assert!(!dir.path().join("absent").exists());
-        }
     }
 
     #[test]

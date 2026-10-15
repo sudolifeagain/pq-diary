@@ -87,7 +87,7 @@ tdd-refactor       品質改善 → {feature}-refactor-phase.md
 tdd-verify-complete  全テスト実行・網羅率チェック
     ├── テストケース不足 → tdd-red に戻る
     ├── 実装不足 → tdd-green に戻る
-    └── 全パス → タスク完了
+    └── 全パス → 回帰・変更リスク・DoDを確認してタスク完了
 ```
 
 ### 手動で個別実行する場合
@@ -98,6 +98,47 @@ tdd-verify-complete  全テスト実行・網羅率チェック
 /tsumiki:tdd-refactor {スプリント名} TASK-0001
 /tsumiki:tdd-verify-complete {スプリント名} TASK-0001
 ```
+
+### 軽量CIと変更リスクに応じた検証
+
+通常PRと `main` pushではLinuxの短い検証を標準とする。ブランチpushとPRで
+同じCIを二重実行せず、新しいコミットが来たら同じPRの古いrunを取り消す。
+標準の検証コマンドは次のとおり（CIは同じjobのbuild成果物をsmokeに再利用）:
+
+```bash
+cargo fmt --all -- --check
+cargo build --workspace --locked
+cargo test --workspace --locked
+cargo clippy --workspace --locked --all-targets -- -D warnings
+bash ci/smoke-test.sh ./target/debug/pq-diary
+```
+
+`cargo test --workspace` にはintegration testとdoctestも含まれる。
+別jobで同じテストを重ねない。脆弱性を確認する `cargo audit` と、
+依存ポリシーを確認する `cargo deny check bans licenses sources` は役割が異なるため維持する。
+依存変更がなくても新しい脆弱性情報が出るため、監査はpath filterで省略しない。
+
+全OS/ARM・release・Miri・性能・大量データ・長時間検証は毎PRの一律必須にしない。
+必要な検証を作業環境または手動で選ぶ:
+
+- OS API / unsafe / 対象依存を変更: 該当OSでテストする。MiriはOS FFIの実動作確認の代わりにはならない
+- 保存形式 / 鍵更新 / 書込みを変更: 日記・テンプレート・添付など該当する混在データ、旧形式互換性、失敗時の原本・設定保全と再読込を確認する
+- 性能や容量上限を変更: 該当するignoredテストを作業環境で選んで実行する。全ignored一括実行には環境変数・OS状態を変更するテストも含まれるため、対象と実行条件を確認する
+- 全環境を確認する場合: Actions → CI → Run workflowで対象branchを選び、`full_matrix=true` にする。既存3 OSのbuild/test/Clippyと、Linux x64/ARM・macOS・Windowsのrelease smokeが追加される。新しい手動入力はworkflowがdefault branchに存在してから利用可能になる
+
+不具合修正では修正前に失敗・修正後に成功する小さい回帰テストを優先する。
+件数や網羅率だけで完了とせず、失敗時の状態や機能の組合せも確認する。
+PRテンプレートに環境（OS/Rust）、コマンド、結果、実測時間、cold/warm cacheの区別、
+未実施の検証と理由を書く。秒数の上限を根拠なく設けず、実測を比較して
+重複jobや不要な再ビルドから減らす。GitHub Actionsのstep所要時間も測定に使える。
+
+### Rustの判断根拠
+
+- [Rust Book: panicとResultの使い分け](https://doc.rust-lang.org/book/ch09-03-to-panic-or-not-to-panic.html)
+- [Clippy: restrictionは必要なlintを個別選択](https://doc.rust-lang.org/clippy/usage.html)
+- [zeroize: Dropと複製・再割当ての注意](https://docs.rs/zeroize/latest/zeroize/)
+- [Cargo: CIの検証範囲と所要時間のバランス](https://doc.rust-lang.org/cargo/guide/continuous-integration.html)
+- [Cargo: test対象とdoctest](https://doc.rust-lang.org/cargo/commands/cargo-test.html)
 
 ## 7. スプリント完了
 

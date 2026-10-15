@@ -11,6 +11,9 @@ the **History** table at the bottom for git-tag pointers.
 ## [Unreleased]
 
 ### Security (review follow-up)
+- Reject edits to INHERIT entries when the legacy key is unavailable, preserving the owner's content and the separate heir-recovery payload. Create a separate entry for revisions instead.
+- Direct attachment and master-password legacy APIs verify vault integrity before using records or changing files; these APIs and password rotation authenticate the same byte snapshot they parse.
+- Keep attachment API master-key copies in zeroize-on-drop storage through success and error paths.
 - Update locked anyhow to 1.0.103 and rand to 0.8.6 for RUSTSEC-2026-0190 / RUSTSEC-2026-0097; replace yanked der 0.8.0 with 0.8.2.
 - Fail dependency audits on unsound advisories and yanked crates as well as vulnerabilities.
 

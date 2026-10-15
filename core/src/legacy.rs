@@ -32,8 +32,7 @@ use crate::vault::config::{ConfirmationMode, VaultConfig};
 use crate::vault::format::{
     generate_verification_token, EntryRecord, VaultHeader, RECORD_TYPE_ENTRY, SCHEMA_VERSION,
 };
-use crate::vault::reader::read_vault;
-use crate::vault::writer::write_vault_authenticated;
+use crate::vault::reader::read_vault_with_attachments_from_bytes;
 
 // ============================================================================
 // LegacyKeyDeriver trait + default Argon2 implementation
@@ -164,12 +163,14 @@ pub fn initialize_legacy(
         ));
     }
 
-    let (header, _entries) = read_vault(&vault_pqd)?;
+    let vault_bytes = std::fs::read(&vault_pqd)?;
+    let (header, _entries, _attachments) = read_vault_with_attachments_from_bytes(&vault_bytes)?;
 
     // 1) verify the master password against the vault's verification token —
     //    refuse to initialize on a vault the caller cannot already unlock.
     let params = argon2_params_from(&config);
-    verify_master(&header, master_pwd, &params)?;
+    verify_master(&vault_bytes, &header, master_pwd, &params)?;
+    drop(vault_bytes);
 
     // 2) derive K_legacy and stamp a fresh verification token under it.
     let k_legacy = deriver.derive(legacy_code.expose_secret().as_bytes(), &header.legacy_salt)?;
@@ -209,9 +210,11 @@ pub fn set_entry_flag(
         ));
     }
 
-    let (header, mut entries) = read_vault(&vault_pqd)?;
+    let vault_bytes = std::fs::read(&vault_pqd)?;
+    let (header, mut entries, attachments) = read_vault_with_attachments_from_bytes(&vault_bytes)?;
     let params = argon2_params_from(&config);
-    let k_master = verify_master(&header, master_pwd, &params)?;
+    let k_master = verify_master(&vault_bytes, &header, master_pwd, &params)?;
+    drop(vault_bytes);
 
     // Locate the unique entry matching `id_prefix`.
     let prefix_lower = id_prefix.to_ascii_lowercase();
@@ -278,7 +281,13 @@ pub fn set_entry_flag(
 
     // Vault stays encrypted under the master key, so the integrity MAC keys on it.
     let mac_key = crate::crypto::derive_vault_mac_key(&k_master)?;
-    write_vault_authenticated(&vault_pqd, header, &entries, &mac_key)?;
+    crate::vault::writer::write_vault_with_attachments_authenticated(
+        &vault_pqd,
+        header,
+        &entries,
+        &attachments,
+        &mac_key,
+    )?;
     Ok(())
 }
 
@@ -295,9 +304,11 @@ pub fn list_legacy_status(
     let vault_toml = vault_dir.join("vault.toml");
     let config = VaultConfig::from_file(&vault_toml)?;
 
-    let (header, entries) = read_vault(&vault_pqd)?;
+    let vault_bytes = std::fs::read(&vault_pqd)?;
+    let (header, entries, _attachments) = read_vault_with_attachments_from_bytes(&vault_bytes)?;
     let params = argon2_params_from(&config);
-    let k_master = verify_master(&header, master_pwd, &params)?;
+    let k_master = verify_master(&vault_bytes, &header, master_pwd, &params)?;
+    drop(vault_bytes);
 
     let mut out = Vec::with_capacity(entries.len());
     for record in &entries {
@@ -349,10 +360,12 @@ pub fn rotate_legacy_code(
         ));
     }
 
+    let vault_bytes = std::fs::read(&vault_pqd)?;
     let (header, mut entries, mut attachments) =
-        crate::vault::reader::read_vault_with_attachments(&vault_pqd)?;
+        read_vault_with_attachments_from_bytes(&vault_bytes)?;
     let params = argon2_params_from(&config);
-    let _k_master = verify_master(&header, master_pwd, &params)?;
+    let _k_master = verify_master(&vault_bytes, &header, master_pwd, &params)?;
+    drop(vault_bytes);
 
     let k_legacy_old = deriver.derive(old_code.expose_secret().as_bytes(), &header.legacy_salt)?;
     verify_legacy_code(&config, &k_legacy_old)?;
@@ -677,6 +690,7 @@ fn argon2_params_from(config: &VaultConfig) -> kdf::Argon2Params {
 }
 
 fn verify_master(
+    vault_bytes: &[u8],
     header: &VaultHeader,
     master_pwd: &SecretString,
     params: &kdf::Argon2Params,
@@ -692,6 +706,10 @@ fn verify_master(
         &header.verification_ct,
     )
     .map_err(|_| DiaryError::Crypto("invalid master password".to_string()))?;
+    // Direct module callers must authenticate the vault before trusting its
+    // records or creating side effects; they do not pass through DiaryCore::unlock.
+    let mac_key = crate::crypto::derive_vault_mac_key(key.as_ref())?;
+    crate::vault::reader::verify_vault_integrity_bytes(vault_bytes, &mac_key)?;
     Ok(Zeroizing::new(*key.as_ref()))
 }
 
@@ -1000,6 +1018,7 @@ mod tests {
     use super::*;
     use crate::crypto::kdf::Argon2Params;
     use crate::vault::init::VaultManager;
+    use crate::vault::reader::read_vault;
     use crate::DiaryCore;
     use secrecy::SecretBox;
     use tempfile::tempdir;
@@ -1038,6 +1057,253 @@ mod tests {
 
     fn always_reject(_: ConfirmationMode) -> Result<bool, DiaryError> {
         Ok(false)
+    }
+
+    fn assert_tampered_vault_rejected(tamper_timestamp: bool) {
+        for operation in ["set flag", "rotate", "initialize", "list"] {
+            let dir = tempdir().unwrap();
+            let (vault_dir, ids) = vault_with_one_entry(&dir, 1);
+            let pwd = secret("master-pw");
+            if operation == "initialize" {
+                let config_path = vault_dir.join("vault.toml");
+                let mut config = VaultConfig::from_file(&config_path).unwrap();
+                config.legacy.initialized = false;
+                config.to_file(&config_path).unwrap();
+            } else {
+                set_entry_flag(
+                    &vault_dir,
+                    &pwd,
+                    Some(&secret("legacy-code")),
+                    &ids[0],
+                    LegacyFlag::Inherit,
+                    &fast_deriver(),
+                )
+                .unwrap();
+            }
+
+            let vault_path = vault_dir.join("vault.pqd");
+            let config_before = std::fs::read(vault_dir.join("vault.toml")).unwrap();
+            let mut bytes = std::fs::read(&vault_path).unwrap();
+            let mut cursor = std::io::Cursor::new(&bytes);
+            let header = crate::vault::reader::read_header(&mut cursor).unwrap();
+            let key = kdf::derive_key(b"master-pw", &header.kdf_salt, &fast_params()).unwrap();
+            let mac_key = crate::crypto::derive_vault_mac_key(key.as_ref()).unwrap();
+            crate::vault::reader::verify_vault_integrity(&vault_path, &mac_key).unwrap();
+            let offset = if tamper_timestamp {
+                // First entry: length prefix + record type + UUID + created_at.
+                cursor.position() as usize + 4 + 1 + 16 + 8
+            } else {
+                bytes.len() - 1
+            };
+            bytes[offset] ^= 1;
+            std::fs::write(&vault_path, &bytes).unwrap();
+            assert!(crate::vault::reader::verify_vault_integrity(&vault_path, &mac_key).is_err());
+
+            let result = match operation {
+                "set flag" => set_entry_flag(
+                    &vault_dir,
+                    &pwd,
+                    None,
+                    &ids[0],
+                    LegacyFlag::Destroy,
+                    &fast_deriver(),
+                ),
+                "rotate" => rotate_legacy_code(
+                    &vault_dir,
+                    &pwd,
+                    &secret("legacy-code"),
+                    &secret("new-code"),
+                    &fast_deriver(),
+                )
+                .map(|_| ()),
+                "initialize" => initialize_legacy(
+                    &vault_dir,
+                    &pwd,
+                    &secret("legacy-code"),
+                    ConfirmationMode::Yn,
+                    &fast_deriver(),
+                ),
+                "list" => list_legacy_status(&vault_dir, &pwd).map(|_| ()),
+                _ => unreachable!(),
+            };
+            assert!(
+                matches!(&result, Err(DiaryError::Crypto(message)) if message.contains("vault integrity")),
+                "{operation} accepted or misclassified corruption: {result:?}; post-operation MAC valid: {}",
+                crate::vault::reader::verify_vault_integrity(&vault_path, &mac_key).is_ok()
+            );
+            assert_eq!(std::fs::read(&vault_path).unwrap(), bytes, "{operation}");
+            assert_eq!(
+                std::fs::read(vault_dir.join("vault.toml")).unwrap(),
+                config_before,
+                "{operation}"
+            );
+            for sidecar in [
+                "vault.pqd.tmp",
+                "vault.pqd.tmp.rotate",
+                "vault.toml.tmp",
+                "vault.toml.tmp.rotate",
+                "vault.pqd.bak.rotate",
+                "vault.toml.bak.rotate",
+            ] {
+                assert!(!vault_dir.join(sidecar).exists(), "{operation}: {sidecar}");
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_apis_reject_tampered_mac_without_side_effects() {
+        assert_tampered_vault_rejected(false);
+    }
+
+    #[test]
+    fn legacy_apis_reject_tampered_timestamp_without_side_effects() {
+        assert_tampered_vault_rejected(true);
+    }
+
+    #[test]
+    fn set_flag_preserves_attachments_from_authenticated_snapshot() {
+        struct ReplacingDeriver {
+            path: PathBuf,
+            replacement: Vec<u8>,
+        }
+
+        impl LegacyKeyDeriver for ReplacingDeriver {
+            fn derive(
+                &self,
+                code: &[u8],
+                salt: &[u8; 32],
+            ) -> Result<Zeroizing<[u8; 32]>, DiaryError> {
+                // set_entry_flag calls this after master-password/MAC verification.
+                std::fs::write(&self.path, &self.replacement)?;
+                fast_deriver().derive(code, salt)
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let (vault_dir, ids) = vault_with_one_entry(&dir, 1);
+        let pwd = secret("master-pw");
+        let source = dir.path().join("original.txt");
+        std::fs::write(&source, b"original attachment").unwrap();
+        crate::attachment::add_attachment(&vault_dir, &pwd, &ids[0], &source).unwrap();
+        let vault_path = vault_dir.join("vault.pqd");
+        let (header, entries, mut attachments) =
+            crate::vault::reader::read_vault_with_attachments(&vault_path).unwrap();
+        assert_eq!(attachments[0].legacy_flag, LegacyFlag::Destroy.to_byte());
+        let original = attachments[0].clone();
+        attachments[0].legacy_flag = LegacyFlag::Inherit.to_byte();
+        let replacement_path = dir.path().join("replacement.pqd");
+        crate::vault::writer::write_vault_with_attachments(
+            &replacement_path,
+            header,
+            &entries,
+            &attachments,
+        )
+        .unwrap();
+        let deriver = ReplacingDeriver {
+            path: vault_path.clone(),
+            replacement: std::fs::read(replacement_path).unwrap(),
+        };
+
+        set_entry_flag(
+            &vault_dir,
+            &pwd,
+            Some(&secret("legacy-code")),
+            &ids[0],
+            LegacyFlag::Inherit,
+            &deriver,
+        )
+        .unwrap();
+
+        let (_, _, final_attachments) =
+            crate::vault::reader::read_vault_with_attachments(&vault_path).unwrap();
+        assert_eq!(final_attachments.len(), 1);
+        assert_eq!(final_attachments[0].legacy_flag, original.legacy_flag);
+        assert_eq!(final_attachments[0].ciphertext, original.ciphertext);
+        assert_eq!(
+            final_attachments[0].legacy_key_block,
+            original.legacy_key_block
+        );
+        let (_, final_entries) = read_vault(&vault_path).unwrap();
+        assert_eq!(final_entries[0].legacy_flag, LegacyFlag::Inherit.to_byte());
+        let mut core = DiaryCore::new(vault_path.to_str().unwrap()).unwrap();
+        core.unlock(secret("master-pw")).unwrap();
+        assert_eq!(core.list_entries(None).unwrap().len(), 1);
+    }
+
+    /// Editing without the legacy key must not leave a stale recovery payload.
+    #[test]
+    fn inherit_edit_rejected_preserves_vault_and_legacy_recovery() {
+        let dir = tempdir().unwrap();
+        let vault_dir = setup_vault(&dir, b"password");
+        let vault_path = vault_dir.join("vault.pqd");
+        let config_path = vault_dir.join("vault.toml");
+        let mut core = DiaryCore::new(&vault_pqd_str(&vault_dir)).unwrap();
+        core.unlock(secret("password")).unwrap();
+        let original = EntryPlaintext {
+            title: "original title".into(),
+            body: "original body".into(),
+            tags: vec!["original".into()],
+        };
+        let id = core
+            .new_entry(&original.title, &original.body, original.tags.clone())
+            .unwrap();
+        let destroy_id = core
+            .new_entry("destroy title", "destroy body", vec![])
+            .unwrap();
+        let deriver = fast_deriver();
+        initialize_legacy(
+            &vault_dir,
+            &secret("password"),
+            &secret("heir-code"),
+            ConfirmationMode::Yn,
+            &deriver,
+        )
+        .unwrap();
+        set_entry_flag(
+            &vault_dir,
+            &secret("password"),
+            Some(&secret("heir-code")),
+            &id,
+            LegacyFlag::Inherit,
+            &deriver,
+        )
+        .unwrap();
+        let revision = EntryPlaintext {
+            title: "latest title".into(),
+            body: "latest body".into(),
+            tags: vec!["latest".into()],
+        };
+
+        // A normal DESTROY entry remains editable in the same legacy-enabled vault.
+        core.update_entry(&destroy_id, &revision).unwrap();
+        let (destroy_record, destroy_plaintext) = core.get_entry(&destroy_id).unwrap();
+        assert_eq!(destroy_plaintext, revision);
+        assert_eq!(destroy_record.legacy_flag, LegacyFlag::Destroy.to_byte());
+        assert!(destroy_record.legacy_key_block.is_empty());
+
+        let vault_before = std::fs::read(&vault_path).unwrap();
+        let config_before = std::fs::read(&config_path).unwrap();
+        let error = core.update_entry(&id, &revision).unwrap_err();
+        assert!(matches!(error, DiaryError::Entry(_)));
+        assert!(error.to_string().contains("INHERIT"));
+        assert!(error.to_string().contains("separate entry"));
+        assert_eq!(std::fs::read(&vault_path).unwrap(), vault_before);
+        assert_eq!(std::fs::read(&config_path).unwrap(), config_before);
+        let (record, plaintext) = core.get_entry(&id).unwrap();
+        assert_eq!(plaintext, original);
+        assert_eq!(record.legacy_flag, LegacyFlag::Inherit.to_byte());
+        core.lock();
+
+        // Reopen under the owner password, then perform real legacy recovery.
+        core.unlock(secret("password")).unwrap();
+        assert_eq!(core.get_entry(&id).unwrap().1, original);
+        assert_eq!(core.get_entry(&destroy_id).unwrap().1, revision);
+        core.lock();
+        execute_legacy_access(&vault_dir, &secret("heir-code"), &deriver, always_confirm).unwrap();
+        let mut recovered = DiaryCore::new(&vault_pqd_str(&vault_dir)).unwrap();
+        recovered.unlock(secret("heir-code")).unwrap();
+        assert_eq!(recovered.get_entry(&id).unwrap().1, original);
+        assert!(recovered.get_entry(&destroy_id).is_err());
     }
 
     // ── LegacyKeyDeriver / Argon2LegacyDeriver ────────────────────────────

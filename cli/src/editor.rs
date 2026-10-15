@@ -232,14 +232,15 @@ pub fn write_header_file(tmpdir: &Path, plaintext: &EntryPlaintext) -> Result<Pa
     let filename = format!("{}.md", uuid::Uuid::new_v4().as_simple());
     let path = tmpdir.join(&filename);
 
-    let tags_str = plaintext.tags.join(", ");
-    let content = format!(
+    let tags_str = zeroize::Zeroizing::new(plaintext.tags.join(", "));
+    let content = zeroize::Zeroizing::new(format!(
         "# Title: {}\n# Tags: {}\n# ---\n\n{}",
-        plaintext.title, tags_str, plaintext.body
-    );
+        plaintext.title,
+        tags_str.as_str(),
+        plaintext.body
+    ));
 
-    let mut file = create_tmpfile(&path)?;
-    file.write_all(content.as_bytes())?;
+    write_tmpfile(&path, |file| file.write_all(content.as_bytes()))?;
 
     Ok(path)
 }
@@ -249,7 +250,8 @@ pub fn write_header_file(tmpdir: &Path, plaintext: &EntryPlaintext) -> Result<Pa
 /// **Parse rules**:
 /// - Lines before `# ---` are scanned for `# Title: ` and `# Tags: `.
 /// - The `# Tags:` value is split on commas; empty strings are discarded.
-/// - Body is the content after `# ---` (one leading blank line is skipped).
+/// - Body is the raw content after `# ---` (one leading LF/CRLF blank line is skipped).
+///   All remaining bytes, including line endings and trailing blank lines, are preserved.
 ///
 /// **Fallback when no `# ---` separator is found**:
 /// - `title` and `tags` are set to `None`.
@@ -261,11 +263,23 @@ pub fn write_header_file(tmpdir: &Path, plaintext: &EntryPlaintext) -> Result<Pa
 pub fn read_header_file(path: &Path) -> Result<HeaderComment, DiaryError> {
     let content = std::fs::read_to_string(path)?;
 
-    let lines: Vec<&str> = content.lines().collect();
+    // Track byte offsets while recognizing the same LF/CRLF header lines as
+    // `str::lines`. Never rebuild the body from lines: doing so changes CRLF
+    // endings and drops the final newline even when the editor makes no edits.
+    let mut offset = 0;
+    let mut separator = None;
+    for raw_line in content.split_inclusive('\n') {
+        let line = raw_line
+            .strip_suffix('\n')
+            .map_or(raw_line, |line| line.strip_suffix('\r').unwrap_or(line));
+        if line == "# ---" {
+            separator = Some((offset, offset + raw_line.len()));
+            break;
+        }
+        offset += raw_line.len();
+    }
 
-    let sep_idx = lines.iter().position(|l| *l == "# ---");
-
-    let Some(sep_idx) = sep_idx else {
+    let Some((header_end, body_start)) = separator else {
         // No separator: invalid format — return whole content as body.
         return Ok(HeaderComment {
             title: None,
@@ -277,7 +291,7 @@ pub fn read_header_file(path: &Path) -> Result<HeaderComment, DiaryError> {
     let mut title: Option<String> = None;
     let mut tags: Option<Vec<String>> = None;
 
-    for line in &lines[..sep_idx] {
+    for line in content[..header_end].lines() {
         if let Some(t) = line.strip_prefix("# Title: ") {
             title = Some(t.to_string());
         } else if let Some(t) = line.strip_prefix("# Tags: ") {
@@ -296,14 +310,13 @@ pub fn read_header_file(path: &Path) -> Result<HeaderComment, DiaryError> {
         }
     }
 
-    // Body = lines after the separator.
-    // Skip exactly one leading blank line (the blank line between header and body).
-    let after_sep = &lines[sep_idx + 1..];
-    let body = if after_sep.first().is_some_and(|l| l.is_empty()) {
-        after_sep[1..].join("\n")
-    } else {
-        after_sep.join("\n")
-    };
+    // Skip exactly one header/body blank line, preserving every body byte.
+    let after_sep = &content[body_start..];
+    let body = after_sep
+        .strip_prefix("\r\n")
+        .or_else(|| after_sep.strip_prefix('\n'))
+        .unwrap_or(after_sep)
+        .to_string();
 
     Ok(HeaderComment { title, tags, body })
 }
@@ -348,9 +361,8 @@ pub fn write_completion_file(tmpdir: &Path, titles: &[String]) -> Result<PathBuf
     use std::io::Write as _;
     let filename = format!("{}.completion", uuid::Uuid::new_v4().as_simple());
     let path = tmpdir.join(&filename);
-    let content = titles.join("\n");
-    let mut file = create_tmpfile(&path)?;
-    file.write_all(content.as_bytes())?;
+    let content = zeroize::Zeroizing::new(titles.join("\n"));
+    write_tmpfile(&path, |file| file.write_all(content.as_bytes()))?;
     Ok(path)
 }
 
@@ -498,11 +510,56 @@ fn vim_options_for(command: &str) -> Vec<String> {
     }
 }
 
+/// Owns only a newly created file until its initial write succeeds.
+/// Declared before the file handle so unwinding closes the handle first,
+/// including on Windows, where an open handle can prevent removal.
+#[derive(Default)]
+struct IncompleteTmpfile<'a> {
+    path: Option<&'a Path>,
+}
+
+impl Drop for IncompleteTmpfile<'_> {
+    fn drop(&mut self) {
+        if let Some(path) = self.path {
+            discard_incomplete_tmpfile(path, secure_delete);
+        }
+    }
+}
+
+fn discard_incomplete_tmpfile(path: &Path, erase: impl FnOnce(&Path) -> Result<(), DiaryError>) {
+    if let Err(error) = erase(path) {
+        // Disk-full and write-limit errors can also prevent overwriting. Still
+        // unlink the owned plaintext, without replacing the original error.
+        eprintln!(
+            "Warning: failed to overwrite incomplete temporary file '{}': {error}",
+            path.display()
+        );
+        if let Err(error) = std::fs::remove_file(path) {
+            eprintln!(
+                "Warning: failed to remove incomplete temporary file '{}': {error}",
+                path.display()
+            );
+        }
+    }
+}
+
+fn write_tmpfile(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> Result<(), DiaryError> {
+    let mut incomplete = IncompleteTmpfile::default();
+    let mut file = create_tmpfile(path)?;
+    incomplete.path = Some(path);
+    write(&mut file)?;
+    incomplete.path = None;
+    Ok(())
+}
+
 /// Creates a file at `path` with owner-only permissions.
 ///
 /// On Unix, the file is created with `0o600` mode so that other users on the
 /// same system cannot read the temporary plaintext content.
-/// On non-Unix platforms, falls back to `std::fs::File::create`.
+/// Existing files and symlinks are rejected on every platform.
 ///
 /// # Errors
 ///
@@ -513,15 +570,18 @@ fn create_tmpfile(path: &Path) -> Result<std::fs::File, DiaryError> {
         use std::os::unix::fs::OpenOptionsExt as _;
         std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true) // overwrite existing file entirely (clippy::suspicious_open_options, Rust 1.95)
+            .create_new(true)
             .mode(0o600)
             .open(path)
             .map_err(DiaryError::from)
     }
     #[cfg(not(unix))]
     {
-        std::fs::File::create(path).map_err(DiaryError::from)
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(DiaryError::from)
     }
 }
 
@@ -639,6 +699,89 @@ fn set_owner_only_acl(path: &Path) -> Result<(), DiaryError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incomplete_plaintext_write_removes_file_and_preserves_error() {
+        use std::io::Write as _;
+
+        for extension in ["md", "completion"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(format!("partial.{extension}"));
+            let result = write_tmpfile(&path, |file| {
+                file.write_all(b"private partial plaintext")?;
+                assert_eq!(std::fs::read(&path).unwrap(), b"private partial plaintext");
+                Err(std::io::Error::other("injected write failure"))
+            });
+            match result {
+                Err(DiaryError::Io(error)) => {
+                    assert_eq!(error.kind(), std::io::ErrorKind::Other);
+                    assert_eq!(error.to_string(), "injected write failure");
+                }
+                other => panic!("expected original write error, got {other:?}"),
+            }
+            assert!(!path.exists());
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn incomplete_plaintext_is_unlinked_when_overwrite_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("partial.md");
+        std::fs::write(&path, b"private partial plaintext").unwrap();
+        discard_incomplete_tmpfile(&path, |_| {
+            Err(std::io::Error::other("injected overwrite failure").into())
+        });
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn incomplete_plaintext_write_does_not_claim_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing.md");
+        std::fs::write(&path, b"original").unwrap();
+        let result = write_tmpfile(&path, |_| panic!("must reject collision before writing"));
+        assert!(
+            matches!(result, Err(DiaryError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists)
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incomplete_plaintext_write_does_not_follow_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("original.md");
+        let path = dir.path().join("symlink.md");
+        std::fs::write(&original, b"original").unwrap();
+        std::os::unix::fs::symlink(&original, &path).unwrap();
+        let result = write_tmpfile(&path, |_| panic!("must reject symlink before writing"));
+        assert!(
+            matches!(result, Err(DiaryError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists)
+        );
+        assert!(std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&original).unwrap(), b"original");
+    }
+
+    #[test]
+    fn incomplete_plaintext_write_cleans_up_during_unwind() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("partial.md");
+        let result = std::panic::catch_unwind(|| {
+            let _ = write_tmpfile(&path, |file| {
+                file.write_all(b"private partial plaintext").unwrap();
+                panic!("injected panic after writing plaintext");
+            });
+        });
+        assert!(result.is_err());
+        assert!(!path.exists());
+    }
 
     // -------------------------------------------------------------------------
     // secure_delete tests (TASK-0035)
@@ -860,6 +1003,59 @@ mod tests {
             ])
         );
         assert_eq!(header.body, "Hello\nWorld");
+    }
+
+    #[test]
+    fn header_roundtrip_preserves_body_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for body in [
+            "",
+            "plain",
+            "line1\nline2",
+            "line1\nline2\n",
+            "line1\r\nline2\r\n",
+            "line1\r\nline2\n\nX",
+            "trailing\n\n\n",
+            "\n",
+            "\r\n",
+            "\n\nbody\n",
+            "日本語\r\n本文\n",
+            "lone\rcarriage return\r",
+        ] {
+            let plaintext = make_plaintext("Title", vec!["tag"], body);
+            let path = write_header_file(dir.path(), &plaintext).expect("write header");
+            let header = read_header_file(&path).expect("read header");
+            assert_eq!(header.title.as_deref(), Some("Title"));
+            assert_eq!(header.tags, Some(vec!["tag".to_string()]));
+            assert_eq!(header.body.as_bytes(), body.as_bytes(), "body: {body:?}");
+        }
+    }
+
+    #[test]
+    fn header_boundary_preserves_raw_body() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("header.md");
+        for (raw, expected) in [
+            (
+                "# Title: T\r\n# Tags: a, b\r\n# ---\r\n\r\nbody\r\n\n",
+                "body\r\n\n",
+            ),
+            ("# ---\nbody\r\n", "body\r\n"),
+            ("# ---\r\n\n\r\nbody\n", "\r\nbody\n"),
+            ("# ---", ""),
+            ("# ---\n", ""),
+            ("# ---\r\n\r\n", ""),
+            ("# ---\n\r", "\r"),
+            ("# ---\r", "# ---\r"),
+            (
+                "# Title: T\r\nno separator\n\n",
+                "# Title: T\r\nno separator\n\n",
+            ),
+        ] {
+            std::fs::write(&path, raw).expect("write");
+            let header = read_header_file(&path).expect("read header");
+            assert_eq!(header.body.as_bytes(), expected.as_bytes(), "raw: {raw:?}");
+        }
     }
 
     /// TC-0036-02: round-trip with empty tag list.

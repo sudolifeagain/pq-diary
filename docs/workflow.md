@@ -116,6 +116,7 @@ bash ci/smoke-test.sh ./target/debug/pq-diary
 `cargo test --workspace` にはintegration testとdoctestも含まれる。
 別jobで同じテストを重ねない。脆弱性を確認する `cargo audit` と、
 依存ポリシーを確認する `cargo deny check bans licenses sources` は役割が異なるため維持する。
+監査は `cargo audit --deny unsound --deny yanked` を使い、unsound advisoryやyanked依存も失敗として扱う。
 依存変更がなくても新しい脆弱性情報が出るため、監査はpath filterで省略しない。
 
 全OS/ARM・release・Miri・性能・大量データ・長時間検証は毎PRの一律必須にしない。

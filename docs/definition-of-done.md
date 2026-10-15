@@ -6,7 +6,7 @@
 - [ ] `cargo test --workspace --locked` が通る（単体・integration・doctest。ignoredは別途扱う）
 - [ ] `cargo clippy --workspace --locked --all-targets -- -D warnings` が通る
 - [ ] Linuxの `bash ci/smoke-test.sh ./target/debug/pq-diary` が通る（上記buildの成果物を再利用）
-- [ ] `cargo audit` で未対処の既知脆弱性がない
+- [ ] `cargo audit --deny unsound --deny yanked` が通り、未対処の既知脆弱性・unsound advisory・yanked依存がない
 - [ ] `cargo deny check bans licenses sources` が通る（フォークgitソース・ライセンス・重複検査; ADR-0010）
 
 ## 変更リスクに応じた検証

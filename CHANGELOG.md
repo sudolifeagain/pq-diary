@@ -10,6 +10,10 @@ the **History** table at the bottom for git-tag pointers.
 
 ## [Unreleased]
 
+### Security (review follow-up)
+- Update locked anyhow to 1.0.103 and rand to 0.8.6 for RUSTSEC-2026-0190 / RUSTSEC-2026-0097; replace yanked der 0.8.0 with 0.8.2.
+- Fail dependency audits on unsound advisories and yanked crates as well as vulnerabilities.
+
 ### Fixed (S17)
 - Legacy access preserves the original vault and configuration when either backup rename fails; old backups are wiped only after both replacements succeed.
 - Password changes accept template payloads as templates, preserving mixed diary/template vaults.

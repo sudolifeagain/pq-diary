@@ -72,7 +72,7 @@ impl std::ops::Deref for VaultGuard<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::setup_vault;
+    use super::super::test_support::setup_vault;
     use super::*;
     // =========================================================================
     // TC-A13: VaultGuard drop guard tests (TASK-0056)

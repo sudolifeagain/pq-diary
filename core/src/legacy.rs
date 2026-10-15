@@ -1230,6 +1230,82 @@ mod tests {
         assert_eq!(core.list_entries(None).unwrap().len(), 1);
     }
 
+    /// Editing without the legacy key must not leave a stale recovery payload.
+    #[test]
+    fn inherit_edit_rejected_preserves_vault_and_legacy_recovery() {
+        let dir = tempdir().unwrap();
+        let vault_dir = setup_vault(&dir, b"password");
+        let vault_path = vault_dir.join("vault.pqd");
+        let config_path = vault_dir.join("vault.toml");
+        let mut core = DiaryCore::new(&vault_pqd_str(&vault_dir)).unwrap();
+        core.unlock(secret("password")).unwrap();
+        let original = EntryPlaintext {
+            title: "original title".into(),
+            body: "original body".into(),
+            tags: vec!["original".into()],
+        };
+        let id = core
+            .new_entry(&original.title, &original.body, original.tags.clone())
+            .unwrap();
+        let destroy_id = core
+            .new_entry("destroy title", "destroy body", vec![])
+            .unwrap();
+        let deriver = fast_deriver();
+        initialize_legacy(
+            &vault_dir,
+            &secret("password"),
+            &secret("heir-code"),
+            ConfirmationMode::Yn,
+            &deriver,
+        )
+        .unwrap();
+        set_entry_flag(
+            &vault_dir,
+            &secret("password"),
+            Some(&secret("heir-code")),
+            &id,
+            LegacyFlag::Inherit,
+            &deriver,
+        )
+        .unwrap();
+        let revision = EntryPlaintext {
+            title: "latest title".into(),
+            body: "latest body".into(),
+            tags: vec!["latest".into()],
+        };
+
+        // A normal DESTROY entry remains editable in the same legacy-enabled vault.
+        core.update_entry(&destroy_id, &revision).unwrap();
+        let (destroy_record, destroy_plaintext) = core.get_entry(&destroy_id).unwrap();
+        assert_eq!(destroy_plaintext, revision);
+        assert_eq!(destroy_record.legacy_flag, LegacyFlag::Destroy.to_byte());
+        assert!(destroy_record.legacy_key_block.is_empty());
+
+        let vault_before = std::fs::read(&vault_path).unwrap();
+        let config_before = std::fs::read(&config_path).unwrap();
+        let error = core.update_entry(&id, &revision).unwrap_err();
+        assert!(matches!(error, DiaryError::Entry(_)));
+        assert!(error.to_string().contains("INHERIT"));
+        assert!(error.to_string().contains("separate entry"));
+        assert_eq!(std::fs::read(&vault_path).unwrap(), vault_before);
+        assert_eq!(std::fs::read(&config_path).unwrap(), config_before);
+        let (record, plaintext) = core.get_entry(&id).unwrap();
+        assert_eq!(plaintext, original);
+        assert_eq!(record.legacy_flag, LegacyFlag::Inherit.to_byte());
+        core.lock();
+
+        // Reopen under the owner password, then perform real legacy recovery.
+        core.unlock(secret("password")).unwrap();
+        assert_eq!(core.get_entry(&id).unwrap().1, original);
+        assert_eq!(core.get_entry(&destroy_id).unwrap().1, revision);
+        core.lock();
+        execute_legacy_access(&vault_dir, &secret("heir-code"), &deriver, always_confirm).unwrap();
+        let mut recovered = DiaryCore::new(&vault_pqd_str(&vault_dir)).unwrap();
+        recovered.unlock(secret("heir-code")).unwrap();
+        assert_eq!(recovered.get_entry(&id).unwrap().1, original);
+        assert!(recovered.get_entry(&destroy_id).is_err());
+    }
+
     // ── LegacyKeyDeriver / Argon2LegacyDeriver ────────────────────────────
 
     /// TC-S12-002-01: same code+salt → identical K_legacy.

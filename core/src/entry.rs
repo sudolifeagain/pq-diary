@@ -464,11 +464,12 @@ pub fn get_entry(
 /// Reads the vault, locates the record with the given `uuid`, re-encrypts
 /// `plaintext`, updates `ciphertext`, `iv`, `signature`, `content_hmac`, and
 /// `updated_at`, then writes the vault back.  `uuid` and `created_at` are
-/// preserved unchanged.
+/// preserved unchanged. INHERIT entries are rejected without changes: this API
+/// has no legacy key with which to refresh their separately encrypted payload.
 ///
 /// # Errors
 ///
-/// Returns [`DiaryError::Entry`] if no record with `uuid` is found.
+/// Returns [`DiaryError::Entry`] if no record with `uuid` is found or it is INHERIT.
 /// Returns [`DiaryError::Io`] on vault I/O failure.
 /// Returns [`DiaryError::Entry`] if JSON serialisation fails.
 /// Returns [`DiaryError::Crypto`] on encryption or signing failure.
@@ -485,6 +486,18 @@ pub fn update_entry(
         .iter_mut()
         .find(|r| r.uuid == uuid)
         .ok_or_else(|| DiaryError::Entry("エントリが見つかりません".to_string()))?;
+
+    // The legacy block contains the entire plaintext, not just a wrapped key.
+    // Updating only the master ciphertext would silently restore old content
+    // during legacy access. This API cannot refresh both copies atomically.
+    if crate::legacy::LegacyFlag::from_byte(record.legacy_flag)?
+        == crate::legacy::LegacyFlag::Inherit
+    {
+        return Err(DiaryError::Entry(
+            "INHERIT entries cannot be edited without updating legacy recovery data; no changes saved. Create a separate entry for this revision."
+                .to_string(),
+        ));
+    }
 
     let json_bytes = Zeroizing::new(
         serde_json::to_vec(plaintext)

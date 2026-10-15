@@ -118,7 +118,9 @@ impl DiaryCore {
     /// Returns [`DiaryError::Crypto`] if the password is incorrect.
     /// Returns [`DiaryError::Vault`] if the vault file format is invalid.
     /// Returns [`DiaryError::Io`] on vault file read failure.
+    /// Any failed attempt leaves this instance locked, including a re-unlock.
     pub fn unlock(&mut self, password: secrecy::SecretString) -> Result<(), DiaryError> {
+        self.lock();
         let mut file = std::fs::File::open(&self.vault_path)?;
         let header = vault::reader::read_header(&mut file)?;
 
@@ -149,21 +151,13 @@ impl DiaryCore {
             vault::reader::verify_vault_integrity(&self.vault_path, &mac_key)?;
         }
 
+        // Complete all fallible validation before publishing an unlocked state.
+        // Borrow the protected bodies directly; avoid unprotected whole-body
+        // String copies during index construction.
+        let entries = entry::list_entries_with_body(&self.vault_path, &engine)?;
+        let index = link::LinkIndex::build_protected(&entries);
         self.engine = Some(engine);
-
-        // Build the link index from all current entries.
-        // list_entries_with_body returns Zeroizing<String> bodies; convert to
-        // plain Strings for LinkIndex::build.  The intermediate Vec is dropped
-        // immediately after index construction.
-        let zeroizing_entries = {
-            let e = self.require_engine()?;
-            entry::list_entries_with_body(&self.vault_path, e)?
-        };
-        let entries_with_body: Vec<(entry::EntryMeta, String)> = zeroizing_entries
-            .into_iter()
-            .map(|(meta, body)| (meta, body.as_str().to_owned()))
-            .collect();
-        self.link_index = Some(link::LinkIndex::build(&entries_with_body));
+        self.link_index = Some(index);
 
         Ok(())
     }
@@ -646,6 +640,47 @@ mod tests {
             core.list_entries(None).is_err(),
             "list_entries on re-locked vault must return an error"
         );
+    }
+
+    #[test]
+    fn failed_unlock_does_not_publish_partial_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = setup_test_vault(&dir);
+        let mut core = DiaryCore::new(path.to_str().expect("utf8")).expect("open");
+        core.unlock(secret("password")).expect("unlock");
+        core.new_entry("title", "body", vec![]).expect("entry");
+        let engine = core.require_engine().expect("engine");
+        let (header, mut records) = vault::reader::read_vault(&path).expect("read");
+        let (ciphertext, iv) = engine.encrypt(b"not valid JSON").expect("encrypt");
+        records[0].signature = engine.dsa_sign(&ciphertext).expect("sign");
+        records[0].content_hmac = engine.hmac(&ciphertext).expect("hmac");
+        records[0].ciphertext = ciphertext;
+        records[0].iv = iv;
+        let mac = engine.vault_mac_key().expect("mac key");
+        vault::writer::write_vault_authenticated(&path, header, &records, &mac).expect("write");
+        core.lock();
+
+        assert!(core.unlock(secret("password")).is_err());
+        assert!(
+            core.engine.is_none(),
+            "failed unlock must not expose key material"
+        );
+        assert!(core.link_index.is_none());
+        assert!(matches!(
+            core.new_entry("x", "y", vec![]),
+            Err(DiaryError::NotUnlocked)
+        ));
+    }
+
+    #[test]
+    fn failed_reunlock_clears_previous_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = setup_test_vault(&dir);
+        let mut core = DiaryCore::new(path.to_str().expect("utf8")).expect("open");
+        core.unlock(secret("password")).expect("unlock");
+        assert!(core.unlock(secret("wrong password")).is_err());
+        assert!(core.engine.is_none());
+        assert!(core.link_index.is_none());
     }
 
     // =========================================================================

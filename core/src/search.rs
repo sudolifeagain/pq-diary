@@ -75,7 +75,12 @@ pub struct SearchResults {
     pub matches: Vec<SearchMatch>,
     /// Number of distinct records (entries or templates) with at least one match.
     pub matched_entry_count: usize,
-    /// Total number of individual lines that matched across all fields.
+    /// Total number of distinct matching lines across all fields.
+    ///
+    /// Body/template lines are projected from full-body regex matches. Line
+    /// terminators belong to the preceding line; zero-width matches at a line
+    /// start belong to that line, and EOF belongs to the last displayed line.
+    /// An empty body has no displayed lines, even if the regex matches it.
     ///
     /// Available for future `--count --verbose` mode extension in the CLI.
     pub matched_line_count: usize,
@@ -154,13 +159,13 @@ pub fn search_entries(
                 }
 
                 // --- body ---
-                if regex.is_match(&plaintext.body) {
-                    let line_count = plaintext.body.lines().filter(|l| regex.is_match(l)).count();
-                    matched_line_count += line_count;
+                let body_matches = BodyMatches::new(&plaintext.body, &regex);
+                if body_matches.has_match {
+                    matched_line_count += body_matches.match_indices.len();
                     let context_blocks = if query.count_only {
                         Vec::new()
                     } else {
-                        format_context(&plaintext.body, &regex, query.context_lines)
+                        body_matches.format_context(query.context_lines)
                     };
                     all_matches.push(SearchMatch {
                         uuid_hex: uuid_hex.clone(),
@@ -233,13 +238,13 @@ pub fn search_entries(
                     .map_err(|e| DiaryError::Template(format!("deserialization failed: {e}")))?;
 
                 // Search template body only.
-                if regex.is_match(&plaintext.body) {
-                    let line_count = plaintext.body.lines().filter(|l| regex.is_match(l)).count();
-                    matched_line_count += line_count;
+                let body_matches = BodyMatches::new(&plaintext.body, &regex);
+                if body_matches.has_match {
+                    matched_line_count += body_matches.match_indices.len();
                     let context_blocks = if query.count_only {
                         Vec::new()
                     } else {
-                        format_context(&plaintext.body, &regex, query.context_lines)
+                        body_matches.format_context(query.context_lines)
                     };
                     all_matches.push(SearchMatch {
                         uuid_hex: uuid_hex.clone(),
@@ -272,78 +277,98 @@ pub fn search_entries(
 // Private helpers
 // =============================================================================
 
-/// Extract context lines surrounding each regex match in `body`.
-///
-/// Splits `body` into lines and finds all lines that match `regex`.  For each
-/// matching line, a window of `[idx - context_lines, idx + context_lines]`
-/// (clamped to the line range) is included in a [`ContextBlock`].
-/// Overlapping windows are merged into a single block.
-///
-/// Returns an empty `Vec` if no line matches.
-fn format_context(body: &str, regex: &Regex, context_lines: usize) -> Vec<ContextBlock> {
-    let lines: Vec<&str> = body.lines().collect();
-    let n = lines.len();
+/// Line projection of the regex engine's full-body, non-overlapping matches.
+/// No plaintext is copied until context output is requested. Projection uses
+/// O(lines) memory and O(matches * log(lines) + lines) work beyond regex matching;
+/// non-overlapping match spans cannot repeatedly traverse the same line ranges.
+struct BodyMatches<'a> {
+    lines: Vec<&'a str>,
+    match_indices: Vec<usize>,
+    has_match: bool,
+}
 
-    if n == 0 {
-        return Vec::new();
-    }
-
-    // Collect 0-based indices of all matching lines.
-    let match_indices: Vec<usize> = lines
-        .iter()
-        .enumerate()
-        .filter(|(_, line)| regex.is_match(line))
-        .map(|(i, _)| i)
-        .collect();
-
-    if match_indices.is_empty() {
-        return Vec::new();
-    }
-
-    // Build context ranges [start, end] (0-based), merging overlapping ones.
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
-
-    for &idx in &match_indices {
-        let start = idx.saturating_sub(context_lines);
-        let end = idx.saturating_add(context_lines).min(n - 1);
-
-        if let Some(last) = ranges.last_mut() {
-            if start <= last.1 + 1 {
-                // Overlapping or adjacent: extend the current range.
-                last.1 = last.1.max(end);
-            } else {
-                ranges.push((start, end));
-            }
-        } else {
-            ranges.push((start, end));
-        }
-    }
-
-    // Convert ranges to ContextBlocks, tracking which match_index belongs to
-    // which range so we can report the correct 1-based match_line_number.
-    let mut blocks = Vec::new();
-    let mut match_pos = 0usize;
-
-    for (range_start, range_end) in ranges {
-        // First match index within this range.
-        let first_match = match_indices.get(match_pos).copied().unwrap_or(range_start);
-
-        // Advance past all match indices consumed by this range.
-        while match_pos < match_indices.len() && match_indices[match_pos] <= range_end {
-            match_pos += 1;
-        }
-
-        let block_lines: Vec<(usize, String, bool)> = (range_start..=range_end)
-            .map(|i| (i + 1, lines[i].to_string(), regex.is_match(lines[i])))
+impl<'a> BodyMatches<'a> {
+    fn new(body: &'a str, regex: &Regex) -> Self {
+        let lines: Vec<&str> = body.lines().collect();
+        // Include terminators in each line's byte range, but not its displayed
+        // text (str::lines strips both LF and CRLF). Do not invent a final line
+        // after a trailing newline, preserving the existing display convention.
+        let mut offset = 0;
+        let starts: Vec<usize> = body
+            .split_inclusive('\n')
+            .map(|line| {
+                let start = offset;
+                offset += line.len();
+                start
+            })
             .collect();
-
-        blocks.push(ContextBlock {
-            match_line_number: first_match + 1, // convert to 1-based
-            lines: block_lines,
-        });
+        let mut matched = vec![false; lines.len()];
+        let mut has_match = false;
+        for found in regex.find_iter(body) {
+            has_match = true;
+            if lines.is_empty() {
+                continue;
+            }
+            // A zero-width match belongs to the line starting at that position;
+            // EOF belongs to the last displayed line. A nonempty match's end
+            // is exclusive, so a match ending at a line start excludes that line.
+            let first = starts.partition_point(|&start| start <= found.start()) - 1;
+            let last_byte = if found.is_empty() {
+                found.start()
+            } else {
+                found.end() - 1
+            };
+            let last = starts.partition_point(|&start| start <= last_byte) - 1;
+            matched[first..=last].fill(true);
+        }
+        let match_indices = matched
+            .into_iter()
+            .enumerate()
+            .filter_map(|(idx, is_match)| is_match.then_some(idx))
+            .collect();
+        Self {
+            lines,
+            match_indices,
+            has_match,
+        }
     }
 
-    blocks
+    /// Merge overlapping or adjacent context windows. Regex matching is never
+    /// repeated against isolated lines, which would change anchors and flags.
+    fn format_context(&self, context_lines: usize) -> Vec<ContextBlock> {
+        let mut ranges: Vec<(usize, usize, usize)> = Vec::new();
+        for &idx in &self.match_indices {
+            let start = idx.saturating_sub(context_lines);
+            let end = idx.saturating_add(context_lines).min(self.lines.len() - 1);
+            if let Some(last) = ranges.last_mut() {
+                if start <= last.1 + 1 {
+                    last.1 = last.1.max(end);
+                    continue;
+                }
+            }
+            ranges.push((start, end, idx));
+        }
+
+        let mut match_pos = 0;
+        ranges
+            .into_iter()
+            .map(|(start, end, first)| {
+                let lines = (start..=end)
+                    .map(|idx| {
+                        let is_match = self.match_indices.get(match_pos) == Some(&idx);
+                        if is_match {
+                            match_pos += 1;
+                        }
+                        (idx + 1, self.lines[idx].to_string(), is_match)
+                    })
+                    .collect();
+                ContextBlock {
+                    match_line_number: first + 1,
+                    lines,
+                }
+            })
+            .collect()
+    }
 }
 
 // =============================================================================
@@ -391,6 +416,113 @@ mod tests {
             tag_filter: None,
             context_lines: 2,
             count_only: false,
+        }
+    }
+
+    #[test]
+    fn body_match_spans_respect_line_boundaries_and_flags() {
+        // Expected indices are zero-based and unique, not the number of regex hits.
+        let cases = [
+            ("alpha\r\nbeta\r\nend", r"alpha\r\nbeta", vec![0, 1]),
+            ("alpha\nbeta\nend", r"alpha\n", vec![0]),
+            ("alpha\nbeta", r"\n", vec![0]),
+            ("alpha\nbeta\nalpha\nbeta", r"alpha\nbeta", vec![0, 1, 2, 3]),
+            ("hit hit\nother\nhit", "hit", vec![0, 2]),
+            ("hit\nother\nhit", "^hit", vec![0]),
+            ("hit\nother\nhit", "(?m)^hit", vec![0, 2]),
+            ("alpha\ninside\nbeta", "(?s)alpha.*beta", vec![0, 1, 2]),
+            ("α\nβ", r"\A|\z", vec![0, 1]),
+            ("a\nb\n", "(?m)^", vec![0, 1]),
+            ("a\r\nb", "(?mR)$", vec![0, 1]),
+            ("a\nb\n", r"\z", vec![1]),
+            ("a\n\nb", "(?m)^$", vec![1]),
+            ("α\nβ", "", vec![0, 1]),
+            ("", "^$", vec![]),
+            ("x", "missing", vec![]),
+        ];
+        for (body, pattern, expected) in cases {
+            let regex = Regex::new(pattern).unwrap();
+            let found = BodyMatches::new(body, &regex);
+            assert_eq!(found.has_match, regex.is_match(body), "{pattern:?}");
+            assert_eq!(found.match_indices, expected, "{body:?} / {pattern:?}");
+            let blocks = found.format_context(usize::MAX);
+            let displayed_matches: Vec<_> = blocks
+                .iter()
+                .flat_map(|block| &block.lines)
+                .filter_map(|(line, _, matched)| matched.then_some(line - 1))
+                .collect();
+            assert_eq!(displayed_matches, expected);
+            assert!(blocks
+                .iter()
+                .flat_map(|block| &block.lines)
+                .all(|(_, text, _)| !text.ends_with('\r')));
+        }
+    }
+
+    #[test]
+    fn multiline_context_windows_merge_without_duplicate_lines() {
+        let body = "before\na\nb\nbetween\na\nb\nafter\ngap\ngap\na\nb\nlast";
+        let found = BodyMatches::new(body, &Regex::new(r"a\nb").unwrap());
+        let blocks = found.format_context(1);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].match_line_number, 2);
+        assert_eq!(blocks[1].match_line_number, 10);
+        assert_eq!(
+            blocks[0]
+                .lines
+                .iter()
+                .map(|line| line.0)
+                .collect::<Vec<_>>(),
+            (1..=7).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            blocks[1]
+                .lines
+                .iter()
+                .map(|line| line.0)
+                .collect::<Vec<_>>(),
+            (9..=12).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            blocks
+                .iter()
+                .flat_map(|block| &block.lines)
+                .filter(|line| line.2)
+                .count(),
+            6
+        );
+    }
+
+    #[test]
+    fn multiline_body_and_template_context_regression() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = setup_test_vault(&dir);
+        let mut core = DiaryCore::new(vault.to_str().unwrap()).unwrap();
+        core.unlock(secret("password")).unwrap();
+        let body = "before\nalpha\nbeta\nafter";
+        core.new_entry("entry", body, vec![]).unwrap();
+        core.new_template("template", body).unwrap();
+        for count_only in [false, true] {
+            let mut query = make_query(r"alpha\nbeta");
+            query.count_only = count_only;
+            query.context_lines = 0;
+            let result = core.search(&query).unwrap();
+            assert_eq!(result.matched_entry_count, 2);
+            assert_eq!(result.matched_line_count, 4);
+            assert_eq!(result.matches.len(), 2);
+            for found in result.matches {
+                if count_only {
+                    assert!(found.context_blocks.is_empty());
+                } else {
+                    assert_eq!(found.context_blocks.len(), 1);
+                    let block = &found.context_blocks[0];
+                    assert_eq!(block.match_line_number, 2);
+                    assert_eq!(
+                        block.lines,
+                        vec![(2, "alpha".into(), true), (3, "beta".into(), true)]
+                    );
+                }
+            }
         }
     }
 

@@ -1,11 +1,13 @@
 //! vault.pqd read operations.
 //!
-//! Provides three public functions for deserialising vault data from
+//! Provides helpers for deserialising vault data from
 //! little-endian binary format:
 //!
 //! - `read_header`: parse a `VaultHeader` from any `Read` source
 //! - `read_entries`: parse a sequence of `EntryRecord`s from any `Read` source
 //! - `read_vault`: read a complete vault file from a `Path`
+//! - `read_vault_with_attachments_authenticated`: authenticate and parse one
+//!   complete snapshot for read-modify-write operations
 
 use std::io::{self, Read};
 use std::path::Path;
@@ -161,7 +163,14 @@ pub fn read_header(reader: &mut impl Read) -> Result<VaultHeader, DiaryError> {
 /// - [`DiaryError::Io`] on read failure.
 pub fn verify_vault_integrity(path: &Path, mac_key: &[u8; 32]) -> Result<(), DiaryError> {
     let data = std::fs::read(path)?;
+    verify_vault_integrity_bytes(&data, mac_key)
+}
 
+/// Verify an encrypted vault snapshot without first writing it to disk.
+pub(crate) fn verify_vault_integrity_bytes(
+    data: &[u8],
+    mac_key: &[u8; 32],
+) -> Result<(), DiaryError> {
     // Need at least magic(8) + version(1) + flags(1) to inspect the header.
     if data.len() < 10 {
         return Err(DiaryError::Vault(
@@ -475,6 +484,30 @@ pub fn read_vault_with_attachments(
     let mut file = std::fs::File::open(path)?;
     let header = read_header(&mut file)?;
     let (entries, attachments) = read_records(&mut file)?;
+    Ok((header, entries, attachments))
+}
+
+/// Read and authenticate one complete vault snapshot, including attachments.
+///
+/// Verification and parsing use the same bytes, so a mutation cannot carry
+/// records from a second, unverified read into a newly authenticated vault.
+/// Legacy vaults without a MAC retain the compatibility behavior documented
+/// by [`verify_vault_integrity`]. Callers performing read-modify-write must pass
+/// the returned attachments to the explicit with-attachments writer.
+///
+/// # Errors
+///
+/// Returns [`DiaryError::Crypto`] if the vault MAC is invalid, or the same
+/// parsing and I/O errors as [`read_vault_with_attachments`].
+pub fn read_vault_with_attachments_authenticated(
+    path: &Path,
+    mac_key: &[u8; 32],
+) -> Result<(VaultHeader, Vec<EntryRecord>, Vec<AttachmentRecord>), DiaryError> {
+    let data = std::fs::read(path)?;
+    verify_vault_integrity_bytes(&data, mac_key)?;
+    let mut cursor = io::Cursor::new(&data);
+    let header = read_header(&mut cursor)?;
+    let (entries, attachments) = read_records(&mut cursor)?;
     Ok((header, entries, attachments))
 }
 

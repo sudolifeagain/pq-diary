@@ -970,7 +970,11 @@ where
     let guard = VaultGuard::new(&mut core);
 
     // Check for an existing template with the same name.
-    let already_exists = guard.get_template(&name).is_ok();
+    let already_exists = match guard.get_template(&name) {
+        Ok(_) => true,
+        Err(pq_diary_core::DiaryError::TemplateNotFound(_)) => false,
+        Err(e) => return Err(anyhow::anyhow!("Failed to look up template: {e}")),
+    };
     if already_exists && !cli.claude {
         use std::io::Write as _;
         eprint!("Template \"{name}\" already exists. Overwrite? [y/N]: ");
@@ -1005,19 +1009,16 @@ where
     edit_result.map_err(|e| anyhow::anyhow!("Editor failed: {e}"))?;
     let body = read_result.map_err(|e| anyhow::anyhow!("Failed to read temp file: {e}"))?;
 
-    // Delete the existing template before creating the replacement.
+    // Commit an overwrite once, so a failed replacement retains the original.
     if already_exists {
         guard
-            .delete_template(&name)
-            .map_err(|e| anyhow::anyhow!("Failed to delete old template: {e}"))?;
-    }
-
-    guard
-        .new_template(&name, &body)
-        .map_err(|e| anyhow::anyhow!("Failed to create template: {e}"))?;
-    if already_exists {
+            .replace_template(&name, &body)
+            .map_err(|e| anyhow::anyhow!("Failed to replace template: {e}"))?;
         println!("Template replaced: \"{name}\"");
     } else {
+        guard
+            .new_template(&name, &body)
+            .map_err(|e| anyhow::anyhow!("Failed to create template: {e}"))?;
         println!("Template created: \"{name}\"");
     }
 
@@ -5130,6 +5131,139 @@ mod tests {
         let tpl = core.get_template("weekly").expect("get_template");
         core.lock();
         assert_eq!(tpl.body, "## 週次レビュー");
+    }
+
+    #[test]
+    fn template_overwrite_preserves_confirmation_and_identity() {
+        use pq_diary_core::policy::AccessPolicy;
+        for (claude, answer, replace) in [
+            (false, "n\n", false),
+            (false, "y\n", true),
+            (true, "", true),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let vault_dir = setup_vault_with_policy(&dir, AccessPolicy::Full);
+            seed_templates(&vault_dir, &[("daily", "original")]);
+            let vault_path = vault_dir.join("vault.pqd");
+            let before = std::fs::read(&vault_path).expect("snapshot");
+            let mut core = DiaryCore::new(vault_path.to_str().expect("UTF-8")).expect("core");
+            core.unlock(secrecy::SecretBox::new(Box::from("password")))
+                .expect("unlock");
+            let original = core.list_templates().expect("template metadata");
+            core.lock();
+
+            let mut args = vec![
+                "pq-diary",
+                "--vault",
+                vault_dir.to_str().expect("UTF-8"),
+                "--password",
+                "password",
+            ];
+            if claude {
+                args.push("--claude");
+            }
+            args.extend(["template", "add", "daily"]);
+            let cli = crate::Cli::try_parse_from(args).expect("CLI");
+            let launch = |path: &Path, _: &EditorConfig| {
+                assert!(replace, "declining overwrite must not open the editor");
+                std::fs::write(path, "replacement").map_err(pq_diary_core::DiaryError::Io)
+            };
+            cmd_template_add_impl(
+                &cli,
+                "daily".into(),
+                launch,
+                &mut std::io::Cursor::new(answer),
+            )
+            .expect("template add");
+
+            core.unlock(secrecy::SecretBox::new(Box::from("password")))
+                .expect("reopen");
+            let templates = core.list_templates().expect("templates");
+            assert_eq!(templates.len(), 1);
+            assert_eq!(templates[0].uuid_hex, original[0].uuid_hex);
+            assert_eq!(templates[0].created_at, original[0].created_at);
+            assert_eq!(
+                core.get_template("daily").expect("template").body,
+                if replace { "replacement" } else { "original" }
+            );
+            if !replace {
+                assert_eq!(std::fs::read(&vault_path).expect("vault"), before);
+            }
+        }
+    }
+
+    #[test]
+    fn template_overwrite_editor_error_preserves_original() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        seed_templates(&vault_dir, &[("daily", "original")]);
+        let vault_path = vault_dir.join("vault.pqd");
+        let before = std::fs::read(&vault_path).expect("snapshot");
+        let cli = crate::Cli::try_parse_from([
+            "pq-diary",
+            "--vault",
+            vault_dir.to_str().expect("UTF-8"),
+            "--password",
+            "password",
+            "template",
+            "add",
+            "daily",
+        ])
+        .expect("CLI");
+        let launch = |_: &Path, _: &EditorConfig| {
+            Err(pq_diary_core::DiaryError::Editor(
+                "synthetic failure".into(),
+            ))
+        };
+        let error = cmd_template_add_impl(
+            &cli,
+            "daily".into(),
+            launch,
+            &mut std::io::Cursor::new("y\n"),
+        )
+        .expect_err("editor failure");
+        assert!(error.to_string().contains("Editor failed"));
+        assert_eq!(std::fs::read(&vault_path).expect("vault"), before);
+    }
+
+    #[test]
+    fn template_overwrite_rejects_tampering_during_editor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        seed_templates(&vault_dir, &[("daily", "original")]);
+        let vault_path = vault_dir.join("vault.pqd");
+        let mut tampered = std::fs::read(&vault_path).expect("snapshot");
+        let padding_offset = tampered.len() - pq_diary_core::vault::format::VAULT_MAC_LEN - 1;
+        tampered[padding_offset] ^= 1;
+        let cli = crate::Cli::try_parse_from([
+            "pq-diary",
+            "--vault",
+            vault_dir.to_str().expect("UTF-8"),
+            "--password",
+            "password",
+            "template",
+            "add",
+            "daily",
+        ])
+        .expect("CLI");
+        let launch = |path: &Path, _: &EditorConfig| {
+            std::fs::write(path, "replacement")?;
+            // The vault was valid at unlock; alter authenticated padding while
+            // the editor is open, after the original lookup already succeeded.
+            std::fs::write(&vault_path, &tampered).map_err(pq_diary_core::DiaryError::Io)
+        };
+        let error = cmd_template_add_impl(
+            &cli,
+            "daily".into(),
+            launch,
+            &mut std::io::Cursor::new("y\n"),
+        )
+        .expect_err("integrity failure");
+        assert!(
+            error.to_string().contains("integrity verification failed"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&vault_path).expect("vault"), tampered);
     }
 
     // =========================================================================

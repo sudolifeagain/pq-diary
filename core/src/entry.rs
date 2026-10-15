@@ -468,7 +468,7 @@ pub fn get_entry(
 ///
 /// # Errors
 ///
-/// Returns [`DiaryError::Entry`] if no record with `uuid` is found.
+/// Returns [`DiaryError::Entry`] if no entry record with `uuid` is found.
 /// Returns [`DiaryError::Io`] on vault I/O failure.
 /// Returns [`DiaryError::Entry`] if JSON serialisation fails.
 /// Returns [`DiaryError::Crypto`] on encryption or signing failure.
@@ -483,7 +483,7 @@ pub fn update_entry(
 
     let record = entries
         .iter_mut()
-        .find(|r| r.uuid == uuid)
+        .find(|r| r.record_type == RECORD_TYPE_ENTRY && r.uuid == uuid)
         .ok_or_else(|| DiaryError::Entry("エントリが見つかりません".to_string()))?;
 
     let json_bytes = Zeroizing::new(
@@ -518,7 +518,7 @@ pub fn update_entry(
 ///
 /// # Errors
 ///
-/// Returns [`DiaryError::Entry`] if no record with `uuid` is found.
+/// Returns [`DiaryError::Entry`] if no entry record with `uuid` is found.
 /// Returns [`DiaryError::Io`] on vault I/O failure.
 pub fn delete_entry(
     vault_path: &Path,
@@ -527,11 +527,14 @@ pub fn delete_entry(
 ) -> Result<(), DiaryError> {
     let (header, mut entries, attachments) = read_vault_with_attachments(vault_path)?;
 
-    if !entries.iter().any(|r| r.uuid == uuid) {
+    if !entries
+        .iter()
+        .any(|r| r.record_type == RECORD_TYPE_ENTRY && r.uuid == uuid)
+    {
         return Err(DiaryError::Entry("エントリが見つかりません".to_string()));
     }
 
-    entries.retain(|r| r.uuid != uuid);
+    entries.retain(|r| r.record_type != RECORD_TYPE_ENTRY || r.uuid != uuid);
 
     let mut kept_attachments = Vec::with_capacity(attachments.len());
     let mut removed_blobs = std::collections::HashSet::new();
@@ -1646,6 +1649,77 @@ mod tests {
         let nonexistent_uuid = [0xffu8; 16];
         let err = delete_entry(&vault_path, &engine, nonexistent_uuid).expect_err("should be Err");
         assert!(matches!(err, DiaryError::Entry(_)));
+    }
+
+    fn check_entry_mutation_record_type(update: bool) {
+        use crate::template::{create_template, get_template, TemplatePlaintext};
+
+        let dir = tempdir().expect("tempdir");
+        let vault_path = dir.path().join("vault.pqd");
+        let engine = make_test_engine();
+        init_test_vault(&vault_path);
+        let template = TemplatePlaintext {
+            name: "daily".to_string(),
+            body: "Template {{date}}".to_string(),
+        };
+        let template_uuid = create_template(&vault_path, &engine, &template).expect("template");
+        let original = EntryPlaintext {
+            title: "Original".to_string(),
+            tags: vec!["keep".to_string()],
+            body: "Original body".to_string(),
+        };
+        let entry_uuid = create_entry(&vault_path, &engine, &original).expect("entry");
+        let replacement = EntryPlaintext {
+            title: "Updated".to_string(),
+            tags: vec!["changed".to_string()],
+            body: "Updated body".to_string(),
+        };
+        let mutate = |uuid| {
+            if update {
+                update_entry(&vault_path, &engine, uuid, &replacement)
+            } else {
+                delete_entry(&vault_path, &engine, uuid)
+            }
+        };
+        let before = std::fs::read(&vault_path).expect("original bytes");
+        for uuid in [*template_uuid.as_bytes(), [0xff; 16]] {
+            let error = mutate(uuid).expect_err("only entry records may be mutated");
+            assert!(matches!(error, DiaryError::Entry(ref message)
+                if message == "エントリが見つかりません"));
+            assert_eq!(std::fs::read(&vault_path).expect("unchanged bytes"), before);
+            assert_eq!(
+                get_template(&vault_path, &engine, &template.name).expect("template readback"),
+                template
+            );
+            assert_eq!(
+                get_entry(&vault_path, &engine, &prefix_from_uuid(&entry_uuid))
+                    .expect("entry readback")
+                    .1,
+                original
+            );
+        }
+
+        mutate(*entry_uuid.as_bytes()).expect("ordinary entry mutation");
+        assert_eq!(
+            get_template(&vault_path, &engine, &template.name).expect("template preserved"),
+            template
+        );
+        let entry = get_entry(&vault_path, &engine, &prefix_from_uuid(&entry_uuid));
+        if update {
+            assert_eq!(entry.expect("updated entry").1, replacement);
+        } else {
+            assert!(matches!(entry, Err(DiaryError::Entry(_))));
+        }
+    }
+
+    #[test]
+    fn test_update_entry_rejects_template_uuid_without_writing() {
+        check_entry_mutation_record_type(true);
+    }
+
+    #[test]
+    fn test_delete_entry_rejects_template_uuid_without_writing() {
+        check_entry_mutation_record_type(false);
     }
 
     // =========================================================================

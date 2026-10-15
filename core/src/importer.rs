@@ -23,10 +23,11 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 // Static regexes (compiled once via LazyLock)
 // =========================================================================
 
-static WIKI_LINK_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]").unwrap());
+static WIKI_LINK_RE: LazyLock<Result<Regex, regex::Error>> =
+    LazyLock::new(|| Regex::new(r"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]"));
 
-static TAG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"#([\w/-]+)").unwrap());
+static TAG_RE: LazyLock<Result<Regex, regex::Error>> =
+    LazyLock::new(|| Regex::new(r"#([\w/\p{S}-]+)"));
 
 /// Obsidian attachment-embed pattern: `![[filename.ext]]` (S13).
 static ATTACHMENT_LINK_RE: LazyLock<Regex> =
@@ -721,7 +722,9 @@ fn extract_frontmatter_tags(fm: &str) -> Vec<String> {
 ///
 /// Returns [`DiaryError::Import`] if the regex fails to compile.
 fn convert_wiki_links(body: &str) -> Result<(String, usize), DiaryError> {
-    let re = &*WIKI_LINK_RE;
+    let re = WIKI_LINK_RE
+        .as_ref()
+        .map_err(|e| DiaryError::Import(format!("wiki-link regex: {e}")))?;
 
     let protected = protected_markdown(body);
     let mut count = 0usize;
@@ -747,7 +750,8 @@ fn convert_wiki_links(body: &str) -> Result<(String, usize), DiaryError> {
 /// Extract inline `#tag` notation from body text.
 ///
 /// Finds tags at the start of text, after whitespace, or after an opening
-/// bracket/quote, using Unicode word characters, hyphens and slashes. Nested
+/// bracket/quote, using Unicode word characters and symbols, hyphens and slashes.
+/// Numeric-only tags are preserved as text, matching Obsidian's tag format. Nested
 /// tags (e.g. `#work/project/alpha`) retain their `/` separators. Literal source
 /// spans, escapes, embedded hashes and wiki-link targets are left unchanged.
 ///
@@ -757,11 +761,16 @@ fn convert_wiki_links(body: &str) -> Result<(String, usize), DiaryError> {
 ///
 /// Returns [`DiaryError::Import`] if the regex fails to compile.
 fn extract_tags(body: &str) -> Result<(Vec<String>, String, usize), DiaryError> {
-    let re = &*TAG_RE;
+    let re = TAG_RE
+        .as_ref()
+        .map_err(|e| DiaryError::Import(format!("tag regex: {e}")))?;
+    let wiki_re = WIKI_LINK_RE
+        .as_ref()
+        .map_err(|e| DiaryError::Import(format!("wiki-link regex: {e}")))?;
 
     let mut protected = protected_markdown(body);
     // A heading fragment or filename inside a wiki-link is not an inline tag.
-    for m in WIKI_LINK_RE.find_iter(body) {
+    for m in wiki_re.find_iter(body) {
         protected[m.start()..m.end()].fill(true);
     }
 
@@ -783,7 +792,11 @@ fn extract_tags(body: &str) -> Result<(Vec<String>, String, usize), DiaryError> 
         {
             return m.as_str().to_string();
         }
-        let tag_name = caps.get(1).map_or("", |m| m.as_str()).to_string();
+        let name = caps.get(1).map_or("", |m| m.as_str());
+        if name.chars().all(char::is_numeric) {
+            return m.as_str().to_string();
+        }
+        let tag_name = name.to_string();
         if seen.insert(tag_name.clone()) {
             tags.push(tag_name);
         }
@@ -844,6 +857,15 @@ mod tests {
         assert_eq!(md.tags, ["daily-note", "日本語/日記", "café"]);
         assert_eq!(md.body, "  () ");
         assert_eq!((links, count), (0, 4));
+    }
+
+    #[test]
+    fn markdown_tags_preserve_numbers_and_complete_emoji_names() {
+        let (md, links, count) =
+            parse_markdown("#1984 #１２３ #diary😀 #👩‍💻 #y1984", "test.md").unwrap();
+        assert_eq!(md.tags, ["diary😀", "👩‍💻", "y1984"]);
+        assert_eq!(md.body, "#1984 #１２３   ");
+        assert_eq!((links, count), (0, 3));
     }
 
     #[test]

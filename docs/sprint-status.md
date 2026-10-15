@@ -1,6 +1,8 @@
 # Sprint Status
 
-## Current: S15 セキュリティ硬化 完了 → S16 キースロット/MDK 要件定義済 (実装は下位モデルへ委譲)
+## Current: S17 既存不具合・データ保全の修正中（S16 は基盤のみマージ済み）
+
+2026-10-16棚卸し: [development-inventory.md](development-inventory.md)。S16のMDK・キースロット基盤はmainに存在するが、現行vaultはv0x06で、作成・解錠・CLIへの統合は未完了。
 
 Phase 1 全完了 + Phase 2 で legacy (S12) / 添付ファイル (S13 + S13.1) / change-password / info --security / export を完了。
 
@@ -26,7 +28,8 @@ Phase 1 全完了 + Phase 2 で legacy (S12) / 添付ファイル (S13 + S13.1) 
 | S13.1 | cmd_import の `![[FILE]]` 統合 (S13 follow-up) | completed (PR #9) | 13 |
 | S14 | Phase 2 棚卸し + CHANGELOG.md 新規作成 | in_progress (housekeeping) | 14 |
 | S15 | セキュリティ硬化 (整合性MAC v0x06・WER抑止・監査M系修正) | completed (PR #11) | 15 |
-| S16 | キースロット封筒 + MDK (ML-KEM load-bearing 化, v0x07) | spec整備済 / 実装委譲 | 16 |
+| S16 | キースロット封筒 + MDK (ML-KEM load-bearing 化, v0x07) | 基盤マージ済 / vault・CLI統合未完了 | 16 |
+| S17 | 既存不具合・データ保全 | in_progress | 17 |
 
 ## Sprint Scope
 

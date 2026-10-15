@@ -10,6 +10,10 @@ the **History** table at the bottom for git-tag pointers.
 
 ## [Unreleased]
 
+### Fixed (S17)
+- Legacy access preserves the original vault and configuration when either backup rename fails; old backups are wiped only after both replacements succeed.
+- Password changes accept template payloads as templates, preserving mixed diary/template vaults.
+
 ### Phase 2 (in progress)
 
 Phase 2 中核 (legacy / attachments) を完了。残候補は Bases like ビュー / 固定ブロックサイズ化 (OQ-20) / Web Clipper / 鍵素材 XOR 分散 / Unix ソケット + ロックデーモン。

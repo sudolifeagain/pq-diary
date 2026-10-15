@@ -30,8 +30,7 @@ use crate::entry::EntryPlaintext;
 use crate::error::DiaryError;
 use crate::vault::config::{ConfirmationMode, VaultConfig};
 use crate::vault::format::{
-    generate_verification_token, EntryRecord, VaultHeader, HEADER_SIZE, RECORD_TYPE_ATTACHMENT,
-    RECORD_TYPE_ENTRY, RECORD_TYPE_TEMPLATE, SCHEMA_VERSION,
+    generate_verification_token, EntryRecord, VaultHeader, RECORD_TYPE_ENTRY, SCHEMA_VERSION,
 };
 use crate::vault::reader::read_vault;
 use crate::vault::writer::write_vault_authenticated;
@@ -606,12 +605,10 @@ where
         return Err(e);
     }
 
-    let keep_record_uuids: std::collections::HashSet<[u8; 16]> = new_entries
-        .iter()
-        .map(|r| r.uuid)
-        .chain(new_attachments.iter().map(|r| r.uuid))
-        .collect();
-    zeroize_non_inherited_record_ciphertexts(&vault_pqd, &old_header, &keep_record_uuids)?;
+    // Keep the original vault intact until both replacements succeed. The
+    // transaction helper then wipes the entire old vault through its renamed
+    // backup, including any hard links to that inode. Wiping here would corrupt
+    // the original that rollback must restore if a later rename fails.
     replace_vault_and_toml(
         &vault_pqd,
         &vault_tmp,
@@ -808,6 +805,9 @@ fn replace_vault_and_toml(
         return Err(e);
     }
 
+    // Only destroy the old files once both replacements have committed. These
+    // are renamed originals, not copies, so overwriting also clears hard links
+    // to the previous vault while leaving the new vault intact.
     cleanup_sensitive_file(&vault_bak);
     cleanup_sensitive_file(&toml_bak);
     Ok(())
@@ -858,121 +858,6 @@ fn zeroize_file_range(file: &mut std::fs::File, offset: u64, len: u64) -> Result
         remaining -= chunk_len as u64;
     }
     Ok(())
-}
-
-fn zeroize_non_inherited_record_ciphertexts(
-    vault_path: &Path,
-    header: &VaultHeader,
-    keep_record_uuids: &std::collections::HashSet<[u8; 16]>,
-) -> Result<(), DiaryError> {
-    use std::io::{Read as _, Seek as _};
-
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(vault_path)?;
-    let entries_start = HEADER_SIZE as u64
-        + 4
-        + u64::try_from(header.kem_encrypted_sk.len())
-            .map_err(|_| DiaryError::Vault("KEM key length overflow".to_string()))?
-        + 4
-        + u64::try_from(header.dsa_encrypted_sk.len())
-            .map_err(|_| DiaryError::Vault("DSA key length overflow".to_string()))?;
-
-    file.seek(std::io::SeekFrom::Start(entries_start))?;
-    loop {
-        let record_len_pos = file.stream_position()?;
-        let mut len_buf = [0u8; 4];
-        file.read_exact(&mut len_buf)?;
-        let record_len = u32::from_le_bytes(len_buf);
-        if record_len == 0 {
-            break;
-        }
-
-        let payload_start = record_len_pos + 4;
-        let mut payload = vec![0u8; record_len as usize];
-        file.read_exact(&mut payload)?;
-        let parsed = parse_record_offsets_for_zeroize(&payload)?;
-        let should_zeroize = !keep_record_uuids.contains(&parsed.uuid);
-        if should_zeroize && parsed.ciphertext_len > 0 {
-            zeroize_file_range(
-                &mut file,
-                payload_start + parsed.ciphertext_offset as u64,
-                parsed.ciphertext_len as u64,
-            )?;
-        }
-        file.seek(std::io::SeekFrom::Start(
-            payload_start + u64::from(record_len),
-        ))?;
-    }
-    file.sync_all()?;
-    Ok(())
-}
-
-struct RecordOffsets {
-    uuid: [u8; 16],
-    ciphertext_offset: usize,
-    ciphertext_len: usize,
-}
-
-fn parse_record_offsets_for_zeroize(payload: &[u8]) -> Result<RecordOffsets, DiaryError> {
-    const UUID_OFFSET: usize = 1;
-    const UUID_END: usize = UUID_OFFSET + 16;
-
-    if payload.len() < UUID_END {
-        return Err(DiaryError::Vault(
-            "record payload is too short for record uuid".to_string(),
-        ));
-    }
-    let record_type = payload[0];
-    let uuid: [u8; 16] = payload[UUID_OFFSET..UUID_END]
-        .try_into()
-        .map_err(|_| DiaryError::Vault("record payload has invalid uuid".to_string()))?;
-    let ct_len_offset = match record_type {
-        RECORD_TYPE_ENTRY | RECORD_TYPE_TEMPLATE => 1 + 16 + 8 + 8 + aead::NONCE_SIZE,
-        RECORD_TYPE_ATTACHMENT => 1 + 16 + aead::NONCE_SIZE,
-        other => {
-            return Err(DiaryError::Vault(format!(
-                "unknown record_type 0x{other:02x} while zeroizing legacy vault"
-            )))
-        }
-    };
-    let ct_offset = checked_add(ct_len_offset, 4, "ciphertext offset")?;
-    if payload.len() < ct_offset {
-        return Err(DiaryError::Vault(
-            "record payload is too short for ciphertext length".to_string(),
-        ));
-    }
-    let ct_len = read_u32_at(payload, ct_len_offset, "ciphertext length")? as usize;
-    let sig_len_offset = checked_add(ct_offset, ct_len, "ciphertext end")?;
-    let sig_len = read_u32_at(payload, sig_len_offset, "signature length")? as usize;
-    let sig_offset = checked_add(sig_len_offset, 4, "signature offset")?;
-    let hmac_offset = checked_add(sig_offset, sig_len, "signature end")?;
-    let legacy_flag_offset = checked_add(hmac_offset, 32, "content_hmac end")?;
-    let _flag_byte = *payload
-        .get(legacy_flag_offset)
-        .ok_or_else(|| DiaryError::Vault("record payload is missing legacy flag".to_string()))?;
-
-    Ok(RecordOffsets {
-        uuid,
-        ciphertext_offset: ct_offset,
-        ciphertext_len: ct_len,
-    })
-}
-
-fn read_u32_at(payload: &[u8], offset: usize, label: &str) -> Result<u32, DiaryError> {
-    let end = checked_add(offset, 4, label)?;
-    let bytes: [u8; 4] = payload
-        .get(offset..end)
-        .ok_or_else(|| DiaryError::Vault(format!("record payload is missing {label}")))?
-        .try_into()
-        .map_err(|_| DiaryError::Vault(format!("record payload has invalid {label}")))?;
-    Ok(u32::from_le_bytes(bytes))
-}
-
-fn checked_add(a: usize, b: usize, label: &str) -> Result<usize, DiaryError> {
-    a.checked_add(b)
-        .ok_or_else(|| DiaryError::Vault(format!("record payload offset overflow at {label}")))
 }
 
 fn encrypt_legacy_block(k_legacy: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, DiaryError> {
@@ -1145,14 +1030,6 @@ mod tests {
 
     fn vault_pqd_str(vault_dir: &Path) -> String {
         vault_dir.join("vault.pqd").to_str().unwrap().to_string()
-    }
-
-    fn hex_to_uuid(hex: &str) -> [u8; 16] {
-        let mut out = [0u8; 16];
-        for i in 0..16 {
-            out[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap();
-        }
-        out
     }
 
     fn always_confirm(_: ConfirmationMode) -> Result<bool, DiaryError> {
@@ -1661,10 +1538,10 @@ mod tests {
         assert!(matches!(result, Err(DiaryError::Vault(_))));
     }
 
-    /// TC-S12-007-05: legacy-access physical deletion step zeroizes
-    /// non-INHERIT ciphertext bytes while leaving INHERIT ciphertext intact.
+    /// TC-S12-007-05: after committing legacy-access, the renamed original is
+    /// zeroized in full, including hard links, while the heir's vault is intact.
     #[test]
-    fn tc_s12_007_05_zeroize_non_inherited_ciphertexts() {
+    fn tc_s12_007_05_committed_backup_zeroizes_original_hardlink() {
         let dir = tempdir().unwrap();
         let (vault_dir, ids) = vault_with_one_entry(&dir, 2);
         set_entry_flag(
@@ -1678,36 +1555,33 @@ mod tests {
         .unwrap();
 
         let vault_pqd = vault_dir.join("vault.pqd");
-        let (header, records_before) = read_vault(&vault_pqd).unwrap();
-        let inherit_before = records_before
-            .iter()
-            .find(|r| hex_lower(&r.uuid) == ids[0])
-            .unwrap()
-            .ciphertext
-            .clone();
-        let destroy_before = records_before
-            .iter()
-            .find(|r| hex_lower(&r.uuid) == ids[1])
-            .unwrap()
-            .ciphertext
-            .clone();
-        assert!(destroy_before.iter().any(|&b| b != 0));
+        let old_hardlink = dir.path().join("original-vault.pqd");
+        std::fs::hard_link(&vault_pqd, &old_hardlink).unwrap();
+        let original_len = std::fs::metadata(&old_hardlink).unwrap().len();
+        assert!(original_len > 0);
 
-        let keep_record_uuids = std::collections::HashSet::from([hex_to_uuid(&ids[0])]);
-        zeroize_non_inherited_record_ciphertexts(&vault_pqd, &header, &keep_record_uuids).unwrap();
+        let report = execute_legacy_access(
+            &vault_dir,
+            &secret("legacy-code"),
+            &fast_deriver(),
+            always_confirm,
+        )
+        .unwrap();
+        assert_eq!(report.inherited, 1);
+        assert_eq!(report.destroyed, 1);
 
-        let (_header_after, records_after) = read_vault(&vault_pqd).unwrap();
-        let inherit_after = records_after
-            .iter()
-            .find(|r| hex_lower(&r.uuid) == ids[0])
-            .unwrap();
-        let destroy_after = records_after
-            .iter()
-            .find(|r| hex_lower(&r.uuid) == ids[1])
-            .unwrap();
+        let wiped = std::fs::read(&old_hardlink).unwrap();
+        assert_eq!(wiped.len() as u64, original_len);
+        assert!(wiped.iter().all(|&b| b == 0));
+        assert!(!vault_dir.join("vault.pqd.bak.legacy").exists());
+        assert!(!vault_dir.join("vault.toml.bak.legacy").exists());
 
-        assert_eq!(inherit_after.ciphertext, inherit_before);
-        assert!(destroy_after.ciphertext.iter().all(|&b| b == 0));
+        let mut heir = DiaryCore::new(&vault_pqd_str(&vault_dir)).unwrap();
+        heir.unlock(secret("legacy-code")).unwrap();
+        assert_eq!(heir.list_entries(None).unwrap().len(), 1);
+        let (_, inherited) = heir.get_entry(&ids[0]).unwrap();
+        assert_eq!(inherited.title, "title-0");
+        assert!(heir.get_entry(&ids[1]).is_err());
     }
 
     /// TC-S12-007-06: if the reset vault.toml sidecar cannot be written, the
@@ -1740,6 +1614,60 @@ mod tests {
         let bytes_after = std::fs::read(vault_dir.join("vault.pqd")).unwrap();
         assert_eq!(bytes_before, bytes_after);
         assert!(!vault_dir.join("vault.pqd.tmp.legacy").exists());
+    }
+
+    fn assert_backup_failure_preserves_original(blocked_backup: &str) {
+        let dir = tempdir().unwrap();
+        let (vault_dir, ids) = vault_with_one_entry(&dir, 2);
+        set_entry_flag(
+            &vault_dir,
+            &secret("master-pw"),
+            Some(&secret("legacy-code")),
+            &ids[0][..8],
+            LegacyFlag::Inherit,
+            &fast_deriver(),
+        )
+        .unwrap();
+
+        // Keep one DESTROY entry: its ciphertext must remain recoverable if
+        // either backup rename fails, including after the vault was moved.
+        let vault_before = std::fs::read(vault_dir.join("vault.pqd")).unwrap();
+        let config_before = std::fs::read(vault_dir.join("vault.toml")).unwrap();
+        std::fs::create_dir(vault_dir.join(blocked_backup)).unwrap();
+
+        let result = execute_legacy_access(
+            &vault_dir,
+            &secret("legacy-code"),
+            &fast_deriver(),
+            always_confirm,
+        );
+        assert!(matches!(result, Err(DiaryError::Io(_))));
+        assert!(
+            vault_before == std::fs::read(vault_dir.join("vault.pqd")).unwrap(),
+            "failed backup rename must leave the original vault byte-for-byte intact"
+        );
+        assert_eq!(config_before, std::fs::read(vault_dir.join("vault.toml")).unwrap());
+        assert!(!vault_dir.join("vault.pqd.tmp.legacy").exists());
+        assert!(!vault_dir.join("vault.toml.tmp.legacy").exists());
+
+        let mut core = DiaryCore::new(&vault_pqd_str(&vault_dir)).unwrap();
+        core.unlock(secret("master-pw")).unwrap();
+        assert_eq!(core.list_entries(None).unwrap().len(), 2);
+        for id in ids {
+            core.get_entry(&id).unwrap();
+        }
+    }
+
+    /// A failed first backup rename must not destroy the original records.
+    #[test]
+    fn tc_s12_007_08_vault_backup_failure_keeps_original() {
+        assert_backup_failure_preserves_original("vault.pqd.bak.legacy");
+    }
+
+    /// A failed second backup rename must restore the untouched vault backup.
+    #[test]
+    fn tc_s12_007_09_toml_backup_failure_keeps_original() {
+        assert_backup_failure_preserves_original("vault.toml.bak.legacy");
     }
 
     /// TC-S12-007-07: non-entry records are dropped during legacy-access but

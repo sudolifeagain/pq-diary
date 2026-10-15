@@ -249,7 +249,8 @@ pub fn write_header_file(tmpdir: &Path, plaintext: &EntryPlaintext) -> Result<Pa
 /// **Parse rules**:
 /// - Lines before `# ---` are scanned for `# Title: ` and `# Tags: `.
 /// - The `# Tags:` value is split on commas; empty strings are discarded.
-/// - Body is the content after `# ---` (one leading blank line is skipped).
+/// - Body is the raw content after `# ---` (one leading LF/CRLF blank line is skipped).
+///   All remaining bytes, including line endings and trailing blank lines, are preserved.
 ///
 /// **Fallback when no `# ---` separator is found**:
 /// - `title` and `tags` are set to `None`.
@@ -261,11 +262,23 @@ pub fn write_header_file(tmpdir: &Path, plaintext: &EntryPlaintext) -> Result<Pa
 pub fn read_header_file(path: &Path) -> Result<HeaderComment, DiaryError> {
     let content = std::fs::read_to_string(path)?;
 
-    let lines: Vec<&str> = content.lines().collect();
+    // Track byte offsets while recognizing the same LF/CRLF header lines as
+    // `str::lines`. Never rebuild the body from lines: doing so changes CRLF
+    // endings and drops the final newline even when the editor makes no edits.
+    let mut offset = 0;
+    let mut separator = None;
+    for raw_line in content.split_inclusive('\n') {
+        let line = raw_line
+            .strip_suffix('\n')
+            .map_or(raw_line, |line| line.strip_suffix('\r').unwrap_or(line));
+        if line == "# ---" {
+            separator = Some((offset, offset + raw_line.len()));
+            break;
+        }
+        offset += raw_line.len();
+    }
 
-    let sep_idx = lines.iter().position(|l| *l == "# ---");
-
-    let Some(sep_idx) = sep_idx else {
+    let Some((header_end, body_start)) = separator else {
         // No separator: invalid format — return whole content as body.
         return Ok(HeaderComment {
             title: None,
@@ -277,7 +290,7 @@ pub fn read_header_file(path: &Path) -> Result<HeaderComment, DiaryError> {
     let mut title: Option<String> = None;
     let mut tags: Option<Vec<String>> = None;
 
-    for line in &lines[..sep_idx] {
+    for line in content[..header_end].lines() {
         if let Some(t) = line.strip_prefix("# Title: ") {
             title = Some(t.to_string());
         } else if let Some(t) = line.strip_prefix("# Tags: ") {
@@ -296,14 +309,13 @@ pub fn read_header_file(path: &Path) -> Result<HeaderComment, DiaryError> {
         }
     }
 
-    // Body = lines after the separator.
-    // Skip exactly one leading blank line (the blank line between header and body).
-    let after_sep = &lines[sep_idx + 1..];
-    let body = if after_sep.first().is_some_and(|l| l.is_empty()) {
-        after_sep[1..].join("\n")
-    } else {
-        after_sep.join("\n")
-    };
+    // Skip exactly one header/body blank line, preserving every body byte.
+    let after_sep = &content[body_start..];
+    let body = after_sep
+        .strip_prefix("\r\n")
+        .or_else(|| after_sep.strip_prefix('\n'))
+        .unwrap_or(after_sep)
+        .to_string();
 
     Ok(HeaderComment { title, tags, body })
 }
@@ -860,6 +872,59 @@ mod tests {
             ])
         );
         assert_eq!(header.body, "Hello\nWorld");
+    }
+
+    #[test]
+    fn header_roundtrip_preserves_body_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for body in [
+            "",
+            "plain",
+            "line1\nline2",
+            "line1\nline2\n",
+            "line1\r\nline2\r\n",
+            "line1\r\nline2\n\nX",
+            "trailing\n\n\n",
+            "\n",
+            "\r\n",
+            "\n\nbody\n",
+            "日本語\r\n本文\n",
+            "lone\rcarriage return\r",
+        ] {
+            let plaintext = make_plaintext("Title", vec!["tag"], body);
+            let path = write_header_file(dir.path(), &plaintext).expect("write header");
+            let header = read_header_file(&path).expect("read header");
+            assert_eq!(header.title.as_deref(), Some("Title"));
+            assert_eq!(header.tags, Some(vec!["tag".to_string()]));
+            assert_eq!(header.body.as_bytes(), body.as_bytes(), "body: {body:?}");
+        }
+    }
+
+    #[test]
+    fn header_boundary_preserves_raw_body() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("header.md");
+        for (raw, expected) in [
+            (
+                "# Title: T\r\n# Tags: a, b\r\n# ---\r\n\r\nbody\r\n\n",
+                "body\r\n\n",
+            ),
+            ("# ---\nbody\r\n", "body\r\n"),
+            ("# ---\r\n\n\r\nbody\n", "\r\nbody\n"),
+            ("# ---", ""),
+            ("# ---\n", ""),
+            ("# ---\r\n\r\n", ""),
+            ("# ---\n\r", "\r"),
+            ("# ---\r", "# ---\r"),
+            (
+                "# Title: T\r\nno separator\n\n",
+                "# Title: T\r\nno separator\n\n",
+            ),
+        ] {
+            std::fs::write(&path, raw).expect("write");
+            let header = read_header_file(&path).expect("read header");
+            assert_eq!(header.body.as_bytes(), expected.as_bytes(), "raw: {raw:?}");
+        }
     }
 
     /// TC-0036-02: round-trip with empty tag list.

@@ -1,9 +1,21 @@
 name: CI
 on:
   push:
-    branches: [main, "sprint/**", "hotfix/**"]
+    branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      full_matrix:
+        description: "Run cross-platform checks and release smoke tests"
+        type: boolean
+        default: false
+
+# A new commit supersedes an older check of the same PR/branch. Keep manual
+# full-matrix runs separate from automatic runs so neither cancels the other.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -14,15 +26,24 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # Normal PRs use one runner. Opt into the existing platform coverage
+        # when a change touches OS APIs, portability, or release behavior.
+        os: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.full_matrix && '["ubuntu-latest", "macos-latest", "windows-latest"]' || '["ubuntu-latest"]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87  # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2
+      - name: Check formatting
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo fmt --all -- --check
       - run: cargo build --workspace --locked
       - run: cargo test --workspace --locked
       - run: cargo clippy --workspace --locked --all-targets -- -D warnings
+      - name: CLI smoke test (reuse debug binary)
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: bash ./ci/smoke-test.sh ./target/debug/pq-diary
 
   audit:
     name: audit
@@ -32,7 +53,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87  # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2
       - run: cargo install cargo-audit --locked
-      - run: cargo audit
+      - run: cargo audit --deny unsound --deny yanked
 
   deny:
     name: cargo-deny (supply chain)
@@ -47,6 +68,9 @@ jobs:
 
   smoke:
     name: CLI smoke test
+    # Release builds and the full OS/architecture matrix are opt-in, rather
+    # than adding repeated compilation to every PR's default checks.
+    if: github.event_name == 'workflow_dispatch' && inputs.full_matrix
     strategy:
       fail-fast: false
       matrix:

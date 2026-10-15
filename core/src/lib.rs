@@ -30,6 +30,7 @@ pub mod legacy;
 pub mod link;
 /// Access-policy evaluation (implemented in Sprint 7).
 pub mod policy;
+mod record_payload;
 /// Full-text regex search across vault entries (implemented in Sprint 6).
 pub mod search;
 /// Vault-wide statistics collection (implemented in Sprint 6).

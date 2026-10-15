@@ -814,7 +814,7 @@ fn verify_master(
     header: &VaultHeader,
     master_pwd: &SecretString,
     params: &kdf::Argon2Params,
-) -> Result<[u8; 32], DiaryError> {
+) -> Result<Zeroizing<[u8; 32]>, DiaryError> {
     let key = kdf::derive_key(
         master_pwd.expose_secret().as_bytes(),
         &header.kdf_salt,
@@ -830,7 +830,7 @@ fn verify_master(
     // records or creating side effects; they do not pass through DiaryCore::unlock.
     let mac_key = crate::crypto::derive_vault_mac_key(key.as_ref())?;
     crate::vault::reader::verify_vault_integrity_bytes(vault_bytes, &mac_key)?;
-    Ok(*key.as_ref())
+    Ok(Zeroizing::new(*key.as_ref()))
 }
 
 fn verify_hmac(expected: &[u8; 32], data: &[u8], key: &[u8; 32]) -> Result<(), DiaryError> {

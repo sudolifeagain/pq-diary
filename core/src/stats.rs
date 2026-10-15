@@ -10,7 +10,7 @@ use crate::{
     crypto::CryptoEngine,
     entry::EntryPlaintext,
     error::DiaryError,
-    vault::{format::RECORD_TYPE_ENTRY, reader::read_vault},
+    vault::{format::RECORD_TYPE_ENTRY, reader::read_vault_with_attachments_authenticated},
 };
 use chrono::DateTime;
 use serde::Serialize;
@@ -109,7 +109,9 @@ pub struct DailyActivity {
 /// Returns [`DiaryError::Crypto`] on decryption failure.
 /// Returns [`DiaryError::Io`] on vault file I/O failure.
 pub fn collect_stats(vault_path: &Path, engine: &CryptoEngine) -> Result<VaultStats, DiaryError> {
-    let (_header, records) = read_vault(vault_path)?;
+    let mac_key = engine.vault_mac_key()?;
+    let (_header, records, _attachments) =
+        read_vault_with_attachments_authenticated(vault_path, &mac_key)?;
 
     let mut entry_count = 0usize;
     let mut total_chars = 0usize;

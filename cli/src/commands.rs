@@ -22,18 +22,18 @@ use std::path::{Path, PathBuf};
 ///
 /// - `--vault <path>.pqd` → used as-is.
 /// - `--vault <dir>`      → `<dir>/vault.pqd`.
-/// - No `--vault`         → `vault.pqd` in the current working directory.
+/// - No `--vault`         → the configured default vault under the app home.
 fn resolve_vault_path(cli: &Cli) -> anyhow::Result<PathBuf> {
     let path = match &cli.vault {
         Some(v) => {
             let p = PathBuf::from(v);
-            if p.extension().is_some_and(|e| e == "pqd") {
+            if !p.is_dir() && p.extension().is_some_and(|e| e == "pqd") {
                 p
             } else {
                 p.join("vault.pqd")
             }
         }
-        None => PathBuf::from("vault.pqd"),
+        None => resolve_default_vault_dir()?.join("vault.pqd"),
     };
     Ok(path)
 }
@@ -209,6 +209,11 @@ pub fn cmd_new_with_attach(
     check_claude_policy(cli, OperationType::Write)?;
     if cli.claude && !attach.is_empty() {
         anyhow::bail!("--attach is not permitted with --claude");
+    }
+
+    // Validate directory-only attachment support before creating an entry.
+    if !attach.is_empty() {
+        resolve_legacy_vault_dir(cli)?;
     }
 
     // Step 1: Obtain password and unlock the vault.
@@ -1526,6 +1531,10 @@ pub(crate) fn cmd_import_to(
         ));
     }
 
+    // Import may add attachments after entries; reject unsupported targets before
+    // any writes rather than partially importing or opening a sibling vault.
+    resolve_legacy_vault_dir(cli)?;
+
     // 2. Policy check before any password prompt or vault decryption.
     {
         use pq_diary_core::policy::OperationType;
@@ -1969,6 +1978,12 @@ fn cmd_vault_delete_impl(
 /// Derive the vault directory from a vault path, canonicalising an empty
 /// parent to the current working directory.
 fn vault_dir_from_path(vault_path: &std::path::Path) -> anyhow::Result<PathBuf> {
+    if vault_path.file_name() != Some(std::ffi::OsStr::new("vault.pqd")) {
+        anyhow::bail!(
+            "This operation requires a vault directory containing vault.pqd; custom vault filename is unsupported: {}",
+            vault_path.display()
+        );
+    }
     let parent = vault_path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("vault path has no parent directory"))?;
@@ -2365,6 +2380,10 @@ pub fn cmd_git_status(cli: &Cli) -> anyhow::Result<()> {
 /// API does not report directory ownership, so deleting it here could destroy
 /// a pre-existing vault or one created by another process.
 pub fn cmd_init(cli: &Cli) -> anyhow::Result<()> {
+    if cli.vault.is_some() {
+        anyhow::bail!("init creates the configured default vault and does not support --vault; use vault create for a named vault");
+    }
+
     use pq_diary_core::policy::AccessPolicy;
     use pq_diary_core::vault::config::AppConfig;
     use pq_diary_core::vault::init::VaultManager;
@@ -2475,6 +2494,8 @@ pub fn cmd_change_password(cli: &Cli) -> anyhow::Result<()> {
         anyhow::bail!("change-password is not permitted with --claude");
     }
 
+    resolve_change_password_vault_dir(cli)?;
+
     let old_source = get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
     let old_pwd: SecretString = SecretBox::new(Box::from(old_source.secret().expose_secret()));
     drop(old_source);
@@ -2541,19 +2562,9 @@ fn cmd_change_password_impl(
     Ok(())
 }
 
+/// Directory-only core operations must never silently substitute a sibling file.
 fn resolve_change_password_vault_dir(cli: &Cli) -> anyhow::Result<PathBuf> {
-    if let Some(v) = &cli.vault {
-        let p = PathBuf::from(v);
-        let dir = if p.extension().is_some_and(|e| e == "pqd") {
-            p.parent()
-                .ok_or_else(|| anyhow::anyhow!("vault path has no parent directory"))?
-                .to_path_buf()
-        } else {
-            p
-        };
-        return Ok(dir);
-    }
-    resolve_default_vault_dir()
+    vault_dir_from_path(&resolve_vault_path(cli)?)
 }
 
 fn resolve_default_vault_dir() -> anyhow::Result<PathBuf> {
@@ -2566,6 +2577,8 @@ fn resolve_default_vault_dir() -> anyhow::Result<PathBuf> {
     }
     let config = AppConfig::from_file(&config_path)
         .map_err(|e| anyhow::anyhow!("Invalid config.toml: {e}"))?;
+    pq_diary_core::vault::init::VaultManager::validate_vault_name(&config.app.default_vault)
+        .map_err(|e| anyhow::anyhow!("Invalid config.toml default_vault: {e}"))?;
     let vaults_dir = AppConfig::default_vaults_dir().map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(vaults_dir.join(&config.app.default_vault))
 }
@@ -2575,9 +2588,11 @@ pub fn cmd_info(cli: &Cli, security: bool) -> anyhow::Result<()> {
     use pq_diary_core::vault::config::VaultConfig;
     use secrecy::{ExposeSecret as _, SecretBox};
 
-    let vault_dir = resolve_info_vault_dir(cli)?;
-    let vault_pqd = vault_dir.join("vault.pqd");
-    let vault_toml = vault_dir.join("vault.toml");
+    let vault_pqd = resolve_vault_path(cli)?;
+    let vault_toml = vault_pqd
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("vault path has no parent directory"))?
+        .join("vault.toml");
     let vault_pqd_str = vault_pqd
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("vault path contains non-UTF-8 characters"))?;
@@ -2652,21 +2667,6 @@ pub fn cmd_info(cli: &Cli, security: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn resolve_info_vault_dir(cli: &Cli) -> anyhow::Result<PathBuf> {
-    if let Some(v) = &cli.vault {
-        let p = PathBuf::from(v);
-        let dir = if p.extension().is_some_and(|e| e == "pqd") {
-            p.parent()
-                .ok_or_else(|| anyhow::anyhow!("vault path has no parent directory"))?
-                .to_path_buf()
-        } else {
-            p
-        };
-        return Ok(dir);
-    }
-    resolve_default_vault_dir()
-}
-
 fn format_system_time(t: std::time::SystemTime) -> String {
     let secs = t
         .duration_since(std::time::UNIX_EPOCH)
@@ -2710,6 +2710,10 @@ fn cmd_export_impl(
         anyhow::bail!("Directory does not exist: {}", dir.display());
     }
 
+    // Preserve policy/output preflight errors before loading configuration,
+    // while rejecting unsupported vault targets before any plaintext writes.
+    let vault_dir = resolve_legacy_vault_dir(cli)?;
+
     eprint!(
         "平文を {} に書き出します。続行しますか? [y/N]: ",
         dir.display()
@@ -2729,8 +2733,7 @@ fn cmd_export_impl(
 
     let password_source =
         get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let vault_dir = resolve_info_vault_dir(cli)?;
-    let vault_pqd = vault_dir.join("vault.pqd");
+    let vault_pqd = resolve_vault_path(cli)?;
     let vault_pqd_str = vault_pqd
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("vault path contains non-UTF-8 characters"))?;
@@ -3848,12 +3851,24 @@ mod tests {
         assert_eq!(path, PathBuf::from("/some/vault.pqd"));
     }
 
-    /// TC-0037-10: No `--vault` flag → defaults to `vault.pqd` in CWD.
+    /// TC-0037-10: No flag uses the same configured target as info/password.
     #[test]
     fn tc_0037_10_resolve_vault_path_default() {
+        let _lock = lock_home();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = HomeOverride::new(dir.path());
+        let root = dir.path().join(".pq-diary");
+        std::fs::create_dir_all(&root).expect("create config root");
+        let mut config = pq_diary_core::vault::config::AppConfig::default();
+        config.app.default_vault = "chosen".into();
+        config.to_file(&root.join("config.toml")).expect("config");
         let cli = crate::Cli::try_parse_from(["pq-diary", "new"]).expect("parse");
         let path = resolve_vault_path(&cli).expect("resolve_vault_path");
-        assert_eq!(path, PathBuf::from("vault.pqd"));
+        assert_eq!(path, root.join("vaults/chosen/vault.pqd"));
+        assert_eq!(
+            resolve_change_password_vault_dir(&cli).unwrap(),
+            root.join("vaults/chosen")
+        );
     }
 
     // =========================================================================

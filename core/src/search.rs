@@ -4,7 +4,7 @@
 //! and then its plaintext is dropped (zeroed via [`zeroize::ZeroizeOnDrop`])
 //! before moving to the next entry.  Plaintext memory is O(1 entry) — each
 //! entry is decrypted, searched, and zeroized before the next.  However, all
-//! encrypted records are loaded into memory by `read_vault()`.
+//! encrypted records are loaded from one freshly authenticated vault snapshot.
 //!
 //! # Search fields
 //!
@@ -20,7 +20,7 @@ use crate::{
     template::TemplatePlaintext,
     vault::{
         format::{RECORD_TYPE_ENTRY, RECORD_TYPE_TEMPLATE},
-        reader::read_vault,
+        reader::read_vault_with_attachments_authenticated,
     },
 };
 use regex::Regex;
@@ -114,7 +114,9 @@ pub fn search_entries(
     let regex = Regex::new(&query.pattern)
         .map_err(|e| DiaryError::Search(format!("invalid regex pattern: {e}")))?;
 
-    let (_header, records) = read_vault(vault_path)?;
+    let mac_key = engine.vault_mac_key()?;
+    let (_header, records, _attachments) =
+        read_vault_with_attachments_authenticated(vault_path, &mac_key)?;
 
     let mut all_matches: Vec<SearchMatch> = Vec::new();
     let mut matched_entry_count = 0usize;

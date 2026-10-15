@@ -72,8 +72,6 @@ pub struct DiaryCore {
     engine: Option<crypto::CryptoEngine>,
     /// Per-vault configuration loaded from `vault.toml`.
     config: vault::config::VaultConfig,
-    /// Forward and reverse link index; built at unlock time, dropped at lock time.
-    link_index: Option<link::LinkIndex>,
 }
 
 impl DiaryCore {
@@ -101,7 +99,6 @@ impl DiaryCore {
             vault_path,
             engine: None,
             config,
-            link_index: None,
         })
     }
 
@@ -153,12 +150,9 @@ impl DiaryCore {
         }
 
         // Complete all fallible validation before publishing an unlocked state.
-        // Borrow the protected bodies directly; avoid unprotected whole-body
-        // String copies during index construction.
-        let entries = entry::list_entries_with_body(&self.vault_path, &engine)?;
-        let index = link::LinkIndex::build_protected(&entries);
+        // Validate protected entry bodies without retaining a stale link index.
+        entry::list_entries_with_body(&self.vault_path, &engine)?;
         self.engine = Some(engine);
-        self.link_index = Some(index);
 
         Ok(())
     }
@@ -168,11 +162,10 @@ impl DiaryCore {
     /// After this call any entry operation will return
     /// [`DiaryError::NotUnlocked`].  The [`crypto::CryptoEngine`] is dropped
     /// and all key material is zeroed on drop via
-    /// [`zeroize::ZeroizeOnDrop`].  The [`link::LinkIndex`] is also dropped,
-    /// triggering its zeroize-on-drop implementation.
+    /// [`zeroize::ZeroizeOnDrop`]. Link indexes are scoped to individual queries
+    /// and are zeroized when those queries return.
     pub fn lock(&mut self) {
         self.engine = None;
-        self.link_index = None;
     }
 
     /// Derive the vault-level MAC key for authenticated vault rewrites.
@@ -402,18 +395,27 @@ impl DiaryCore {
     // Link operations
     // =========================================================================
 
+    /// Build from current protected entries on every query, covering every writer
+    /// without introducing fallible cache refreshes after a committed mutation.
+    fn current_link_index(&self) -> Result<link::LinkIndex, DiaryError> {
+        let engine = self.require_engine()?;
+        let entries = entry::list_entries_with_body(&self.vault_path, engine)?;
+        Ok(link::LinkIndex::build_protected(&entries))
+    }
+
     /// Resolve all `[[title]]` link references found in `body`.
     ///
     /// Parses wiki-links from `body` and looks up each title in the
-    /// [`link::LinkIndex`] built at unlock time.  Each [`link::ResolvedLink`]
+    /// [`link::LinkIndex`] built from current vault contents.  Each [`link::ResolvedLink`]
     /// indicates whether the link is unresolved (0 matches), unique (1 match),
     /// or ambiguous (≥2 matches).
     ///
     /// # Errors
     ///
     /// Returns [`DiaryError::NotUnlocked`] if the vault is locked.
+    /// Returns an error if reading, authenticating, or decoding current entries fails.
     pub fn resolve_links(&self, body: &str) -> Result<Vec<link::ResolvedLink>, DiaryError> {
-        let index = self.link_index.as_ref().ok_or(DiaryError::NotUnlocked)?;
+        let index = self.current_link_index()?;
         let resolved = link::parse_links(body)
             .iter()
             .map(|l| index.resolve(&l.title))
@@ -430,8 +432,9 @@ impl DiaryCore {
     /// # Errors
     ///
     /// Returns [`DiaryError::NotUnlocked`] if the vault is locked.
+    /// Returns an error if reading, authenticating, or decoding current entries fails.
     pub fn backlinks_for(&self, title: &str) -> Result<Vec<link::BacklinkEntry>, DiaryError> {
-        let index = self.link_index.as_ref().ok_or(DiaryError::NotUnlocked)?;
+        let index = self.current_link_index()?;
         Ok(index.backlinks_for(title))
     }
 
@@ -443,8 +446,9 @@ impl DiaryCore {
     /// # Errors
     ///
     /// Returns [`DiaryError::NotUnlocked`] if the vault is locked.
+    /// Returns an error if reading, authenticating, or decoding current entries fails.
     pub fn all_titles(&self) -> Result<Vec<String>, DiaryError> {
-        let index = self.link_index.as_ref().ok_or(DiaryError::NotUnlocked)?;
+        let index = self.current_link_index()?;
         Ok(index.all_titles())
     }
 
@@ -691,7 +695,6 @@ mod tests {
             core.engine.is_none(),
             "failed unlock must not expose key material"
         );
-        assert!(core.link_index.is_none());
         assert!(matches!(
             core.new_entry("x", "y", vec![]),
             Err(DiaryError::NotUnlocked)
@@ -706,7 +709,6 @@ mod tests {
         core.unlock(secret("password")).expect("unlock");
         assert!(core.unlock(secret("wrong password")).is_err());
         assert!(core.engine.is_none());
-        assert!(core.link_index.is_none());
     }
 
     // =========================================================================
@@ -746,12 +748,174 @@ mod tests {
     }
 
     // =========================================================================
-    // TC-046-01: unlock後にlink_indexが構築される
+    #[test]
+    fn link_queries_reject_tampered_current_snapshot_and_recover() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = setup_test_vault(&dir);
+        let mut core = DiaryCore::new(path.to_str().unwrap()).unwrap();
+        core.unlock(secret("password")).unwrap();
+        core.new_entry("Target", "[[Target]]", vec![]).unwrap();
+        assert_eq!(core.all_titles().unwrap(), vec!["Target"]);
+        let original = std::fs::read(&path).unwrap();
+        let mut tampered = original.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        std::fs::write(&path, tampered).unwrap();
+        assert!(core.all_titles().is_err());
+        assert!(core.resolve_links("[[Target]]").is_err());
+        assert!(core.backlinks_for("Target").is_err());
+        std::fs::write(&path, original).unwrap();
+        assert_eq!(
+            core.resolve_links("[[Target]]").unwrap()[0].matches.len(),
+            1
+        );
+        assert_eq!(
+            core.backlinks_for("Target").unwrap()[0].source_title,
+            "Target"
+        );
+        core.lock();
+        assert!(matches!(core.all_titles(), Err(DiaryError::NotUnlocked)));
+        assert!(matches!(
+            core.backlinks_for("Target"),
+            Err(DiaryError::NotUnlocked)
+        ));
+    }
+
+    #[test]
+    fn link_queries_follow_create_update_delete_without_reunlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = setup_test_vault(&dir);
+        let mut core = DiaryCore::new(path.to_str().unwrap()).unwrap();
+        core.unlock(secret("password")).unwrap();
+        let source = core.new_entry("Source", "[[Target]]", vec![]).unwrap();
+        assert!(core.resolve_links("[[Target]]").unwrap()[0]
+            .matches
+            .is_empty());
+        let target = core.new_entry("Target", "[[Source]]", vec![]).unwrap();
+        assert_eq!(
+            core.resolve_links("[[Target]]").unwrap()[0].matches[0].uuid_hex,
+            target
+        );
+        assert_eq!(
+            core.backlinks_for("Target").unwrap()[0].source_title,
+            "Source"
+        );
+        assert_eq!(
+            core.backlinks_for("Source").unwrap()[0].source_title,
+            "Target"
+        );
+        let duplicate = core.new_entry("Target", "", vec![]).unwrap();
+        assert_eq!(
+            core.resolve_links("[[Target]]").unwrap()[0].matches.len(),
+            2
+        );
+        // Existing duplicate-title semantics aggregate one backlink per target.
+        assert_eq!(core.backlinks_for("Target").unwrap().len(), 2);
+        core.update_entry(
+            &source,
+            &entry::EntryPlaintext {
+                title: "Renamed".into(),
+                body: "[[Other]]".into(),
+                tags: vec![],
+            },
+        )
+        .unwrap();
+        assert!(core.resolve_links("[[Source]]").unwrap()[0]
+            .matches
+            .is_empty());
+        assert_eq!(
+            core.resolve_links("[[Renamed]]").unwrap()[0].matches.len(),
+            1
+        );
+        assert!(core.backlinks_for("Target").unwrap().is_empty());
+        let other = core.new_entry("Other", "[[Renamed]]", vec![]).unwrap();
+        assert_eq!(
+            core.backlinks_for("Other").unwrap()[0].source_title,
+            "Renamed"
+        );
+        assert_eq!(
+            core.backlinks_for("Renamed").unwrap()[0].source_title,
+            "Other"
+        );
+        core.delete_entry(&duplicate).unwrap();
+        assert_eq!(
+            core.resolve_links("[[Target]]").unwrap()[0].matches.len(),
+            1
+        );
+        core.delete_entry(&target).unwrap();
+        assert!(core.resolve_links("[[Target]]").unwrap()[0]
+            .matches
+            .is_empty());
+        core.delete_entry(&other).unwrap();
+        assert!(core.backlinks_for("Other").unwrap().is_empty());
+        assert!(core.backlinks_for("Renamed").unwrap().is_empty());
+        assert_eq!(core.all_titles().unwrap(), vec!["Renamed"]);
+    }
+
+    #[test]
+    fn link_queries_follow_import_and_preserve_failed_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = setup_test_vault(&dir);
+        let mut core = DiaryCore::new(path.to_str().unwrap()).unwrap();
+        core.unlock(secret("password")).unwrap();
+        core.new_entry("Existing", "[[Imported]]", vec![]).unwrap();
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("Imported.md"), "[[Existing]]").unwrap();
+        core.import(source.path(), true).unwrap();
+        assert!(core.resolve_links("[[Imported]]").unwrap()[0]
+            .matches
+            .is_empty());
+        assert_eq!(core.import(source.path(), false).unwrap().imported, 1);
+        assert_eq!(
+            core.resolve_links("[[Imported]]").unwrap()[0].matches.len(),
+            1
+        );
+        assert_eq!(
+            core.backlinks_for("Existing").unwrap()[0].source_title,
+            "Imported"
+        );
+        assert_eq!(
+            core.backlinks_for("Imported").unwrap()[0].source_title,
+            "Existing"
+        );
+        let before = std::fs::read(&path).unwrap();
+        assert!(core.delete_entry("not-hex").is_err());
+        assert!(core
+            .update_entry(
+                "not-hex",
+                &entry::EntryPlaintext {
+                    title: "Wrong".into(),
+                    body: "".into(),
+                    tags: vec![],
+                }
+            )
+            .is_err());
+        assert!(core.import(&source.path().join("missing"), false).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let mut titles = core.all_titles().unwrap();
+        titles.sort();
+        assert_eq!(titles, vec!["Existing", "Imported"]);
+        assert_eq!(
+            core.backlinks_for("Existing").unwrap()[0].source_title,
+            "Imported"
+        );
+        assert_eq!(
+            core.resolve_links("[[Imported]]").unwrap()[0].matches.len(),
+            1
+        );
+        core.lock();
+        core.unlock(secret("password")).unwrap();
+        assert_eq!(
+            core.backlinks_for("Imported").unwrap()[0].source_title,
+            "Existing"
+        );
+    }
+
+    // TC-046-01: titles after unlock
     // =========================================================================
 
     /// TC-046-01: After unlock, all_titles returns every entry title.
     #[test]
-    fn tc_046_01_unlock_builds_link_index() {
+    fn tc_046_01_titles_after_unlock() {
         let dir = tempfile::tempdir().expect("tempdir");
         let vault_pqd = setup_test_vault(&dir);
 
@@ -767,7 +931,7 @@ mod tests {
             .expect("new_entry C");
         core.lock();
 
-        // Re-unlock: LinkIndex must be built with the 3 entries
+        // Re-unlock: queries must still reflect all 3 entries
         core.unlock(secret("password")).expect("second unlock");
         let mut titles = core.all_titles().expect("all_titles");
         titles.sort();
@@ -776,12 +940,12 @@ mod tests {
     }
 
     // =========================================================================
-    // TC-046-02: lock後にlink_indexがNone
+    // TC-046-02: locked queries are rejected
     // =========================================================================
 
     /// TC-046-02: After lock, resolve_links returns DiaryError::NotUnlocked.
     #[test]
-    fn tc_046_02_lock_clears_link_index() {
+    fn tc_046_02_lock_rejects_link_queries() {
         let dir = tempfile::tempdir().expect("tempdir");
         let vault_pqd = setup_test_vault(&dir);
 

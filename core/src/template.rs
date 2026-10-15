@@ -425,36 +425,22 @@ mod tests {
     // TC-042-05: TemplatePlaintext の zeroize 検証
     // =========================================================================
 
-    /// TC-042-05: zeroize() clears all fields of TemplatePlaintext.
-    ///
-    /// Uses `ManuallyDrop` to call `zeroize()` while the allocation is still live,
-    /// avoiding undefined behavior from reading freed memory.
+    /// TC-042-05: zeroize clears the live template fields.
+    /// Backing-memory erasure is the zeroize crate's contract, not something
+    /// this test can verify by reading pointers retained across mutation/drop.
     #[test]
     fn tc_042_05_template_plaintext_zeroize() {
-        use std::mem::ManuallyDrop;
+        fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<TemplatePlaintext>();
 
-        let mut t = ManuallyDrop::new(TemplatePlaintext {
+        let mut t = TemplatePlaintext {
             name: "daily".to_string(),
             body: "## {{date}}".to_string(),
-        });
-
-        let name_ptr = t.name.as_ptr();
-        let name_len = t.name.len();
-        let body_ptr = t.body.as_ptr();
-        let body_len = t.body.len();
+        };
 
         t.zeroize();
-
-        // SAFETY: ManuallyDrop suppresses deallocation; allocations are still live.
-        unsafe {
-            for i in 0..name_len {
-                assert_eq!(*name_ptr.add(i), 0u8, "name byte {i} not zeroed");
-            }
-            for i in 0..body_len {
-                assert_eq!(*body_ptr.add(i), 0u8, "body byte {i} not zeroed");
-            }
-        }
-        // Intentional leak — allocation is small and this is test code.
+        assert!(t.name.is_empty());
+        assert!(t.body.is_empty());
     }
 
     // =========================================================================

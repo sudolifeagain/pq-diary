@@ -470,14 +470,15 @@ mod tests {
         );
     }
 
-    /// TC-015-05: sym_key bytes are zeroed in memory after lock().
+    /// TC-015-05: lock removes the key and makes it inaccessible through the API.
     ///
-    /// # Safety
-    /// Reads a raw pointer after the `SecretBox<MasterKey>` is dropped to confirm
-    /// that `ZeroizeOnDrop` ran before deallocation.  Intentional for security
-    /// validation; permitted in test code only.
+    /// The live-value zeroize test is in `secure_mem`. Reading the allocation
+    /// after lock has dropped it would be undefined behavior, even in a test.
     #[test]
-    fn tc_015_05_lock_zeroizes_master_key() {
+    fn tc_015_05_lock_removes_master_key() {
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<MasterKey>();
+
         let params = fast_params();
         let password = b"correct-password";
         let salt = b"salt-16byte-long";
@@ -486,22 +487,17 @@ mod tests {
         let mut engine = CryptoEngine::new();
         engine.unlock(password, salt, &params, iv, &ct).unwrap();
 
-        // Capture a raw pointer to sym_key before locking.
-        let ptr: *const u8;
-        {
-            let mk: &MasterKey = engine.master_key.as_ref().unwrap().expose_secret();
-            ptr = mk.sym_key.as_ptr();
-        }
-
         engine.lock();
+        assert!(engine.master_key.is_none());
+        assert!(!engine.is_unlocked());
+        assert!(matches!(
+            engine.ensure_unlocked(),
+            Err(DiaryError::NotUnlocked)
+        ));
 
-        // SAFETY: intentional post-drop read for security verification.
-        // ZeroizeOnDrop guarantees bytes are cleared before the Box frees the allocation.
-        unsafe {
-            for i in 0..32 {
-                assert_eq!(*ptr.add(i), 0u8, "sym_key byte {i} not zeroed after lock");
-            }
-        }
+        // Repeated lock calls must not restore or attempt to reuse a dropped key.
+        engine.lock();
+        assert!(engine.master_key.is_none());
     }
 
     // -------------------------------------------------------------------------

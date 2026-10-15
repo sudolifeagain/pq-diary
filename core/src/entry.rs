@@ -601,37 +601,24 @@ mod tests {
     // TC-A10-01: EntryPlaintext ZeroizeOnDrop
     // =========================================================================
 
-    /// TC-A10-01: zeroize() clears all fields of EntryPlaintext.
-    ///
-    /// Uses `ManuallyDrop` to call `zeroize()` while the allocation is still live,
-    /// avoiding undefined behavior from reading freed memory.
+    /// TC-A10-01: zeroize clears the live plaintext fields.
+    /// Backing-memory erasure is the zeroize crate's contract; do not inspect
+    /// allocation contents through pointers retained across mutation or drop.
     #[test]
-    fn tc_a10_01_entry_plaintext_zeroize_on_drop() {
-        use std::mem::ManuallyDrop;
+    fn tc_a10_01_entry_plaintext_zeroize_clears_fields() {
+        fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<EntryPlaintext>();
 
-        let mut pt = ManuallyDrop::new(EntryPlaintext {
+        let mut pt = EntryPlaintext {
             title: "secret title".to_string(),
             tags: vec!["tag1".to_string(), "tag2".to_string()],
             body: "secret body content".to_string(),
-        });
-
-        let title_ptr = pt.title.as_ptr();
-        let title_len = pt.title.len();
-        let body_ptr = pt.body.as_ptr();
-        let body_len = pt.body.len();
+        };
 
         pt.zeroize();
-
-        // SAFETY: ManuallyDrop suppresses deallocation; allocations are still live.
-        unsafe {
-            for i in 0..title_len {
-                assert_eq!(*title_ptr.add(i), 0u8, "title byte {i} not zeroed");
-            }
-            for i in 0..body_len {
-                assert_eq!(*body_ptr.add(i), 0u8, "body byte {i} not zeroed");
-            }
-        }
-        // Intentional leak — allocation is small and this is test code.
+        assert!(pt.title.is_empty());
+        assert!(pt.tags.is_empty());
+        assert!(pt.body.is_empty());
     }
 
     // =========================================================================

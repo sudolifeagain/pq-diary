@@ -140,24 +140,16 @@ mod tests {
         assert!(result, "expected valid signature to verify as true");
     }
 
-    /// TC-005-03: signing key (SecureBuffer) is zeroed by zeroize (called by Drop::drop).
-    ///
-    /// Uses `ManuallyDrop` to call `zeroize()` while the allocation is still live,
-    /// avoiding undefined behavior from reading freed memory.
+    /// TC-005-03: zeroize clears the live signing-key buffer.
     #[test]
-    fn tc_005_03_signing_key_zeroize_on_drop() {
-        use std::mem::ManuallyDrop;
+    fn tc_005_03_signing_key_zeroize_clears_live_buffer() {
         use zeroize::Zeroize;
-        let mut kp = ManuallyDrop::new(keygen().unwrap());
-        let ptr = kp.signing_key.as_ref().as_ptr();
+        let mut kp = keygen().unwrap();
         let len = kp.signing_key.len();
         kp.signing_key.zeroize();
-        // SAFETY: the allocation is still live because ManuallyDrop suppresses deallocation.
-        unsafe {
-            for i in 0..len {
-                assert_eq!(*ptr.add(i), 0u8, "byte {i} not zeroed after zeroize");
-            }
-        }
+        assert_ne!(len, 0);
+        assert_eq!(kp.signing_key.len(), len);
+        assert!(kp.signing_key.as_ref().iter().all(|&byte| byte == 0));
     }
 
     /// TC-005-E01: tampered message causes verify to return false.

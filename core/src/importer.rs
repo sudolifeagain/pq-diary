@@ -100,8 +100,8 @@ use crate::{
     error::DiaryError,
     vault::{
         format::{generate_entry_padding, EntryRecord, RECORD_TYPE_ENTRY},
-        reader::read_vault,
-        writer::write_vault_authenticated,
+        reader::read_vault_with_attachments_authenticated,
+        writer::write_vault_with_attachments_authenticated,
     },
 };
 
@@ -264,7 +264,9 @@ pub fn batch_create_entries(
     engine: &CryptoEngine,
     files: Vec<MarkdownFile>,
 ) -> Result<ImportResult, DiaryError> {
-    let (header, mut records) = read_vault(vault_path)?;
+    let mac_key = engine.vault_mac_key()?;
+    let (header, mut records, attachments) =
+        read_vault_with_attachments_authenticated(vault_path, &mac_key)?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -310,8 +312,13 @@ pub fn batch_create_entries(
         records.push(record);
     }
 
-    let mac_key = engine.vault_mac_key()?;
-    write_vault_authenticated(vault_path, header, &records, &mac_key)?;
+    write_vault_with_attachments_authenticated(
+        vault_path,
+        header,
+        &records,
+        &attachments,
+        &mac_key,
+    )?;
 
     Ok(ImportResult {
         imported,

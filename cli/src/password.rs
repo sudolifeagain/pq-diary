@@ -221,84 +221,88 @@ fn read_password_tty(prompt: &str) -> Result<SecretString, DiaryError> {
     };
     use zeroize::Zeroizing;
 
-    // SAFETY: This block calls Win32 Console APIs (GetConsoleMode,
-    // SetConsoleMode, ReadConsoleW) via windows-sys FFI, which requires
-    // `unsafe`.  Four invariants are maintained per ADR-0007:
-    //
-    // 1. Handle validity: GetStdHandle return value is checked against both
-    //    null (0) and INVALID_HANDLE_VALUE (-1 as isize) before use.
-    // 2. Console mode restoration: SetConsoleMode(handle, old_mode) is called
-    //    unconditionally after ReadConsoleW, before any early return, ensuring
-    //    the original mode is always restored even on error.
-    // 3. Buffer boundary: ReadConsoleW is given `buf.len() as u32` (= 256) as
-    //    the character limit, so the API guarantees chars_read ≤ 256.  The
-    //    subsequent slice `&buf[..chars_read as usize]` is therefore always
-    //    within bounds.
-    // 4. Lifetime: the handle, old_mode, and buf are all valid for the entire
-    //    duration of this unsafe block.
-    unsafe {
-        let handle = GetStdHandle(STD_INPUT_HANDLE);
-        // INVALID_HANDLE_VALUE = -1 as pointer; null = 0 pointer (both invalid)
-        if handle.is_null() || (handle as isize) == -1 {
-            return Err(DiaryError::Password(
-                "Failed to obtain stdin console handle".to_string(),
-            ));
-        }
+    // SAFETY: STD_INPUT_HANDLE is a documented selector. The returned handle
+    // is checked before use and is borrowed, never closed by this function.
+    #[allow(unsafe_code, reason = "OS console-handle boundary: GetStdHandle")]
+    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    // INVALID_HANDLE_VALUE = -1 as pointer; null = 0 pointer (both invalid)
+    if handle.is_null() || (handle as isize) == -1 {
+        return Err(DiaryError::Password(
+            "Failed to obtain stdin console handle".to_string(),
+        ));
+    }
 
-        let mut old_mode: u32 = 0;
-        if GetConsoleMode(handle, &mut old_mode) == 0 {
-            return Err(DiaryError::Password(
-                "Failed to read console mode".to_string(),
-            ));
-        }
+    let mut old_mode: u32 = 0;
+    // SAFETY: handle passed the invalid-handle checks; old_mode is a live,
+    // uniquely borrowed u32 output slot for the duration of the call.
+    #[allow(unsafe_code, reason = "OS console-mode boundary: GetConsoleMode")]
+    let mode_read = unsafe { GetConsoleMode(handle, &mut old_mode) };
+    if mode_read == 0 {
+        return Err(DiaryError::Password(
+            "Failed to read console mode".to_string(),
+        ));
+    }
 
-        // Disable echo input.
-        let new_mode = old_mode & !ENABLE_ECHO_INPUT;
-        if SetConsoleMode(handle, new_mode) == 0 {
-            return Err(DiaryError::Password(
-                "Failed to disable console echo".to_string(),
-            ));
-        }
+    // Disable echo input.
+    let new_mode = old_mode & !ENABLE_ECHO_INPUT;
+    // SAFETY: handle is a console handle verified by GetConsoleMode; new_mode
+    // preserves the original flags except for disabling echo.
+    #[allow(unsafe_code, reason = "OS console-mode boundary: SetConsoleMode")]
+    let mode_set = unsafe { SetConsoleMode(handle, new_mode) };
+    if mode_set == 0 {
+        return Err(DiaryError::Password(
+            "Failed to disable console echo".to_string(),
+        ));
+    }
 
-        // Print the prompt to stderr so it is always visible.
-        eprint!("{prompt}");
+    // Print the prompt to stderr so it is always visible.
+    eprint!("{prompt}");
 
-        // Read up to 256 UTF-16 code units from the console.
-        let mut buf: Zeroizing<[u16; 256]> = Zeroizing::new([0u16; 256]);
-        let mut chars_read: u32 = 0;
-        let ok = ReadConsoleW(
+    // Read up to 256 UTF-16 code units from the console.
+    let mut buf: Zeroizing<[u16; 256]> = Zeroizing::new([0u16; 256]);
+    let mut chars_read: u32 = 0;
+    // SAFETY: buf is a live, uniquely borrowed 256-unit UTF-16 buffer, and the
+    // supplied count is its capacity. chars_read is a live u32 output slot.
+    // The optional input-control pointer is null; neither pointer escapes.
+    #[allow(unsafe_code, reason = "OS console-input boundary: ReadConsoleW")]
+    let ok = unsafe {
+        ReadConsoleW(
             handle,
             buf.as_mut_ptr().cast(),
             buf.len() as u32,
             &mut chars_read,
             std::ptr::null(),
-        );
+        )
+    };
 
-        // Restore console mode before any early return.
-        if SetConsoleMode(handle, old_mode) == 0 {
-            eprintln!("Warning: Failed to restore console mode");
-        }
-        eprintln!(); // newline after the hidden input
-
-        if ok == 0 {
-            return Err(DiaryError::Password(
-                "Failed to read password from console".to_string(),
-            ));
-        }
-
-        let slice = &buf[..chars_read as usize];
-        // Strip trailing CR+LF, lone LF, or lone CR.
-        let trimmed = slice
-            .strip_suffix(&[b'\r' as u16, b'\n' as u16])
-            .or_else(|| slice.strip_suffix(&[b'\n' as u16]))
-            .or_else(|| slice.strip_suffix(&[b'\r' as u16]))
-            .unwrap_or(slice);
-
-        let password = String::from_utf16(trimmed)
-            .map_err(|e| DiaryError::Password(format!("Failed to decode console input: {e}")))?;
-
-        Ok(SecretBox::new(password.into_boxed_str()))
+    // Restore console mode before any early return.
+    // SAFETY: the same live console handle and its saved original flags are
+    // passed back before handling any read or decoding error.
+    #[allow(unsafe_code, reason = "OS console-mode restoration: SetConsoleMode")]
+    let mode_restored = unsafe { SetConsoleMode(handle, old_mode) };
+    if mode_restored == 0 {
+        eprintln!("Warning: Failed to restore console mode");
     }
+    eprintln!(); // newline after the hidden input
+
+    if ok == 0 {
+        return Err(DiaryError::Password(
+            "Failed to read password from console".to_string(),
+        ));
+    }
+
+    let slice = &buf[..chars_read as usize];
+    // Strip trailing CR+LF, lone LF, or lone CR.
+    let trimmed = slice
+        .strip_suffix(&[b'\r' as u16, b'\n' as u16])
+        .or_else(|| slice.strip_suffix(&[b'\n' as u16]))
+        .or_else(|| slice.strip_suffix(&[b'\r' as u16]))
+        .unwrap_or(slice);
+
+    let password = String::from_utf16(trimmed)
+        .map_err(|e| DiaryError::Password(format!("Failed to decode console input: {e}")))?;
+
+    Ok(SecretBox::new(password.into_boxed_str()))
 }
 
 /// Fallback for platforms that support neither Unix termios nor Win32 console.

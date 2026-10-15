@@ -130,24 +130,16 @@ mod tests {
         assert_eq!(ss_sender.as_ref(), ss_receiver.as_ref());
     }
 
-    /// TC-004-03: DecapsulationKey (SecureBuffer) is zeroed by zeroize (called by Drop::drop).
-    ///
-    /// Uses `ManuallyDrop` to call `zeroize()` while the allocation is still live,
-    /// avoiding undefined behavior from reading freed memory.
+    /// TC-004-03: zeroize clears the live decapsulation-key buffer.
     #[test]
-    fn tc_004_03_decapsulation_key_zeroize_on_drop() {
-        use std::mem::ManuallyDrop;
+    fn tc_004_03_decapsulation_key_zeroize_clears_live_buffer() {
         use zeroize::Zeroize;
-        let mut kp = ManuallyDrop::new(keygen().unwrap());
-        let ptr = kp.decapsulation_key.as_ref().as_ptr();
+        let mut kp = keygen().unwrap();
         let len = kp.decapsulation_key.len();
         kp.decapsulation_key.zeroize();
-        // SAFETY: the allocation is still live because ManuallyDrop suppresses deallocation.
-        unsafe {
-            for i in 0..len {
-                assert_eq!(*ptr.add(i), 0u8, "byte {i} not zeroed after zeroize");
-            }
-        }
+        assert_ne!(len, 0);
+        assert_eq!(kp.decapsulation_key.len(), len);
+        assert!(kp.decapsulation_key.as_ref().iter().all(|&byte| byte == 0));
     }
 
     /// TC-004-E01: incorrectly sized ciphertext returns DiaryError::Crypto.

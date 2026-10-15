@@ -59,6 +59,17 @@ pub enum DiaryError {
     #[error("legacy error: {0}")]
     Legacy(String),
 
+    /// Recovery committed successfully, but obsolete attachment cleanup failed.
+    #[error("legacy recovery committed; attachment cleanup incomplete at {path}: {source}. The heir vault is usable; do not repeat legacy-access")]
+    LegacyCleanupIncomplete {
+        /// Counts from the already-committed recovery, not a rollback report.
+        report: crate::legacy::LegacyAccessReport,
+        /// Blob or attachment directory where cleanup stopped.
+        path: std::path::PathBuf,
+        #[source]
+        source: Box<DiaryError>,
+    },
+
     /// Access-policy evaluation error.
     #[error("policy error: {0}")]
     Policy(String),
@@ -107,6 +118,11 @@ mod tests {
             DiaryError::Import("malformed wiki-link".into()),
             DiaryError::Template("missing template".into()),
             DiaryError::Legacy("legacy key expired".into()),
+            DiaryError::LegacyCleanupIncomplete {
+                report: Default::default(),
+                path: "attachments".into(),
+                source: Box::new(DiaryError::Io(io::Error::other("cleanup failure"))),
+            },
             DiaryError::Policy("access denied".into()),
             DiaryError::Daemon("daemon not running".into()),
             DiaryError::Password("too short".into()),
@@ -115,7 +131,7 @@ mod tests {
             DiaryError::InvalidTemplateName("bad name".into()),
         ];
 
-        assert_eq!(errors.len(), 18, "expected exactly 18 variants");
+        assert_eq!(errors.len(), 19, "expected exactly 19 variants");
 
         for e in &errors {
             let msg = format!("{}", e);
@@ -154,10 +170,10 @@ mod tests {
         );
     }
 
-    /// TC-002-B01: all 18 variants compile and produce non-empty Display strings.
+    /// TC-002-B01: all 19 variants compile and produce non-empty Display strings.
     /// This is a compile-time exhaustiveness check + runtime Display check.
     #[test]
-    fn test_all_18_variants_exhaustive() {
+    fn test_all_19_variants_exhaustive() {
         fn check(e: &DiaryError) {
             assert!(!format!("{}", e).is_empty());
         }
@@ -173,6 +189,11 @@ mod tests {
         check(&DiaryError::Import("x".into()));
         check(&DiaryError::Template("x".into()));
         check(&DiaryError::Legacy("x".into()));
+        check(&DiaryError::LegacyCleanupIncomplete {
+            report: Default::default(),
+            path: "attachments".into(),
+            source: Box::new(DiaryError::Io(io::Error::other("x"))),
+        });
         check(&DiaryError::Policy("x".into()));
         check(&DiaryError::Daemon("x".into()));
         check(&DiaryError::Password("x".into()));

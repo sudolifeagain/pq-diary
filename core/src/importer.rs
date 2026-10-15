@@ -340,7 +340,8 @@ pub struct SkipDetail {
 ///
 /// # Errors
 ///
-/// Returns [`DiaryError::Import`] if an internal regex fails to compile.
+/// Returns [`DiaryError::Import`] for malformed supported frontmatter scalars/lists
+/// or if an internal rewrite regex fails to compile.
 pub fn parse_markdown(
     content: &str,
     filename: &str,
@@ -349,7 +350,7 @@ pub fn parse_markdown(
     let content = Zeroizing::new(content.replace("\r\n", "\n"));
 
     // 1. Parse YAML frontmatter
-    let (frontmatter_title, frontmatter_tags, body_raw) = parse_frontmatter(&content);
+    let (frontmatter_title, frontmatter_tags, body_raw) = parse_frontmatter(&content)?;
 
     // 2. Determine title: frontmatter title takes priority over filename stem
     let title = frontmatter_title.unwrap_or_else(|| {
@@ -362,6 +363,9 @@ pub fn parse_markdown(
 
     // 3. Convert wiki-links in body
     let (body_after_links, links_converted) = convert_wiki_links(body_raw)?;
+    // This intermediate body is replaced by tag extraction; wipe its allocation
+    // when it is discarded, including if a later rewrite fails.
+    let body_after_links = Zeroizing::new(body_after_links);
 
     // 4. Extract inline #tags from body
     let (extracted_tags, body_final, tags_converted) = extract_tags(&body_after_links)?;
@@ -613,9 +617,9 @@ pub fn import_directory(
 /// Returns `(title, tags, body_str)` where `body_str` is a `&str` slice
 /// into `content` following the closing `---` delimiter.  When no valid
 /// frontmatter is detected, returns `(None, [], content)`.
-fn parse_frontmatter(content: &str) -> (Option<String>, Vec<String>, &str) {
+fn parse_frontmatter(content: &str) -> Result<(Option<String>, Vec<String>, &str), DiaryError> {
     if !content.starts_with("---\n") {
-        return (None, Vec::new(), content);
+        return Ok((None, Vec::new(), content));
     }
 
     let after_open = &content[4..]; // skip "---\n"
@@ -636,79 +640,129 @@ fn parse_frontmatter(content: &str) -> (Option<String>, Vec<String>, &str) {
 
     let (fm_end, body_start) = match close_pair {
         Some(pair) => pair,
-        None => return (None, Vec::new(), content),
+        None => return Ok((None, Vec::new(), content)),
     };
 
     let fm_str = &after_open[..fm_end];
     let body = &after_open[body_start..];
 
-    let title = extract_frontmatter_title(fm_str);
-    let tags = extract_frontmatter_tags(fm_str);
+    let mut title = Zeroizing::new(extract_frontmatter_title(fm_str)?);
+    let tags = extract_frontmatter_tags(fm_str)?;
 
-    (title, tags, body)
+    Ok((title.take(), tags, body))
 }
 
-/// Extract the `title:` value from a frontmatter string.
-fn extract_frontmatter_title(fm: &str) -> Option<String> {
+/// Decode the scalar subset emitted by export: JSON-compatible double quotes,
+/// YAML single quotes (doubled apostrophes), and legacy unquoted strings.
+/// This is deliberately not a general YAML parser. Never include secret input
+/// in diagnostics. Return the unused suffix for inline tag-list parsing.
+fn frontmatter_scalar_prefix(value: &str) -> Result<(String, &str), DiaryError> {
+    let value = value.trim_start();
+    if value.starts_with('"') {
+        let mut stream = serde_json::Deserializer::from_str(value).into_iter::<String>();
+        let decoded = stream
+            .next()
+            .and_then(Result::ok)
+            .ok_or_else(|| DiaryError::Import("invalid double-quoted frontmatter scalar".into()))?;
+        return Ok((decoded, &value[stream.byte_offset()..]));
+    }
+    if let Some(inner) = value.strip_prefix('\'') {
+        let mut decoded = Zeroizing::new(String::new());
+        let mut chars = inner.char_indices().peekable();
+        while let Some((offset, ch)) = chars.next() {
+            if ch == '\'' {
+                if chars.peek().is_some_and(|(_, next)| *next == '\'') {
+                    chars.next();
+                    decoded.push('\'');
+                } else {
+                    return Ok((std::mem::take(&mut *decoded), &inner[offset + 1..]));
+                }
+            } else {
+                decoded.push(ch);
+            }
+        }
+        return Err(DiaryError::Import(
+            "unterminated single-quoted frontmatter scalar".into(),
+        ));
+    }
+    let end = value.find(',').unwrap_or(value.len());
+    Ok((value[..end].trim().to_string(), &value[end..]))
+}
+
+fn frontmatter_scalar(value: &str) -> Result<String, DiaryError> {
+    let value = value.trim();
+    if !value.starts_with(['"', '\'']) {
+        return Ok(value.to_string());
+    }
+    let (decoded, rest) = frontmatter_scalar_prefix(value)?;
+    let mut decoded = Zeroizing::new(decoded);
+    if !rest.trim().is_empty() {
+        return Err(DiaryError::Import(
+            "unexpected text after quoted frontmatter scalar".into(),
+        ));
+    }
+    Ok(std::mem::take(&mut *decoded))
+}
+
+/// Extract the first nonempty title, preserving legacy unquoted values.
+fn extract_frontmatter_title(fm: &str) -> Result<Option<String>, DiaryError> {
     for line in fm.lines() {
         if let Some(rest) = line.strip_prefix("title:") {
-            let value = rest.trim().trim_matches('"').trim_matches('\'').to_string();
-            if !value.is_empty() {
-                return Some(value);
+            let value = frontmatter_scalar(rest)?;
+            // An explicitly quoted empty title is meaningful in exported data.
+            if !value.is_empty() || rest.trim().starts_with(['"', '\'']) {
+                return Ok(Some(value));
             }
         }
     }
-    None
+    Ok(None)
 }
 
-/// Extract `tags:` values from a frontmatter string.
-///
-/// Handles both inline `tags: [tag1, tag2]` and YAML list formats:
-/// ```text
-/// tags:
-///   - tag1
-///   - tag2
-/// ```
-fn extract_frontmatter_tags(fm: &str) -> Vec<String> {
-    let mut tags = Vec::new();
+/// Supports inline scalar lists and the block list emitted by export.
+fn extract_frontmatter_tags(fm: &str) -> Result<Vec<String>, DiaryError> {
+    let mut tags = Zeroizing::new(Vec::new());
     let mut in_tags_list = false;
-
     for line in fm.lines() {
         if let Some(rest) = line.strip_prefix("tags:") {
             in_tags_list = false;
             let rest = rest.trim();
-            if rest.starts_with('[') && rest.ends_with(']') {
-                // Inline format: tags: [tag1, tag2]
-                let inner = &rest[1..rest.len() - 1];
-                for tag in inner.split(',') {
-                    let t = tag.trim().trim_matches('"').trim_matches('\'').to_string();
-                    if !t.is_empty() {
-                        tags.push(t);
+            if let Some(inner) = rest.strip_prefix('[') {
+                let mut remaining = inner
+                    .strip_suffix(']')
+                    .ok_or_else(|| DiaryError::Import("unterminated frontmatter tag list".into()))?
+                    .trim();
+                while !remaining.is_empty() {
+                    let quoted = remaining.starts_with(['"', '\'']);
+                    let (tag, rest) = frontmatter_scalar_prefix(remaining)?;
+                    if !tag.is_empty() || quoted {
+                        tags.push(tag);
+                    }
+                    remaining = rest.trim_start();
+                    if !remaining.is_empty() {
+                        remaining = remaining
+                            .strip_prefix(',')
+                            .ok_or_else(|| {
+                                DiaryError::Import("expected comma in frontmatter tag list".into())
+                            })?
+                            .trim_start();
                     }
                 }
             } else if rest.is_empty() {
-                // List format: tags: followed by "- tag" lines
                 in_tags_list = true;
             }
         } else if in_tags_list {
             let trimmed = line.trim();
             if let Some(tag_str) = trimmed.strip_prefix("- ") {
-                let t = tag_str
-                    .trim()
-                    .trim_matches('"')
-                    .trim_matches('\'')
-                    .to_string();
-                if !t.is_empty() {
-                    tags.push(t);
+                let tag = frontmatter_scalar(tag_str)?;
+                if !tag.is_empty() || tag_str.trim().starts_with(['"', '\'']) {
+                    tags.push(tag);
                 }
             } else if !trimmed.is_empty() {
-                // Non-list-item line encountered: end of tag list
                 in_tags_list = false;
             }
         }
     }
-
-    tags
+    Ok(std::mem::take(&mut *tags))
 }
 
 /// Convert Obsidian `[[wiki-link|alias]]` to `[[wiki-link]]`.
@@ -936,6 +990,90 @@ mod tests {
     // -------------------------------------------------------------------------
     // Shared helpers
     // -------------------------------------------------------------------------
+
+    #[test]
+    fn frontmatter_scalar_compatibility() {
+        let content = r#"---
+title: A plain, unquoted title
+tags: [plain, "comma,tag", 'it''s a tag', "\u65e5\u672c", "line\nnext", "a\\b"]
+---
+body"#;
+        let (parsed, _, _) = parse_markdown(content, "note.md").unwrap();
+        assert_eq!(parsed.title, "A plain, unquoted title");
+        assert_eq!(
+            parsed.tags,
+            [
+                "plain",
+                "comma,tag",
+                "it's a tag",
+                "日本",
+                "line\nnext",
+                "a\\b"
+            ]
+        );
+        let (parsed, _, _) = parse_markdown(
+            "---\ntitle: 'it''s a title'\ntags:\n  - unquoted, comma\n  - 'it''s a tag'\n---\nbody",
+            "note.md",
+        )
+        .unwrap();
+        assert_eq!(parsed.title, "it's a title");
+        assert_eq!(parsed.tags, ["unquoted, comma", "it's a tag"]);
+    }
+
+    #[test]
+    fn malformed_frontmatter_is_rejected_without_echoing_content() {
+        for field in [
+            r#"title: "secret\q""#,
+            r#"title: "secret" suffix"#,
+            "title: 'secret",
+            "title: \"secret",
+            r#"tags: ["secret" missingcomma]"#,
+            r#"tags: ["secret\uZZZZ"]"#,
+            r#"tags: ["secret"] suffix"#,
+            "tags:\n  - 'secret' suffix",
+            "tags:\n  - \"secret\\\"",
+        ] {
+            let result = parse_markdown(&format!("---\n{field}\n---\nbody"), "note.md");
+            let err = result.err().expect(field);
+            assert!(matches!(err, DiaryError::Import(_)));
+            assert!(!err.to_string().contains("secret"));
+        }
+    }
+
+    #[test]
+    fn malformed_frontmatter_import_preserves_vault_and_sources() {
+        let vault_dir = tempfile::tempdir().unwrap();
+        let vault_pqd = setup_test_vault(&vault_dir);
+        let source_dir = tempfile::tempdir().unwrap();
+        let valid_path = source_dir.path().join("a-valid.md");
+        let bad_path = source_dir.path().join("z-invalid.md");
+        let bad = "---\ntitle: \"secret\\q\"\n---\nbody";
+        std::fs::write(&valid_path, "valid body").unwrap();
+        std::fs::write(&bad_path, bad).unwrap();
+        let mut core = DiaryCore::new(vault_pqd.to_str().unwrap()).unwrap();
+        core.unlock(secret("password")).unwrap();
+        core.new_entry("existing", "keep this body", vec!["keep".into()])
+            .unwrap();
+        let before = std::fs::read(&vault_pqd).unwrap();
+        let config_path = vault_pqd.with_file_name("vault.toml");
+        let config_before = std::fs::read(&config_path).unwrap();
+        for dry_run in [false, true] {
+            assert!(core.import(source_dir.path(), dry_run).is_err());
+            assert_eq!(std::fs::read(&vault_pqd).unwrap(), before);
+            assert_eq!(std::fs::read(&config_path).unwrap(), config_before);
+            assert_eq!(std::fs::read_to_string(&valid_path).unwrap(), "valid body");
+            assert_eq!(std::fs::read_to_string(&bad_path).unwrap(), bad);
+        }
+        drop(core);
+        let mut reopened = DiaryCore::new(vault_pqd.to_str().unwrap()).unwrap();
+        reopened.unlock(secret("password")).unwrap();
+        let entries = reopened.list_entries(None).unwrap();
+        assert_eq!(entries.len(), 1);
+        let (_, entry) = reopened.get_entry(&entries[0].uuid_hex).unwrap();
+        assert_eq!(entry.title, "existing");
+        assert_eq!(entry.body, "keep this body");
+        assert_eq!(entry.tags, ["keep"]);
+    }
 
     fn fast_params() -> Argon2Params {
         Argon2Params {

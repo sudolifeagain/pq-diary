@@ -108,7 +108,13 @@ fn failed_template_overwrite_preserves_original_vault() {
     );
     assert_eq!(std::fs::read(&blob_path).expect("blob"), blob_before);
     assert!(
-        !vault_dir.join("vault.pqd.tmp").exists(),
+        !std::fs::read_dir(&vault_dir).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("vault.pqd.tmp")
+        }),
         "failed write must clean its temporary file"
     );
 

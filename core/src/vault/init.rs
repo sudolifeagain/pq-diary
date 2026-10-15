@@ -30,12 +30,14 @@ struct InitStaging {
 impl InitStaging {
     fn new(base: &Path) -> Result<Self, DiaryError> {
         let root = base.join(format!(".init-{}", uuid::Uuid::new_v4()));
-        let mut builder = std::fs::DirBuilder::new();
+        let builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
-        {
+        let builder = {
             use std::os::unix::fs::DirBuilderExt as _;
+            let mut builder = builder;
             builder.mode(0o700);
-        }
+            builder
+        };
         builder.create(&root)?;
         // Keep prepared files one level below the root so list_vaults cannot
         // mistake the temporary directory for an initialized user vault.

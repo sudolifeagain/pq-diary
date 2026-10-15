@@ -172,15 +172,7 @@ pub fn collect_stats(vault_path: &Path, engine: &CryptoEngine) -> Result<VaultSt
 
     // active_days_30d: count distinct days within the last 30 days.
     let now_ts = chrono::Utc::now().timestamp();
-    let cutoff_ts = now_ts - 30i64 * 24 * 3600;
-    let active_days_30d = daily_counts
-        .keys()
-        .filter(|date_str| {
-            date_str_to_day_start_ts(date_str)
-                .map(|ts| ts >= cutoff_ts)
-                .unwrap_or(false)
-        })
-        .count();
+    let active_days_30d = count_active_days_30d(&daily_counts, now_ts);
 
     // Daily activity: sorted by date ascending.
     let mut daily_activity: Vec<DailyActivity> = daily_counts
@@ -208,6 +200,18 @@ pub fn collect_stats(vault_path: &Path, engine: &CryptoEngine) -> Result<VaultSt
 // =============================================================================
 // Private helpers
 // =============================================================================
+
+fn count_active_days_30d(daily_counts: &HashMap<String, usize>, now_ts: i64) -> usize {
+    let cutoff_ts = now_ts - 30i64 * 24 * 3600;
+    daily_counts
+        .keys()
+        .filter(|date_str| {
+            date_str_to_day_start_ts(date_str)
+                .map(|ts| ts >= cutoff_ts && ts <= now_ts)
+                .unwrap_or(false)
+        })
+        .count()
+}
 
 /// Convert a Unix timestamp (seconds) to a "YYYY-MM-DD" date string in UTC.
 fn unix_ts_to_date_str(ts: u64) -> String {
@@ -242,6 +246,33 @@ mod tests {
     use secrecy::SecretBox;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
+
+    #[test]
+    fn recent_activity_excludes_future_days_and_preserves_cutoff() {
+        let now = "2026-10-15T12:00:00Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .expect("fixed time")
+            .timestamp();
+        for (date, expected) in [
+            ("2026-10-15", 1), // Today is included, including its UTC midnight.
+            ("2026-10-16", 0), // Tomorrow must not count as recent activity.
+            ("2026-09-16", 1), // The last midnight inside the rolling window.
+            ("2026-09-15", 0), // Midnight is before the 30-day cutoff at noon.
+            ("2026-09-14", 0),
+            ("invalid", 0),
+        ] {
+            let days = std::collections::HashMap::from([(date.to_string(), 3)]);
+            assert_eq!(super::count_active_days_30d(&days, now), expected, "{date}");
+        }
+        let midnight = now - 12 * 3600;
+        let boundary = std::collections::HashMap::from([("2026-09-15".to_string(), 1)]);
+        assert_eq!(super::count_active_days_30d(&boundary, midnight), 1);
+        assert_eq!(super::count_active_days_30d(&boundary, midnight + 1), 0);
+        assert_eq!(
+            super::count_active_days_30d(&std::collections::HashMap::new(), now),
+            0
+        );
+    }
 
     // -------------------------------------------------------------------------
     // Test helpers

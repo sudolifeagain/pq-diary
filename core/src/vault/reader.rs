@@ -9,6 +9,7 @@
 //! - `read_vault_with_attachments_authenticated`: authenticate and parse one
 //!   complete snapshot for read-modify-write operations
 
+use super::slice_reader::read_vec;
 use std::io::{self, Read};
 use std::path::Path;
 
@@ -305,19 +306,13 @@ fn parse_entry_payload(payload: &[u8]) -> Result<EntryRecord, DiaryError> {
     cursor.read_exact(&mut u32_buf)?;
     let ct_len = u32::from_le_bytes(u32_buf) as usize;
     check_field_size(ct_len)?;
-    let mut ciphertext = vec![0u8; ct_len];
-    if ct_len > 0 {
-        cursor.read_exact(&mut ciphertext)?;
-    }
+    let ciphertext = read_vec(&mut cursor, ct_len)?;
 
     // Signature length (LE u32) + signature
     cursor.read_exact(&mut u32_buf)?;
     let sig_len = u32::from_le_bytes(u32_buf) as usize;
     check_field_size(sig_len)?;
-    let mut signature = vec![0u8; sig_len];
-    if sig_len > 0 {
-        cursor.read_exact(&mut signature)?;
-    }
+    let signature = read_vec(&mut cursor, sig_len)?;
 
     // HMAC-SHA256 (32 bytes)
     let mut content_hmac = [0u8; 32];
@@ -332,10 +327,7 @@ fn parse_entry_payload(payload: &[u8]) -> Result<EntryRecord, DiaryError> {
     cursor.read_exact(&mut u32_buf)?;
     let lkb_len = u32::from_le_bytes(u32_buf) as usize;
     check_field_size(lkb_len)?;
-    let mut legacy_key_block = vec![0u8; lkb_len];
-    if lkb_len > 0 {
-        cursor.read_exact(&mut legacy_key_block)?;
-    }
+    let legacy_key_block = read_vec(&mut cursor, lkb_len)?;
 
     // Attachment count (LE u16)
     let mut u16_buf = [0u8; 2];
@@ -349,10 +341,7 @@ fn parse_entry_payload(payload: &[u8]) -> Result<EntryRecord, DiaryError> {
     // Padding length (1 byte) + padding
     cursor.read_exact(&mut flag_buf)?;
     let pad_len = flag_buf[0] as usize;
-    let mut padding = vec![0u8; pad_len];
-    if pad_len > 0 {
-        cursor.read_exact(&mut padding)?;
-    }
+    let padding = read_vec(&mut cursor, pad_len)?;
 
     Ok(EntryRecord {
         record_type,
@@ -393,19 +382,13 @@ fn parse_attachment_payload(payload: &[u8]) -> Result<AttachmentRecord, DiaryErr
     cursor.read_exact(&mut u32_buf)?;
     let ct_len = u32::from_le_bytes(u32_buf) as usize;
     check_field_size(ct_len)?;
-    let mut ciphertext = vec![0u8; ct_len];
-    if ct_len > 0 {
-        cursor.read_exact(&mut ciphertext)?;
-    }
+    let ciphertext = read_vec(&mut cursor, ct_len)?;
 
     // Signature length (LE u32) + signature
     cursor.read_exact(&mut u32_buf)?;
     let sig_len = u32::from_le_bytes(u32_buf) as usize;
     check_field_size(sig_len)?;
-    let mut signature = vec![0u8; sig_len];
-    if sig_len > 0 {
-        cursor.read_exact(&mut signature)?;
-    }
+    let signature = read_vec(&mut cursor, sig_len)?;
 
     // HMAC-SHA256 (32 bytes)
     let mut content_hmac = [0u8; 32];
@@ -420,18 +403,12 @@ fn parse_attachment_payload(payload: &[u8]) -> Result<AttachmentRecord, DiaryErr
     cursor.read_exact(&mut u32_buf)?;
     let lkb_len = u32::from_le_bytes(u32_buf) as usize;
     check_field_size(lkb_len)?;
-    let mut legacy_key_block = vec![0u8; lkb_len];
-    if lkb_len > 0 {
-        cursor.read_exact(&mut legacy_key_block)?;
-    }
+    let legacy_key_block = read_vec(&mut cursor, lkb_len)?;
 
     // Padding length (1 byte) + padding
     cursor.read_exact(&mut flag_buf)?;
     let pad_len = flag_buf[0] as usize;
-    let mut padding = vec![0u8; pad_len];
-    if pad_len > 0 {
-        cursor.read_exact(&mut padding)?;
-    }
+    let padding = read_vec(&mut cursor, pad_len)?;
 
     Ok(AttachmentRecord {
         record_type,
@@ -519,6 +496,60 @@ mod tests {
         VaultHeader, RECORD_TYPE_ENTRY, RECORD_TYPE_TEMPLATE, SCHEMA_VERSION,
     };
     use crate::vault::writer::{write_entries, write_header, write_vault};
+
+    #[test]
+    fn nested_entry_and_attachment_lengths_reject_truncated_fields() {
+        // Minimal complete payloads, with each variable field initially empty.
+        // The entry-only timestamps and attachment reservation are kept intact.
+        for attachment in [false, true] {
+            let mut payload = vec![0; if attachment { 29 } else { 45 }];
+            payload[0] = if attachment {
+                RECORD_TYPE_ATTACHMENT
+            } else {
+                RECORD_TYPE_ENTRY
+            };
+            let mut offsets = Vec::new();
+            offsets.push(payload.len()); // ciphertext
+            payload.extend_from_slice(&0u32.to_le_bytes());
+            offsets.push(payload.len()); // signature
+            payload.extend_from_slice(&0u32.to_le_bytes());
+            payload.extend_from_slice(&[0; 33]); // HMAC and legacy flag
+            offsets.push(payload.len()); // legacy key block
+            payload.extend_from_slice(&0u32.to_le_bytes());
+            if !attachment {
+                payload.extend_from_slice(&[0; 10]);
+            }
+            let padding_offset = payload.len();
+            payload.push(0);
+            let parse = |bytes: &[u8]| {
+                if attachment {
+                    parse_attachment_payload(bytes).map(|_| ())
+                } else {
+                    parse_entry_payload(bytes).map(|_| ())
+                }
+            };
+            parse(&payload).expect("complete empty-field payload");
+            for offset in offsets {
+                for claimed in [3u32, 16 * 1024 * 1024] {
+                    let mut truncated = payload[..offset].to_vec();
+                    truncated.extend_from_slice(&claimed.to_le_bytes());
+                    truncated.extend_from_slice(&[1, 2]);
+                    assert!(
+                        matches!(parse(&truncated), Err(DiaryError::Io(e))
+                        if e.kind() == io::ErrorKind::UnexpectedEof),
+                        "attachment={attachment}, offset={offset}, claimed={claimed}"
+                    );
+                }
+                let mut oversized = payload[..offset].to_vec();
+                oversized.extend_from_slice(&(16 * 1024 * 1024 + 1u32).to_le_bytes());
+                assert!(matches!(parse(&oversized), Err(DiaryError::Vault(_))));
+            }
+            payload[padding_offset] = 3;
+            payload.extend_from_slice(&[1, 2]);
+            assert!(matches!(parse(&payload), Err(DiaryError::Io(e))
+                if e.kind() == io::ErrorKind::UnexpectedEof));
+        }
+    }
 
     /// Build a [`VaultHeader`] with recognisable non-zero field values.
     fn make_test_header() -> VaultHeader {

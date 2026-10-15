@@ -1357,7 +1357,13 @@ mod tests {
             );
             assert_eq!(std::fs::read(&out).unwrap(), b"existing output");
             assert!(!with_extension(&out, "pq-diary.tmp").exists());
-            assert!(!vault_dir.join("vault.pqd.tmp").exists());
+            assert!(!std::fs::read_dir(&vault_dir).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("vault.pqd.tmp")
+            }));
         }
     }
 

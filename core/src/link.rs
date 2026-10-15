@@ -125,8 +125,8 @@ impl Drop for BacklinkEntry {
 
 /// In-memory forward and reverse link index.
 ///
-/// Built at vault unlock time from all decrypted entries; dropped and zeroized
-/// at lock time.  Contains plaintext title strings, so it must be treated as
+/// Built from decrypted entries for each vault link query; dropped and zeroized
+/// when the query finishes. Contains plaintext title strings, so it must be treated as
 /// secret data.
 ///
 /// # Fields (private)

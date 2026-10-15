@@ -987,4 +987,234 @@ mod tests {
             "expected DiaryError::Crypto from integrity check, got {err:?}"
         );
     }
+    /// Keep the same unlocked engine while an external writer changes bytes
+    /// outside the entry ciphertext. Every operation must authenticate again.
+    #[test]
+    fn post_unlock_operations_reject_tampered_snapshots_without_effects() {
+        use vault::{
+            format::{AttachmentRecord, RECORD_TYPE_ATTACHMENT},
+            reader::{read_header, read_vault_with_attachments_authenticated},
+            writer::write_vault_with_attachments_authenticated,
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = setup_test_vault(&dir);
+        let mut core = DiaryCore::new(path.to_str().unwrap()).unwrap();
+        core.unlock(secret("password")).unwrap();
+        let id = core.new_entry("original", "body", vec![]).unwrap();
+        core.new_template("daily", "original template").unwrap();
+        let key = core.vault_mac_key().unwrap();
+        let (header, entries, _) = read_vault_with_attachments_authenticated(&path, &key).unwrap();
+        let engine = core.require_engine().unwrap();
+        let attachment = attachment::AttachmentPlaintext {
+            entry_uuid: entries[0].uuid,
+            blob_uuid: [0x88; 16],
+            created_at: 123,
+            filename: "keep.txt".into(),
+            mime_type: "text/plain".into(),
+            size_bytes: 4,
+            chunk_count: 1,
+            sha256: [0; 32],
+            file_key: zeroize::Zeroizing::new([0x99; 32]),
+        };
+        let (ciphertext, iv) = engine.encrypt(&attachment.encode().unwrap()).unwrap();
+        let attachment_marker = ciphertext[..32].to_vec();
+        let attachments = vec![AttachmentRecord {
+            record_type: RECORD_TYPE_ATTACHMENT,
+            uuid: [0x11; 16],
+            iv,
+            signature: engine.dsa_sign(&ciphertext).unwrap(),
+            content_hmac: engine.hmac(&ciphertext).unwrap(),
+            ciphertext,
+            legacy_flag: 0,
+            legacy_key_block: vec![],
+            padding: vec![],
+        }];
+        write_vault_with_attachments_authenticated(&path, header, &entries, &attachments, &key)
+            .unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let mut cursor = std::io::Cursor::new(&original);
+        read_header(&mut cursor).unwrap();
+        let timestamp_offset = cursor.position() as usize + 4 + 1 + 16;
+        let attachment_offset = original
+            .windows(32)
+            .position(|w| w == attachment_marker)
+            .unwrap();
+        let source = dir.path().join("import");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("new.md"), "# imported\nbody").unwrap();
+        let config = std::fs::read(path.with_file_name("vault.toml")).unwrap();
+        let blob = attachment::blob_path(path.parent().unwrap(), &attachment.blob_uuid);
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, b"must remain").unwrap();
+        let query = search::SearchQuery {
+            pattern: "body".into(),
+            tag_filter: None,
+            context_lines: 0,
+            count_only: false,
+        };
+        let plaintext = entry::EntryPlaintext {
+            title: "changed".into(),
+            body: "changed".into(),
+            tags: vec![],
+        };
+        let engine = core.require_engine().unwrap();
+        let uuid = entries[0].uuid;
+        for offset in [timestamp_offset, attachment_offset, original.len() - 1] {
+            let mut tampered = original.clone();
+            tampered[offset] ^= 1;
+            std::fs::write(&path, &tampered).unwrap();
+            macro_rules! rejects {
+                ($operation:expr) => {{
+                    assert!(
+                        matches!($operation, Err(DiaryError::Crypto(_))),
+                        "{} accepted tamper at {}",
+                        stringify!($operation),
+                        offset
+                    );
+                    assert_eq!(
+                        std::fs::read(&path).unwrap(),
+                        tampered,
+                        "vault changed after rejection"
+                    );
+                    assert_eq!(
+                        std::fs::read(path.with_file_name("vault.toml")).unwrap(),
+                        config
+                    );
+                    assert_eq!(std::fs::read(&blob).unwrap(), b"must remain");
+                }};
+            }
+            rejects!(core.list_entries(None));
+            rejects!(entry::list_entries_with_body(&path, engine));
+            rejects!(core.get_entry(&id));
+            rejects!(core.new_entry("new", "body", vec![]));
+            rejects!(entry::update_entry(&path, engine, uuid, &plaintext));
+            rejects!(entry::delete_entry(&path, engine, uuid));
+            rejects!(core.list_templates());
+            rejects!(core.get_template("daily"));
+            rejects!(template::create_template(
+                &path,
+                engine,
+                &template::TemplatePlaintext {
+                    name: "new".into(),
+                    body: "body".into()
+                }
+            ));
+            rejects!(core.replace_template("daily", "replacement"));
+            rejects!(core.delete_template("daily"));
+            rejects!(core.search(&query));
+            rejects!(core.stats());
+            rejects!(core.import(&source, false));
+            rejects!(importer::batch_create_entries(&path, engine, vec![]));
+        }
+        std::fs::write(&path, &original).unwrap();
+        assert_eq!(core.get_entry(&id).unwrap().1.title, "original");
+        assert_eq!(
+            core.get_template("daily").unwrap().body,
+            "original template"
+        );
+        assert_eq!(
+            std::fs::read(source.join("new.md")).unwrap(),
+            b"# imported\nbody"
+        );
+    }
+
+    #[test]
+    fn authenticated_operations_preserve_mixed_snapshot_attachments() {
+        use vault::{
+            format::{AttachmentRecord, RECORD_TYPE_ATTACHMENT},
+            reader::read_vault_with_attachments_authenticated,
+            writer::{write_attachments, write_vault_with_attachments_authenticated},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = setup_test_vault(&dir);
+        let mut core = DiaryCore::new(path.to_str().unwrap()).unwrap();
+        core.unlock(secret("password")).unwrap();
+        let id = core.new_entry("original", "body", vec![]).unwrap();
+        let key = core.vault_mac_key().unwrap();
+        let engine = core.require_engine().unwrap();
+        let attachment = attachment::AttachmentPlaintext {
+            entry_uuid: [0x77; 16],
+            blob_uuid: [0x88; 16],
+            created_at: 123,
+            filename: "keep.txt".into(),
+            mime_type: "text/plain".into(),
+            size_bytes: 4,
+            chunk_count: 1,
+            sha256: [0; 32],
+            file_key: zeroize::Zeroizing::new([0x99; 32]),
+        };
+        let (ciphertext, iv) = engine.encrypt(&attachment.encode().unwrap()).unwrap();
+        let attachments = vec![AttachmentRecord {
+            record_type: RECORD_TYPE_ATTACHMENT,
+            uuid: [0x11; 16],
+            iv,
+            signature: engine.dsa_sign(&ciphertext).unwrap(),
+            content_hmac: engine.hmac(&ciphertext).unwrap(),
+            ciphertext,
+            legacy_flag: 0,
+            legacy_key_block: vec![],
+            padding: vec![],
+        }];
+        let (header, entries, _) = read_vault_with_attachments_authenticated(&path, &key).unwrap();
+        write_vault_with_attachments_authenticated(&path, header, &entries, &attachments, &key)
+            .unwrap();
+        let (_, _, persisted) = read_vault_with_attachments_authenticated(&path, &key).unwrap();
+        let mut before = Vec::new();
+        write_attachments(&mut before, &persisted).unwrap();
+        macro_rules! preserves {
+            ($operation:expr) => {{
+                $operation.unwrap();
+                let (_, _, after) = read_vault_with_attachments_authenticated(&path, &key).unwrap();
+                let mut bytes = Vec::new();
+                write_attachments(&mut bytes, &after).unwrap();
+                assert_eq!(
+                    bytes,
+                    before,
+                    "{} changed attachments",
+                    stringify!($operation)
+                );
+            }};
+        }
+        preserves!(core.new_entry("second", "body", vec![]));
+        preserves!(core.update_entry(
+            &id,
+            &entry::EntryPlaintext {
+                title: "updated".into(),
+                body: "body".into(),
+                tags: vec![]
+            }
+        ));
+        preserves!(core.new_template("daily", "body"));
+        preserves!(core.replace_template("daily", "updated"));
+        preserves!(core.delete_template("daily"));
+        let source = dir.path().join("import");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("new.md"), "# imported\nbody").unwrap();
+        preserves!(core.import(&source, false));
+        preserves!(importer::batch_create_entries(&path, engine, vec![]));
+        preserves!(core.delete_entry(&id));
+        assert_eq!(core.list_entries(None).unwrap().len(), 2);
+        assert_eq!(core.stats().unwrap().entry_count, 2);
+        assert_eq!(
+            entry::list_entries_with_body(&path, engine).unwrap().len(),
+            2
+        );
+    }
+    #[test]
+    fn post_unlock_mutation_cannot_launder_tampered_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = setup_test_vault(&dir);
+        let mut core = DiaryCore::new(path.to_str().unwrap()).unwrap();
+        core.unlock(secret("password")).unwrap();
+        core.new_entry("original", "body", vec![]).unwrap();
+        let mut tampered = std::fs::read(&path).unwrap();
+        let mut cursor = std::io::Cursor::new(&tampered);
+        vault::reader::read_header(&mut cursor).unwrap();
+        let timestamp_offset = cursor.position() as usize + 4 + 1 + 16;
+        tampered[timestamp_offset] ^= 1;
+        std::fs::write(&path, &tampered).unwrap();
+        let result = core.new_entry("would launder", "body", vec![]);
+        assert!(matches!(result, Err(DiaryError::Crypto(_))));
+        assert_eq!(std::fs::read(&path).unwrap(), tampered);
+    }
 }

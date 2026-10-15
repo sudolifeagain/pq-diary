@@ -10,6 +10,10 @@ the **History** table at the bottom for git-tag pointers.
 
 ## [Unreleased]
 
+### Markdown import fixes
+- Preserve code, escaped markers, wiki-link targets and URL fragments during inline tag and alias conversion.
+- Import complete hyphenated, nested and Unicode symbol/emoji tags; preserve numeric-only hashes as text, matching Obsidian's tag format.
+
 ### Security (review follow-up)
 - Reject edits to INHERIT entries when the legacy key is unavailable, preserving the owner's content and the separate heir-recovery payload. Create a separate entry for revisions instead.
 - Direct attachment and master-password legacy APIs verify vault integrity before using records or changing files; these APIs and password rotation authenticate the same byte snapshot they parse.

@@ -23,10 +23,11 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 // Static regexes (compiled once via LazyLock)
 // =========================================================================
 
-static WIKI_LINK_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]").unwrap());
+static WIKI_LINK_RE: LazyLock<Result<Regex, regex::Error>> =
+    LazyLock::new(|| Regex::new(r"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]"));
 
-static TAG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"#([\w/]+)").unwrap());
+static TAG_RE: LazyLock<Result<Regex, regex::Error>> =
+    LazyLock::new(|| Regex::new(r"#([\w/\p{S}-]+)"));
 
 /// Obsidian attachment-embed pattern: `![[filename.ext]]` (S13).
 static ATTACHMENT_LINK_RE: LazyLock<Regex> =
@@ -89,10 +90,157 @@ mod attachment_link_tests {
     }
 }
 
-static FENCED_CODE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?s)```[^\n]*\n.*?```").unwrap());
+/// Conservative source-span protection, not a complete CommonMark parser.
+/// Both import rewrites use this scanner so literal source bytes stay intact.
+fn protected_markdown(body: &str) -> Vec<bool> {
+    let bytes = body.as_bytes();
+    let mut protected = vec![false; bytes.len()];
+    let mut fence: Option<(u8, usize)> = None;
+    let mut offset = 0;
+    for line in body.split_inclusive('\n') {
+        let trimmed = line.trim_start_matches(' ');
+        let indent = line.len() - trimmed.len();
+        let marker = trimmed.as_bytes().first().copied().unwrap_or(0);
+        let run = trimmed.bytes().take_while(|&b| b == marker).count();
+        if let Some((kind, width)) = fence {
+            protected[offset..offset + line.len()].fill(true);
+            if indent <= 3 && marker == kind && run >= width && trimmed[run..].trim().is_empty() {
+                fence = None;
+            }
+        } else if indent <= 3
+            && matches!(marker, b'`' | b'~')
+            && run >= 3
+            && (marker != b'`' || !trimmed[run..].contains('`'))
+        {
+            fence = Some((marker, run));
+            protected[offset..offset + line.len()].fill(true);
+        } else if indent >= 4
+            || line.starts_with('\t')
+            || (trimmed.starts_with('[') && trimmed.contains("]:"))
+        {
+            // Preserve indented code and reference-definition lines conservatively.
+            protected[offset..offset + line.len()].fill(true);
+        }
+        offset += line.len();
+    }
+    // Index delimiter runs once: unmatched runs must not rescan every suffix.
+    let mut backticks: std::collections::HashMap<usize, Vec<usize>> =
+        std::collections::HashMap::new();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'`' {
+            let width = bytes[cursor..].iter().take_while(|&&b| b == b'`').count();
+            backticks.entry(width).or_default().push(cursor);
+            cursor += width;
+        } else {
+            cursor += 1;
+        }
+    }
+    let mut i = 0;
+    while i < bytes.len() {
+        if protected[i] {
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'\\' {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'`' {
+            let width = bytes[i..].iter().take_while(|&&b| b == b'`').count();
+            if let Some(positions) = backticks.get(&width) {
+                if let Some(&start) = positions.get(positions.partition_point(|&start| start <= i))
+                {
+                    let end = start + width;
+                    protected[i..end].fill(true);
+                    i = end;
+                    continue;
+                }
+            }
+            i += width;
+            continue;
+        }
+        // Protect balanced inline destinations (including optional titles),
+        // and angle-bracket autolinks/HTML. Unclosed spans conservatively
+        // protect the remainder rather than repeatedly rescanning suffixes.
+        let close = if bytes[i] == b'(' && i > 0 && bytes[i - 1] == b']' {
+            Some(b')')
+        } else if bytes[i] == b'<'
+            && bytes
+                .get(i + 1)
+                .is_some_and(|b| b.is_ascii_alphabetic() || matches!(b, b'/' | b'!' | b'?'))
+        {
+            Some(b'>')
+        } else {
+            None
+        };
+        if let Some(close) = close {
+            let mut depth = 1;
+            let mut quote = None;
+            let mut j = i + 1;
+            while j < bytes.len() {
+                if bytes[j] == b'\\' {
+                    j += 2;
+                    continue;
+                }
+                if let Some(delimiter) = quote {
+                    if bytes[j] == delimiter {
+                        quote = None;
+                    }
+                } else if bytes[j] == b'<' && close == b')' {
+                    // Parentheses inside an angle-bracket destination are literal.
+                    quote = Some(b'>');
+                } else if matches!(bytes[j], b'\'' | b'"')
+                    && (bytes[i] == b'<' || bytes[j - 1].is_ascii_whitespace())
+                {
+                    quote = Some(bytes[j]);
+                } else {
+                    if bytes[j] == bytes[i] {
+                        depth += 1;
+                    }
+                    if bytes[j] == close {
+                        depth -= 1;
+                    }
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                j += 1;
+            }
+            if j < bytes.len() && depth == 0 {
+                protected[i..=j].fill(true);
+                i = j + 1;
+                continue;
+            }
+            protected[i..].fill(true);
+            break;
+        }
+        i += 1;
+    }
+    // A fragment may follow punctuation inside a bare URL, e.g. /(#part).
+    // Conservatively preserve the whole whitespace-delimited URL token.
+    let mut offset = 0;
+    for token in body.split_whitespace() {
+        if let Some(relative) = body[offset..].find(token) {
+            let start = offset + relative;
+            offset = start + token.len();
+            if token.contains("://") || token.starts_with("www.") {
+                protected[start..offset].fill(true);
+            }
+        }
+    }
+    protected
+}
 
-static INLINE_CODE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`[^`]+`").unwrap());
+fn escaped(bytes: &[u8], pos: usize) -> bool {
+    bytes[..pos]
+        .iter()
+        .rev()
+        .take_while(|&&b| b == b'\\')
+        .count()
+        % 2
+        == 1
+}
 
 use crate::{
     crypto::CryptoEngine,
@@ -100,8 +248,8 @@ use crate::{
     error::DiaryError,
     vault::{
         format::{generate_entry_padding, EntryRecord, RECORD_TYPE_ENTRY},
-        reader::read_vault,
-        writer::write_vault_authenticated,
+        reader::read_vault_with_attachments_authenticated,
+        writer::write_vault_with_attachments_authenticated,
     },
 };
 
@@ -166,6 +314,19 @@ pub struct SkipDetail {
 /// Processes YAML frontmatter for `title` and `tags`, converts Obsidian-style
 /// `[[link|alias]]` to `[[link]]`, and extracts inline `#tag` notation into
 /// the tag list.
+///
+/// This is a conservative Markdown subset, not a CommonMark parser. Rewrites
+/// skip backtick code spans with matching delimiter lengths, backtick/tilde
+/// fences (up to three leading spaces, including unclosed fences), indented
+/// lines, balanced inline link destinations/titles, angle-bracket spans, and
+/// reference-definition lines, and whitespace-delimited tokens containing
+/// `://` or starting with `www.`. Backslash-escaped markers are preserved. Tags
+/// also skip wiki-link targets. Blockquote/list-nested fences and HTML blocks
+/// are not parsed as containers. Unclosed inline destinations/angle spans
+/// conservatively protect the remainder of the body. Angle spans must start
+/// with an ASCII letter, `/`, `!` or `?` after `<`; ordinary math like `1 < 2`
+/// is not a protected span. CRLF normalization and frontmatter handling
+/// remain separate from these body rewrites.
 ///
 /// # Arguments
 ///
@@ -264,7 +425,9 @@ pub fn batch_create_entries(
     engine: &CryptoEngine,
     files: Vec<MarkdownFile>,
 ) -> Result<ImportResult, DiaryError> {
-    let (header, mut records) = read_vault(vault_path)?;
+    let mac_key = engine.vault_mac_key()?;
+    let (header, mut records, attachments) =
+        read_vault_with_attachments_authenticated(vault_path, &mac_key)?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -310,8 +473,13 @@ pub fn batch_create_entries(
         records.push(record);
     }
 
-    let mac_key = engine.vault_mac_key()?;
-    write_vault_authenticated(vault_path, header, &records, &mac_key)?;
+    write_vault_with_attachments_authenticated(
+        vault_path,
+        header,
+        &records,
+        &attachments,
+        &mac_key,
+    )?;
 
     Ok(ImportResult {
         imported,
@@ -554,10 +722,20 @@ fn extract_frontmatter_tags(fm: &str) -> Vec<String> {
 ///
 /// Returns [`DiaryError::Import`] if the regex fails to compile.
 fn convert_wiki_links(body: &str) -> Result<(String, usize), DiaryError> {
-    let re = &*WIKI_LINK_RE;
+    let re = WIKI_LINK_RE
+        .as_ref()
+        .map_err(|e| DiaryError::Import(format!("wiki-link regex: {e}")))?;
 
+    let protected = protected_markdown(body);
     let mut count = 0usize;
     let result = re.replace_all(body, |caps: &regex::Captures| {
+        if let Some(m) = caps.get(0) {
+            if protected[m.start()..m.end()].iter().any(|&p| p)
+                || escaped(body.as_bytes(), m.start())
+            {
+                return m.as_str().to_string();
+            }
+        }
         let title = caps.get(1).map_or("", |m| m.as_str());
         let full_match = caps.get(0).map_or("", |m| m.as_str());
         if full_match.contains('|') {
@@ -571,9 +749,11 @@ fn convert_wiki_links(body: &str) -> Result<(String, usize), DiaryError> {
 
 /// Extract inline `#tag` notation from body text.
 ///
-/// Finds all `#word` and `#word/word` patterns, adds them to the tag list, and
-/// removes them from the body.  Nested tags (e.g. `#work/project/alpha`) are
-/// preserved with the `/` separator intact.
+/// Finds tags at the start of text, after whitespace, or after an opening
+/// bracket/quote, using Unicode word characters and symbols, hyphens and slashes.
+/// Numeric-only tags are preserved as text, matching Obsidian's tag format. Nested
+/// tags (e.g. `#work/project/alpha`) retain their `/` separators. Literal source
+/// spans, escapes, embedded hashes and wiki-link targets are left unchanged.
 ///
 /// Returns `(tags, cleaned_body, extraction_count)`.
 ///
@@ -581,31 +761,42 @@ fn convert_wiki_links(body: &str) -> Result<(String, usize), DiaryError> {
 ///
 /// Returns [`DiaryError::Import`] if the regex fails to compile.
 fn extract_tags(body: &str) -> Result<(Vec<String>, String, usize), DiaryError> {
-    let re = &*TAG_RE;
+    let re = TAG_RE
+        .as_ref()
+        .map_err(|e| DiaryError::Import(format!("tag regex: {e}")))?;
+    let wiki_re = WIKI_LINK_RE
+        .as_ref()
+        .map_err(|e| DiaryError::Import(format!("wiki-link regex: {e}")))?;
 
-    // Build a set of byte-offset ranges that fall inside code blocks
-    // (fenced ```...``` and inline `...`).  Tags inside these ranges are ignored.
-    let mut code_ranges: Vec<std::ops::Range<usize>> = Vec::new();
-    for m in FENCED_CODE_RE.find_iter(body) {
-        code_ranges.push(m.start()..m.end());
+    let mut protected = protected_markdown(body);
+    // A heading fragment or filename inside a wiki-link is not an inline tag.
+    for m in wiki_re.find_iter(body) {
+        protected[m.start()..m.end()].fill(true);
     }
-    for m in INLINE_CODE_RE.find_iter(body) {
-        code_ranges.push(m.start()..m.end());
-    }
-
-    let in_code = |pos: usize| -> bool { code_ranges.iter().any(|r| r.contains(&pos)) };
 
     let mut tags: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut count = 0usize;
 
     let cleaned = re.replace_all(body, |caps: &regex::Captures| {
-        let m = caps.get(0).unwrap();
-        if in_code(m.start()) {
-            // Inside a code block — keep the original text untouched.
+        let Some(m) = caps.get(0) else {
+            return String::new();
+        };
+        let boundary = body[..m.start()]
+            .chars()
+            .next_back()
+            .is_none_or(|c| c.is_whitespace() || matches!(c, '(' | '[' | '{' | '\'' | '"'));
+        if !boundary
+            || escaped(body.as_bytes(), m.start())
+            || protected[m.start()..m.end()].iter().any(|&p| p)
+        {
             return m.as_str().to_string();
         }
-        let tag_name = caps.get(1).map_or("", |m| m.as_str()).to_string();
+        let name = caps.get(1).map_or("", |m| m.as_str());
+        if name.chars().all(char::is_numeric) {
+            return m.as_str().to_string();
+        }
+        let tag_name = name.to_string();
         if seen.insert(tag_name.clone()) {
             tags.push(tag_name);
         }
@@ -631,6 +822,116 @@ mod tests {
     use secrecy::SecretBox;
     use std::path::Path;
     use tempfile::TempDir;
+
+    #[test]
+    fn markdown_literals_survive_import() {
+        for body in [
+            "https://example.test/page#fragment",
+            "https://example.test/(#fragment)",
+            "[jump](#fragment) and ![img](image.png#part)",
+            r##"[jump]( #fragment "#title")"##,
+            "`[[x|literal]] #literal`",
+            "`https://example.test/ #literal [[x|literal]]`",
+            "`` [[x|literal]] ` #literal ``",
+            "`first\n    second\n#literal [[x|literal]]`",
+            "~~~rust\n[[x|literal]] #literal\n~~~",
+            "````\n```\n[[x|literal]] #literal\n````",
+            "~~~\n[[x|literal]] #literal",
+            r"\#literal \[[x|literal]]",
+            "[[Note #section]] and ![[image #1.png]]",
+            "[id]: #fragment \"#title\"",
+            "    #literal [[x|literal]]",
+            "word#literal ##heading C#code",
+        ] {
+            let (md, links, tags) = parse_markdown(body, "test.md").unwrap();
+            assert_eq!(md.body, body, "body: {body}");
+            assert!(md.tags.is_empty(), "body: {body}");
+            assert_eq!((links, tags), (0, 0), "body: {body}");
+        }
+    }
+
+    #[test]
+    fn markdown_tags_have_boundaries_and_unicode_names() {
+        let body = "#daily-note #日本語/日記 (#café) #daily-note";
+        let (md, links, count) = parse_markdown(body, "test.md").unwrap();
+        assert_eq!(md.tags, ["daily-note", "日本語/日記", "café"]);
+        assert_eq!(md.body, "  () ");
+        assert_eq!((links, count), (0, 4));
+    }
+
+    #[test]
+    fn markdown_tags_preserve_numbers_and_complete_emoji_names() {
+        let (md, links, count) =
+            parse_markdown("#1984 #１２３ #diary😀 #👩‍💻 #y1984", "test.md").unwrap();
+        assert_eq!(md.tags, ["diary😀", "👩‍💻", "y1984"]);
+        assert_eq!(md.body, "#1984 #１２３   ");
+        assert_eq!((links, count), (0, 3));
+    }
+
+    #[test]
+    fn markdown_protection_ends_at_matching_delimiters() {
+        let body = "~~~rust\n#literal [[x|literal]]\n~~\n~~~\n#real [[x|alias]]";
+        let (md, links, tags) = parse_markdown(body, "test.md").unwrap();
+        assert_eq!(md.body, "~~~rust\n#literal [[x|literal]]\n~~\n~~~\n [[x]]");
+        assert_eq!(md.tags, ["real"]);
+        assert_eq!((links, tags), (1, 1));
+    }
+
+    #[test]
+    fn markdown_backslash_parity_and_unmatched_ticks() {
+        let body = r"\\[[x|alias]] \[[x|literal]] `unclosed #real";
+        let (md, links, tags) = parse_markdown(body, "test.md").unwrap();
+        assert_eq!(md.body, r"\\[[x]] \[[x|literal]] `unclosed ");
+        assert_eq!(md.tags, ["real"]);
+        assert_eq!((links, tags), (1, 1));
+    }
+
+    #[test]
+    fn markdown_links_preserve_nested_and_escaped_destinations() {
+        for body in [
+            r"[a](path(with)#fragment)",
+            r"[a](<path) #literal>)",
+            r"[a](<path) [[x|literal]]>)",
+            r"[a](path\) #fragment)",
+            r##"[a](path "a) #literal [[x|alias]]")"##,
+            "<https://example.test/#fragment>",
+            "[a](path/[[x|literal]] \"#title\")",
+            "日本語 `#例 [[例|別名]]` 続き",
+            "   ~~~\n#literal\n   ~~~",
+            "```\n#literal\n~~~\n#still-literal",
+        ] {
+            let (md, links, tags) = parse_markdown(body, "test.md").unwrap();
+            assert_eq!(md.body, body);
+            assert_eq!((links, tags), (0, 0));
+        }
+    }
+
+    #[test]
+    fn markdown_unmatched_delimiters_do_not_rescan_suffixes() {
+        for body in [
+            "<".repeat(100_000),
+            "<a".repeat(50_000),
+            "](".repeat(50_000),
+        ] {
+            let (md, links, tags) = parse_markdown(&body, "test.md").unwrap();
+            assert_eq!(md.body, body);
+            assert_eq!((links, tags), (0, 0));
+        }
+        let body = (1..500)
+            .map(|n| format!("{} ", "`".repeat(n)))
+            .collect::<String>();
+        let (md, links, tags) = parse_markdown(&body, "test.md").unwrap();
+        assert_eq!(md.body, body);
+        assert_eq!((links, tags), (0, 0));
+    }
+
+    #[test]
+    fn markdown_math_does_not_hide_real_tags_or_aliases() {
+        let (md, links, tags) = parse_markdown("1 < 2 #daily [[note|alias]]", "test.md").unwrap();
+        assert_eq!(md.body, "1 < 2  [[note]]");
+        assert_eq!(md.tags, ["daily"]);
+        assert_eq!((links, tags), (1, 1));
+    }
 
     // -------------------------------------------------------------------------
     // Shared helpers

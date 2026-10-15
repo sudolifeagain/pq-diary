@@ -13,8 +13,8 @@ use crate::{
     record_payload::{seal, SealedPayload},
     vault::{
         format::{generate_entry_padding, EntryRecord, RECORD_TYPE_TEMPLATE},
-        reader::{read_vault, read_vault_with_attachments_authenticated},
-        writer::{write_vault_authenticated, write_vault_with_attachments_authenticated},
+        reader::read_vault_with_attachments_authenticated,
+        writer::write_vault_with_attachments_authenticated,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -165,10 +165,17 @@ pub fn create_template(
         padding: generate_entry_padding(),
     };
 
-    let (header, mut records) = read_vault(vault_path)?;
-    records.push(record);
     let mac_key = engine.vault_mac_key()?;
-    write_vault_authenticated(vault_path, header, &records, &mac_key)?;
+    let (header, mut records, attachments) =
+        read_vault_with_attachments_authenticated(vault_path, &mac_key)?;
+    records.push(record);
+    write_vault_with_attachments_authenticated(
+        vault_path,
+        header,
+        &records,
+        &attachments,
+        &mac_key,
+    )?;
 
     Ok(uuid)
 }
@@ -253,7 +260,9 @@ pub fn list_templates(
     vault_path: &Path,
     engine: &CryptoEngine,
 ) -> Result<Vec<TemplateMeta>, DiaryError> {
-    let (_header, records) = read_vault(vault_path)?;
+    let mac_key = engine.vault_mac_key()?;
+    let (_header, records, _attachments) =
+        read_vault_with_attachments_authenticated(vault_path, &mac_key)?;
     let mut metas = Vec::new();
     for record in records {
         if record.record_type != RECORD_TYPE_TEMPLATE {
@@ -289,7 +298,9 @@ pub fn get_template(
     engine: &CryptoEngine,
     name: &str,
 ) -> Result<TemplatePlaintext, DiaryError> {
-    let (_header, records) = read_vault(vault_path)?;
+    let mac_key = engine.vault_mac_key()?;
+    let (_header, records, _attachments) =
+        read_vault_with_attachments_authenticated(vault_path, &mac_key)?;
     for record in records {
         if record.record_type != RECORD_TYPE_TEMPLATE {
             continue;
@@ -320,7 +331,9 @@ pub fn delete_template(
     engine: &CryptoEngine,
     name: &str,
 ) -> Result<(), DiaryError> {
-    let (header, mut records) = read_vault(vault_path)?;
+    let mac_key = engine.vault_mac_key()?;
+    let (header, mut records, attachments) =
+        read_vault_with_attachments_authenticated(vault_path, &mac_key)?;
 
     let mut target_uuid: Option<[u8; 16]> = None;
     for record in &records {
@@ -338,8 +351,13 @@ pub fn delete_template(
 
     let uuid = target_uuid.ok_or_else(|| DiaryError::TemplateNotFound(name.to_string()))?;
     records.retain(|r| r.uuid != uuid);
-    let mac_key = engine.vault_mac_key()?;
-    write_vault_authenticated(vault_path, header, &records, &mac_key)?;
+    write_vault_with_attachments_authenticated(
+        vault_path,
+        header,
+        &records,
+        &attachments,
+        &mac_key,
+    )?;
     Ok(())
 }
 
@@ -353,7 +371,7 @@ mod tests {
     use crate::{
         crypto::{dsa, CryptoEngine},
         entry::{create_entry, list_entries, EntryPlaintext},
-        vault::{format::VaultHeader, writer::write_vault},
+        vault::{format::VaultHeader, reader::read_vault, writer::write_vault},
     };
     use tempfile::tempdir;
 

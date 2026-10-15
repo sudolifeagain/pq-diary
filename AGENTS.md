@@ -20,6 +20,8 @@ Rust製・耐量子暗号CLIジャーナルツール。詳細は `requirements.m
 - プラットフォーム分岐は `#[cfg()]` で。core/ にプラットフォーム依存UIコードを入れない
 - 単体テストは各モジュールの `#[cfg(test)] mod tests`、機能の組合せはintegration testやCLI smokeで検証する
 
+- コマンド認証のリファクタリングではpolicy/confirmationと秘密取得の既存順序を保ち、複数回利用する認証情報（newの添付・import等）は意図を明記する
+
 ## テスト・CI方針
 
 - 個人運用のため、通常PRのCIは短いLinux検証を標準とする。fmt、build、workspace test（doctestを含む）、Clippy、既存debugバイナリを使うCLI smokeを実行する。脆弱性監査と依存ポリシー検査は維持する

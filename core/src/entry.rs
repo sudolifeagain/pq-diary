@@ -6,6 +6,7 @@
 use crate::{
     crypto::CryptoEngine,
     error::DiaryError,
+    record_payload::{seal, SealedPayload},
     vault::{
         format::{generate_entry_padding, EntryRecord, RECORD_TYPE_ENTRY},
         reader::{read_vault, read_vault_with_attachments},
@@ -338,14 +339,13 @@ pub fn create_entry(
             .map_err(|e| DiaryError::Entry(format!("serialization failed: {e}")))?,
     );
 
-    // Step 3: Encrypt.
-    let (ciphertext, iv) = engine.encrypt(&json_bytes)?;
-
-    // Step 4: Sign the ciphertext.
-    let signature = engine.dsa_sign(&ciphertext)?;
-
-    // Step 5: Compute HMAC over the ciphertext.
-    let content_hmac = engine.hmac(&ciphertext)?;
+    // Steps 3–5: Encrypt, sign, and authenticate the ciphertext.
+    let SealedPayload {
+        ciphertext,
+        iv,
+        signature,
+        content_hmac,
+    } = seal(engine, &json_bytes)?;
 
     // Step 6: Capture current Unix timestamp.
     let now = std::time::SystemTime::now()
@@ -504,9 +504,12 @@ pub fn update_entry(
             .map_err(|e| DiaryError::Entry(format!("serialization failed: {e}")))?,
     );
 
-    let (ciphertext, iv) = engine.encrypt(&json_bytes)?;
-    let signature = engine.dsa_sign(&ciphertext)?;
-    let content_hmac = engine.hmac(&ciphertext)?;
+    let SealedPayload {
+        ciphertext,
+        iv,
+        signature,
+        content_hmac,
+    } = seal(engine, &json_bytes)?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

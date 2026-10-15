@@ -10,6 +10,7 @@
 use crate::{
     crypto::CryptoEngine,
     error::DiaryError,
+    record_payload::{seal, SealedPayload},
     vault::{
         format::{generate_entry_padding, EntryRecord, RECORD_TYPE_TEMPLATE},
         reader::{read_vault, read_vault_with_attachments_authenticated},
@@ -136,9 +137,12 @@ pub fn create_template(
             .map_err(|e| DiaryError::Template(format!("serialization failed: {e}")))?,
     );
 
-    let (ciphertext, iv) = engine.encrypt(&json_bytes)?;
-    let signature = engine.dsa_sign(&ciphertext)?;
-    let content_hmac = engine.hmac(&ciphertext)?;
+    let SealedPayload {
+        ciphertext,
+        iv,
+        signature,
+        content_hmac,
+    } = seal(engine, &json_bytes)?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -212,9 +216,12 @@ pub fn replace_template(
         serde_json::to_vec(template)
             .map_err(|e| DiaryError::Template(format!("serialization failed: {e}")))?,
     );
-    let (ciphertext, iv) = engine.encrypt(&json_bytes)?;
-    let signature = engine.dsa_sign(&ciphertext)?;
-    let content_hmac = engine.hmac(&ciphertext)?;
+    let SealedPayload {
+        ciphertext,
+        iv,
+        signature,
+        content_hmac,
+    } = seal(engine, &json_bytes)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| DiaryError::Template(format!("system time error: {e}")))?

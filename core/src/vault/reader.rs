@@ -151,7 +151,14 @@ pub fn read_header(reader: &mut impl Read) -> Result<VaultHeader, DiaryError> {
 /// - [`DiaryError::Io`] on read failure.
 pub fn verify_vault_integrity(path: &Path, mac_key: &[u8; 32]) -> Result<(), DiaryError> {
     let data = std::fs::read(path)?;
+    verify_vault_integrity_bytes(&data, mac_key)
+}
 
+/// Verify an encrypted vault snapshot without first writing it to disk.
+pub(crate) fn verify_vault_integrity_bytes(
+    data: &[u8],
+    mac_key: &[u8; 32],
+) -> Result<(), DiaryError> {
     // Need at least magic(8) + version(1) + flags(1) to inspect the header.
     if data.len() < 10 {
         return Err(DiaryError::Vault(
@@ -465,6 +472,16 @@ pub fn read_vault_with_attachments(
     let mut file = std::fs::File::open(path)?;
     let header = read_header(&mut file)?;
     let (entries, attachments) = read_records(&mut file)?;
+    Ok((header, entries, attachments))
+}
+
+/// Parse the same encrypted snapshot that a caller authenticates before use.
+pub(crate) fn read_vault_with_attachments_from_bytes(
+    data: &[u8],
+) -> Result<(VaultHeader, Vec<EntryRecord>, Vec<AttachmentRecord>), DiaryError> {
+    let mut cursor = io::Cursor::new(data);
+    let header = read_header(&mut cursor)?;
+    let (entries, attachments) = read_records(&mut cursor)?;
     Ok((header, entries, attachments))
 }
 

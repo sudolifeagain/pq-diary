@@ -360,6 +360,26 @@ pub fn write_vault_authenticated_with_extra_padding(
     write_vault_dispatch(path, header, entries, Some(mac_key), extra_padding)
 }
 
+/// Write records from a validated snapshot without reopening the destination
+/// to recover attachment metadata. Padding and MAC semantics are unchanged.
+pub(crate) fn write_vault_with_attachments_authenticated_with_extra_padding(
+    path: &Path,
+    header: VaultHeader,
+    entries: &[EntryRecord],
+    attachments: &[AttachmentRecord],
+    mac_key: &[u8; 32],
+    extra_padding: &[u8],
+) -> Result<(), DiaryError> {
+    write_vault_inner(
+        path,
+        header,
+        entries,
+        attachments,
+        Some(mac_key),
+        extra_padding,
+    )
+}
+
 /// Shared body for [`write_vault`] / [`write_vault_authenticated`]: preserves
 /// any existing attachment records, then delegates to the with-attachments path.
 fn write_vault_dispatch(
@@ -724,6 +744,41 @@ mod tests {
         assert!(header.payload_size as usize > MAX_FIELD_SIZE);
         assert_eq!(entries[0].ciphertext.len(), MAX_FIELD_SIZE / 2);
         assert_eq!(attachments[0].ciphertext.len(), MAX_FIELD_SIZE / 2);
+    }
+
+    #[test]
+    fn authenticated_snapshot_writer_preserves_records_and_extra_padding() {
+        use crate::vault::format::VAULT_MAC_LEN;
+        use crate::vault::reader::{read_vault_with_attachments, verify_vault_integrity};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.pqd");
+        // The destination may differ from the snapshot already validated by
+        // the caller. It must not supply any unverified attachment records.
+        std::fs::write(&path, b"replaced after snapshot").unwrap();
+        let entry = make_test_entry();
+        let attachment = make_test_attachment();
+        let extra = [0x5A; 127];
+        let mac_key = [0x42; 32];
+        write_vault_with_attachments_authenticated_with_extra_padding(
+            &path,
+            VaultHeader::new(),
+            std::slice::from_ref(&entry),
+            std::slice::from_ref(&attachment),
+            &mac_key,
+            &extra,
+        )
+        .unwrap();
+
+        verify_vault_integrity(&path, &mac_key).unwrap();
+        let (_, entries, attachments) = read_vault_with_attachments(&path).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].ciphertext, entry.ciphertext);
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].ciphertext, attachment.ciphertext);
+        let bytes = std::fs::read(path).unwrap();
+        let body_len = bytes.len() - VAULT_MAC_LEN;
+        assert_eq!(&bytes[body_len - extra.len()..body_len], &extra);
     }
 
     /// TC-021-01: write_header produces bytes whose first 8 bytes equal MAGIC.

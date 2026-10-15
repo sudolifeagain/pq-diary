@@ -73,7 +73,6 @@ pub struct MdkSubkeys {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::mem::ManuallyDrop;
 
     #[test]
     fn tc_s16_mdk_02_subkeys_are_domain_separated() {
@@ -105,16 +104,8 @@ mod tests {
         fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
         assert_zeroize_on_drop::<MasterDataKey>();
 
-        let mut mdk = ManuallyDrop::new(MasterDataKey::from_bytes([0xAAu8; 32]));
-        let ptr = mdk.as_ref().as_ptr();
+        let mut mdk = MasterDataKey::from_bytes([0xAAu8; 32]);
         mdk.zeroize();
-
-        // SAFETY: ManuallyDrop keeps the allocation alive while we inspect the
-        // in-place zeroize effect. This is test-only memory inspection.
-        unsafe {
-            for i in 0..32 {
-                assert_eq!(*ptr.add(i), 0u8, "MDK byte {i} was not zeroized");
-            }
-        }
+        assert_eq!(mdk.as_ref(), &[0u8; 32]);
     }
 }

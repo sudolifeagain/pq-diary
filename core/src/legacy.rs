@@ -667,7 +667,7 @@ where
 }
 
 fn parse_hex_uuid(s: &str) -> Option<[u8; 16]> {
-    if s.len() != 32 {
+    if s.len() != 32 || !s.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }
     let mut out = [0u8; 16];
@@ -1022,6 +1022,49 @@ mod tests {
     use crate::DiaryCore;
     use secrecy::SecretBox;
     use tempfile::tempdir;
+
+    #[test]
+    fn attachment_uuid_parser_accepts_only_ascii_hex() {
+        assert_eq!(
+            parse_hex_uuid("00112233445566778899aAbBcCdDeEfF"),
+            Some([
+                0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff,
+            ])
+        );
+        for invalid in [
+            format!("€{}", "a".repeat(29)),
+            "é".repeat(16),
+            "a".repeat(31),
+            "g".repeat(32),
+            format!("+1{}", "a".repeat(30)),
+        ] {
+            assert_eq!(parse_hex_uuid(&invalid), None);
+        }
+    }
+
+    #[test]
+    fn legacy_access_preserves_unrelated_unicode_attachment_filename() {
+        let dir = tempdir().unwrap();
+        let (vault_dir, _) = vault_with_one_entry(&dir, 1);
+        let attachments = crate::attachment::attachments_dir(&vault_dir);
+        std::fs::create_dir_all(&attachments).unwrap();
+        let unrelated = attachments.join(format!("€{}.bin", "a".repeat(29)));
+        std::fs::write(&unrelated, b"unrelated synthetic data").unwrap();
+        execute_legacy_access(
+            &vault_dir,
+            &secret("legacy-code"),
+            &fast_deriver(),
+            always_confirm,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(unrelated).unwrap(),
+            b"unrelated synthetic data"
+        );
+        let mut heir = DiaryCore::new(&vault_pqd_str(&vault_dir)).unwrap();
+        heir.unlock(secret("legacy-code")).unwrap();
+    }
 
     fn fast_params() -> Argon2Params {
         Argon2Params {

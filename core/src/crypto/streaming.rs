@@ -194,7 +194,8 @@ pub fn decrypt_stream<R: Read, W: Write>(
         reader.read_exact(&mut ct)?;
 
         let aad = build_aad(chunk_index, 0, blob_uuid);
-        let pt = cipher
+        // Own plaintext in a drop guard before validation or fallible output.
+        let pt: Zeroizing<Vec<u8>> = cipher
             .decrypt(
                 nonce,
                 Payload {
@@ -202,6 +203,7 @@ pub fn decrypt_stream<R: Read, W: Write>(
                     aad: &aad,
                 },
             )
+            .map(Zeroizing::new)
             .map_err(|e| DiaryError::Crypto(format!("chunk {chunk_index} decrypt failed: {e}")))?;
 
         if pt.len() as u64 != pt_len as u64 {
@@ -228,7 +230,8 @@ pub fn decrypt_stream<R: Read, W: Write>(
         let mut ct = vec![0u8; TAG_SIZE];
         reader.read_exact(&mut ct)?;
         let aad = build_aad(0, 0, blob_uuid);
-        let pt = cipher
+        // Own plaintext in a drop guard before validation or fallible output.
+        let pt: Zeroizing<Vec<u8>> = cipher
             .decrypt(
                 nonce,
                 Payload {
@@ -236,6 +239,7 @@ pub fn decrypt_stream<R: Read, W: Write>(
                     aad: &aad,
                 },
             )
+            .map(Zeroizing::new)
             .map_err(|e| DiaryError::Crypto(format!("empty-chunk decrypt failed: {e}")))?;
         assert!(pt.is_empty(), "empty-chunk plaintext must be 0 bytes");
     }
@@ -268,6 +272,60 @@ mod tests {
 
     fn test_blob_uuid() -> [u8; 16] {
         [0xABu8; 16]
+    }
+
+    #[test]
+    fn decrypt_stream_propagates_partial_writer_failure() {
+        struct FailingWriter {
+            written: usize,
+        }
+        impl Write for FailingWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if self.written == 0 {
+                    assert!(!buf.is_empty());
+                    self.written = 1;
+                    Ok(1)
+                } else {
+                    Err(std::io::Error::other("injected writer failure"))
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut ciphertext = Vec::new();
+        let (size, hash) = encrypt_stream(
+            &test_key(),
+            &test_blob_uuid(),
+            &mut Cursor::new(b"private attachment payload"),
+            &mut ciphertext,
+        )
+        .unwrap();
+        let mut writer = FailingWriter { written: 0 };
+        let error = decrypt_stream(
+            &test_key(),
+            &test_blob_uuid(),
+            size,
+            &hash,
+            &mut Cursor::new(ciphertext),
+            &mut writer,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, DiaryError::Io(ref e) if e.to_string() == "injected writer failure")
+        );
+        assert_eq!(writer.written, 1);
+    }
+
+    #[test]
+    fn plaintext_chunk_owner_supports_live_zeroization_and_drop_guard() {
+        use zeroize::{Zeroize, ZeroizeOnDrop};
+        fn assert_protected<T: Zeroize + ZeroizeOnDrop>(_: &T) {}
+        let mut chunk: Zeroizing<Vec<u8>> = Zeroizing::new(b"private payload".to_vec());
+        assert_protected(&chunk);
+        // Vec zeroization clears the live buffer; no freed-memory inspection.
+        chunk.zeroize();
+        assert!(chunk.is_empty());
     }
 
     /// TC-S13-003-01: round-trip a small (sub-chunk) buffer.

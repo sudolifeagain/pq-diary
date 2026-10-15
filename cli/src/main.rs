@@ -23,7 +23,7 @@ fn parse_secret_string(s: &str) -> Result<SecretString, std::convert::Infallible
     about = "Post-quantum cryptography CLI journal"
 )]
 pub struct Cli {
-    /// Vault path or name
+    /// Vault directory or .pqd file (default: configured app-home vault)
     #[arg(short = 'v', long, global = true)]
     pub vault: Option<String>,
 
@@ -95,7 +95,7 @@ pub struct SearchArgs {
 /// Top-level subcommands for pq-diary.
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    /// Initialize a new vault in the current directory
+    /// Initialize app configuration and the default vault in the app home
     Init,
 
     /// Manage vaults (create, list, policy, delete)

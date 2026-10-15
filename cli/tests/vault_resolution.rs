@@ -274,3 +274,33 @@ fn configured_default_preserves_unicode_and_spaces() {
     let list = success(run(&root, temp.path(), None, &["list"], ""));
     assert!(list.contains("unicode-default"));
 }
+
+#[test]
+fn export_preconditions_do_not_require_default_configuration() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("missing-home");
+    let out = temp.path().join("out");
+    std::fs::create_dir(&out).unwrap();
+    let cases = [
+        (
+            vec!["--claude", "export", out.to_str().unwrap()],
+            "export is not permitted with --claude",
+        ),
+        (
+            vec!["export", root.to_str().unwrap()],
+            "Directory does not exist",
+        ),
+    ];
+    for (args, expected) in cases {
+        let output = run(&root, temp.path(), None, &args, "");
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains(expected), "expected {expected}, got {error}");
+        assert!(
+            !error.contains("続行しますか"),
+            "must fail before prompting"
+        );
+        assert!(!root.exists());
+        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0);
+    }
+}

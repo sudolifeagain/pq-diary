@@ -63,6 +63,95 @@ pub struct HeaderComment {
     pub body: String,
 }
 
+/// Owns the main editor file and optional best-effort completion file.
+/// Initial writes retain their partial-write guard; successful creation transfers
+/// ownership here immediately. Explicit finish and Drop share one cleanup path.
+pub struct EditorSession {
+    main: Option<PathBuf>,
+    completion: Option<PathBuf>,
+}
+
+impl EditorSession {
+    pub fn header(tmpdir: &Path, plaintext: &EntryPlaintext) -> Result<Self, DiaryError> {
+        Ok(Self {
+            main: Some(write_header_file(tmpdir, plaintext)?),
+            completion: None,
+        })
+    }
+
+    pub fn template(tmpdir: &Path) -> Result<Self, DiaryError> {
+        Ok(Self {
+            main: Some(write_template_file(tmpdir)?),
+            completion: None,
+        })
+    }
+
+    /// Completion remains optional: failed writes are cleaned by their own guard.
+    pub fn add_completion(&mut self, config: &mut EditorConfig, titles: &[String]) {
+        if self.completion.is_none() {
+            self.completion = write_completion_file(&config.secure_tmpdir, titles).ok();
+            if let Some(path) = &self.completion {
+                config.vim_options.extend(vim_completion_options(path));
+            }
+        }
+    }
+
+    /// Read even when launch fails, clean both files, then retain launch-error
+    /// priority. No command may save the original content after editor failure.
+    pub fn finish<T>(
+        mut self,
+        config: &EditorConfig,
+        launch: impl FnOnce(&Path, &EditorConfig) -> Result<(), DiaryError>,
+        read: impl FnOnce(&Path) -> Result<T, DiaryError>,
+    ) -> anyhow::Result<T> {
+        let path = self
+            .main
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Editor session has already been cleaned up"))?;
+        let edit_result = launch(path, config);
+        let read_result = read(path);
+        self.cleanup();
+        edit_result.map_err(|e| anyhow::anyhow!("Editor failed: {e}"))?;
+        read_result.map_err(|e| anyhow::anyhow!("Failed to read temp file: {e}"))
+    }
+
+    fn cleanup(&mut self) {
+        self.cleanup_with_writer(&mut std::io::stderr().lock());
+    }
+
+    fn cleanup_with_writer(&mut self, writer: &mut impl std::io::Write) {
+        self.cleanup_with_warning(|kind, error| {
+            // Drop may run during unwinding. A broken stderr must neither panic
+            // nor prevent cleanup of the remaining owned files.
+            let _ = writeln!(
+                writer,
+                "Warning: failed to securely delete {kind} file: {error}"
+            );
+        });
+    }
+
+    fn cleanup_with_warning(&mut self, mut warn: impl FnMut(&str, DiaryError)) {
+        // Take before attempting deletion: explicit finish and Drop must not
+        // retry cleanup, even after failure (the path might have been reused).
+        if let Some(path) = self.main.take() {
+            if let Err(error) = cleanup_tmpfile(&path) {
+                warn("temp", error);
+            }
+        }
+        if let Some(path) = self.completion.take() {
+            if let Err(error) = secure_delete(&path) {
+                warn("completion", error);
+            }
+        }
+    }
+}
+
+impl Drop for EditorSession {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
 // =============================================================================
 // Public API
 // =============================================================================
@@ -179,7 +268,9 @@ pub fn cleanup_tmpfile(tmpfile: &Path) -> Result<(), DiaryError> {
             match std::fs::symlink_metadata(&p) {
                 Ok(meta) if meta.file_type().is_file() => {
                     if let Err(e) = secure_delete(&p) {
-                        eprintln!(
+                        use std::io::Write as _;
+                        let _ = writeln!(
+                            std::io::stderr().lock(),
                             "Warning: failed to securely delete editor backup '{}': {e}",
                             p.display()
                         );
@@ -527,15 +618,18 @@ impl Drop for IncompleteTmpfile<'_> {
 }
 
 fn discard_incomplete_tmpfile(path: &Path, erase: impl FnOnce(&Path) -> Result<(), DiaryError>) {
+    use std::io::Write as _;
     if let Err(error) = erase(path) {
         // Disk-full and write-limit errors can also prevent overwriting. Still
         // unlink the owned plaintext, without replacing the original error.
-        eprintln!(
+        let _ = writeln!(
+            std::io::stderr().lock(),
             "Warning: failed to overwrite incomplete temporary file '{}': {error}",
             path.display()
         );
         if let Err(error) = std::fs::remove_file(path) {
-            eprintln!(
+            let _ = writeln!(
+                std::io::stderr().lock(),
                 "Warning: failed to remove incomplete temporary file '{}': {error}",
                 path.display()
             );
@@ -699,6 +793,269 @@ fn set_owner_only_acl(path: &Path) -> Result<(), DiaryError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn session_config(dir: &Path) -> EditorConfig {
+        EditorConfig {
+            command: "unused-editor".into(),
+            vim_options: vec![],
+            secure_tmpdir: dir.to_path_buf(),
+        }
+    }
+
+    #[test]
+    fn session_finish_reads_content_and_cleans_owned_files_and_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = session_config(dir.path());
+        let mut session = EditorSession::template(dir.path()).unwrap();
+        session.add_completion(&mut config, &["private title".into()]);
+        let main = session.main.clone().unwrap();
+        let completion = session.completion.clone().unwrap();
+        let backup =
+            main.with_file_name(format!("{}~", main.file_name().unwrap().to_str().unwrap()));
+        let unrelated = dir.path().join("unrelated.md");
+        std::fs::write(&unrelated, "keep").unwrap();
+        let result = session
+            .finish(
+                &config,
+                |path, _| {
+                    std::fs::write(path, "changed\r\n\n")?;
+                    std::fs::write(&backup, "private backup")?;
+                    Ok(())
+                },
+                read_template_file,
+            )
+            .unwrap();
+        assert_eq!(result, "changed\r\n\n");
+        assert!(!main.exists());
+        assert!(!completion.exists());
+        assert!(!backup.exists());
+        assert_eq!(std::fs::read_to_string(unrelated).unwrap(), "keep");
+    }
+
+    #[test]
+    fn session_launch_error_wins_over_read_error_and_cleans_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = session_config(dir.path());
+        let mut session = EditorSession::template(dir.path()).unwrap();
+        session.add_completion(&mut config, &["private title".into()]);
+        let main = session.main.clone().unwrap();
+        let completion = session.completion.clone().unwrap();
+        let error = session
+            .finish(
+                &config,
+                |path, _| {
+                    std::fs::write(path, [0xff])?;
+                    Err(DiaryError::Editor("launch failure".into()))
+                },
+                read_template_file,
+            )
+            .unwrap_err();
+        assert!(error.to_string().starts_with("Editor failed:"));
+        assert!(error.to_string().contains("launch failure"));
+        assert!(!main.exists());
+        assert!(!completion.exists());
+    }
+
+    #[test]
+    fn session_cleanup_failure_does_not_replace_launch_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = session_config(dir.path());
+        let mut session = EditorSession::template(dir.path()).unwrap();
+        session.add_completion(&mut config, &["private title".into()]);
+        let completion = session.completion.clone().unwrap();
+        let error = session
+            .finish(
+                &config,
+                |path, _| {
+                    std::fs::remove_file(path)?;
+                    Err(DiaryError::Editor("primary launch failure".into()))
+                },
+                read_template_file,
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Editor failed: editor error: primary launch failure"
+        );
+        assert!(!completion.exists());
+    }
+
+    #[test]
+    fn session_read_error_cleans_both_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = session_config(dir.path());
+        let mut session = EditorSession::template(dir.path()).unwrap();
+        session.add_completion(&mut config, &["private title".into()]);
+        let main = session.main.clone().unwrap();
+        let completion = session.completion.clone().unwrap();
+        let error = session
+            .finish(
+                &config,
+                |path, _| {
+                    std::fs::write(path, [0xff])?;
+                    Ok(())
+                },
+                read_template_file,
+            )
+            .unwrap_err();
+        assert!(error.to_string().starts_with("Failed to read temp file:"));
+        assert!(!main.exists());
+        assert!(!completion.exists());
+    }
+
+    #[test]
+    fn session_drop_cleans_early_return_and_launcher_unwind() {
+        for panic in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = session_config(dir.path());
+            let mut session = EditorSession::template(dir.path()).unwrap();
+            session.add_completion(&mut config, &["private title".into()]);
+            let main = session.main.clone().unwrap();
+            let completion = session.completion.clone().unwrap();
+            let outcome = std::panic::catch_unwind(|| {
+                let session = session;
+                if !panic {
+                    return;
+                }
+                let _ = session.finish(
+                    &config,
+                    |_, _| panic!("editor panicked"),
+                    read_template_file,
+                );
+            });
+            assert_eq!(outcome.is_err(), panic);
+            assert!(!main.exists());
+            assert!(!completion.exists());
+        }
+    }
+
+    #[test]
+    fn session_cleanup_warns_for_each_failure_and_never_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = session_config(dir.path());
+        let mut session = EditorSession::template(dir.path()).unwrap();
+        session.add_completion(&mut config, &["private title".into()]);
+        let main = session.main.clone().unwrap();
+        let completion = session.completion.clone().unwrap();
+        std::fs::remove_file(&main).unwrap();
+        std::fs::remove_file(&completion).unwrap();
+        let mut warnings = Vec::new();
+        session.cleanup_with_warning(|kind, _| warnings.push(kind.to_owned()));
+        assert_eq!(warnings, ["temp", "completion"]);
+        std::fs::write(&main, "replacement main").unwrap();
+        std::fs::write(&completion, "replacement completion").unwrap();
+        session.cleanup_with_warning(|_, _| panic!("cleanup ran twice"));
+        drop(session);
+        assert_eq!(std::fs::read_to_string(main).unwrap(), "replacement main");
+        assert_eq!(
+            std::fs::read_to_string(completion).unwrap(),
+            "replacement completion"
+        );
+    }
+
+    #[test]
+    fn session_broken_warning_writer_still_cleans_completion() {
+        struct BrokenWriter;
+        impl std::io::Write for BrokenWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = session_config(dir.path());
+        let mut session = EditorSession::template(dir.path()).unwrap();
+        session.add_completion(&mut config, &["private title".into()]);
+        let main = session.main.clone().unwrap();
+        let completion = session.completion.clone().unwrap();
+        std::fs::remove_file(main).unwrap();
+        session.cleanup_with_writer(&mut BrokenWriter);
+        assert!(!completion.exists());
+        assert!(session.main.is_none());
+        assert!(session.completion.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn session_broken_stderr_preserves_primary_error() {
+        const CHILD: &str = "PQ_DIARY_TEST_BROKEN_EDITOR_STDERR";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "editor::tests::session_broken_stderr_preserves_primary_error",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .stderr(
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open("/dev/full")
+                        .unwrap(),
+                )
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "cleanup must tolerate an unwritable stderr"
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = session_config(dir.path());
+        let mut session = EditorSession::template(dir.path()).unwrap();
+        session.add_completion(&mut config, &["private title".into()]);
+        let completion = session.completion.clone().unwrap();
+        let error = session
+            .finish(
+                &config,
+                |path, _| {
+                    std::fs::remove_file(path)?;
+                    Err(DiaryError::Editor("primary launch failure".into()))
+                },
+                read_template_file,
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Editor failed: editor error: primary launch failure"
+        );
+        assert!(!completion.exists());
+    }
+
+    #[test]
+    fn session_read_unwind_cleans_both_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = session_config(dir.path());
+        let mut session = EditorSession::template(dir.path()).unwrap();
+        session.add_completion(&mut config, &["private title".into()]);
+        let main = session.main.clone().unwrap();
+        let completion = session.completion.clone().unwrap();
+        let outcome = std::panic::catch_unwind(|| {
+            let _: anyhow::Result<()> =
+                session.finish(&config, |_, _| Ok(()), |_| panic!("reader panicked"));
+        });
+        assert!(outcome.is_err());
+        assert!(!main.exists());
+        assert!(!completion.exists());
+    }
+
+    #[test]
+    fn session_completion_creation_failure_is_optional() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = session_config(&dir.path().join("missing"));
+        let mut session = EditorSession::template(dir.path()).unwrap();
+        session.add_completion(&mut config, &["private title".into()]);
+        assert!(session.completion.is_none());
+        assert!(config.vim_options.is_empty());
+        assert_eq!(
+            session
+                .finish(&config, |_, _| Ok(()), read_template_file)
+                .unwrap(),
+            ""
+        );
+    }
 
     #[test]
     fn incomplete_plaintext_write_removes_file_and_preserves_error() {

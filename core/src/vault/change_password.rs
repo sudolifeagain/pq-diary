@@ -590,7 +590,13 @@ mod tests {
                 config_before
             );
             assert!(!vault_dir.join("vault.pqd.tmp.new").exists());
-            assert!(!vault_dir.join("vault.pqd.tmp.new.tmp").exists());
+            assert!(!std::fs::read_dir(&vault_dir).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("vault.pqd.tmp.new.tmp")
+            }));
         }
     }
 }

@@ -1094,7 +1094,11 @@ where
                 vars.insert(BUILTIN_TITLE.to_string(), today.to_string());
                 expand(&tmpl.body, &vars)
             }
-            Err(_) => String::new(),
+            Err(pq_diary_core::DiaryError::TemplateNotFound(_)) => String::new(),
+            Err(e) => {
+                let message = format!("Failed to look up daily template: {e}");
+                return Err(anyhow::Error::new(e).context(message));
+            }
         };
 
         // Create the entry.
@@ -5287,6 +5291,58 @@ mod tests {
         let (_, plaintext) = core.get_entry(&prefix).expect("get_entry");
         core.lock();
         Some(plaintext)
+    }
+
+    /// A valid encrypted entry payload is not a valid template payload. Re-signing
+    /// the container isolates template deserialization from unlock integrity checks.
+    fn seed_malformed_template(vault_dir: &std::path::Path) {
+        use pq_diary_core::vault::{
+            format::RECORD_TYPE_TEMPLATE, reader::read_vault, writer::write_vault_authenticated,
+        };
+        let path = vault_dir.join("vault.pqd");
+        let mut core = DiaryCore::new(path.to_str().unwrap()).unwrap();
+        core.unlock(secrecy::SecretString::new("password".into()))
+            .unwrap();
+        core.new_entry("daily", "S47_PRIVATE_BODY", vec![]).unwrap();
+        let key = core.vault_mac_key().unwrap();
+        let (header, mut records) = read_vault(&path).unwrap();
+        records[0].record_type = RECORD_TYPE_TEMPLATE;
+        write_vault_authenticated(&path, header, &records, &key).unwrap();
+    }
+
+    #[test]
+    fn today_rejects_malformed_template_without_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault_dir = setup_vault(&dir);
+        seed_malformed_template(&vault_dir);
+        let path = vault_dir.join("vault.pqd");
+        let before = std::fs::read(&path).unwrap();
+        let config = std::fs::read(vault_dir.join("vault.toml")).unwrap();
+        let cli = make_today_cli(vault_dir.to_str().unwrap(), Some("password"));
+        let mut launched = false;
+        let result = cmd_today_impl(&cli, "2099-01-02", |_, _| {
+            launched = true;
+            Ok(())
+        });
+        assert!(
+            result.is_err(),
+            "malformed template must not become an empty daily entry"
+        );
+        let error = result.unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<pq_diary_core::DiaryError>(),
+            Some(pq_diary_core::DiaryError::Template(_))
+        ));
+        assert!(error
+            .to_string()
+            .starts_with("Failed to look up daily template:"));
+        let diagnostic = format!("{error:?}");
+        assert!(!diagnostic.contains("S47_PRIVATE_BODY"));
+        assert!(!diagnostic.contains("password"));
+        assert!(!launched);
+        assert_eq!(std::fs::read(path).unwrap(), before);
+        assert_eq!(std::fs::read(vault_dir.join("vault.toml")).unwrap(), config);
+        assert!(read_entry_by_title(&vault_dir, "2099-01-02").is_none());
     }
 
     /// TC-049-01: Empty vault, no template → creates entry with today's title and empty body.

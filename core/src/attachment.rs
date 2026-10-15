@@ -11,7 +11,7 @@
 //! [`add_attachment`], [`list_attachments`], [`extract_attachment`],
 //! [`delete_attachment`], [`set_attachment_legacy_flag`].
 
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use rand::{rngs::OsRng, RngCore};
@@ -28,7 +28,7 @@ use crate::vault::format::{
     generate_entry_padding, AttachmentRecord, EntryRecord, VaultHeader, MAX_ATTACHMENTS_PER_ENTRY,
     MAX_ATTACHMENT_SIZE_BYTES, RECORD_TYPE_ATTACHMENT, RECORD_TYPE_ENTRY,
 };
-use crate::vault::reader::read_vault_with_attachments;
+use crate::vault::reader::read_vault_with_attachments_from_bytes;
 use crate::vault::writer::write_vault_with_attachments_authenticated;
 
 // ============================================================================
@@ -212,9 +212,12 @@ pub fn add_attachment(
     let vault_pqd = vault_dir.join("vault.pqd");
     let vault_toml = vault_dir.join("vault.toml");
     let config = VaultConfig::from_file(&vault_toml)?;
-    let (mut header, mut entries, mut attachments) = read_vault_with_attachments(&vault_pqd)?;
+    let vault_bytes = std::fs::read(&vault_pqd)?;
+    let (mut header, mut entries, mut attachments) =
+        read_vault_with_attachments_from_bytes(&vault_bytes)?;
     let params = argon2_params_from(&config);
-    let k_master = verify_master(&header, master_pwd, &params)?;
+    let k_master = verify_master(&vault_bytes, &header, master_pwd, &params)?;
+    drop(vault_bytes);
     let dsa_seed = decrypt_blob(&k_master, &header.dsa_encrypted_sk, "DSA")?;
 
     // Resolve entry by ID prefix.
@@ -382,9 +385,11 @@ pub fn list_attachments(
     let vault_pqd = vault_dir.join("vault.pqd");
     let vault_toml = vault_dir.join("vault.toml");
     let config = VaultConfig::from_file(&vault_toml)?;
-    let (header, entries, attachments) = read_vault_with_attachments(&vault_pqd)?;
+    let vault_bytes = std::fs::read(&vault_pqd)?;
+    let (header, entries, attachments) = read_vault_with_attachments_from_bytes(&vault_bytes)?;
     let params = argon2_params_from(&config);
-    let k_master = verify_master(&header, master_pwd, &params)?;
+    let k_master = verify_master(&vault_bytes, &header, master_pwd, &params)?;
+    drop(vault_bytes);
 
     let filter_uuid = match entry_id_prefix {
         Some(p) => Some(find_unique_entry(&entries, p).map(|i| entries[i].uuid)?),
@@ -418,6 +423,10 @@ pub fn list_attachments(
 
 /// Extract the attachment named `filename` on entry `entry_id_prefix` and
 /// write the decrypted plaintext to `out_path`.
+///
+/// The destination directory must not be writable by untrusted users. Unix
+/// output files are created owner-only; on Windows the directory's inherited
+/// ACL controls access to both temporary and final plaintext files.
 pub fn extract_attachment(
     vault_dir: &Path,
     master_pwd: &SecretString,
@@ -428,9 +437,11 @@ pub fn extract_attachment(
     let vault_pqd = vault_dir.join("vault.pqd");
     let vault_toml = vault_dir.join("vault.toml");
     let config = VaultConfig::from_file(&vault_toml)?;
-    let (header, entries, attachments) = read_vault_with_attachments(&vault_pqd)?;
+    let vault_bytes = std::fs::read(&vault_pqd)?;
+    let (header, entries, attachments) = read_vault_with_attachments_from_bytes(&vault_bytes)?;
     let params = argon2_params_from(&config);
-    let k_master = verify_master(&header, master_pwd, &params)?;
+    let k_master = verify_master(&vault_bytes, &header, master_pwd, &params)?;
+    drop(vault_bytes);
 
     let entry_idx = find_unique_entry(&entries, entry_id_prefix)?;
     let entry_uuid = entries[entry_idx].uuid;
@@ -438,32 +449,104 @@ pub fn extract_attachment(
     let decoded = decode_named_attachment(&attachments, &k_master, &entry_uuid, filename)?;
 
     let bin_path = blob_path(vault_dir, &decoded.plaintext.blob_uuid);
-    let tmp_path = with_extension(out_path, "pq-diary.tmp");
-
-    let result = (|| -> Result<(), DiaryError> {
-        let mut src = std::fs::File::open(&bin_path)?;
-        let mut tmp = std::fs::File::create(&tmp_path)?;
+    // Open the source before allocating a temporary output. In particular, an
+    // absent blob must never cause cleanup of a path we did not create.
+    let mut src = std::fs::File::open(&bin_path)?;
+    write_extracted_attachment(out_path, |tmp| {
         streaming::decrypt_stream(
             &decoded.plaintext.file_key,
             &decoded.plaintext.blob_uuid,
             decoded.plaintext.size_bytes,
             &decoded.plaintext.sha256,
             &mut src,
-            &mut tmp,
-        )?;
-        tmp.sync_all()?;
-        Ok(())
-    })();
+            tmp,
+        )
+    })
+}
 
-    if let Err(e) = result {
-        cleanup_sensitive_file(&tmp_path);
-        return Err(e);
+/// Stage authenticated plaintext beside the destination, then publish it with
+/// one rename. Only the exclusively created file belongs to this operation.
+fn write_extracted_attachment(
+    out_path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> Result<(), DiaryError>,
+) -> Result<(), DiaryError> {
+    let tmp_path = out_path.with_file_name(format!(".pq-diary-extract-{}.tmp", Uuid::new_v4()));
+    let mut tmp = create_extraction_temp(&tmp_path)?;
+    let result = write(&mut tmp)
+        .and_then(|()| tmp.sync_all().map_err(DiaryError::Io))
+        .and_then(|()| std::fs::rename(&tmp_path, out_path).map_err(DiaryError::Io));
+    match result {
+        Ok(()) => Ok(()),
+        Err(primary) => Err(cleanup_extraction_temp(tmp, &tmp_path, primary)),
     }
-    if let Err(e) = std::fs::rename(&tmp_path, out_path) {
-        cleanup_sensitive_file(&tmp_path);
-        return Err(DiaryError::Io(e));
+}
+
+/// `create_new` atomically rejects existing files, including symlinks. Unix
+/// permissions apply before any plaintext is written. Windows retains the
+/// destination directory's inherited ACL; std does not expose owner-only ACLs.
+fn create_extraction_temp(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
     }
-    Ok(())
+    options.open(path)
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{primary}; cleanup of temporary attachment {} also failed: {cleanup}", path.display())]
+struct ExtractionCleanupError {
+    #[source]
+    primary: DiaryError,
+    path: PathBuf,
+    cleanup: String,
+}
+
+/// Wipe through the handle that we created, never by reopening a pathname.
+/// Always attempt unlink even if overwriting or syncing fails. An overwrite is
+/// only best effort on copy-on-write filesystems, snapshots, and SSD storage.
+fn cleanup_extraction_temp(mut tmp: std::fs::File, path: &Path, primary: DiaryError) -> DiaryError {
+    let overwrite = (|| -> std::io::Result<()> {
+        let mut remaining = tmp.metadata()?.len();
+        tmp.rewind()?;
+        let zeros = [0u8; 64 * 1024];
+        while remaining > 0 {
+            let count = remaining.min(zeros.len() as u64) as usize;
+            tmp.write_all(&zeros[..count])?;
+            remaining -= count as u64;
+        }
+        tmp.sync_all()
+    })();
+    drop(tmp);
+    let removal = std::fs::remove_file(path).or_else(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    });
+    let cleanup = match (overwrite, removal) {
+        (Ok(()), Ok(())) => return primary,
+        (Err(error), Ok(())) => format!("overwrite: {error}; temporary file was removed"),
+        (Ok(()), Err(error)) => format!("remove: {error}; temporary file may remain"),
+        (Err(overwrite), Err(removal)) => {
+            format!("overwrite: {overwrite}; remove: {removal}; temporary file may remain")
+        }
+    };
+    let kind = match &primary {
+        DiaryError::Io(error) => error.kind(),
+        _ => std::io::ErrorKind::Other,
+    };
+    DiaryError::Io(std::io::Error::new(
+        kind,
+        ExtractionCleanupError {
+            primary,
+            path: path.to_path_buf(),
+            cleanup,
+        },
+    ))
 }
 
 /// Delete the attachment named `filename` on entry `entry_id_prefix`. The
@@ -478,9 +561,12 @@ pub fn delete_attachment(
     let vault_pqd = vault_dir.join("vault.pqd");
     let vault_toml = vault_dir.join("vault.toml");
     let config = VaultConfig::from_file(&vault_toml)?;
-    let (header, mut entries, mut attachments) = read_vault_with_attachments(&vault_pqd)?;
+    let vault_bytes = std::fs::read(&vault_pqd)?;
+    let (header, mut entries, mut attachments) =
+        read_vault_with_attachments_from_bytes(&vault_bytes)?;
     let params = argon2_params_from(&config);
-    let k_master = verify_master(&header, master_pwd, &params)?;
+    let k_master = verify_master(&vault_bytes, &header, master_pwd, &params)?;
+    drop(vault_bytes);
 
     let entry_idx = find_unique_entry(&entries, entry_id_prefix)?;
     let entry_uuid = entries[entry_idx].uuid;
@@ -546,9 +632,11 @@ pub fn set_attachment_legacy_flag(
             "legacy not initialized — run `pq-diary legacy init` first".to_string(),
         ));
     }
-    let (header, entries, mut attachments) = read_vault_with_attachments(&vault_pqd)?;
+    let vault_bytes = std::fs::read(&vault_pqd)?;
+    let (header, entries, mut attachments) = read_vault_with_attachments_from_bytes(&vault_bytes)?;
     let params = argon2_params_from(&config);
-    let _k_master = verify_master(&header, master_pwd, &params)?;
+    let _k_master = verify_master(&vault_bytes, &header, master_pwd, &params)?;
+    drop(vault_bytes);
 
     let entry_idx = find_unique_entry(&entries, entry_id_prefix)?;
     let entry_uuid = entries[entry_idx].uuid;
@@ -812,6 +900,7 @@ fn argon2_params_from(config: &VaultConfig) -> kdf::Argon2Params {
 }
 
 fn verify_master(
+    vault_bytes: &[u8],
     header: &VaultHeader,
     master_pwd: &SecretString,
     params: &kdf::Argon2Params,
@@ -827,6 +916,10 @@ fn verify_master(
         &header.verification_ct,
     )
     .map_err(|_| DiaryError::Crypto("invalid master password".to_string()))?;
+    // Direct module callers must authenticate the vault before trusting its
+    // records or creating side effects; they do not pass through DiaryCore::unlock.
+    let mac_key = crate::crypto::derive_vault_mac_key(key.as_ref())?;
+    crate::vault::reader::verify_vault_integrity_bytes(vault_bytes, &mac_key)?;
     Ok(Zeroizing::new(*key.as_ref()))
 }
 
@@ -1041,6 +1134,7 @@ mod tests {
     use crate::crypto::kdf::Argon2Params;
     use crate::legacy::Argon2LegacyDeriver;
     use crate::vault::init::VaultManager;
+    use crate::vault::reader::read_vault_with_attachments;
     use crate::DiaryCore;
     use secrecy::SecretBox;
     use tempfile::tempdir;
@@ -1091,15 +1185,16 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let vault = setup_vault(&dir, b"master-pw");
-        let (header, _, _) = read_vault_with_attachments(&vault.join("vault.pqd")).unwrap();
+        let vault_bytes = std::fs::read(vault.join("vault.pqd")).unwrap();
+        let (header, _, _) = read_vault_with_attachments_from_bytes(&vault_bytes).unwrap();
         let expected = kdf::derive_key(b"master-pw", &header.kdf_salt, &fast_params()).unwrap();
-        let mut key = verify_master(&header, &secret("master-pw"), &fast_params()).unwrap();
+        let mut key = verify_master(&vault_bytes, &header, &secret("master-pw"), &fast_params()).unwrap();
         assert_protected(&key);
         assert_eq!(key.as_ref(), expected.as_ref());
         // Inspect only live, explicitly zeroized memory; never freed allocations.
         key.zeroize();
         assert_eq!(*key, [0; 32]);
-        assert!(verify_master(&header, &secret("wrong-password"), &fast_params()).is_err());
+        assert!(verify_master(&vault_bytes, &header, &secret("wrong-password"), &fast_params()).is_err());
     }
 
     #[test]
@@ -1139,6 +1234,166 @@ mod tests {
         ] {
             assert_eq!(compact, expected);
             assert_eq!(pretty, expected);
+        }
+    }
+
+    fn directory_entries(path: &Path) -> std::collections::BTreeSet<PathBuf> {
+        std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect()
+    }
+
+    fn assert_tampered_vault_rejected(tamper_timestamp: bool) {
+        for operation in ["add", "delete", "set legacy flag", "list", "extract"] {
+            let dir = tempdir().unwrap();
+            let (vault_dir, entry_id) = vault_with_entry(&dir);
+            let pwd = secret("master-pw");
+            crate::legacy::initialize_legacy(
+                &vault_dir,
+                &pwd,
+                &secret("legacy-code"),
+                crate::vault::config::ConfirmationMode::Yn,
+                &fast_deriver(),
+            )
+            .unwrap();
+            let src = write_source(&dir, "original.txt", b"original attachment");
+            add_attachment(&vault_dir, &pwd, &entry_id, &src).unwrap();
+            let meta = list_attachments(&vault_dir, &pwd, None).unwrap().remove(0);
+            let blob = blob_path(&vault_dir, &meta.blob_uuid);
+            let blob_before = std::fs::read(&blob).unwrap();
+            let src_new = write_source(&dir, "new.txt", b"new attachment");
+            let out = write_source(&dir, "output.txt", b"existing output");
+
+            let vault_path = vault_dir.join("vault.pqd");
+            let config_before = std::fs::read(vault_dir.join("vault.toml")).unwrap();
+            let mut bytes = std::fs::read(&vault_path).unwrap();
+            let mut cursor = std::io::Cursor::new(&bytes);
+            let header = crate::vault::reader::read_header(&mut cursor).unwrap();
+            let key = kdf::derive_key(b"master-pw", &header.kdf_salt, &fast_params()).unwrap();
+            let mac_key = crate::crypto::derive_vault_mac_key(key.as_ref()).unwrap();
+            crate::vault::reader::verify_vault_integrity(&vault_path, &mac_key).unwrap();
+            let offset = if tamper_timestamp {
+                // First entry: length prefix + record type + UUID + created_at.
+                cursor.position() as usize + 4 + 1 + 16 + 8
+            } else {
+                bytes.len() - 1
+            };
+            bytes[offset] ^= 1;
+            std::fs::write(&vault_path, &bytes).unwrap();
+            assert!(crate::vault::reader::verify_vault_integrity(&vault_path, &mac_key).is_err());
+
+            let result = match operation {
+                "add" => add_attachment(&vault_dir, &pwd, &entry_id, &src_new).map(|_| ()),
+                "delete" => delete_attachment(&vault_dir, &pwd, &entry_id, "original.txt"),
+                "set legacy flag" => set_attachment_legacy_flag(
+                    &vault_dir,
+                    &pwd,
+                    Some(&secret("legacy-code")),
+                    &entry_id,
+                    "original.txt",
+                    LegacyFlag::Inherit,
+                    &fast_deriver(),
+                ),
+                "list" => list_attachments(&vault_dir, &pwd, None).map(|_| ()),
+                "extract" => extract_attachment(&vault_dir, &pwd, &entry_id, "original.txt", &out),
+                _ => unreachable!(),
+            };
+            assert!(
+                matches!(&result, Err(DiaryError::Crypto(message)) if message.contains("vault integrity")),
+                "{operation} accepted or misclassified corruption: {result:?}; post-operation MAC valid: {}",
+                crate::vault::reader::verify_vault_integrity(&vault_path, &mac_key).is_ok()
+            );
+            assert_eq!(std::fs::read(&vault_path).unwrap(), bytes, "{operation}");
+            assert_eq!(
+                std::fs::read(vault_dir.join("vault.toml")).unwrap(),
+                config_before,
+                "{operation}"
+            );
+            assert_eq!(std::fs::read(&blob).unwrap(), blob_before, "{operation}");
+            assert_eq!(
+                std::fs::read_dir(attachments_dir(&vault_dir))
+                    .unwrap()
+                    .count(),
+                1
+            );
+            assert_eq!(std::fs::read(&out).unwrap(), b"existing output");
+            assert!(!with_extension(&out, "pq-diary.tmp").exists());
+            assert!(!vault_dir.join("vault.pqd.tmp").exists());
+        }
+    }
+
+    #[test]
+    fn attachment_apis_reject_tampered_mac_without_side_effects() {
+        assert_tampered_vault_rejected(false);
+    }
+
+    #[test]
+    fn attachment_apis_reject_tampered_timestamp_without_side_effects() {
+        assert_tampered_vault_rejected(true);
+    }
+
+    #[test]
+    fn master_password_mutations_migrate_flag_clear_vaults() {
+        use crate::vault::format::{FLAG_INTEGRITY, SCHEMA_VERSION, VAULT_MAC_LEN};
+
+        for version in 0x04..=SCHEMA_VERSION {
+            for operation in ["attachment", "legacy", "password"] {
+                let dir = tempdir().unwrap();
+                let (vault_dir, entry_id) = vault_with_entry(&dir);
+                let pwd = secret("master-pw");
+                crate::legacy::initialize_legacy(
+                    &vault_dir,
+                    &pwd,
+                    &secret("legacy-code"),
+                    crate::vault::config::ConfirmationMode::Yn,
+                    &fast_deriver(),
+                )
+                .unwrap();
+                let vault_path = vault_dir.join("vault.pqd");
+                let mut bytes = std::fs::read(&vault_path).unwrap();
+                assert_ne!(bytes[9] & FLAG_INTEGRITY, 0);
+                bytes.truncate(bytes.len() - VAULT_MAC_LEN);
+                bytes[8] = version;
+                bytes[9] &= !FLAG_INTEGRITY;
+                std::fs::write(&vault_path, &bytes).unwrap();
+
+                let expected_password = match operation {
+                    "attachment" => {
+                        let source = write_source(&dir, "new.txt", b"new attachment");
+                        add_attachment(&vault_dir, &pwd, &entry_id, &source).unwrap();
+                        "master-pw"
+                    }
+                    "legacy" => {
+                        crate::legacy::set_entry_flag(
+                            &vault_dir,
+                            &pwd,
+                            None,
+                            &entry_id,
+                            LegacyFlag::Destroy,
+                            &fast_deriver(),
+                        )
+                        .unwrap();
+                        "master-pw"
+                    }
+                    "password" => {
+                        crate::vault::change_password::re_encrypt_vault(
+                            &vault_dir,
+                            &pwd,
+                            &secret("new-master"),
+                        )
+                        .unwrap();
+                        "new-master"
+                    }
+                    _ => unreachable!(),
+                };
+                let (header, _, _) = read_vault_with_attachments(&vault_path).unwrap();
+                assert_eq!(header.schema_version, SCHEMA_VERSION);
+                assert_ne!(header.flags & FLAG_INTEGRITY, 0);
+                let mut core = DiaryCore::new(vault_path.to_str().unwrap()).unwrap();
+                core.unlock(secret(expected_password)).unwrap();
+                assert_eq!(core.list_entries(None).unwrap()[0].title, "title");
+            }
         }
     }
 
@@ -1424,7 +1679,9 @@ mod tests {
 
         let out_dir = dir.path().join("existing-dir");
         std::fs::create_dir(&out_dir).unwrap();
-        let tmp_path = with_extension(&out_dir, "pq-diary.tmp");
+        let marker = out_dir.join("keep.txt");
+        std::fs::write(&marker, b"existing directory content").unwrap();
+        let before = directory_entries(dir.path());
         let result = extract_attachment(
             &vault_dir,
             &secret("master-pw"),
@@ -1434,10 +1691,242 @@ mod tests {
         );
 
         assert!(matches!(result, Err(DiaryError::Io(_))));
-        assert!(
-            !tmp_path.exists(),
-            "decrypted temp file must be removed after rename failure"
+        assert_eq!(directory_entries(dir.path()), before);
+        assert_eq!(
+            std::fs::read(&marker).unwrap(),
+            b"existing directory content"
         );
+    }
+
+    #[test]
+    fn extract_missing_blob_preserves_preexisting_temp_and_output() {
+        let dir = tempdir().unwrap();
+        let (vault_dir, entry_id) = vault_with_entry(&dir);
+        let src = write_source(&dir, "source.txt", b"attachment payload");
+        add_attachment(&vault_dir, &secret("master-pw"), &entry_id[..8], &src).unwrap();
+        let metas = list_attachments(&vault_dir, &secret("master-pw"), None).unwrap();
+        std::fs::remove_file(blob_path(&vault_dir, &metas[0].blob_uuid)).unwrap();
+
+        let out = write_source(&dir, "output.txt", b"existing output");
+        let sentinel = with_extension(&out, "pq-diary.tmp");
+        std::fs::write(&sentinel, b"unrelated sentinel").unwrap();
+        let before = directory_entries(dir.path());
+
+        let result = extract_attachment(
+            &vault_dir,
+            &secret("master-pw"),
+            &entry_id[..8],
+            "source.txt",
+            &out,
+        );
+
+        assert!(
+            matches!(result, Err(DiaryError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound)
+        );
+        assert_eq!(std::fs::read(&out).unwrap(), b"existing output");
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"unrelated sentinel");
+        assert_eq!(directory_entries(dir.path()), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_does_not_follow_preexisting_temp_symlink() {
+        let dir = tempdir().unwrap();
+        let (vault_dir, entry_id) = vault_with_entry(&dir);
+        let src = write_source(&dir, "source.txt", b"attachment payload");
+        add_attachment(&vault_dir, &secret("master-pw"), &entry_id[..8], &src).unwrap();
+        let out = dir.path().join("output.txt");
+        let unrelated = write_source(&dir, "unrelated.txt", b"unrelated sentinel");
+        let old_temp = with_extension(&out, "pq-diary.tmp");
+        std::os::unix::fs::symlink(&unrelated, &old_temp).unwrap();
+
+        extract_attachment(
+            &vault_dir,
+            &secret("master-pw"),
+            &entry_id[..8],
+            "source.txt",
+            &out,
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(&unrelated).unwrap(), b"unrelated sentinel");
+        assert!(std::fs::symlink_metadata(&old_temp).unwrap().is_symlink());
+        assert!(!std::fs::symlink_metadata(&out).unwrap().is_symlink());
+        assert_eq!(std::fs::read(&out).unwrap(), b"attachment payload");
+    }
+
+    #[test]
+    fn extract_late_decrypt_failure_preserves_output_and_removes_owned_temp() {
+        let dir = tempdir().unwrap();
+        let (vault_dir, entry_id) = vault_with_entry(&dir);
+        let payload = vec![0x42; streaming::CHUNK_SIZE + 32];
+        let src = write_source(&dir, "source.bin", &payload);
+        add_attachment(&vault_dir, &secret("master-pw"), &entry_id[..8], &src).unwrap();
+        let metas = list_attachments(&vault_dir, &secret("master-pw"), None).unwrap();
+        let blob = blob_path(&vault_dir, &metas[0].blob_uuid);
+        let mut ciphertext = std::fs::read(&blob).unwrap();
+        *ciphertext.last_mut().unwrap() ^= 1;
+        std::fs::write(&blob, &ciphertext).unwrap();
+
+        let out = write_source(&dir, "output.bin", b"existing output");
+        let sentinel = with_extension(&out, "pq-diary.tmp");
+        std::fs::write(&sentinel, b"unrelated sentinel").unwrap();
+        let before = directory_entries(dir.path());
+
+        let error = extract_attachment(
+            &vault_dir,
+            &secret("master-pw"),
+            &entry_id[..8],
+            "source.bin",
+            &out,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, DiaryError::Crypto(ref message) if message.contains("chunk 1")));
+        assert_eq!(std::fs::read(&out).unwrap(), b"existing output");
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"unrelated sentinel");
+        assert_eq!(directory_entries(dir.path()), before);
+        assert_eq!(std::fs::read(&blob).unwrap(), ciphertext);
+    }
+
+    #[test]
+    fn extract_partial_write_failure_preserves_output_and_removes_owned_temp() {
+        let dir = tempdir().unwrap();
+        let out = write_source(&dir, "output.txt", b"existing output");
+        let sentinel = with_extension(&out, "pq-diary.tmp");
+        std::fs::write(&sentinel, b"unrelated sentinel").unwrap();
+        let before = directory_entries(dir.path());
+
+        let error = write_extracted_attachment(&out, |tmp| {
+            tmp.write_all(b"partial plaintext")?;
+            Err(DiaryError::Io(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "injected partial write failure",
+            )))
+        })
+        .unwrap_err();
+
+        assert!(
+            matches!(error, DiaryError::Io(ref e) if e.kind() == std::io::ErrorKind::WriteZero)
+        );
+        assert_eq!(std::fs::read(&out).unwrap(), b"existing output");
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"unrelated sentinel");
+        assert_eq!(directory_entries(dir.path()), before);
+    }
+
+    #[test]
+    fn extract_temp_creation_does_not_truncate_existing_file() {
+        let dir = tempdir().unwrap();
+        let path = write_source(&dir, "existing.tmp", b"unrelated sentinel");
+        let error = create_extraction_temp(&path).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).unwrap(), b"unrelated sentinel");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_temp_creation_rejects_symlink() {
+        let dir = tempdir().unwrap();
+        let unrelated = write_source(&dir, "unrelated.txt", b"unrelated sentinel");
+        let path = dir.path().join("existing.tmp");
+        std::os::unix::fs::symlink(&unrelated, &path).unwrap();
+        let error = create_extraction_temp(&path).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&unrelated).unwrap(), b"unrelated sentinel");
+        assert!(std::fs::symlink_metadata(&path).unwrap().is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_temp_is_owner_only_before_writing_and_after_publication() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempdir().unwrap();
+        let out = dir.path().join("output.txt");
+        write_extracted_attachment(&out, |tmp| {
+            assert_eq!(tmp.metadata()?.permissions().mode() & 0o777, 0o600);
+            tmp.write_all(b"authenticated plaintext")?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&out).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(std::fs::read(&out).unwrap(), b"authenticated plaintext");
+        assert_eq!(directory_entries(dir.path()), [out].into_iter().collect());
+    }
+
+    #[test]
+    fn extract_cleanup_failure_preserves_primary_error_and_reports_remainder() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("owned.tmp");
+        let moved_path = dir.path().join("moved.tmp");
+        let mut tmp = create_extraction_temp(&path).unwrap();
+        tmp.write_all(b"partial plaintext").unwrap();
+        // Simulate an unlink failure without permissions tricks that root can
+        // bypass. Wiping must still use the original handle after its rename.
+        std::fs::rename(&path, &moved_path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let marker = path.join("keep.txt");
+        std::fs::write(&marker, b"unrelated directory content").unwrap();
+        let primary = DiaryError::Io(std::io::Error::new(
+            std::io::ErrorKind::WriteZero,
+            "injected original write failure",
+        ));
+
+        let error = cleanup_extraction_temp(tmp, &path, primary);
+        let DiaryError::Io(ref io_error) = error else {
+            panic!("cleanup failure must be reported as an I/O error");
+        };
+        assert_eq!(io_error.kind(), std::io::ErrorKind::WriteZero);
+        let context = io_error.get_ref().unwrap();
+        let original = context
+            .source()
+            .unwrap()
+            .downcast_ref::<DiaryError>()
+            .unwrap();
+        assert!(matches!(original, DiaryError::Io(e) if e.kind() == std::io::ErrorKind::WriteZero));
+        let message = error.to_string();
+        assert!(message.contains("injected original write failure"));
+        assert!(message.contains("cleanup of temporary attachment"));
+        assert!(message.contains("temporary file may remain"));
+        assert_eq!(std::fs::read(&moved_path).unwrap(), vec![0; 17]);
+        assert_eq!(
+            std::fs::read(&marker).unwrap(),
+            b"unrelated directory content"
+        );
+    }
+
+    #[test]
+    fn extract_cleanup_attempts_removal_after_overwrite_failure() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("owned.tmp");
+        let mut tmp = create_extraction_temp(&path).unwrap();
+        tmp.write_all(b"partial plaintext").unwrap();
+        drop(tmp);
+        // A read-only handle deterministically forces the wipe write to fail.
+        let tmp = std::fs::File::open(&path).unwrap();
+        let primary = DiaryError::Crypto("injected authentication failure".into());
+
+        let error = cleanup_extraction_temp(tmp, &path, primary);
+        assert!(!path.exists(), "failed overwrite must not skip unlink");
+        let message = error.to_string();
+        assert!(message.contains("injected authentication failure"));
+        assert!(message.contains("overwrite:"));
+        assert!(message.contains("temporary file was removed"));
+        let DiaryError::Io(ref io_error) = error else {
+            panic!("cleanup failure must be reported as an I/O error");
+        };
+        let original = io_error
+            .get_ref()
+            .unwrap()
+            .source()
+            .unwrap()
+            .downcast_ref::<DiaryError>()
+            .unwrap();
+        assert!(matches!(original, DiaryError::Crypto(_)));
     }
 
     /// TC-S13-004-13: 256 attachments per entry max.

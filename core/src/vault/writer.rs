@@ -15,11 +15,60 @@ use rand::Rng;
 use crate::crypto::hmac_util;
 use crate::error::DiaryError;
 use crate::vault::format::{
-    AttachmentRecord, EntryRecord, VaultHeader, FLAG_INTEGRITY, MAGIC, SCHEMA_VERSION,
+    check_field_size, AttachmentRecord, EntryRecord, VaultHeader, FLAG_INTEGRITY, MAGIC,
+    SCHEMA_VERSION,
 };
 
 // Fixed size of the on-disk verification-token ciphertext field (bytes 92-140).
 const VERIFICATION_CT_LEN: usize = 48;
+
+// Payload bytes excluding ciphertext, signature, legacy key block, and padding.
+// The three u32 lengths and the u8 padding length are included.
+const ENTRY_FIXED_LEN: usize = 1 + 16 + 8 + 8 + 12 + 4 + 4 + 32 + 1 + 4 + 2 + 8 + 1;
+const ATTACHMENT_FIXED_LEN: usize = 1 + 16 + 12 + 4 + 4 + 32 + 1 + 4 + 1;
+
+fn record_payload_len(
+    fixed_len: usize,
+    field_lengths: [usize; 3],
+    padding_len: usize,
+) -> Result<usize, DiaryError> {
+    u8::try_from(padding_len)
+        .map_err(|_| DiaryError::Vault("padding length exceeds 255-byte maximum".to_string()))?;
+    let record_len =
+        field_lengths
+            .into_iter()
+            .chain([padding_len])
+            .try_fold(fixed_len, |len, field_len| {
+                len.checked_add(field_len)
+                    .ok_or_else(|| DiaryError::Vault("record length overflow".to_string()))
+            })?;
+    check_field_size(record_len)?;
+    Ok(record_len)
+}
+
+fn entry_payload_len(entry: &EntryRecord) -> Result<usize, DiaryError> {
+    record_payload_len(
+        ENTRY_FIXED_LEN,
+        [
+            entry.ciphertext.len(),
+            entry.signature.len(),
+            entry.legacy_key_block.len(),
+        ],
+        entry.padding.len(),
+    )
+}
+
+fn attachment_payload_len(attachment: &AttachmentRecord) -> Result<usize, DiaryError> {
+    record_payload_len(
+        ATTACHMENT_FIXED_LEN,
+        [
+            attachment.ciphertext.len(),
+            attachment.signature.len(),
+            attachment.legacy_key_block.len(),
+        ],
+        attachment.padding.len(),
+    )
+}
 
 /// Serialise `header` into `writer` using little-endian byte order.
 ///
@@ -42,6 +91,10 @@ const VERIFICATION_CT_LEN: usize = 48;
 ///           dsa_encrypted_sk_len (LE u32) + dsa_encrypted_sk bytes
 /// ```
 pub fn write_header<W: Write>(writer: &mut W, header: &VaultHeader) -> Result<(), DiaryError> {
+    // Validate both variable fields before touching even a caller-provided sink.
+    check_field_size(header.kem_encrypted_sk.len())?;
+    check_field_size(header.dsa_encrypted_sk.len())?;
+
     // --- Fixed 204-byte section ---
     writer.write_all(MAGIC)?;
     writer.write_all(&[header.schema_version])?;
@@ -121,9 +174,13 @@ fn write_entries_no_sentinel<W: Write>(
     writer: &mut W,
     entries: &[EntryRecord],
 ) -> Result<(), DiaryError> {
+    // Preflight the entire slice so a later invalid record cannot leave a
+    // partially written sink. Include metadata and padding in the reader's cap.
     for entry in entries {
-        // Serialise the record payload into a temporary buffer so we know the length.
-        let mut payload: Vec<u8> = Vec::new();
+        entry_payload_len(entry)?;
+    }
+    for entry in entries {
+        let mut payload = Vec::with_capacity(entry_payload_len(entry)?);
 
         // Record type is the first byte of every payload.
         payload.push(entry.record_type);
@@ -179,8 +236,11 @@ pub fn write_attachments<W: Write>(
     writer: &mut W,
     attachments: &[AttachmentRecord],
 ) -> Result<(), DiaryError> {
+    for attachment in attachments {
+        attachment_payload_len(attachment)?;
+    }
     for a in attachments {
-        let mut payload: Vec<u8> = Vec::new();
+        let mut payload = Vec::with_capacity(attachment_payload_len(a)?);
 
         payload.push(a.record_type);
         payload.extend_from_slice(&a.uuid);
@@ -465,8 +525,8 @@ fn write_vault_inner(
 mod tests {
     use super::*;
     use crate::vault::format::{
-        AttachmentRecord, EntryRecord, VaultHeader, MAGIC, RECORD_TYPE_ATTACHMENT,
-        RECORD_TYPE_ENTRY,
+        AttachmentRecord, EntryRecord, VaultHeader, MAGIC, MAX_FIELD_SIZE, RECORD_TYPE_ATTACHMENT,
+        RECORD_TYPE_ENTRY, RECORD_TYPE_TEMPLATE,
     };
 
     /// Build a minimal [`EntryRecord`] with known content for testing.
@@ -500,6 +560,190 @@ mod tests {
             legacy_key_block: vec![],
             padding: vec![],
         }
+    }
+
+    fn assert_preserved_vault(path: &Path, before: &[u8], key: &[u8; 32]) {
+        assert_eq!(std::fs::read(path).unwrap(), before);
+        let (_, entries, attachments) =
+            crate::vault::reader::read_vault_with_attachments(path).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].uuid, make_test_entry().uuid);
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].uuid, make_test_attachment().uuid);
+        crate::vault::reader::verify_vault_integrity(path, key).unwrap();
+        assert!(!path.with_file_name("vault.pqd.tmp").exists());
+    }
+
+    fn existing_vault(path: &Path, key: &[u8; 32]) -> Vec<u8> {
+        write_vault_with_attachments_authenticated(
+            path,
+            VaultHeader::new(),
+            &[make_test_entry()],
+            &[make_test_attachment()],
+            key,
+        )
+        .unwrap();
+        std::fs::read(path).unwrap()
+    }
+
+    #[test]
+    fn oversized_entries_cannot_replace_readable_vault() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.pqd");
+        let key = [0x42; 32];
+        let before = existing_vault(&path, &key);
+
+        for record_type in [RECORD_TYPE_ENTRY, RECORD_TYPE_TEMPLATE] {
+            let mut oversized = make_test_entry();
+            oversized.record_type = record_type;
+            // The ciphertext alone fits; the complete record does not.
+            oversized.ciphertext = vec![0xA5; MAX_FIELD_SIZE];
+            let result = write_vault_authenticated(&path, VaultHeader::new(), &[oversized], &key);
+            assert!(matches!(result, Err(DiaryError::Vault(_))), "{result:?}");
+            assert_preserved_vault(&path, &before, &key);
+        }
+    }
+
+    #[test]
+    fn oversized_attachment_cannot_replace_readable_vault() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.pqd");
+        let key = [0x42; 32];
+        let before = existing_vault(&path, &key);
+        let mut oversized = make_test_attachment();
+        oversized.ciphertext = vec![0xA5; MAX_FIELD_SIZE];
+        let result = write_vault_with_attachments_authenticated(
+            &path,
+            VaultHeader::new(),
+            &[],
+            &[oversized],
+            &key,
+        );
+        assert!(matches!(result, Err(DiaryError::Vault(_))), "{result:?}");
+        assert_preserved_vault(&path, &before, &key);
+    }
+
+    #[test]
+    fn oversized_header_fields_cannot_mutate_sink_or_vault() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.pqd");
+        let key = [0x42; 32];
+        let before = existing_vault(&path, &key);
+        for kem in [true, false] {
+            let mut header = VaultHeader::new();
+            let field = if kem {
+                &mut header.kem_encrypted_sk
+            } else {
+                &mut header.dsa_encrypted_sk
+            };
+            *field = vec![0xA5; MAX_FIELD_SIZE + 1];
+            let mut sink = b"unchanged".to_vec();
+            let result = write_header(&mut sink, &header);
+            assert!(matches!(result, Err(DiaryError::Vault(_))), "{result:?}");
+            assert_eq!(sink, b"unchanged");
+            let result = write_vault_authenticated(&path, header, &[], &key);
+            assert!(matches!(result, Err(DiaryError::Vault(_))), "{result:?}");
+            assert_preserved_vault(&path, &before, &key);
+        }
+    }
+
+    #[test]
+    fn invalid_later_record_cannot_mutate_sink() {
+        let mut entry = make_test_entry();
+        entry.padding = vec![0; 256];
+        let mut sink = b"unchanged".to_vec();
+        assert!(write_entries(&mut sink, &[make_test_entry(), entry]).is_err());
+        assert_eq!(sink, b"unchanged");
+
+        let mut attachment = make_test_attachment();
+        attachment.padding = vec![0; 256];
+        assert!(write_attachments(&mut sink, &[make_test_attachment(), attachment]).is_err());
+        assert_eq!(sink, b"unchanged");
+    }
+
+    #[test]
+    fn reader_size_boundaries_roundtrip() {
+        use crate::vault::reader::{read_entries, read_header, read_records};
+
+        for record_type in [RECORD_TYPE_ENTRY, RECORD_TYPE_TEMPLATE] {
+            let mut entry = make_test_entry();
+            entry.record_type = record_type;
+            entry.legacy_key_block = vec![0x17; 13];
+            entry.padding = vec![0x28; 255];
+            let mut initial = Vec::new();
+            write_entries(&mut initial, std::slice::from_ref(&entry)).unwrap();
+            let overhead = initial.len() - 8 - entry.ciphertext.len();
+            entry.ciphertext = vec![0xA5; MAX_FIELD_SIZE - overhead];
+            let mut bytes = Vec::new();
+            write_entries(&mut bytes, std::slice::from_ref(&entry)).unwrap();
+            assert_eq!(bytes.len(), MAX_FIELD_SIZE + 8);
+            let records = read_entries(&mut bytes.as_slice()).unwrap();
+            assert_eq!(records[0].record_type, record_type);
+            assert_eq!(records[0].ciphertext, entry.ciphertext);
+            assert_eq!(records[0].signature, entry.signature);
+            assert_eq!(records[0].legacy_key_block, entry.legacy_key_block);
+            assert_eq!(records[0].padding, entry.padding);
+            drop(records);
+            drop(bytes);
+            entry.ciphertext.push(0);
+            let mut sink = Vec::new();
+            assert!(write_entries(&mut sink, &[make_test_entry(), entry]).is_err());
+            assert!(sink.is_empty());
+        }
+
+        let mut attachment = make_test_attachment();
+        attachment.legacy_key_block = vec![0x17; 13];
+        attachment.padding = vec![0x28; 255];
+        let mut initial = Vec::new();
+        write_attachments(&mut initial, std::slice::from_ref(&attachment)).unwrap();
+        let overhead = initial.len() - 4 - attachment.ciphertext.len();
+        attachment.ciphertext = vec![0xA5; MAX_FIELD_SIZE - overhead];
+        let mut bytes = Vec::new();
+        write_attachments(&mut bytes, std::slice::from_ref(&attachment)).unwrap();
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(bytes.len(), MAX_FIELD_SIZE + 8);
+        let (_, records) = read_records(&mut bytes.as_slice()).unwrap();
+        assert_eq!(records[0].ciphertext, attachment.ciphertext);
+        assert_eq!(records[0].signature, attachment.signature);
+        assert_eq!(records[0].legacy_key_block, attachment.legacy_key_block);
+        assert_eq!(records[0].padding, attachment.padding);
+        drop(records);
+        drop(bytes);
+        attachment.ciphertext.push(0);
+        let mut sink = Vec::new();
+        assert!(write_attachments(&mut sink, &[make_test_attachment(), attachment]).is_err());
+        assert!(sink.is_empty());
+
+        for kem in [true, false] {
+            let mut header = VaultHeader::new();
+            let field = if kem {
+                &mut header.kem_encrypted_sk
+            } else {
+                &mut header.dsa_encrypted_sk
+            };
+            *field = vec![0xA5; MAX_FIELD_SIZE];
+            let mut bytes = Vec::new();
+            write_header(&mut bytes, &header).unwrap();
+            let restored = read_header(&mut bytes.as_slice()).unwrap();
+            assert_eq!(restored.kem_encrypted_sk, header.kem_encrypted_sk);
+            assert_eq!(restored.dsa_encrypted_sk, header.dsa_encrypted_sk);
+        }
+    }
+
+    #[test]
+    fn combined_vault_payload_may_exceed_single_record_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.pqd");
+        let mut entry = make_test_entry();
+        entry.ciphertext = vec![0xA5; MAX_FIELD_SIZE / 2];
+        let mut attachment = make_test_attachment();
+        attachment.ciphertext = vec![0xB6; MAX_FIELD_SIZE / 2];
+        write_vault_with_attachments(&path, VaultHeader::new(), &[entry], &[attachment]).unwrap();
+        let (header, entries, attachments) =
+            crate::vault::reader::read_vault_with_attachments(&path).unwrap();
+        assert!(header.payload_size as usize > MAX_FIELD_SIZE);
+        assert_eq!(entries[0].ciphertext.len(), MAX_FIELD_SIZE / 2);
+        assert_eq!(attachments[0].ciphertext.len(), MAX_FIELD_SIZE / 2);
     }
 
     #[test]

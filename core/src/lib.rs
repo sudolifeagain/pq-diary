@@ -261,12 +261,15 @@ impl DiaryCore {
     ///
     /// The entry UUID and `created_at` timestamp are preserved; only the
     /// encrypted payload, signature, HMAC, and `updated_at` are changed.
+    /// INHERIT entries are rejected unchanged because this API has no legacy key
+    /// to refresh their separately encrypted recovery payload.
     ///
     /// # Errors
     ///
     /// Returns [`DiaryError::NotUnlocked`] if the vault is locked.
     /// Returns [`DiaryError::InvalidArgument`] if `id` is not a valid hex prefix.
     /// Returns [`DiaryError::Entry`] if the entry is not found or multiple match.
+    /// Returns [`DiaryError::Entry`] if the entry is INHERIT.
     /// Returns [`DiaryError::Crypto`] on re-encryption failure.
     /// Returns [`DiaryError::Io`] on vault file I/O failure.
     pub fn update_entry(
@@ -329,6 +332,28 @@ impl DiaryCore {
         };
         let uuid = template::create_template(&self.vault_path, engine, &plaintext)?;
         Ok(uuid.as_simple().to_string())
+    }
+
+    /// Replace an existing template body without deleting the old template first.
+    ///
+    /// The replacement uses a single atomic vault write, preserving the template
+    /// UUID and creation time. A failed replacement leaves the original intact.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DiaryError::NotUnlocked`] if the vault is locked.
+    /// Returns [`DiaryError::InvalidTemplateName`] if `name` is invalid.
+    /// Returns [`DiaryError::TemplateNotFound`] if `name` does not exist.
+    /// Returns [`DiaryError::Template`] for duplicate names or JSON errors.
+    /// Returns [`DiaryError::Crypto`] for integrity/encryption failures and
+    /// [`DiaryError::Io`] for vault I/O failures.
+    pub fn replace_template(&self, name: &str, body: &str) -> Result<(), DiaryError> {
+        let engine = self.require_engine()?;
+        let plaintext = template::TemplatePlaintext {
+            name: name.to_string(),
+            body: body.to_string(),
+        };
+        template::replace_template(&self.vault_path, engine, &plaintext)
     }
 
     /// List all templates stored in the vault.
@@ -802,10 +827,31 @@ mod tests {
         assert_eq!(got.name, "daily");
         assert_eq!(got.body, "## {{date}}");
 
+        // Duplicate creation still fails; replacement preserves identity.
+        assert!(matches!(
+            core.new_template("daily", "duplicate"),
+            Err(DiaryError::Template(_))
+        ));
+        core.replace_template("daily", "updated {{date}}")
+            .expect("replace_template");
+        assert_eq!(
+            core.get_template("daily").expect("replacement").body,
+            "updated {{date}}"
+        );
+        let replaced = core.list_templates().expect("templates after replacement");
+        assert_eq!(replaced.len(), 1);
+        assert_eq!(replaced[0].uuid_hex, uuid_hex);
+        assert_eq!(replaced[0].created_at, metas[0].created_at);
+
         // delete_template
         core.delete_template("daily").expect("delete_template");
         let metas2 = core.list_templates().expect("list_templates after delete");
         assert!(metas2.is_empty(), "list must be empty after delete");
+        core.lock();
+        assert!(matches!(
+            core.replace_template("daily", "locked"),
+            Err(DiaryError::NotUnlocked)
+        ));
     }
 
     // =========================================================================

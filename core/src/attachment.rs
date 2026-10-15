@@ -36,7 +36,7 @@ use crate::vault::writer::write_vault_with_attachments_authenticated;
 // ============================================================================
 
 /// Decrypted attachment metadata. Held in memory only while a vault is unlocked.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AttachmentPlaintext {
     pub entry_uuid: [u8; 16],
     pub blob_uuid: [u8; 16],
@@ -50,6 +50,13 @@ pub struct AttachmentPlaintext {
     /// Wrapped in `Zeroizing` because it never has another safe home: callers must take
     /// care not to clone it without re-wrapping.
     pub file_key: Zeroizing<[u8; 32]>,
+}
+
+// Redact all decrypted metadata, including the per-blob encryption key.
+impl std::fmt::Debug for AttachmentPlaintext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AttachmentPlaintext([REDACTED])")
+    }
 }
 
 /// CLI-friendly view of an attachment. Excludes `file_key` so logs and
@@ -74,7 +81,7 @@ pub struct AttachmentMeta {
 ///    "entry DESTROY cascades to attachments"),
 /// 2. reconstruct the AttachmentPlaintext under the new K_master (= K_legacy),
 /// 3. decrypt the `.attachments/<blob_uuid>.bin` body (`file_key`).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct AttachmentLegacyPlaintext {
     pub entry_uuid: [u8; 16],
     pub blob_uuid: [u8; 16],
@@ -84,6 +91,13 @@ pub(crate) struct AttachmentLegacyPlaintext {
     pub size_bytes: u64,
     pub chunk_count: u32,
     pub sha256: [u8; 32],
+}
+
+// Redact all decrypted metadata, including the per-blob encryption key.
+impl std::fmt::Debug for AttachmentLegacyPlaintext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AttachmentLegacyPlaintext([REDACTED])")
+    }
 }
 
 // ============================================================================
@@ -801,7 +815,7 @@ fn verify_master(
     header: &VaultHeader,
     master_pwd: &SecretString,
     params: &kdf::Argon2Params,
-) -> Result<[u8; 32], DiaryError> {
+) -> Result<Zeroizing<[u8; 32]>, DiaryError> {
     let key = kdf::derive_key(
         master_pwd.expose_secret().as_bytes(),
         &header.kdf_salt,
@@ -813,7 +827,7 @@ fn verify_master(
         &header.verification_ct,
     )
     .map_err(|_| DiaryError::Crypto("invalid master password".to_string()))?;
-    Ok(*key.as_ref())
+    Ok(Zeroizing::new(*key.as_ref()))
 }
 
 fn verify_hmac(expected: &[u8; 32], data: &[u8], key: &[u8; 32]) -> Result<(), DiaryError> {
@@ -1068,6 +1082,64 @@ mod tests {
         let p = dir.path().join(name);
         std::fs::write(&p, contents).unwrap();
         p
+    }
+
+    #[test]
+    fn verified_attachment_key_keeps_zeroizing_ownership() {
+        use zeroize::{Zeroize, ZeroizeOnDrop};
+        fn assert_protected<T: Zeroize + ZeroizeOnDrop>(_: &T) {}
+
+        let dir = tempdir().unwrap();
+        let vault = setup_vault(&dir, b"master-pw");
+        let (header, _, _) = read_vault_with_attachments(&vault.join("vault.pqd")).unwrap();
+        let expected = kdf::derive_key(b"master-pw", &header.kdf_salt, &fast_params()).unwrap();
+        let mut key = verify_master(&header, &secret("master-pw"), &fast_params()).unwrap();
+        assert_protected(&key);
+        assert_eq!(key.as_ref(), expected.as_ref());
+        // Inspect only live, explicitly zeroized memory; never freed allocations.
+        key.zeroize();
+        assert_eq!(*key, [0; 32]);
+        assert!(verify_master(&header, &secret("wrong-password"), &fast_params()).is_err());
+    }
+
+    #[test]
+    fn attachment_secret_debug_is_redacted() {
+        let pt = AttachmentPlaintext {
+            entry_uuid: [0x11; 16],
+            blob_uuid: [0x22; 16],
+            created_at: 1_700_000_000,
+            filename: "private-filename-sentinel".into(),
+            mime_type: "private-mime-sentinel".into(),
+            size_bytes: 12345,
+            chunk_count: 1,
+            sha256: [0x33; 32],
+            file_key: Zeroizing::new([0xEC; 32]),
+        };
+        let legacy = AttachmentLegacyPlaintext {
+            entry_uuid: pt.entry_uuid,
+            blob_uuid: pt.blob_uuid,
+            file_key: pt.file_key.clone(),
+            filename: pt.filename.clone(),
+            mime_type: pt.mime_type.clone(),
+            size_bytes: pt.size_bytes,
+            chunk_count: pt.chunk_count,
+            sha256: pt.sha256,
+        };
+        for (compact, pretty, expected) in [
+            (
+                format!("{pt:?}"),
+                format!("{pt:#?}"),
+                "AttachmentPlaintext([REDACTED])",
+            ),
+            (
+                format!("{legacy:?}"),
+                format!("{legacy:#?}"),
+                "AttachmentLegacyPlaintext([REDACTED])",
+            ),
+        ] {
+            assert_eq!(compact, expected);
+            assert_eq!(pretty, expected);
+        }
     }
 
     /// TC-S13-004-01: AttachmentPlaintext encode → decode round-trip.

@@ -867,6 +867,7 @@ fn crc32_ieee(data: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn fast_params() -> Argon2Params {
         Argon2Params {
@@ -1164,5 +1165,169 @@ mod tests {
 
         let result = decoded[0].unwrap_with_recipient_key(&recipient_kp.decapsulation_key);
         assert!(matches!(result, Err(DiaryError::Vault(_))));
+    }
+
+    // These are synthetic codec inputs, not usable keys or ciphertexts. Build
+    // the fields directly so generated cases never invoke Argon2 or keygen.
+    fn arbitrary_codec_slot() -> impl Strategy<Value = Keyslot> {
+        (
+            0u8..6,
+            any::<[u8; 16]>(),
+            any::<[u32; 3]>(),
+            any::<[u8; 32]>(),
+            any::<[u8; aead::NONCE_SIZE]>(),
+            any::<[u8; WRAPPED_MDK_SIZE]>(),
+            prop::collection::vec(any::<u8>(), kem::CIPHERTEXT_SIZE),
+            1usize..=64,
+            prop::collection::vec(any::<char>(), 0..=32),
+        )
+            .prop_map(
+                |(
+                    kind,
+                    slot_id,
+                    params,
+                    salt,
+                    wrap_iv,
+                    wrapped_mdk,
+                    mut kem_ct,
+                    hybrid_len,
+                    label,
+                )| {
+                    let (slot_type, kem_algorithm) = match kind {
+                        0 => (KeyslotType::Password, KemAlgorithm::None),
+                        1 => (KeyslotType::Recovery, KemAlgorithm::None),
+                        2 => (KeyslotType::PasswordKeyfile, KemAlgorithm::MlKem768),
+                        3 => (KeyslotType::Recipient, KemAlgorithm::MlKem768),
+                        4 => (KeyslotType::PasswordKeyfile, KemAlgorithm::MlKem768Hqc),
+                        _ => (KeyslotType::Recipient, KemAlgorithm::MlKem768Hqc),
+                    };
+                    match kem_algorithm {
+                        KemAlgorithm::None => kem_ct.clear(),
+                        KemAlgorithm::MlKem768 => {}
+                        KemAlgorithm::MlKem768Hqc => kem_ct.truncate(hybrid_len),
+                    }
+                    let recipient = slot_type == KeyslotType::Recipient;
+                    Keyslot {
+                        slot_type,
+                        slot_id,
+                        kdf_algorithm: if recipient {
+                            KdfAlgorithm::None
+                        } else {
+                            KdfAlgorithm::Argon2id
+                        },
+                        // Codec validation does not run the KDF. Preserve the
+                        // full u32 domain, including boundary values.
+                        kdf_params: if recipient {
+                            no_kdf_params()
+                        } else {
+                            Argon2Params {
+                                memory_cost_kb: params[0],
+                                time_cost: params[1],
+                                parallelism: params[2],
+                            }
+                        },
+                        salt: if recipient { [0u8; 32] } else { salt },
+                        kem_algorithm,
+                        kem_ct,
+                        wrap_iv,
+                        wrapped_mdk: wrapped_mdk.to_vec(),
+                        label: label.into_iter().collect(),
+                    }
+                },
+            )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 64,
+            max_shrink_iters: 1024,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn prop_keyslots_roundtrip(
+            slots in prop::collection::vec(arbitrary_codec_slot(), 0..=4),
+        ) {
+            let encoded = serialize_keyslots(&slots).expect("valid synthetic slots");
+            let decoded = parse_keyslots(&encoded).expect("serialized slots parse");
+            prop_assert_eq!(decoded, slots);
+        }
+
+        #[test]
+        fn prop_keyslot_rejects_internal_truncation(slot in arbitrary_codec_slot()) {
+            let encoded = serialize_keyslots(&[slot]).expect("valid synthetic slot");
+            // Empty sections and cuts BETWEEN complete slots are valid. Only
+            // cuts inside this single record are required to fail.
+            for cut in 1..encoded.len() {
+                prop_assert!(parse_keyslots(&encoded[..cut]).is_err(), "cut at {}", cut);
+                if cut >= 4 {
+                    // Repair the outer length too, so the parser reaches the
+                    // truncated inner field instead of rejecting at the envelope.
+                    let mut truncated = encoded[..cut].to_vec();
+                    let payload_len = u32::try_from(cut - 4).expect("bounded input");
+                    truncated[..4].copy_from_slice(&payload_len.to_le_bytes());
+                    prop_assert!(parse_keyslots(&truncated).is_err(), "inner cut at {}", cut);
+                }
+            }
+        }
+
+        #[test]
+        fn prop_keyslot_rejects_overstated_length(
+            slot in arbitrary_codec_slot(),
+            extra in 1u32..=1024,
+        ) {
+            let mut encoded = serialize_keyslots(&[slot]).expect("valid synthetic slot");
+            let payload_len = u32::try_from(encoded.len() - 4).expect("bounded input");
+            encoded[..4].copy_from_slice(&(payload_len + extra).to_le_bytes());
+            prop_assert!(parse_keyslots(&encoded).is_err());
+        }
+
+        #[test]
+        fn prop_keyslot_rejects_trailing_payload(
+            slot in arbitrary_codec_slot(),
+            trailing in prop::collection::vec(any::<u8>(), 1..=8),
+        ) {
+            let mut encoded = serialize_keyslots(&[slot]).expect("valid synthetic slot");
+            encoded.extend_from_slice(&trailing);
+            // Include the garbage in the declared payload, rather than
+            // accidentally testing a second record's missing length prefix.
+            let payload_len = u32::try_from(encoded.len() - 4).expect("bounded input");
+            encoded[..4].copy_from_slice(&payload_len.to_le_bytes());
+            prop_assert!(parse_keyslots(&encoded).is_err());
+        }
+
+        #[test]
+        fn prop_keyslot_rejects_unknown_type(
+            slot in arbitrary_codec_slot(),
+            invalid_tag in prop_oneof![Just(0u8), 5u8..=u8::MAX],
+        ) {
+            let mut encoded = serialize_keyslots(&[slot]).expect("valid synthetic slot");
+            encoded[4] = invalid_tag;
+            prop_assert!(parse_keyslots(&encoded).is_err());
+        }
+
+        #[test]
+        fn prop_keyslot_rejects_invalid_utf8(
+            mut slot in arbitrary_codec_slot(),
+            continuation_byte in 0x80u8..=0xBF,
+        ) {
+            slot.label = "x".to_string();
+            let mut encoded = serialize_keyslots(&[slot]).expect("valid synthetic slot");
+            // A one-byte label containing a continuation byte is never UTF-8.
+            *encoded.last_mut().expect("nonempty record") = continuation_byte;
+            prop_assert!(parse_keyslots(&encoded).is_err());
+        }
+
+        #[test]
+        fn prop_keyslots_arbitrary_bytes_do_not_panic(
+            bytes in prop::collection::vec(any::<u8>(), 0..=4096),
+        ) {
+            if let Ok(slots) = parse_keyslots(&bytes) {
+                // Accepted bytes must also be representable without losing
+                // information; rejection alone is not the only allowed result.
+                let encoded = serialize_keyslots(&slots).expect("parsed slots serialize");
+                prop_assert_eq!(encoded, bytes);
+            }
+        }
     }
 }

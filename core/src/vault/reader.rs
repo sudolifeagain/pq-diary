@@ -505,7 +505,14 @@ pub fn read_vault_with_attachments_authenticated(
 ) -> Result<(VaultHeader, Vec<EntryRecord>, Vec<AttachmentRecord>), DiaryError> {
     let data = std::fs::read(path)?;
     verify_vault_integrity_bytes(&data, mac_key)?;
-    let mut cursor = io::Cursor::new(&data);
+    read_vault_with_attachments_from_bytes(&data)
+}
+
+/// Parse the same encrypted snapshot that a caller authenticates before use.
+pub(crate) fn read_vault_with_attachments_from_bytes(
+    data: &[u8],
+) -> Result<(VaultHeader, Vec<EntryRecord>, Vec<AttachmentRecord>), DiaryError> {
+    let mut cursor = io::Cursor::new(data);
     let header = read_header(&mut cursor)?;
     let (entries, attachments) = read_records(&mut cursor)?;
     Ok((header, entries, attachments))
@@ -652,6 +659,40 @@ mod tests {
     /// The vault MAC subkey derived from a fixed non-zero test master key.
     fn test_mac_key() -> [u8; 32] {
         *crate::crypto::derive_vault_mac_key(&[0x5Au8; 32]).expect("derive mac key")
+    }
+
+    #[test]
+    fn snapshot_integrity_rejects_tampering_after_path_is_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.pqd");
+        let mac = test_mac_key();
+        let entry = make_test_entry();
+        crate::vault::writer::write_vault_authenticated(
+            &path,
+            VaultHeader::new(),
+            std::slice::from_ref(&entry),
+            &mac,
+        )
+        .unwrap();
+        let authentic = std::fs::read(&path).unwrap();
+        let mut tampered = authentic.clone();
+        let mut cursor = io::Cursor::new(&tampered);
+        read_header(&mut cursor).unwrap();
+        let timestamp_offset = cursor.position() as usize + 4 + 1 + 16 + 8;
+        tampered[timestamp_offset] ^= 1;
+        std::fs::write(&path, &tampered).unwrap();
+
+        let snapshot = std::fs::read(&path).unwrap();
+        let (_, entries, _) = read_vault_with_attachments_from_bytes(&snapshot).unwrap();
+        assert_ne!(entries[0].updated_at, entry.updated_at);
+        // Model replacement after parsing but before the password-derived MAC check.
+        std::fs::write(&path, &authentic).unwrap();
+        verify_vault_integrity(&path, &mac).unwrap();
+        assert!(matches!(
+            verify_vault_integrity_bytes(&snapshot, &mac),
+            Err(DiaryError::Crypto(_))
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), authentic);
     }
 
     /// TC-S15-INTEG-01: an authenticated vault verifies, and read_vault still

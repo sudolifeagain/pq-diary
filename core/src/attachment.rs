@@ -28,7 +28,7 @@ use crate::vault::format::{
     generate_entry_padding, AttachmentRecord, EntryRecord, VaultHeader, MAX_ATTACHMENTS_PER_ENTRY,
     MAX_ATTACHMENT_SIZE_BYTES, RECORD_TYPE_ATTACHMENT, RECORD_TYPE_ENTRY,
 };
-use crate::vault::reader::read_vault_with_attachments;
+use crate::vault::reader::read_vault_with_attachments_from_bytes;
 use crate::vault::writer::write_vault_with_attachments_authenticated;
 
 // ============================================================================
@@ -198,9 +198,12 @@ pub fn add_attachment(
     let vault_pqd = vault_dir.join("vault.pqd");
     let vault_toml = vault_dir.join("vault.toml");
     let config = VaultConfig::from_file(&vault_toml)?;
-    let (mut header, mut entries, mut attachments) = read_vault_with_attachments(&vault_pqd)?;
+    let vault_bytes = std::fs::read(&vault_pqd)?;
+    let (mut header, mut entries, mut attachments) =
+        read_vault_with_attachments_from_bytes(&vault_bytes)?;
     let params = argon2_params_from(&config);
-    let k_master = verify_master(&header, master_pwd, &params)?;
+    let k_master = verify_master(&vault_bytes, &header, master_pwd, &params)?;
+    drop(vault_bytes);
     let dsa_seed = decrypt_blob(&k_master, &header.dsa_encrypted_sk, "DSA")?;
 
     // Resolve entry by ID prefix.
@@ -368,9 +371,11 @@ pub fn list_attachments(
     let vault_pqd = vault_dir.join("vault.pqd");
     let vault_toml = vault_dir.join("vault.toml");
     let config = VaultConfig::from_file(&vault_toml)?;
-    let (header, entries, attachments) = read_vault_with_attachments(&vault_pqd)?;
+    let vault_bytes = std::fs::read(&vault_pqd)?;
+    let (header, entries, attachments) = read_vault_with_attachments_from_bytes(&vault_bytes)?;
     let params = argon2_params_from(&config);
-    let k_master = verify_master(&header, master_pwd, &params)?;
+    let k_master = verify_master(&vault_bytes, &header, master_pwd, &params)?;
+    drop(vault_bytes);
 
     let filter_uuid = match entry_id_prefix {
         Some(p) => Some(find_unique_entry(&entries, p).map(|i| entries[i].uuid)?),
@@ -414,9 +419,11 @@ pub fn extract_attachment(
     let vault_pqd = vault_dir.join("vault.pqd");
     let vault_toml = vault_dir.join("vault.toml");
     let config = VaultConfig::from_file(&vault_toml)?;
-    let (header, entries, attachments) = read_vault_with_attachments(&vault_pqd)?;
+    let vault_bytes = std::fs::read(&vault_pqd)?;
+    let (header, entries, attachments) = read_vault_with_attachments_from_bytes(&vault_bytes)?;
     let params = argon2_params_from(&config);
-    let k_master = verify_master(&header, master_pwd, &params)?;
+    let k_master = verify_master(&vault_bytes, &header, master_pwd, &params)?;
+    drop(vault_bytes);
 
     let entry_idx = find_unique_entry(&entries, entry_id_prefix)?;
     let entry_uuid = entries[entry_idx].uuid;
@@ -464,9 +471,12 @@ pub fn delete_attachment(
     let vault_pqd = vault_dir.join("vault.pqd");
     let vault_toml = vault_dir.join("vault.toml");
     let config = VaultConfig::from_file(&vault_toml)?;
-    let (header, mut entries, mut attachments) = read_vault_with_attachments(&vault_pqd)?;
+    let vault_bytes = std::fs::read(&vault_pqd)?;
+    let (header, mut entries, mut attachments) =
+        read_vault_with_attachments_from_bytes(&vault_bytes)?;
     let params = argon2_params_from(&config);
-    let k_master = verify_master(&header, master_pwd, &params)?;
+    let k_master = verify_master(&vault_bytes, &header, master_pwd, &params)?;
+    drop(vault_bytes);
 
     let entry_idx = find_unique_entry(&entries, entry_id_prefix)?;
     let entry_uuid = entries[entry_idx].uuid;
@@ -532,9 +542,11 @@ pub fn set_attachment_legacy_flag(
             "legacy not initialized — run `pq-diary legacy init` first".to_string(),
         ));
     }
-    let (header, entries, mut attachments) = read_vault_with_attachments(&vault_pqd)?;
+    let vault_bytes = std::fs::read(&vault_pqd)?;
+    let (header, entries, mut attachments) = read_vault_with_attachments_from_bytes(&vault_bytes)?;
     let params = argon2_params_from(&config);
-    let _k_master = verify_master(&header, master_pwd, &params)?;
+    let _k_master = verify_master(&vault_bytes, &header, master_pwd, &params)?;
+    drop(vault_bytes);
 
     let entry_idx = find_unique_entry(&entries, entry_id_prefix)?;
     let entry_uuid = entries[entry_idx].uuid;
@@ -798,10 +810,11 @@ fn argon2_params_from(config: &VaultConfig) -> kdf::Argon2Params {
 }
 
 fn verify_master(
+    vault_bytes: &[u8],
     header: &VaultHeader,
     master_pwd: &SecretString,
     params: &kdf::Argon2Params,
-) -> Result<[u8; 32], DiaryError> {
+) -> Result<Zeroizing<[u8; 32]>, DiaryError> {
     let key = kdf::derive_key(
         master_pwd.expose_secret().as_bytes(),
         &header.kdf_salt,
@@ -813,7 +826,11 @@ fn verify_master(
         &header.verification_ct,
     )
     .map_err(|_| DiaryError::Crypto("invalid master password".to_string()))?;
-    Ok(*key.as_ref())
+    // Direct module callers must authenticate the vault before trusting its
+    // records or creating side effects; they do not pass through DiaryCore::unlock.
+    let mac_key = crate::crypto::derive_vault_mac_key(key.as_ref())?;
+    crate::vault::reader::verify_vault_integrity_bytes(vault_bytes, &mac_key)?;
+    Ok(Zeroizing::new(*key.as_ref()))
 }
 
 fn verify_hmac(expected: &[u8; 32], data: &[u8], key: &[u8; 32]) -> Result<(), DiaryError> {
@@ -1027,6 +1044,7 @@ mod tests {
     use crate::crypto::kdf::Argon2Params;
     use crate::legacy::Argon2LegacyDeriver;
     use crate::vault::init::VaultManager;
+    use crate::vault::reader::read_vault_with_attachments;
     use crate::DiaryCore;
     use secrecy::SecretBox;
     use tempfile::tempdir;
@@ -1068,6 +1086,159 @@ mod tests {
         let p = dir.path().join(name);
         std::fs::write(&p, contents).unwrap();
         p
+    }
+
+    fn assert_tampered_vault_rejected(tamper_timestamp: bool) {
+        for operation in ["add", "delete", "set legacy flag", "list", "extract"] {
+            let dir = tempdir().unwrap();
+            let (vault_dir, entry_id) = vault_with_entry(&dir);
+            let pwd = secret("master-pw");
+            crate::legacy::initialize_legacy(
+                &vault_dir,
+                &pwd,
+                &secret("legacy-code"),
+                crate::vault::config::ConfirmationMode::Yn,
+                &fast_deriver(),
+            )
+            .unwrap();
+            let src = write_source(&dir, "original.txt", b"original attachment");
+            add_attachment(&vault_dir, &pwd, &entry_id, &src).unwrap();
+            let meta = list_attachments(&vault_dir, &pwd, None).unwrap().remove(0);
+            let blob = blob_path(&vault_dir, &meta.blob_uuid);
+            let blob_before = std::fs::read(&blob).unwrap();
+            let src_new = write_source(&dir, "new.txt", b"new attachment");
+            let out = write_source(&dir, "output.txt", b"existing output");
+
+            let vault_path = vault_dir.join("vault.pqd");
+            let config_before = std::fs::read(vault_dir.join("vault.toml")).unwrap();
+            let mut bytes = std::fs::read(&vault_path).unwrap();
+            let mut cursor = std::io::Cursor::new(&bytes);
+            let header = crate::vault::reader::read_header(&mut cursor).unwrap();
+            let key = kdf::derive_key(b"master-pw", &header.kdf_salt, &fast_params()).unwrap();
+            let mac_key = crate::crypto::derive_vault_mac_key(key.as_ref()).unwrap();
+            crate::vault::reader::verify_vault_integrity(&vault_path, &mac_key).unwrap();
+            let offset = if tamper_timestamp {
+                // First entry: length prefix + record type + UUID + created_at.
+                cursor.position() as usize + 4 + 1 + 16 + 8
+            } else {
+                bytes.len() - 1
+            };
+            bytes[offset] ^= 1;
+            std::fs::write(&vault_path, &bytes).unwrap();
+            assert!(crate::vault::reader::verify_vault_integrity(&vault_path, &mac_key).is_err());
+
+            let result = match operation {
+                "add" => add_attachment(&vault_dir, &pwd, &entry_id, &src_new).map(|_| ()),
+                "delete" => delete_attachment(&vault_dir, &pwd, &entry_id, "original.txt"),
+                "set legacy flag" => set_attachment_legacy_flag(
+                    &vault_dir,
+                    &pwd,
+                    Some(&secret("legacy-code")),
+                    &entry_id,
+                    "original.txt",
+                    LegacyFlag::Inherit,
+                    &fast_deriver(),
+                ),
+                "list" => list_attachments(&vault_dir, &pwd, None).map(|_| ()),
+                "extract" => extract_attachment(&vault_dir, &pwd, &entry_id, "original.txt", &out),
+                _ => unreachable!(),
+            };
+            assert!(
+                matches!(&result, Err(DiaryError::Crypto(message)) if message.contains("vault integrity")),
+                "{operation} accepted or misclassified corruption: {result:?}; post-operation MAC valid: {}",
+                crate::vault::reader::verify_vault_integrity(&vault_path, &mac_key).is_ok()
+            );
+            assert_eq!(std::fs::read(&vault_path).unwrap(), bytes, "{operation}");
+            assert_eq!(
+                std::fs::read(vault_dir.join("vault.toml")).unwrap(),
+                config_before,
+                "{operation}"
+            );
+            assert_eq!(std::fs::read(&blob).unwrap(), blob_before, "{operation}");
+            assert_eq!(
+                std::fs::read_dir(attachments_dir(&vault_dir))
+                    .unwrap()
+                    .count(),
+                1
+            );
+            assert_eq!(std::fs::read(&out).unwrap(), b"existing output");
+            assert!(!with_extension(&out, "pq-diary.tmp").exists());
+            assert!(!vault_dir.join("vault.pqd.tmp").exists());
+        }
+    }
+
+    #[test]
+    fn attachment_apis_reject_tampered_mac_without_side_effects() {
+        assert_tampered_vault_rejected(false);
+    }
+
+    #[test]
+    fn attachment_apis_reject_tampered_timestamp_without_side_effects() {
+        assert_tampered_vault_rejected(true);
+    }
+
+    #[test]
+    fn master_password_mutations_migrate_flag_clear_vaults() {
+        use crate::vault::format::{FLAG_INTEGRITY, SCHEMA_VERSION, VAULT_MAC_LEN};
+
+        for version in 0x04..=SCHEMA_VERSION {
+            for operation in ["attachment", "legacy", "password"] {
+                let dir = tempdir().unwrap();
+                let (vault_dir, entry_id) = vault_with_entry(&dir);
+                let pwd = secret("master-pw");
+                crate::legacy::initialize_legacy(
+                    &vault_dir,
+                    &pwd,
+                    &secret("legacy-code"),
+                    crate::vault::config::ConfirmationMode::Yn,
+                    &fast_deriver(),
+                )
+                .unwrap();
+                let vault_path = vault_dir.join("vault.pqd");
+                let mut bytes = std::fs::read(&vault_path).unwrap();
+                assert_ne!(bytes[9] & FLAG_INTEGRITY, 0);
+                bytes.truncate(bytes.len() - VAULT_MAC_LEN);
+                bytes[8] = version;
+                bytes[9] &= !FLAG_INTEGRITY;
+                std::fs::write(&vault_path, &bytes).unwrap();
+
+                let expected_password = match operation {
+                    "attachment" => {
+                        let source = write_source(&dir, "new.txt", b"new attachment");
+                        add_attachment(&vault_dir, &pwd, &entry_id, &source).unwrap();
+                        "master-pw"
+                    }
+                    "legacy" => {
+                        crate::legacy::set_entry_flag(
+                            &vault_dir,
+                            &pwd,
+                            None,
+                            &entry_id,
+                            LegacyFlag::Destroy,
+                            &fast_deriver(),
+                        )
+                        .unwrap();
+                        "master-pw"
+                    }
+                    "password" => {
+                        crate::vault::change_password::re_encrypt_vault(
+                            &vault_dir,
+                            &pwd,
+                            &secret("new-master"),
+                        )
+                        .unwrap();
+                        "new-master"
+                    }
+                    _ => unreachable!(),
+                };
+                let (header, _, _) = read_vault_with_attachments(&vault_path).unwrap();
+                assert_eq!(header.schema_version, SCHEMA_VERSION);
+                assert_ne!(header.flags & FLAG_INTEGRITY, 0);
+                let mut core = DiaryCore::new(vault_path.to_str().unwrap()).unwrap();
+                core.unlock(secret(expected_password)).unwrap();
+                assert_eq!(core.list_entries(None).unwrap()[0].title, "title");
+            }
+        }
     }
 
     /// TC-S13-004-01: AttachmentPlaintext encode → decode round-trip.

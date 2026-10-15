@@ -31,12 +31,19 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 ///
 /// The struct derives `Zeroize` and `ZeroizeOnDrop` because template content
 /// is considered secret data that must be erased from memory when no longer needed.
-#[derive(Debug, Serialize, Deserialize, PartialEq, Zeroize, ZeroizeOnDrop)]
+/// Debug output redacts all fields.
+#[derive(Serialize, Deserialize, PartialEq, Zeroize, ZeroizeOnDrop)]
 pub struct TemplatePlaintext {
     /// Template name (unique identifier within a vault).
     pub name: String,
     /// Template body text (Markdown, may contain `{{var_name}}` variables).
     pub body: String,
+}
+
+impl std::fmt::Debug for TemplatePlaintext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TemplatePlaintext([REDACTED])")
+    }
 }
 
 /// Template metadata for list display.
@@ -342,6 +349,26 @@ mod tests {
         vault::{format::VaultHeader, writer::write_vault},
     };
     use tempfile::tempdir;
+
+    #[test]
+    fn test_template_plaintext_debug_redacts_contents() {
+        let secrets = ["TEMPLATE_NAME_SENTINEL", "TEMPLATE_BODY_SENTINEL"];
+        let plaintext = TemplatePlaintext {
+            name: secrets[0].to_string(),
+            body: secrets[1].to_string(),
+        };
+
+        for debug in [format!("{plaintext:?}"), format!("{plaintext:#?}")] {
+            for secret in secrets {
+                assert!(
+                    !debug.contains(secret),
+                    "Debug must redact plaintext fields"
+                );
+            }
+            assert!(debug.contains("TemplatePlaintext"));
+            assert!(debug.contains("[REDACTED]"));
+        }
+    }
 
     /// Build a CryptoEngine with a fresh DSA key pair for testing.
     fn make_test_engine() -> CryptoEngine {

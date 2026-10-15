@@ -775,7 +775,7 @@ fn extract_frontmatter_tags(fm: &str) -> Result<Vec<String>, DiaryError> {
 /// # Errors
 ///
 /// Returns [`DiaryError::Import`] if the regex fails to compile.
-fn convert_wiki_links(body: &str) -> Result<(String, usize), DiaryError> {
+fn convert_wiki_links(body: &str) -> Result<(Zeroizing<String>, usize), DiaryError> {
     let re = WIKI_LINK_RE
         .as_ref()
         .map_err(|e| DiaryError::Import(format!("wiki-link regex: {e}")))?;
@@ -798,7 +798,7 @@ fn convert_wiki_links(body: &str) -> Result<(String, usize), DiaryError> {
         format!("[[{title}]]")
     });
 
-    Ok((result.into_owned(), count))
+    Ok((Zeroizing::new(result.into_owned()), count))
 }
 
 /// Extract inline `#tag` notation from body text.
@@ -867,6 +867,21 @@ fn extract_tags(body: &str) -> Result<(Vec<String>, String, usize), DiaryError> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rewritten_body_stays_guarded_through_tag_extraction() {
+        fn assert_guard(_: &Zeroizing<String>) {}
+        let (mut body, links) = convert_wiki_links("PRIVATE [[note|alias]] #tag").unwrap();
+        assert_guard(&body);
+        assert_eq!(links, 1);
+        assert_eq!(body.as_str(), "PRIVATE [[note]] #tag");
+        let (tags, cleaned, count) = extract_tags(&body).unwrap();
+        assert_eq!(tags, vec!["tag"]);
+        assert_eq!(count, 1);
+        assert_eq!(cleaned, "PRIVATE [[note]] ");
+        body.zeroize();
+        assert!(body.is_empty());
+    }
+
     use super::*;
     use crate::{
         crypto::kdf::Argon2Params,

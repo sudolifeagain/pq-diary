@@ -553,12 +553,6 @@ impl VaultManager {
         self.set_policy_with_writer(name, policy, |file, content| {
             use std::io::Write;
             file.write_all(content)?;
-            // Match VaultConfig::to_file: keep the replacement owner-only.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-            }
             file.sync_all()
         })
     }
@@ -589,26 +583,10 @@ impl VaultManager {
         config.access.policy = policy;
         let new_content = toml::to_string_pretty(&config)
             .map_err(|e| DiaryError::Config(format!("failed to serialize vault.toml: {}", e)))?;
-        let tmp_path = toml_path.with_extension("toml.tmp");
-        // Refuse existing files and symlinks; never overwrite or clean up a
-        // temporary path this operation did not successfully create.
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&tmp_path)?;
-        let write_result = write_config(&mut file, new_content.as_bytes());
-        // Close before rename or cleanup, including on Windows.
-        drop(file);
-        let replace_result = write_result.and_then(|()| std::fs::rename(&tmp_path, &toml_path));
-        if let Err(error) = replace_result {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(DiaryError::Io(error));
-        }
-        Ok(())
+        super::atomic_file::write_atomic(&toml_path, |file| {
+            write_config(file, new_content.as_bytes())?;
+            Ok(())
+        })
     }
 
     /// Delete vault `name` and its entire directory tree.
@@ -1136,7 +1114,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn vault_safety_policy_refuses_linked_config_or_temporary_file() {
+    fn vault_safety_policy_refuses_linked_config_and_ignores_old_temporary_symlink() {
         use std::os::unix::fs::symlink;
         for filename in ["vault.toml", "vault.toml.tmp"] {
             let dir = tempdir().expect("tempdir");
@@ -1154,11 +1132,19 @@ mod tests {
             symlink(&outside, &target).expect("symlink config");
             let result = mgr.set_policy("safe", AccessPolicy::Full);
             assert_eq!(std::fs::read(&outside).expect("outside after"), original);
-            assert_eq!(
-                std::fs::read(vault.join("vault.toml")).expect("config after"),
-                original
-            );
-            assert!(result.is_err(), "must reject {filename}");
+            if filename == "vault.toml" {
+                assert_eq!(std::fs::read(vault.join("vault.toml")).unwrap(), original);
+                assert!(result.is_err(), "must reject linked config");
+            } else {
+                result.expect("unused old temporary symlink must not block replacement");
+                assert_eq!(
+                    VaultConfig::from_file(&vault.join("vault.toml"))
+                        .unwrap()
+                        .access
+                        .policy,
+                    AccessPolicy::Full
+                );
+            }
             assert!(target.is_symlink());
         }
     }
@@ -1196,18 +1182,20 @@ mod tests {
         let vault = dir.path().join("safe");
         let mgr = VaultManager::new(dir.path().to_path_buf()).expect("manager");
         safety_vault(&vault);
-        let original = std::fs::read(vault.join("vault.toml")).expect("original config");
         let temporary = vault.join("vault.toml.tmp");
         std::fs::write(&temporary, b"someone else's temporary data").expect("temporary sentinel");
         let result = mgr.set_policy("safe", AccessPolicy::Full);
-        assert!(matches!(result, Err(DiaryError::Io(_))));
+        result.expect("unused old temporary file must not block replacement");
         assert_eq!(
             std::fs::read(&temporary).expect("temporary after"),
             b"someone else's temporary data"
         );
         assert_eq!(
-            std::fs::read(vault.join("vault.toml")).expect("config after"),
-            original
+            VaultConfig::from_file(&vault.join("vault.toml"))
+                .unwrap()
+                .access
+                .policy,
+            AccessPolicy::Full
         );
     }
 
@@ -1237,6 +1225,11 @@ mod tests {
             !vault.join("vault.toml.tmp").exists(),
             "owned temporary file must be cleaned up"
         );
+        assert!(std::fs::read_dir(&vault).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("vault.toml.tmp.")));
         mgr.set_policy("safe", AccessPolicy::WriteOnly)
             .expect("normal retry must succeed");
         assert_eq!(

@@ -5,7 +5,10 @@
 //! TOML serialisation/deserialisation and file I/O helpers.
 
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+
+use super::atomic_file::write_atomic;
 
 use crate::error::DiaryError;
 use crate::policy::AccessPolicy;
@@ -164,26 +167,28 @@ impl VaultConfig {
 
     /// Serialise this [`VaultConfig`] as pretty TOML and write it to `path`.
     ///
-    /// On Unix the file permission is set to `0o600` after writing so that other
+    /// On Unix the replacement is created with `0o600` before writing so that other
     /// local users cannot read the vault metadata — Argon2 parameters, vault
     /// name, git author identity, and the base64 legacy verification token
     /// (REQ-611, audit M1). This matches [`AppConfig::to_file`]. On Windows the
     /// default ACL (owner-only inside the user profile) is left untouched.
     ///
+    /// A unique sibling is synced before replacement. Failures preserve the old
+    /// file; a final-component symlink is replaced, never followed. This is not
+    /// a crash-durability guarantee. Existing TOML comments are not preserved.
+    ///
     /// # Errors
     ///
     /// Returns [`DiaryError::Config`] on serialisation failures and
-    /// [`DiaryError::Io`] on file-write or permission-set failures.
+    /// [`DiaryError::Io`] on file creation, write, sync, or replacement failures.
     pub fn to_file(&self, path: &Path) -> Result<(), DiaryError> {
         let content =
             toml::to_string_pretty(self).map_err(|e| DiaryError::Config(e.to_string()))?;
-        std::fs::write(path, content)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        }
-        Ok(())
+        write_atomic(path, |file| {
+            file.write_all(content.as_bytes())?;
+            file.sync_all()?;
+            Ok(())
+        })
     }
 }
 
@@ -298,24 +303,26 @@ impl AppConfig {
 
     /// Serialise this [`AppConfig`] as TOML and write it to `path`.
     ///
-    /// On Unix the file permission is set to `0o600` after writing so that
+    /// On Unix the replacement is created with `0o600` before writing so that
     /// only the owner can read or modify the configuration (REQ-611).
     /// On Windows the default ACL (owner-only by default in the user's
     /// home directory) is left untouched.
     ///
+    /// A unique sibling is synced before replacement. Failures preserve the old
+    /// file; a final-component symlink is replaced, never followed. This is not
+    /// a crash-durability guarantee. Existing TOML comments are not preserved.
+    ///
     /// # Errors
     ///
     /// Returns [`DiaryError::Config`] on TOML serialisation failures and
-    /// [`DiaryError::Io`] on file-write or permission-set failures.
+    /// [`DiaryError::Io`] on file creation, write, sync, or replacement failures.
     pub fn to_file(&self, path: &Path) -> Result<(), DiaryError> {
         let content = toml::to_string(self).map_err(|e| DiaryError::Config(e.to_string()))?;
-        std::fs::write(path, content)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        }
-        Ok(())
+        write_atomic(path, |file| {
+            file.write_all(content.as_bytes())?;
+            file.sync_all()?;
+            Ok(())
+        })
     }
 }
 
@@ -327,6 +334,151 @@ impl AppConfig {
 mod tests {
     use super::*;
     use crate::policy::AccessPolicy;
+
+    // Limit only a child process: no unsafe calls or process-global test changes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn config_write_failure_preserves_original_and_retries() {
+        const CHILD_PATH: &str = "PQ_DIARY_CONFIG_FAILURE_TEST_PATH";
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            let path = std::path::PathBuf::from(path);
+            let before = std::fs::read(&path).unwrap();
+            let result = if path.file_name().unwrap() == "vault.toml" {
+                let mut config = VaultConfig::default();
+                config.git.author_name = "synthetic".repeat(8192);
+                config.to_file(&path)
+            } else {
+                let mut config = AppConfig::default();
+                config.app.default_vault = "synthetic".repeat(8192);
+                config.to_file(&path)
+            };
+            assert!(matches!(result, Err(DiaryError::Io(_))));
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["vault.toml", "config.toml"] {
+            let path = dir.path().join(name);
+            if name == "vault.toml" {
+                VaultConfig::default().to_file(&path).unwrap();
+            } else {
+                AppConfig::default().to_file(&path).unwrap();
+            }
+            let output = std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    "ulimit -f 1; trap '' XFSZ; exec \"$@\"",
+                    "config-test",
+                ])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "config_write_failure_preserves_original_and_retries",
+                    "--nocapture",
+                ])
+                .env(CHILD_PATH, &path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child failed: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if name == "vault.toml" {
+                assert_eq!(
+                    VaultConfig::from_file(&path).unwrap(),
+                    VaultConfig::default()
+                );
+                VaultConfig::default().to_file(&path).unwrap();
+            } else {
+                assert_eq!(AppConfig::from_file(&path).unwrap(), AppConfig::default());
+                AppConfig::default().to_file(&path).unwrap();
+            }
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn config_rename_failure_preserves_destination_and_cleans_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["vault.toml", "config.toml"] {
+            let path = dir.path().join(name);
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(path.join("keep"), b"original").unwrap();
+            let result = if name == "vault.toml" {
+                VaultConfig::default().to_file(&path)
+            } else {
+                AppConfig::default().to_file(&path)
+            };
+            assert!(matches!(result, Err(DiaryError::Io(_))));
+            assert_eq!(std::fs::read(path.join("keep")).unwrap(), b"original");
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_replacement_does_not_follow_destination_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, vault) in [("vault.toml", true), ("config.toml", false)] {
+            let path = dir.path().join(name);
+            let outside = dir.path().join(format!("outside-{name}"));
+            std::fs::write(&outside, b"unrelated original bytes").unwrap();
+            std::os::unix::fs::symlink(&outside, &path).unwrap();
+            if vault {
+                VaultConfig::default().to_file(&path).unwrap();
+                VaultConfig::from_file(&path).unwrap();
+            } else {
+                AppConfig::default().to_file(&path).unwrap();
+                AppConfig::from_file(&path).unwrap();
+            }
+            assert_eq!(
+                std::fs::read(&outside).unwrap(),
+                b"unrelated original bytes"
+            );
+            assert!(!path.is_symlink());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_config_write_to_keeps_reserved_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let reserved = dir.path().join("reserved.toml");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        std::fs::rename(&path, &reserved).unwrap();
+        std::fs::write(&path, b"unowned replacement").unwrap();
+        AppConfig::default().write_to(&mut file).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        assert_eq!(
+            AppConfig::from_file(&reserved).unwrap(),
+            AppConfig::default()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"unowned replacement");
+    }
+
+    #[test]
+    fn config_writes_leave_predictable_temporary_files_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, vault) in [("vault.toml", true), ("config.toml", false)] {
+            let path = dir.path().join(name);
+            let old_temp = dir.path().join(format!("{name}.tmp"));
+            std::fs::write(&old_temp, b"unowned temporary").unwrap();
+            if vault {
+                VaultConfig::default().to_file(&path).unwrap();
+            } else {
+                AppConfig::default().to_file(&path).unwrap();
+            }
+            assert_eq!(std::fs::read(&old_temp).unwrap(), b"unowned temporary");
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 4);
+    }
 
     #[test]
     fn app_config_writer_roundtrips_and_propagates_io_failure() {

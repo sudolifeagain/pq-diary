@@ -7,6 +7,7 @@
 //! - `reader`: vault.pqd deserialisation (header and entry-record parsing)
 //! - `writer`: vault.pqd serialisation (header and entry-record writing)
 
+mod atomic_file;
 mod slice_reader;
 
 /// Master-password change: re-encrypt all entries with a new symmetric key.

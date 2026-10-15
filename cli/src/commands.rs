@@ -2841,9 +2841,6 @@ fn cmd_export_impl(
     use secrecy::{ExposeSecret as _, SecretBox};
     use std::io::Write as _;
 
-    // Export also reads attachments through directory-only core APIs.
-    let vault_dir = resolve_legacy_vault_dir(cli)?;
-
     if cli.claude {
         anyhow::bail!("export is not permitted with --claude");
     }
@@ -2851,6 +2848,10 @@ fn cmd_export_impl(
     if !dir.exists() {
         anyhow::bail!("Directory does not exist: {}", dir.display());
     }
+
+    // Preserve policy/output preflight errors before loading configuration,
+    // while rejecting unsupported vault targets before any plaintext writes.
+    let vault_dir = resolve_legacy_vault_dir(cli)?;
 
     eprint!(
         "平文を {} に書き出します。続行しますか? [y/N]: ",

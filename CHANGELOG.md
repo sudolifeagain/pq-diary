@@ -11,6 +11,8 @@ the **History** table at the bottom for git-tag pointers.
 ## [Unreleased]
 
 ### Security (review follow-up)
+- Direct attachment and master-password legacy APIs verify vault integrity before using records or changing files; these APIs and password rotation authenticate the same byte snapshot they parse.
+- Keep attachment API master-key copies in zeroize-on-drop storage through success and error paths.
 - Update locked anyhow to 1.0.103 and rand to 0.8.6 for RUSTSEC-2026-0190 / RUSTSEC-2026-0097; replace yanked der 0.8.0 with 0.8.2.
 - Fail dependency audits on unsound advisories and yanked crates as well as vulnerabilities.
 
@@ -47,6 +49,22 @@ Phase 2 中核 (legacy / attachments) を完了。残候補は Bases like ビュ
 - `CHANGELOG.md` 新規 (S14 棚卸し)。
 - `docs/backlog.md` 古い `[ ]` 表現を実装状態に補正 (S4 / S5 全項目、M-5 / H-3、S13 v4 → v5 と Phase 4 v5 → v6 の整理)。
 - `requirements.md` を v5 対応に更新 (§6 / §5.4 / §Phase 4)。
+
+### Git sync safety
+
+- Pull validates fetched vault bytes without checking them out into the local
+  vault/index. Incompatible headers/keys or `vault.toml` changes are rejected
+  before local data is changed
+- Git reads authenticate and parse the same snapshot; writes use its validated
+  records without reopening the destination for attachment metadata
+- Push and pull reject attachment-bearing vaults until attachment metadata and
+  encrypted blob sync are supported together
+- Push and pull commit only their allowlisted vault paths, keeping unrelated
+  staged files out of published history
+- Pull preserves existing recovery backups; a failed commit restores the local
+  vault without changing its original index
+- Remote ancestry and deletion reconciliation remain open work; an ordinary
+  push after a remote advance can still fail with a non-fast-forward rejection
 
 ### Phase 1 (完了済み)
 

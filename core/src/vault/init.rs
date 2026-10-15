@@ -3,7 +3,7 @@
 //! Provides `VaultManager`, which manages the on-disk directory tree for all
 //! pq-diary vaults under a single base directory (typically `~/.pq-diary/`).
 
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
@@ -114,11 +114,14 @@ impl VaultManager {
     ///
     /// # Errors
     ///
+    /// Returns [`DiaryError::InvalidArgument`] if the name is invalid.
     /// Returns [`DiaryError::Vault`] if a vault named `name` already exists.
     /// Returns [`DiaryError::Password`] if `password` is empty.
     /// Returns [`DiaryError::Io`] on filesystem failures.
     /// Returns [`DiaryError::Crypto`] on key derivation or encryption failures.
     pub fn init_vault(&self, name: &str, password: &[u8]) -> Result<(), DiaryError> {
+        Self::validate_vault_name(name)?;
+
         // Guard: refuse empty password.
         if password.is_empty() {
             return Err(DiaryError::Password(
@@ -129,11 +132,15 @@ impl VaultManager {
         let vault_dir = self.base_dir.join(name);
 
         // Guard: refuse to clobber an existing vault directory.
-        if vault_dir.exists() {
-            return Err(DiaryError::Vault(format!(
-                "vault '{}' already exists",
-                name
-            )));
+        match std::fs::symlink_metadata(&vault_dir) {
+            Ok(_) => {
+                return Err(DiaryError::Vault(format!(
+                    "vault '{}' already exists",
+                    name
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(DiaryError::Io(error)),
         }
 
         // Create vault root and entries sub-directory in one shot.
@@ -210,8 +217,9 @@ impl VaultManager {
 
     /// Validate a vault name for use as a filesystem directory name.
     ///
-    /// Rejects empty strings, path-traversal patterns (`/`, `\`, `..`), and
-    /// filesystem-invalid characters (`:`, `*`, `?`, `"`, `<`, `>`, `|`).
+    /// Requires exactly one normal path component. Rejects empty strings,
+    /// dot names, path-traversal patterns (`/`, `\`, `..`), control characters,
+    /// and filesystem-invalid characters (`:`, `*`, `?`, `"`, `<`, `>`, `|`).
     ///
     /// # Errors
     ///
@@ -222,12 +230,25 @@ impl VaultManager {
                 "vault name must not be empty".into(),
             ));
         }
-        if name.contains('/') || name.contains('\\') || name.contains("..") {
+        #[cfg(windows)]
+        if name.ends_with(['.', ' ']) {
+            return Err(DiaryError::InvalidArgument(
+                "vault name must not end with a period or space on Windows".into(),
+            ));
+        }
+        let mut components = Path::new(name).components();
+        if !matches!(components.next(), Some(Component::Normal(_)))
+            || components.next().is_some()
+            || name.contains('/')
+            || name.contains('\\')
+            || name.contains("..")
+        {
             return Err(DiaryError::InvalidArgument(
                 "vault name contains invalid path characters".into(),
             ));
         }
-        if name.contains(':')
+        if name.chars().any(char::is_control)
+            || name.contains(':')
             || name.contains('*')
             || name.contains('?')
             || name.contains('"')
@@ -286,6 +307,36 @@ impl VaultManager {
         self.set_policy(name, policy)?;
 
         Ok(())
+    }
+
+    /// Resolve an existing vault without accepting directory/file symlinks.
+    ///
+    /// These checks reject pre-existing unsafe paths. They do not lock the
+    /// directory tree against concurrent replacement by another process; the
+    /// configured base directory must remain under the caller's control.
+    fn existing_vault_path(&self, name: &str) -> Result<PathBuf, DiaryError> {
+        Self::validate_vault_name(name)?;
+        let vault_path = self.base_dir.join(name);
+        let metadata = |path: &Path| {
+            std::fs::symlink_metadata(path).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    DiaryError::Vault(format!("vault '{}' does not exist", name))
+                } else {
+                    DiaryError::Io(error)
+                }
+            })
+        };
+        if !metadata(&vault_path)?.file_type().is_dir()
+            || !metadata(&vault_path.join("vault.pqd"))?
+                .file_type()
+                .is_file()
+        {
+            return Err(DiaryError::Vault(format!(
+                "vault '{}' must be a real directory containing a regular vault.pqd file",
+                name
+            )));
+        }
+        Ok(vault_path)
     }
 
     /// Return the names of all initialised vaults under `base_dir`.
@@ -372,17 +423,43 @@ impl VaultManager {
     ///
     /// # Errors
     ///
-    /// Returns [`DiaryError::Vault`] if the vault does not exist.
+    /// Returns [`DiaryError::InvalidArgument`] if the name is invalid.
+    /// Returns [`DiaryError::Vault`] if the vault does not exist or uses symlinks.
     /// Returns [`DiaryError::Config`] if `vault.toml` cannot be parsed or serialised.
     /// Returns [`DiaryError::Io`] on filesystem failures.
     pub fn set_policy(&self, name: &str, policy: AccessPolicy) -> Result<(), DiaryError> {
-        let vault_path = self.base_dir.join(name);
+        self.set_policy_with_writer(name, policy, |file, content| {
+            use std::io::Write;
+            file.write_all(content)?;
+            // Match VaultConfig::to_file: keep the replacement owner-only.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+            file.sync_all()
+        })
+    }
+
+    // The injected writer keeps post-create I/O failures deterministic in tests.
+    fn set_policy_with_writer(
+        &self,
+        name: &str,
+        policy: AccessPolicy,
+        write_config: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+    ) -> Result<(), DiaryError> {
+        let vault_path = self.existing_vault_path(name)?;
         let toml_path = vault_path.join("vault.toml");
         if !toml_path.exists() {
             return Err(DiaryError::Vault(format!(
                 "vault '{}' does not exist",
                 name
             )));
+        }
+        if !std::fs::symlink_metadata(&toml_path)?.file_type().is_file() {
+            return Err(DiaryError::Vault(
+                "vault.toml must be a regular file".into(),
+            ));
         }
         let content = std::fs::read_to_string(&toml_path)?;
         let mut config: VaultConfig = toml::from_str(&content)
@@ -391,23 +468,23 @@ impl VaultManager {
         let new_content = toml::to_string_pretty(&config)
             .map_err(|e| DiaryError::Config(format!("failed to serialize vault.toml: {}", e)))?;
         let tmp_path = toml_path.with_extension("toml.tmp");
-        {
-            use std::io::Write;
-            let mut file = std::fs::File::create(&tmp_path)?;
-            file.write_all(new_content.as_bytes())?;
-            file.sync_all()?;
-        }
-        // Match VaultConfig::to_file: restrict to owner-only on Unix so the
-        // atomic rename does not replace the 0600 original with a 0644 file,
-        // re-exposing Argon2 params / git identity / legacy token (audit M1).
+        // Refuse existing files and symlinks; never overwrite or clean up a
+        // temporary path this operation did not successfully create.
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))?;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
         }
-        if let Err(e) = std::fs::rename(&tmp_path, &toml_path) {
+        let mut file = options.open(&tmp_path)?;
+        let write_result = write_config(&mut file, new_content.as_bytes());
+        // Close before rename or cleanup, including on Windows.
+        drop(file);
+        let replace_result = write_result.and_then(|()| std::fs::rename(&tmp_path, &toml_path));
+        if let Err(error) = replace_result {
             let _ = std::fs::remove_file(&tmp_path);
-            return Err(DiaryError::Io(e));
+            return Err(DiaryError::Io(error));
         }
         Ok(())
     }
@@ -421,31 +498,46 @@ impl VaultManager {
     ///
     /// # Errors
     ///
-    /// Returns [`DiaryError::Vault`] if the vault does not exist.
+    /// Returns [`DiaryError::InvalidArgument`] if the name is invalid.
+    /// Returns [`DiaryError::Vault`] if the target is not a real vault directory
+    /// containing a regular `vault.pqd` file. On Unix, zeroizing a multiply
+    /// hard-linked vault file is also refused.
     /// Returns [`DiaryError::Io`] on filesystem failures.
     pub fn delete_vault(&self, name: &str, zeroize: bool) -> Result<(), DiaryError> {
-        let vault_path = self.base_dir.join(name);
-        if !vault_path.exists() {
-            return Err(DiaryError::Vault(format!(
-                "vault '{}' does not exist",
-                name
-            )));
-        }
+        let vault_path = self.existing_vault_path(name)?;
         if zeroize {
             let pqd_path = vault_path.join("vault.pqd");
-            if pqd_path.exists() {
-                let size = usize::try_from(std::fs::metadata(&pqd_path)?.len()).map_err(|_| {
-                    DiaryError::Vault("vault.pqd size exceeds addressable memory".to_string())
-                })?;
-                let mut random_data = zeroize::Zeroizing::new(vec![0u8; size]);
-                OsRng.fill_bytes(&mut random_data);
-                {
-                    use std::io::Write;
-                    let mut file = std::fs::File::create(&pqd_path)?;
-                    file.write_all(&random_data)?;
-                    file.sync_all()?;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                // Also refuse a final-component symlink swapped after the
+                // metadata check. Parent-directory races need handle-relative I/O.
+                options.custom_flags(nix::libc::O_NOFOLLOW);
+            }
+            let mut file = options.open(&pqd_path)?;
+            let metadata = file.metadata()?;
+            if !metadata.is_file() {
+                return Err(DiaryError::Vault("vault.pqd must be a regular file".into()));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                if metadata.nlink() != 1 {
+                    return Err(DiaryError::Vault(
+                        "cannot zeroize vault.pqd with multiple hard links".into(),
+                    ));
                 }
             }
+            let size = usize::try_from(metadata.len()).map_err(|_| {
+                DiaryError::Vault("vault.pqd size exceeds addressable memory".to_string())
+            })?;
+            let mut random_data = zeroize::Zeroizing::new(vec![0u8; size]);
+            OsRng.fill_bytes(&mut random_data);
+            use std::io::Write;
+            file.write_all(&random_data)?;
+            file.sync_all()?;
         }
         std::fs::remove_dir_all(&vault_path)?;
         Ok(())
@@ -468,6 +560,363 @@ mod tests {
             memory_cost_kb: 8,
             time_cost: 1,
             parallelism: 1,
+        }
+    }
+
+    // All safety fixtures live inside their own temporary directory, including
+    // every target that an invalid name or symlink might otherwise reach.
+    fn safety_vault(path: &std::path::Path) {
+        std::fs::create_dir_all(path).expect("create fixture vault");
+        std::fs::write(path.join("vault.pqd"), b"keep encrypted vault bytes")
+            .expect("write fixture vault");
+        VaultConfig::default()
+            .to_file(&path.join("vault.toml"))
+            .expect("write fixture config");
+    }
+
+    #[test]
+    fn vault_safety_name_requires_single_normal_component() {
+        for name in [
+            "",
+            ".",
+            "..",
+            "../sibling",
+            "nested/vault",
+            "nested\\vault",
+            "bad\0name",
+        ] {
+            assert!(
+                matches!(
+                    VaultManager::validate_vault_name(name),
+                    Err(DiaryError::InvalidArgument(_))
+                ),
+                "must reject {name:?}"
+            );
+        }
+        for name in [
+            "daily",
+            "my-vault_2",
+            "my.diary",
+            ".private",
+            "日記",
+            "my diary",
+        ] {
+            VaultManager::validate_vault_name(name).expect("valid existing vault name");
+        }
+    }
+
+    #[test]
+    fn vault_safety_init_rejects_traversal_before_creation() {
+        let dir = tempdir().expect("tempdir");
+        let mgr = VaultManager::new(dir.path().join("vaults"))
+            .expect("manager")
+            .with_kdf_params(fast_params());
+        let result = mgr.init_vault("../outside", b"password");
+        assert!(
+            !dir.path().join("outside").exists(),
+            "must not create outside base"
+        );
+        assert!(matches!(result, Err(DiaryError::InvalidArgument(_))));
+    }
+
+    #[test]
+    fn vault_safety_create_rejects_dot_name() {
+        let dir = tempdir().expect("tempdir");
+        let mgr = VaultManager::new(dir.path().join("vaults")).expect("manager");
+        assert!(matches!(
+            mgr.create_vault(".", b"password", AccessPolicy::None),
+            Err(DiaryError::InvalidArgument(_))
+        ));
+    }
+
+    #[test]
+    fn vault_safety_delete_rejects_paths_without_removing_sentinels() {
+        for zeroize in [false, true] {
+            for case in ["", ".", "..", "../sibling", "nested/vault", "absolute"] {
+                let dir = tempdir().expect("tempdir");
+                let base = dir.path().join("vaults");
+                let sibling = dir.path().join("sibling");
+                for path in [dir.path(), &base, &sibling, &base.join("nested/vault")] {
+                    safety_vault(path);
+                }
+                let sentinel = sibling.join("vault.pqd");
+                let before = std::fs::read(&sentinel).expect("sentinel before");
+                let mgr = VaultManager::new(base.clone()).expect("manager");
+                let name = if case == "absolute" {
+                    sibling.to_str().expect("temp path")
+                } else {
+                    case
+                };
+                let result = mgr.delete_vault(name, zeroize);
+                assert_eq!(
+                    std::fs::read(&sentinel).expect("sibling must survive"),
+                    before
+                );
+                assert!(
+                    base.join("vault.pqd").is_file(),
+                    "base vault must survive {name:?}"
+                );
+                assert!(base.join("nested/vault/vault.pqd").is_file());
+                assert!(
+                    matches!(result, Err(DiaryError::InvalidArgument(_))),
+                    "{name:?}: {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vault_safety_policy_rejects_paths_without_changing_config() {
+        for case in ["", ".", "..", "../sibling", "nested/vault", "absolute"] {
+            let dir = tempdir().expect("tempdir");
+            let base = dir.path().join("vaults");
+            let sibling = dir.path().join("sibling");
+            let nested = base.join("nested/vault");
+            let paths = [dir.path(), &base, &sibling, &nested];
+            for path in paths {
+                safety_vault(path);
+            }
+            let originals: Vec<_> = paths
+                .iter()
+                .map(|path| std::fs::read(path.join("vault.toml")).expect("config before"))
+                .collect();
+            let mgr = VaultManager::new(base.clone()).expect("manager");
+            let name = if case == "absolute" {
+                sibling.to_str().expect("temp path")
+            } else {
+                case
+            };
+            let result = mgr.set_policy(name, AccessPolicy::Full);
+            for (path, original) in paths.iter().zip(originals) {
+                assert_eq!(
+                    std::fs::read(path.join("vault.toml")).expect("config after"),
+                    original,
+                    "must preserve config for {name:?}"
+                );
+            }
+            assert!(
+                matches!(result, Err(DiaryError::InvalidArgument(_))),
+                "{name:?}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn vault_safety_delete_refuses_directory_without_vault_file() {
+        for zeroize in [false, true] {
+            let dir = tempdir().expect("tempdir");
+            let mgr = VaultManager::new(dir.path().to_path_buf()).expect("manager");
+            let unrelated = dir.path().join("unrelated");
+            std::fs::create_dir(&unrelated).expect("unrelated directory");
+            std::fs::write(unrelated.join("sentinel"), b"keep").expect("sentinel");
+            let result = mgr.delete_vault("unrelated", zeroize);
+            assert_eq!(
+                std::fs::read(unrelated.join("sentinel")).expect("sentinel survives"),
+                b"keep"
+            );
+            assert!(matches!(result, Err(DiaryError::Vault(_))));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vault_safety_mutations_refuse_symlinked_vault_directory() {
+        use std::os::unix::fs::symlink;
+        for operation in ["policy", "delete", "zeroize"] {
+            let dir = tempdir().expect("tempdir");
+            let base = dir.path().join("vaults");
+            let outside = dir.path().join("outside");
+            let mgr = VaultManager::new(base.clone()).expect("manager");
+            safety_vault(&outside);
+            let pqd_before = std::fs::read(outside.join("vault.pqd")).expect("pqd before");
+            let toml_before = std::fs::read(outside.join("vault.toml")).expect("config before");
+            symlink(&outside, base.join("linked")).expect("symlink vault directory");
+            let result = match operation {
+                "policy" => mgr.set_policy("linked", AccessPolicy::Full),
+                "delete" => mgr.delete_vault("linked", false),
+                _ => mgr.delete_vault("linked", true),
+            };
+            assert_eq!(
+                std::fs::read(outside.join("vault.pqd")).expect("pqd after"),
+                pqd_before
+            );
+            assert_eq!(
+                std::fs::read(outside.join("vault.toml")).expect("config after"),
+                toml_before
+            );
+            assert!(
+                matches!(result, Err(DiaryError::Vault(_))),
+                "{operation}: {result:?}"
+            );
+            assert!(base.join("linked").is_symlink());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vault_safety_delete_refuses_symlinked_vault_file() {
+        use std::os::unix::fs::symlink;
+        for zeroize in [false, true] {
+            let dir = tempdir().expect("tempdir");
+            let base = dir.path().join("vaults");
+            let vault = base.join("linked");
+            let outside = dir.path().join("outside");
+            let mgr = VaultManager::new(base).expect("manager");
+            std::fs::create_dir(&vault).expect("vault directory");
+            std::fs::write(&outside, b"keep external bytes").expect("external sentinel");
+            symlink(&outside, vault.join("vault.pqd")).expect("symlink vault file");
+            let result = mgr.delete_vault("linked", zeroize);
+            assert_eq!(
+                std::fs::read(&outside).expect("sentinel after"),
+                b"keep external bytes"
+            );
+            assert!(matches!(result, Err(DiaryError::Vault(_))));
+            assert!(vault.join("vault.pqd").is_symlink());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vault_safety_policy_refuses_linked_config_or_temporary_file() {
+        use std::os::unix::fs::symlink;
+        for filename in ["vault.toml", "vault.toml.tmp"] {
+            let dir = tempdir().expect("tempdir");
+            let base = dir.path().join("vaults");
+            let vault = base.join("safe");
+            let outside = dir.path().join("outside.toml");
+            let mgr = VaultManager::new(base).expect("manager");
+            safety_vault(&vault);
+            let original = std::fs::read(vault.join("vault.toml")).expect("original config");
+            std::fs::write(&outside, &original).expect("outside config");
+            let target = vault.join(filename);
+            if target.exists() {
+                std::fs::remove_file(&target).expect("remove fixture config");
+            }
+            symlink(&outside, &target).expect("symlink config");
+            let result = mgr.set_policy("safe", AccessPolicy::Full);
+            assert_eq!(std::fs::read(&outside).expect("outside after"), original);
+            assert_eq!(
+                std::fs::read(vault.join("vault.toml")).expect("config after"),
+                original
+            );
+            assert!(result.is_err(), "must reject {filename}");
+            assert!(target.is_symlink());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vault_safety_zeroize_refuses_hard_linked_vault_file() {
+        let dir = tempdir().expect("tempdir");
+        let base = dir.path().join("vaults");
+        let vault = base.join("linked");
+        let outside = dir.path().join("outside");
+        let mgr = VaultManager::new(base).expect("manager");
+        std::fs::create_dir(&vault).expect("vault directory");
+        std::fs::write(&outside, b"keep external bytes").expect("external sentinel");
+        std::fs::hard_link(&outside, vault.join("vault.pqd")).expect("hard link vault file");
+        let result = mgr.delete_vault("linked", true);
+        assert_eq!(
+            std::fs::read(&outside).expect("sentinel after"),
+            b"keep external bytes"
+        );
+        assert!(matches!(result, Err(DiaryError::Vault(_))));
+        assert!(vault.join("vault.pqd").is_file());
+        // Plain deletion only unlinks the vault's copy, leaving the other link intact.
+        mgr.delete_vault("linked", false)
+            .expect("delete without zeroize");
+        assert_eq!(
+            std::fs::read(&outside).expect("sentinel after delete"),
+            b"keep external bytes"
+        );
+    }
+
+    #[test]
+    fn vault_safety_policy_preserves_preexisting_temporary_file() {
+        let dir = tempdir().expect("tempdir");
+        let vault = dir.path().join("safe");
+        let mgr = VaultManager::new(dir.path().to_path_buf()).expect("manager");
+        safety_vault(&vault);
+        let original = std::fs::read(vault.join("vault.toml")).expect("original config");
+        let temporary = vault.join("vault.toml.tmp");
+        std::fs::write(&temporary, b"someone else's temporary data").expect("temporary sentinel");
+        let result = mgr.set_policy("safe", AccessPolicy::Full);
+        assert!(matches!(result, Err(DiaryError::Io(_))));
+        assert_eq!(
+            std::fs::read(&temporary).expect("temporary after"),
+            b"someone else's temporary data"
+        );
+        assert_eq!(
+            std::fs::read(vault.join("vault.toml")).expect("config after"),
+            original
+        );
+    }
+
+    #[test]
+    fn vault_safety_policy_cleans_owned_temporary_file_after_write_failure_and_retries() {
+        use std::io::Write;
+        let dir = tempdir().expect("tempdir");
+        let vault = dir.path().join("safe");
+        let mgr = VaultManager::new(dir.path().to_path_buf()).expect("manager");
+        safety_vault(&vault);
+        let original = std::fs::read(vault.join("vault.toml")).expect("original config");
+        let result = mgr.set_policy_with_writer("safe", AccessPolicy::Full, |file, _| {
+            file.write_all(b"partial config")?;
+            Err(std::io::Error::other("injected post-create write failure"))
+        });
+        match result {
+            Err(DiaryError::Io(error)) => {
+                assert_eq!(error.to_string(), "injected post-create write failure");
+            }
+            other => panic!("expected original I/O error, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(vault.join("vault.toml")).expect("config after"),
+            original
+        );
+        assert!(
+            !vault.join("vault.toml.tmp").exists(),
+            "owned temporary file must be cleaned up"
+        );
+        mgr.set_policy("safe", AccessPolicy::WriteOnly)
+            .expect("normal retry must succeed");
+        assert_eq!(
+            VaultConfig::from_file(&vault.join("vault.toml"))
+                .expect("config after retry")
+                .access
+                .policy,
+            AccessPolicy::WriteOnly
+        );
+        assert!(!vault.join("vault.toml.tmp").exists());
+    }
+
+    #[test]
+    fn vault_safety_valid_names_keep_create_policy_delete_workflow() {
+        let dir = tempdir().expect("tempdir");
+        let mgr = VaultManager::new(dir.path().to_path_buf())
+            .expect("manager")
+            .with_kdf_params(fast_params());
+        for name in ["my-vault_2", "my.diary", ".private", "日記", "my diary"] {
+            mgr.create_vault(name, b"password", AccessPolicy::None)
+                .expect("create valid name");
+            mgr.set_policy(name, AccessPolicy::WriteOnly)
+                .expect("policy for valid name");
+            let config = VaultConfig::from_file(&mgr.vault_path(name).join("vault.toml"))
+                .expect("read changed config");
+            assert_eq!(config.access.policy, AccessPolicy::WriteOnly);
+            mgr.delete_vault(name, true).expect("delete valid name");
+            assert!(!mgr.vault_path(name).exists());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn vault_safety_windows_rejects_names_normalized_to_other_paths() {
+        for name in [". ", ".. ", " ", "daily.", "daily "] {
+            assert!(matches!(
+                VaultManager::validate_vault_name(name),
+                Err(DiaryError::InvalidArgument(_))
+            ));
         }
     }
 

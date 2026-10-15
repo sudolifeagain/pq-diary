@@ -280,6 +280,22 @@ impl AppConfig {
         toml::from_str(&content).map_err(|e| DiaryError::Config(e.to_string()))
     }
 
+    /// Serialise this configuration into an already-open writer.
+    ///
+    /// This lets initializers retain an exclusively created file handle rather
+    /// than reopening its pathname. The caller owns file permissions and flush
+    /// or durability requirements.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DiaryError::Config`] on serialisation failures and
+    /// [`DiaryError::Io`] if the writer cannot accept the complete configuration.
+    pub fn write_to(&self, writer: &mut impl std::io::Write) -> Result<(), DiaryError> {
+        let content = toml::to_string(self).map_err(|e| DiaryError::Config(e.to_string()))?;
+        writer.write_all(content.as_bytes())?;
+        Ok(())
+    }
+
     /// Serialise this [`AppConfig`] as TOML and write it to `path`.
     ///
     /// On Unix the file permission is set to `0o600` after writing so that
@@ -311,6 +327,49 @@ impl AppConfig {
 mod tests {
     use super::*;
     use crate::policy::AccessPolicy;
+
+    #[test]
+    fn app_config_writer_roundtrips_and_propagates_io_failure() {
+        let config = AppConfig::default();
+        let mut output = Vec::new();
+        config.write_to(&mut output).expect("serialize config");
+        let decoded: AppConfig =
+            toml::from_str(std::str::from_utf8(&output).expect("utf8")).expect("parse config");
+        assert_eq!(decoded, config);
+
+        // A slice writer cannot grow: insufficient capacity must be an error.
+        let mut short = [0; 1];
+        assert!(matches!(
+            config.write_to(&mut short.as_mut_slice()),
+            Err(DiaryError::Io(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_config_writer_keeps_reserved_handle_after_path_replacement() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let mut reserved = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("reserve config");
+        let moved = dir.path().join("reserved.toml");
+        std::fs::rename(&path, &moved).expect("move reservation");
+        std::fs::write(&path, b"foreign config").expect("replacement");
+        AppConfig::default()
+            .write_to(&mut reserved)
+            .expect("write reserved file");
+        assert_eq!(
+            std::fs::read(&path).expect("foreign bytes"),
+            b"foreign config"
+        );
+        assert_eq!(
+            AppConfig::from_file(&moved).expect("reserved config"),
+            AppConfig::default()
+        );
+    }
 
     /// TC-004-01: VaultConfig serialise → deserialise roundtrip.
     ///

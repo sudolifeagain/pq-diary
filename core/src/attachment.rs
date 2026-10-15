@@ -1188,13 +1188,20 @@ mod tests {
         let vault_bytes = std::fs::read(vault.join("vault.pqd")).unwrap();
         let (header, _, _) = read_vault_with_attachments_from_bytes(&vault_bytes).unwrap();
         let expected = kdf::derive_key(b"master-pw", &header.kdf_salt, &fast_params()).unwrap();
-        let mut key = verify_master(&vault_bytes, &header, &secret("master-pw"), &fast_params()).unwrap();
+        let mut key =
+            verify_master(&vault_bytes, &header, &secret("master-pw"), &fast_params()).unwrap();
         assert_protected(&key);
         assert_eq!(key.as_ref(), expected.as_ref());
         // Inspect only live, explicitly zeroized memory; never freed allocations.
         key.zeroize();
         assert_eq!(*key, [0; 32]);
-        assert!(verify_master(&vault_bytes, &header, &secret("wrong-password"), &fast_params()).is_err());
+        assert!(verify_master(
+            &vault_bytes,
+            &header,
+            &secret("wrong-password"),
+            &fast_params()
+        )
+        .is_err());
     }
 
     #[test]

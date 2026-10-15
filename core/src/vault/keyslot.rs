@@ -5,6 +5,7 @@
 //! `AES-256-GCM(slot_key, MDK)`. Password, password+keyfile, recipient, and
 //! recovery slots differ only in how `slot_key` is derived.
 
+use super::slice_reader::read_vec;
 use std::io::{self, Read};
 
 use rand::{rngs::OsRng, RngCore};
@@ -830,14 +831,6 @@ fn read_array<const N: usize>(cursor: &mut io::Cursor<&[u8]>) -> Result<[u8; N],
     Ok(out)
 }
 
-fn read_vec(cursor: &mut io::Cursor<&[u8]>, len: usize) -> Result<Vec<u8>, DiaryError> {
-    let mut out = vec![0u8; len];
-    if len > 0 {
-        cursor.read_exact(&mut out)?;
-    }
-    Ok(out)
-}
-
 fn check_field_size(field: &str, len: usize) -> Result<(), DiaryError> {
     if len > MAX_FIELD_SIZE {
         return Err(DiaryError::Vault(format!(
@@ -868,6 +861,35 @@ fn crc32_ieee(data: &[u8]) -> u32 {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn nested_slot_lengths_reject_truncated_fields() {
+        let slot = Keyslot::password(&test_mdk(), b"password", fast_params(), "label")
+            .expect("password slot");
+        let payload = serialize_slot_payload(&slot).expect("serialize");
+        // Fixed prefix, empty KEM ciphertext, IV, and 48-byte wrapped MDK.
+        let kem_len_offset = 63;
+        let wrapped_len_offset = kem_len_offset + 4 + slot.kem_ct.len() + 12;
+        let label_len_offset = wrapped_len_offset + 4 + slot.wrapped_mdk.len();
+        for offset in [kem_len_offset, wrapped_len_offset, label_len_offset] {
+            for claimed in [3u32, MAX_FIELD_SIZE as u32] {
+                let mut truncated = payload[..offset].to_vec();
+                truncated.extend_from_slice(&claimed.to_le_bytes());
+                truncated.extend_from_slice(&[1, 2]);
+                assert!(
+                    matches!(parse_slot_payload(&truncated), Err(DiaryError::Io(e))
+                    if e.kind() == io::ErrorKind::UnexpectedEof),
+                    "offset={offset}, claimed={claimed}"
+                );
+            }
+            let mut oversized = payload[..offset].to_vec();
+            oversized.extend_from_slice(&(MAX_FIELD_SIZE as u32 + 1).to_le_bytes());
+            assert!(matches!(
+                parse_slot_payload(&oversized),
+                Err(DiaryError::Vault(_))
+            ));
+        }
+    }
 
     fn fast_params() -> Argon2Params {
         Argon2Params {

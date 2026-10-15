@@ -2498,8 +2498,10 @@ pub fn cmd_git_status(cli: &Cli) -> anyhow::Result<()> {
 ///
 /// Initialises `~/.pq-diary/config.toml` plus a default vault at
 /// `~/.pq-diary/vaults/default/`. Refuses to run if `config.toml` already
-/// exists; on vault-creation failure both the partial vault directory and
-/// the freshly written `config.toml` are best-effort removed.
+/// exists; on failure only this attempt's new `config.toml` is best-effort
+/// removed. A failed vault creation may leave a partial directory: the core
+/// API does not report directory ownership, so deleting it here could destroy
+/// a pre-existing vault or one created by another process.
 pub fn cmd_init(cli: &Cli) -> anyhow::Result<()> {
     use pq_diary_core::policy::AccessPolicy;
     use pq_diary_core::vault::config::AppConfig;
@@ -2535,23 +2537,35 @@ pub fn cmd_init(cli: &Cli) -> anyhow::Result<()> {
     std::fs::create_dir_all(&parent_dir)
         .map_err(|e| anyhow::anyhow!("Cannot create config directory: {e}"))?;
 
-    AppConfig::default()
-        .to_file(&config_path)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Reserve the config exclusively. The early existence check above is only
+    // a convenience; create_new also rejects dangling symlinks and a config
+    // created by another initializer after that check.
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut config_file = options
+        .open(&config_path)
+        .map_err(|e| anyhow::anyhow!("Cannot create config file: {e}"))?;
+    // Write through the reserved handle; reopening the pathname would lose
+    // the exclusive-create guarantee if the path were replaced.
+    let config_result = AppConfig::default().write_to(&mut config_file);
+    drop(config_file);
+    if let Err(e) = config_result {
+        let _ = std::fs::remove_file(&config_path);
+        return Err(anyhow::anyhow!("{e}"));
+    }
 
     let vaults_dir = parent_dir.join("vaults");
-    // Rollback policy on failure: remove ONLY the freshly-created `config.toml`
-    // and the new `vaults/default/` directory (the only artifacts we created
-    // in this run). We must NOT remove the entire `vaults/` directory, because
-    // a user may already have other vaults sitting there from a prior
-    // partial init or manual setup (avoiding data loss is a hard constraint
-    // — see TASK-0089 review M-1).
-    let default_vault_dir = vaults_dir.join("default");
-    let mgr = match VaultManager::new(vaults_dir.clone()) {
+    // Only the config is known to belong to this attempt. An error from the
+    // manager or create_vault does not establish ownership of any vault path.
+    let mgr = match VaultManager::new(vaults_dir) {
         Ok(m) => m,
         Err(e) => {
             let _ = std::fs::remove_file(&config_path);
-            let _ = std::fs::remove_dir_all(&default_vault_dir);
             return Err(anyhow::anyhow!("Vault creation failed: {e}"));
         }
     };
@@ -2564,7 +2578,6 @@ pub fn cmd_init(cli: &Cli) -> anyhow::Result<()> {
 
     if let Err(e) = create_result {
         let _ = std::fs::remove_file(&config_path);
-        let _ = std::fs::remove_dir_all(&default_vault_dir);
         return Err(anyhow::anyhow!("Vault creation failed: {e}"));
     }
 
@@ -10193,6 +10206,136 @@ parallelism = 1
         let pq_root = dir.path().join(".pq-diary");
         assert!(!pq_root.join("config.toml").exists());
         assert!(!pq_root.join("vaults").exists());
+    }
+
+    fn assert_failed_init_preserves_existing_default(manager_config_invalid: bool) {
+        use pq_diary_core::policy::AccessPolicy;
+        use pq_diary_core::vault::init::VaultManager;
+
+        let _lock = lock_home();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = HomeOverride::new(dir.path());
+        let pq_root = dir.path().join(".pq-diary");
+        let vaults_dir = pq_root.join("vaults");
+        let mgr = VaultManager::new(vaults_dir.clone())
+            .expect("manager")
+            .with_kdf_params(fast_params());
+        mgr.create_vault("default", b"password", AccessPolicy::None)
+            .expect("existing default vault");
+        let default_dir = vaults_dir.join("default");
+        let vault_path = default_dir.join("vault.pqd");
+        let mut core = DiaryCore::new(vault_path.to_str().expect("utf8")).expect("core");
+        core.unlock(secrecy::SecretBox::new(Box::from("password")))
+            .expect("unlock existing vault");
+        core.new_entry("keep me", "existing entry", vec![])
+            .expect("create existing entry");
+        core.lock();
+
+        let sibling_dir = vaults_dir.join("other");
+        std::fs::create_dir(&sibling_dir).expect("sibling directory");
+        let sibling_path = sibling_dir.join("keep.bin");
+        std::fs::write(&sibling_path, b"existing sibling data").expect("sibling data");
+        let manager_config_path = vaults_dir.join("config.toml");
+        if manager_config_invalid {
+            std::fs::write(&manager_config_path, b"not valid toml [")
+                .expect("invalid manager config");
+        }
+
+        let vault_before = std::fs::read(&vault_path).expect("vault before");
+        let vault_config_path = default_dir.join("vault.toml");
+        let config_before = std::fs::read(&vault_config_path).expect("vault config before");
+        let cli = make_cli_plain(&["--password", "Test123!", "init"]);
+        let err = cmd_init(&cli).expect_err("init must fail");
+        assert!(format!("{err:#}").contains("Vault creation failed"));
+        assert!(
+            !pq_root.join("config.toml").exists(),
+            "new config rolled back"
+        );
+        assert_eq!(
+            std::fs::read(&vault_path).expect("existing vault must survive failed init"),
+            vault_before
+        );
+        assert_eq!(
+            std::fs::read(&vault_config_path).expect("existing vault config must survive"),
+            config_before
+        );
+        assert_eq!(
+            std::fs::read(&sibling_path).expect("sibling data must survive"),
+            b"existing sibling data"
+        );
+        if manager_config_invalid {
+            assert_eq!(
+                std::fs::read(&manager_config_path).expect("manager config must survive"),
+                b"not valid toml ["
+            );
+        }
+        let entries = read_vault_entries(&default_dir);
+        assert_eq!(entries.len(), 1, "existing vault can still be reopened");
+        assert_eq!(entries[0].title, "keep me");
+    }
+
+    #[test]
+    fn init_creation_failure_preserves_existing_default_vault() {
+        assert_failed_init_preserves_existing_default(false);
+    }
+
+    #[test]
+    fn init_manager_failure_preserves_existing_default_vault() {
+        assert_failed_init_preserves_existing_default(true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_failure_preserves_dangling_default_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let _lock = lock_home();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = HomeOverride::new(dir.path());
+        let pq_root = dir.path().join(".pq-diary");
+        let vaults_dir = pq_root.join("vaults");
+        std::fs::create_dir_all(&vaults_dir).expect("vaults directory");
+        let default_dir = vaults_dir.join("default");
+        let target = dir.path().join("missing-vault");
+        symlink(&target, &default_dir).expect("dangling default symlink");
+
+        let cli = make_cli_plain(&["--password", "Test123!", "init"]);
+        cmd_init(&cli).expect_err("init must fail");
+
+        assert_eq!(
+            std::fs::read_link(&default_dir).expect("symlink preserved"),
+            target
+        );
+        assert!(!target.exists(), "symlink target must not be created");
+        assert!(
+            !pq_root.join("config.toml").exists(),
+            "new config rolled back"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_refuses_dangling_config_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let _lock = lock_home();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = HomeOverride::new(dir.path());
+        let pq_root = dir.path().join(".pq-diary");
+        std::fs::create_dir(&pq_root).expect("config directory");
+        let config_path = pq_root.join("config.toml");
+        let target = dir.path().join("missing-config.toml");
+        symlink(&target, &config_path).expect("dangling config symlink");
+
+        let cli = make_cli_plain(&["--password", "Test123!", "init"]);
+        cmd_init(&cli).expect_err("init must fail rather than follow a config symlink");
+
+        assert_eq!(
+            std::fs::read_link(&config_path).expect("symlink preserved"),
+            target
+        );
+        assert!(!target.exists(), "symlink target must not be created");
+        assert!(!pq_root.join("vaults").exists(), "no vault created");
     }
 
     // -------------------------------------------------------------------------

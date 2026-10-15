@@ -19,6 +19,129 @@ use crate::{
     },
 };
 
+/// Owns only a randomly named directory exclusively created by this call.
+/// As with other vault operations, the base directory must remain under the
+/// caller's control; this is not protection against hostile path replacement.
+struct InitStaging {
+    root: PathBuf,
+    path: PathBuf,
+}
+
+impl InitStaging {
+    fn new(base: &Path) -> Result<Self, DiaryError> {
+        let root = base.join(format!(".init-{}", uuid::Uuid::new_v4()));
+        let builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        let builder = {
+            use std::os::unix::fs::DirBuilderExt as _;
+            let mut builder = builder;
+            builder.mode(0o700);
+            builder
+        };
+        builder.create(&root)?;
+        // Keep prepared files one level below the root so list_vaults cannot
+        // mistake the temporary directory for an initialized user vault.
+        let staging = Self {
+            path: root.join("prepared"),
+            root,
+        };
+        std::fs::create_dir(&staging.path)
+            .map_err(|error| staging.cleanup_after_error(error.into()))?;
+        Ok(staging)
+    }
+
+    fn cleanup_after_error(&self, error: DiaryError) -> DiaryError {
+        if let Err(cleanup) = std::fs::remove_dir_all(&self.root) {
+            if cleanup.kind() != std::io::ErrorKind::NotFound {
+                return DiaryError::Vault(format!(
+                    "initialization failed: {error}; staging cleanup failed: {cleanup}"
+                ));
+            }
+        }
+        error
+    }
+
+    fn finish(self, result: Result<(), DiaryError>) -> Result<(), DiaryError> {
+        // Drop cleans staging best-effort after commit, never returning a
+        // misleading failure for a successfully initialized final vault.
+        result.map_err(|error| self.cleanup_after_error(error))
+    }
+
+    fn publish(&self, destination: &Path) -> Result<(), DiaryError> {
+        self.publish_with(destination, |_| Ok(()))
+    }
+
+    fn publish_with(
+        &self,
+        destination: &Path,
+        after_claim: impl FnOnce(&Path) -> Result<(), DiaryError>,
+    ) -> Result<(), DiaryError> {
+        // Never rename a directory onto destination: Unix rename can replace
+        // somebody else's empty directory. Exclusive creation is the claim.
+        std::fs::create_dir(destination).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                DiaryError::Vault("vault already exists".into())
+            } else {
+                DiaryError::Io(error)
+            }
+        })?;
+        let mut created = Vec::new();
+        let result = (|| {
+            after_claim(destination)?;
+            for name in ["vault.toml", "vault.pqd"] {
+                let mut source = std::fs::File::open(self.path.join(name))?;
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt as _;
+                    options.mode(0o600);
+                }
+                let mut target = options.open(destination.join(name))?;
+                // Record ownership immediately: even a partial copy is ours.
+                created.push(name);
+                std::io::copy(&mut source, &mut target)?;
+                target.sync_all()?;
+            }
+            std::fs::create_dir(destination.join("entries"))?;
+            Ok::<_, DiaryError>(())
+        })();
+        if let Err(error) = result {
+            let mut cleanup_errors = Vec::new();
+            for name in created {
+                if let Err(cleanup) = std::fs::remove_file(destination.join(name)) {
+                    if cleanup.kind() != std::io::ErrorKind::NotFound {
+                        cleanup_errors.push(format!("{name}: {cleanup}"));
+                    }
+                }
+            }
+            // Only remove an empty directory we claimed. Never recursively
+            // remove the final path or any unexpected/concurrent contents.
+            if let Err(cleanup) = std::fs::remove_dir(destination) {
+                if cleanup.kind() != std::io::ErrorKind::NotFound {
+                    cleanup_errors.push(format!("vault directory: {cleanup}"));
+                }
+            }
+            if !cleanup_errors.is_empty() {
+                return Err(DiaryError::Vault(format!(
+                    "initialization failed: {error}; rollback incomplete ({}); inspect the destination before retrying",
+                    cleanup_errors.join("; ")
+                )));
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for InitStaging {
+    fn drop(&mut self) {
+        // Cleanup is best-effort, including after successful publication: a
+        // cleanup failure must not turn a committed valid vault into Err.
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
 // =============================================================================
 // VaultInfo
 // =============================================================================
@@ -105,6 +228,17 @@ impl VaultManager {
     /// - `{base_dir}/{name}/vault.toml`  — per-vault TOML configuration
     /// - `{base_dir}/{name}/entries/`    — entries directory (initially empty)
     ///
+    /// Crypto and the requested configuration are prepared in a private staging
+    /// directory before claiming the final name. Ordinary errors roll back only
+    /// files created by this call. Publication is not an atomic directory swap:
+    /// concurrent readers or a process crash can observe an incomplete vault.
+    /// Panics and process termination are not rolled back. Staging cleanup is
+    /// best-effort and cannot turn successful publication into an error.
+    /// On Unix staging is created with mode 0700 and final files with mode 0600
+    /// (subject to umask); final directories retain the usual umask-based mode.
+    /// Other platforms inherit directory access controls from the base.
+    /// The base directory must remain under the caller's control.
+    ///
     /// The vault header includes:
     /// - Random 32-byte Argon2id KDF salt and legacy-inheritance salt
     /// - AES-256-GCM verification token derived from `password`
@@ -120,6 +254,16 @@ impl VaultManager {
     /// Returns [`DiaryError::Io`] on filesystem failures.
     /// Returns [`DiaryError::Crypto`] on key derivation or encryption failures.
     pub fn init_vault(&self, name: &str, password: &[u8]) -> Result<(), DiaryError> {
+        self.init_vault_with_policy(name, password, AccessPolicy::None, VaultConfig::to_file)
+    }
+
+    fn init_vault_with_policy(
+        &self,
+        name: &str,
+        password: &[u8],
+        policy: AccessPolicy,
+        write_config: impl FnOnce(&VaultConfig, &Path) -> Result<(), DiaryError>,
+    ) -> Result<(), DiaryError> {
         Self::validate_vault_name(name)?;
 
         // Guard: refuse empty password.
@@ -142,10 +286,6 @@ impl VaultManager {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(DiaryError::Io(error)),
         }
-
-        // Create vault root and entries sub-directory in one shot.
-        let entries_dir = vault_dir.join("entries");
-        std::fs::create_dir_all(&entries_dir)?;
 
         // ── Cryptographic setup ───────────────────────────────────────────────
 
@@ -198,21 +338,25 @@ impl VaultManager {
             dsa_encrypted_sk,
         };
 
-        let vault_pqd = vault_dir.join("vault.pqd");
         let mac_key = crate::crypto::derive_vault_mac_key(sym_key.as_ref())?;
-        write_vault_authenticated(&vault_pqd, header, &[], &mac_key)?;
-
-        // ── Write vault.toml ──────────────────────────────────────────────────
-
         let mut vault_config = VaultConfig::default();
         vault_config.vault.name = name.to_owned();
+        vault_config.access.policy = policy;
         vault_config.argon2.memory_cost_kb = self.kdf_params.memory_cost_kb;
         vault_config.argon2.time_cost = self.kdf_params.time_cost;
         vault_config.argon2.parallelism = self.kdf_params.parallelism;
-        let vault_toml = vault_dir.join("vault.toml");
-        vault_config.to_file(&vault_toml)?;
+        // Validate serialization before creating any per-vault filesystem state.
+        toml::to_string_pretty(&vault_config)
+            .map_err(|error| DiaryError::Config(error.to_string()))?;
 
-        Ok(())
+        std::fs::create_dir_all(&self.base_dir)?;
+        let staging = InitStaging::new(&self.base_dir)?;
+        let result = (|| {
+            write_vault_authenticated(&staging.path.join("vault.pqd"), header, &[], &mac_key)?;
+            write_config(&vault_config, &staging.path.join("vault.toml"))?;
+            staging.publish(&vault_dir)
+        })();
+        staging.finish(result)
     }
 
     /// Validate a vault name for use as a filesystem directory name.
@@ -269,8 +413,7 @@ impl VaultManager {
     /// 1. Validates the vault name via [`VaultManager::validate_vault_name`].
     /// 2. Rejects duplicate vault names.
     /// 3. Auto-creates the vaults base directory if absent.
-    /// 4. Initialises the vault on disk.
-    /// 5. Writes the requested access policy to `vault.toml`.
+    /// 4. Initialises the vault and requested policy together before publication.
     ///
     /// # Errors
     ///
@@ -285,28 +428,7 @@ impl VaultManager {
         password: &[u8],
         policy: AccessPolicy,
     ) -> Result<(), DiaryError> {
-        // Step 1: Validate the vault name.
-        Self::validate_vault_name(name)?;
-
-        // Step 2: Reject duplicates.
-        let vault_path = self.base_dir.join(name);
-        if vault_path.exists() {
-            return Err(DiaryError::Vault(format!(
-                "vault '{}' already exists",
-                name
-            )));
-        }
-
-        // Step 3: Ensure the base (vaults/) directory exists.
-        std::fs::create_dir_all(&self.base_dir)?;
-
-        // Step 4: Initialise the vault.
-        self.init_vault(name, password)?;
-
-        // Step 5: Apply the access policy via atomic write.
-        self.set_policy(name, policy)?;
-
-        Ok(())
+        self.init_vault_with_policy(name, password, policy, VaultConfig::to_file)
     }
 
     /// Resolve an existing vault without accepting directory/file symlinks.
@@ -561,6 +683,243 @@ mod tests {
             time_cost: 1,
             parallelism: 1,
         }
+    }
+
+    #[test]
+    fn init_transaction_invalid_kdf_leaves_no_vault_and_allows_retry() {
+        let dir = tempdir().unwrap();
+        let bad = VaultManager::new(dir.path().to_owned())
+            .unwrap()
+            .with_kdf_params(kdf::Argon2Params {
+                time_cost: 0,
+                ..fast_params()
+            });
+        assert!(bad.init_vault("retry", b"password").is_err());
+        assert!(
+            !dir.path().join("retry").exists(),
+            "failed initialization left a partial vault"
+        );
+        let good = VaultManager::new(dir.path().to_owned())
+            .unwrap()
+            .with_kdf_params(fast_params());
+        good.create_vault("retry", b"password", AccessPolicy::WriteOnly)
+            .unwrap();
+        assert_eq!(
+            VaultConfig::from_file(&dir.path().join("retry/vault.toml"))
+                .unwrap()
+                .access
+                .policy,
+            AccessPolicy::WriteOnly
+        );
+    }
+
+    #[test]
+    fn init_transaction_config_write_failure_cleans_staging_and_allows_retry() {
+        let dir = tempdir().unwrap();
+        let mgr = VaultManager::new(dir.path().to_owned())
+            .unwrap()
+            .with_kdf_params(fast_params());
+        let result =
+            mgr.init_vault_with_policy("retry", b"password", AccessPolicy::Full, |config, path| {
+                assert_eq!(config.access.policy, AccessPolicy::Full);
+                std::fs::write(path, b"partial config")?;
+                Err(std::io::Error::other("injected policy write failure").into())
+            });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        mgr.create_vault("retry", b"password", AccessPolicy::Full)
+            .unwrap();
+        assert_eq!(
+            VaultConfig::from_file(&dir.path().join("retry/vault.toml"))
+                .unwrap()
+                .access
+                .policy,
+            AccessPolicy::Full
+        );
+    }
+
+    fn staged_fixture(base: &Path) -> InitStaging {
+        let staging = InitStaging::new(base).unwrap();
+        std::fs::write(staging.path.join("vault.toml"), b"config bytes").unwrap();
+        std::fs::write(staging.path.join("vault.pqd"), b"vault bytes").unwrap();
+        staging
+    }
+
+    #[test]
+    fn init_transaction_staging_is_not_listed_as_a_vault() {
+        let dir = tempdir().unwrap();
+        let mgr = VaultManager::new(dir.path().to_owned()).unwrap();
+        let staging = staged_fixture(dir.path());
+        assert!(mgr.list_vaults().unwrap().is_empty());
+        assert!(mgr.list_vaults_with_policy().unwrap().is_empty());
+        drop(staging);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_transaction_staging_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempdir().unwrap();
+        let staging = staged_fixture(dir.path());
+        assert_eq!(
+            std::fs::metadata(&staging.root)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o077,
+            0
+        );
+        let destination = dir.path().join("vault");
+        staging.publish(&destination).unwrap();
+        for name in ["vault.toml", "vault.pqd"] {
+            assert_eq!(
+                std::fs::metadata(destination.join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o077,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn init_transaction_staging_cleanup_error_preserves_original_failure() {
+        let dir = tempdir().unwrap();
+        // A file at a cleanup directory path deterministically makes
+        // remove_dir_all fail, including when the tests run as root.
+        let root = dir.path().join("cleanup-failure");
+        std::fs::write(&root, b"owned fixture").unwrap();
+        let staging = InitStaging {
+            path: root.join("prepared"),
+            root: root.clone(),
+        };
+        let error = staging
+            .finish(Err(DiaryError::Config("injected policy error".into())))
+            .unwrap_err();
+        assert!(error.to_string().contains("injected policy error"));
+        assert!(error.to_string().contains("staging cleanup failed"));
+        assert_eq!(std::fs::read(root).unwrap(), b"owned fixture");
+    }
+
+    #[test]
+    fn init_transaction_cleanup_failure_after_commit_is_not_an_error() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("cleanup-failure");
+        std::fs::write(&root, b"owned fixture").unwrap();
+        let staging = InitStaging {
+            path: root.join("prepared"),
+            root,
+        };
+        assert!(staging.finish(Ok(())).is_ok());
+    }
+
+    #[test]
+    fn init_transaction_entries_collision_preserves_foreign_contents_and_reports_rollback() {
+        let dir = tempdir().unwrap();
+        let staging = staged_fixture(dir.path());
+        let destination = dir.path().join("vault");
+        let error = staging
+            .publish_with(&destination, |path| {
+                std::fs::create_dir(path.join("entries"))?;
+                std::fs::write(path.join("entries/sentinel"), b"foreign")?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("initialization failed:"));
+        assert!(error.to_string().contains("rollback incomplete"));
+        assert!(!destination.join("vault.toml").exists());
+        assert!(!destination.join("vault.pqd").exists());
+        assert_eq!(
+            std::fs::read(destination.join("entries/sentinel")).unwrap(),
+            b"foreign"
+        );
+    }
+
+    #[test]
+    fn init_transaction_publication_failure_cleans_only_owned_files() {
+        let dir = tempdir().unwrap();
+        let staging = staged_fixture(dir.path());
+        let destination = dir.path().join("vault");
+        // Failure after the first file has been published must clean that file,
+        // but preserve the conflicting second file placed by another writer.
+        assert!(staging
+            .publish_with(&destination, |path| {
+                std::fs::write(path.join("vault.pqd"), b"foreign bytes")?;
+                Ok(())
+            })
+            .is_err());
+        assert!(!destination.join("vault.toml").exists());
+        assert_eq!(
+            std::fs::read(destination.join("vault.pqd")).unwrap(),
+            b"foreign bytes"
+        );
+    }
+
+    #[test]
+    fn init_transaction_copy_failure_removes_partial_files_and_allows_retry() {
+        let dir = tempdir().unwrap();
+        let staging = staged_fixture(dir.path());
+        let destination = dir.path().join("vault");
+        // Reading a directory as a file fails, either on open or copy depending
+        // on the platform, after vault.toml has already been published.
+        std::fs::remove_file(staging.path.join("vault.pqd")).unwrap();
+        std::fs::create_dir(staging.path.join("vault.pqd")).unwrap();
+        assert!(staging.publish(&destination).is_err());
+        assert!(!destination.exists());
+        std::fs::remove_dir(staging.path.join("vault.pqd")).unwrap();
+        std::fs::write(staging.path.join("vault.pqd"), b"vault bytes").unwrap();
+        staging.publish(&destination).unwrap();
+        assert_eq!(
+            std::fs::read(destination.join("vault.pqd")).unwrap(),
+            b"vault bytes"
+        );
+    }
+
+    #[test]
+    fn init_transaction_failure_after_claim_removes_empty_directory() {
+        let dir = tempdir().unwrap();
+        let staging = staged_fixture(dir.path());
+        let destination = dir.path().join("vault");
+        assert!(staging
+            .publish_with(&destination, |_| {
+                Err(std::io::Error::other("injected write failure").into())
+            })
+            .is_err());
+        assert!(!destination.exists());
+        staging.publish(&destination).unwrap();
+    }
+
+    #[test]
+    fn init_transaction_existing_and_concurrent_claims_preserve_bytes() {
+        let dir = tempdir().unwrap();
+        let mgr = VaultManager::new(dir.path().to_owned())
+            .unwrap()
+            .with_kdf_params(fast_params());
+        mgr.create_vault("vault", b"password", AccessPolicy::WriteOnly)
+            .unwrap();
+        let destination = dir.path().join("vault");
+        let original_config = std::fs::read(destination.join("vault.toml")).unwrap();
+        let original_vault = std::fs::read(destination.join("vault.pqd")).unwrap();
+        assert!(mgr
+            .create_vault("vault", b"another", AccessPolicy::Full)
+            .is_err());
+        let staging = staged_fixture(dir.path());
+        assert!(staging.publish(&destination).is_err());
+        assert_eq!(
+            std::fs::read(destination.join("vault.toml")).unwrap(),
+            original_config
+        );
+        assert_eq!(
+            std::fs::read(destination.join("vault.pqd")).unwrap(),
+            original_vault
+        );
+        let empty = dir.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        assert!(staging.publish(&empty).is_err());
+        assert!(empty.is_dir());
+        assert_eq!(std::fs::read_dir(&empty).unwrap().count(), 0);
     }
 
     // All safety fixtures live inside their own temporary directory, including

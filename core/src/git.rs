@@ -12,10 +12,11 @@ use rand::{Rng, RngCore};
 
 use crate::error::DiaryError;
 use crate::vault::config::VaultConfig;
-use crate::vault::format::EntryRecord;
-use crate::vault::reader::{read_vault, verify_vault_integrity};
+use crate::vault::format::{AttachmentRecord, EntryRecord, VaultHeader};
+use crate::vault::reader::{read_vault_with_attachments_from_bytes, verify_vault_integrity_bytes};
 use crate::vault::writer::{
-    write_vault_authenticated, write_vault_authenticated_with_extra_padding,
+    write_vault_with_attachments_authenticated,
+    write_vault_with_attachments_authenticated_with_extra_padding,
 };
 
 // =============================================================================
@@ -338,7 +339,8 @@ pub fn generate_extra_padding(max_bytes: usize) -> zeroize::Zeroizing<Vec<u8>> {
 ///
 /// 1. Verifies `.git` directory exists in `vault_dir` (`EDGE-003` if absent).
 /// 2. Verifies at least one remote is configured (`EDGE-002` if absent).
-/// 3. Verifies the authenticated vault before parsing records.
+/// 3. Verifies the authenticated vault before parsing records and rejects
+///    attachment metadata/blobs, whose sync is not yet supported.
 /// 4. Re-writes `vault_path` with new authenticated random padding — makes
 ///    binary diffs across commits unpredictable (REQ-013, REQ-016).
 /// 5. Optionally adds extra random padding inside the authenticated region
@@ -385,11 +387,17 @@ pub fn git_push(
     // (REQ-013, REQ-016). Decryption is not required — EntryRecords are passed
     // through unchanged.
     {
-        verify_vault_integrity(vault_path, mac_key)?;
-        let (header, entries) = read_vault(vault_path)?;
+        let (header, entries, attachments) = read_authenticated_snapshot(vault_path, mac_key)?;
+        reject_attachment_records(&entries, &attachments)?;
+        reject_local_attachment_blobs(vault_dir)?;
         let extra = generate_extra_padding(config.git.privacy.extra_padding_bytes_max);
-        write_vault_authenticated_with_extra_padding(
-            vault_path, header, &entries, mac_key, &extra,
+        write_vault_with_attachments_authenticated_with_extra_padding(
+            vault_path,
+            header,
+            &entries,
+            &attachments,
+            mac_key,
+            &extra,
         )?;
     }
 
@@ -408,8 +416,9 @@ pub fn git_push(
         )));
     }
 
-    // Step 6: Commit with anonymous author, fixed message, and fuzzed date
-    //         (REQ-011, REQ-012, REQ-017).
+    // Step 6: Commit only the allowlisted paths, leaving unrelated staged data
+    // out of the published history (REQ-010). Keep the anonymous author, fixed
+    // message, and fuzzed date (REQ-011, REQ-012, REQ-017).
     let commit_message = &config.git.commit_message;
     let commit_out = std::process::Command::new("git")
         .current_dir(vault_dir)
@@ -417,7 +426,18 @@ pub fn git_push(
         .arg(format!("user.name={}", config.git.author_name))
         .arg("-c")
         .arg(format!("user.email={}", config.git.author_email))
-        .args(["commit", "--date", &ts_str, "-m", commit_message])
+        .args([
+            "commit",
+            "--only",
+            "--date",
+            &ts_str,
+            "-m",
+            commit_message,
+            "--",
+            "vault.pqd",
+            "vault.toml",
+            ".gitignore",
+        ])
         .env("GIT_AUTHOR_DATE", &ts_str)
         .env("GIT_COMMITTER_DATE", &ts_str)
         .output()
@@ -450,20 +470,17 @@ pub fn git_push(
     Ok(())
 }
 
-/// Fetch from origin and merge remote vault.pqd into the local vault using a
-/// 3-way, entry-level merge strategy.
+/// Fetch from origin and merge compatible, attachment-free vault entries.
 ///
 /// # Algorithm
 ///
-/// 1. Backup `vault_path` → `vault_path.bak`.
-/// 2. Run `git fetch origin`.
-/// 3. Count commits ahead on the remote tracking branch.
-///    * If count == 0: delete backup and return a no-op [`MergeResult`].
-/// 4. `git checkout <tracking_ref> -- vault.pqd` to get the remote version.
-/// 5. Verify and parse remote [`EntryRecord`]s from the overwritten `vault_path`.
-/// 6. Restore `vault_path` from backup (local version).
-/// 7. Verify and parse local [`EntryRecord`]s.
-/// 8. Merge by UUID:
+/// 1. Verify local data and reject unsupported attachment sync.
+/// 2. Fetch origin and resolve the remote commit; no new commits means a no-op.
+/// 3. Read the remote vault with `git show`, without changing the working tree
+///    or index. Verify its integrity and reject attachments, header/key changes,
+///    or a different `vault.toml` before creating a backup.
+/// 4. Create `vault_path.bak` without replacing an existing recovery backup.
+/// 5. Merge by UUID:
 ///    - Local-only UUID → keep.
 ///    - Remote-only UUID → add (`MergeResult.added++`).
 ///    - Both sides, same `content_hmac` → keep local unchanged.
@@ -471,13 +488,15 @@ pub fn git_push(
 ///      → adopt the record with the larger (newer) `updated_at`
 ///      (`MergeResult.updated++`).
 ///    - Both sides, different `content_hmac`, same `updated_at`
-///      → true conflict.  When `claude_mode` is `true`, local wins silently.
+///      → true conflict. When `claude_mode` is `true`, local wins silently.
 ///      Otherwise the conflict is recorded in `MergeResult.conflicts` and
 ///      local is used as the provisional resolution.
-/// 9. Write merged records atomically with an authenticated vault MAC.
-/// 10. `git add vault.pqd` + `git commit` with the privacy pipeline from
-///     `config.git`.
-/// 11. Delete backup on success; restore backup on error.
+/// 6. Write merged records atomically with an authenticated vault MAC.
+/// 7. Commit only `vault.pqd` with the privacy pipeline from `config.git`.
+/// 8. Delete the new backup on success; restore it on error.
+///
+/// This remains an entry-level merge: it does not reconcile deletions or record
+/// remote Git ancestry. A later push may still be rejected as non-fast-forward.
 ///
 /// # Errors
 ///
@@ -497,25 +516,46 @@ pub fn git_pull_merge(
     if !vault_path.exists() {
         return Err(DiaryError::Git("vault.pqd does not exist".to_string()));
     }
-    verify_vault_integrity(vault_path, mac_key)?;
+    let Some(input) = prepare_pull(vault_dir, vault_path, mac_key)? else {
+        return Ok(MergeResult {
+            added: 0,
+            updated: 0,
+            deleted: 0,
+            conflicts: Vec::new(),
+        });
+    };
 
-    // Create backup: vault.pqd → vault.pqd.bak
+    // Create a new backup only after preflight. Never replace recovery data
+    // left by an earlier failed merge.
     let bak_name = format!(
         "{}.bak",
         vault_path.file_name().unwrap_or_default().to_string_lossy()
     );
     let bak_path = vault_path.with_file_name(bak_name);
-    std::fs::copy(vault_path, &bak_path)
-        .map_err(|e| DiaryError::Git(format!("failed to create vault backup: {e}")))?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut backup = options.open(&bak_path).map_err(|e| {
+        DiaryError::Git(format!(
+            "cannot create new vault backup; preserve any existing backup before retrying: {e}"
+        ))
+    })?;
+    let copy_result = (|| {
+        let mut source = std::fs::File::open(vault_path)?;
+        std::io::copy(&mut source, &mut backup)?;
+        backup.sync_all()
+    })();
+    drop(backup);
+    if let Err(error) = copy_result {
+        let _ = std::fs::remove_file(&bak_path);
+        return Err(DiaryError::Io(error));
+    }
 
-    let result = git_pull_merge_inner(
-        vault_dir,
-        config,
-        vault_path,
-        &bak_path,
-        mac_key,
-        claude_mode,
-    );
+    let result = git_pull_merge_inner(vault_dir, config, vault_path, mac_key, claude_mode, input);
 
     match &result {
         Ok(_) => {
@@ -539,78 +579,158 @@ pub fn git_pull_merge(
 // Private helpers
 // =============================================================================
 
-/// Inner logic for [`git_pull_merge`].  All errors propagate back to the outer
-/// function which handles backup cleanup/restore.
+struct PullInput {
+    local_header: VaultHeader,
+    local_entries: Vec<EntryRecord>,
+    remote_entries: Vec<EntryRecord>,
+}
+
+fn reject_attachment_records(
+    entries: &[EntryRecord],
+    attachments: &[AttachmentRecord],
+) -> Result<(), DiaryError> {
+    if !attachments.is_empty()
+        || entries
+            .iter()
+            .any(|entry| entry.attachment_count != 0 || entry.attachment_offset != 0)
+    {
+        return Err(DiaryError::Git(
+            "attachment sync is not supported; vault and attachment data were left unchanged"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn reject_local_attachment_blobs(vault_dir: &Path) -> Result<(), DiaryError> {
+    let path = vault_dir.join(".attachments");
+    let has_files = match std::fs::read_dir(path) {
+        Ok(mut entries) => entries.next().transpose()?.is_some(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(DiaryError::Io(error)),
+    };
+    if has_files || !git_stdout(vault_dir, &["ls-files", "--", ".attachments"])?.is_empty() {
+        return Err(DiaryError::Git(
+            "attachment blob sync is not supported; local data was left unchanged".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Authenticate and parse exactly one local snapshot without reopening it.
+fn read_authenticated_snapshot(
+    vault_path: &Path,
+    mac_key: &[u8; 32],
+) -> Result<(VaultHeader, Vec<EntryRecord>, Vec<AttachmentRecord>), DiaryError> {
+    let bytes = std::fs::read(vault_path)?;
+    verify_vault_integrity_bytes(&bytes, mac_key)?;
+    read_vault_with_attachments_from_bytes(&bytes)
+}
+
+/// Fetch and validate remote data without modifying the working tree or index.
+fn prepare_pull(
+    vault_dir: &Path,
+    vault_path: &Path,
+    mac_key: &[u8; 32],
+) -> Result<Option<PullInput>, DiaryError> {
+    let (local_header, local_entries, attachments) =
+        read_authenticated_snapshot(vault_path, mac_key)?;
+    reject_attachment_records(&local_entries, &attachments)?;
+    reject_local_attachment_blobs(vault_dir)?;
+
+    git_stdout(vault_dir, &["fetch", "origin"])?;
+    let tracking_ref = get_tracking_ref(vault_dir)?;
+    let resolved = git_stdout(
+        vault_dir,
+        &[
+            "rev-parse",
+            "--verify",
+            &format!("{tracking_ref}^{{commit}}"),
+        ],
+    )?;
+    let remote_commit = std::str::from_utf8(&resolved)
+        .map_err(|_| DiaryError::Git("invalid remote commit ID".into()))?
+        .trim();
+    let count = git_stdout(
+        vault_dir,
+        &["rev-list", &format!("HEAD..{remote_commit}"), "--count"],
+    )?;
+    let count: u64 = std::str::from_utf8(&count)
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .ok_or_else(|| DiaryError::Git("invalid remote commit count".into()))?;
+    if count == 0 {
+        return Ok(None);
+    }
+
+    let remote_bytes = git_stdout(vault_dir, &["show", &format!("{remote_commit}:vault.pqd")])?;
+    verify_vault_integrity_bytes(&remote_bytes, mac_key)
+        .map_err(|e| DiaryError::Git(format!("remote vault.pqd failed integrity check: {e}")))?;
+    let (remote_header, remote_entries, attachments) =
+        read_vault_with_attachments_from_bytes(&remote_bytes)?;
+    reject_attachment_records(&remote_entries, &attachments)?;
+    if !git_stdout(vault_dir, &["ls-tree", remote_commit, "--", ".attachments"])?.is_empty() {
+        return Err(DiaryError::Git(
+            "remote attachment blob sync is not supported; local data was left unchanged".into(),
+        ));
+    }
+
+    // Payload length changes normally. Every other header field describes the
+    // encryption context or format, which this entry-only merge cannot migrate.
+    if local_header.schema_version != remote_header.schema_version
+        || local_header.flags != remote_header.flags
+        || local_header.kdf_salt != remote_header.kdf_salt
+        || local_header.legacy_salt != remote_header.legacy_salt
+        || local_header.verification_iv != remote_header.verification_iv
+        || local_header.verification_ct != remote_header.verification_ct
+        || local_header.kem_pk_offset != remote_header.kem_pk_offset
+        || local_header.dsa_pk_hash != remote_header.dsa_pk_hash
+        || local_header.kem_encrypted_sk != remote_header.kem_encrypted_sk
+        || local_header.dsa_encrypted_sk != remote_header.dsa_encrypted_sk
+    {
+        return Err(DiaryError::Git("vault header/key changes cannot be merged automatically; local data was left unchanged".into()));
+    }
+    let remote_config = git_stdout(vault_dir, &["show", &format!("{remote_commit}:vault.toml")])?;
+    if parse_sync_config(&remote_config)?
+        != parse_sync_config(&std::fs::read(vault_dir.join("vault.toml"))?)?
+    {
+        return Err(DiaryError::Git(
+            "vault.toml changes cannot be merged automatically; local data was left unchanged"
+                .into(),
+        ));
+    }
+
+    Ok(Some(PullInput {
+        local_header,
+        local_entries,
+        remote_entries,
+    }))
+}
+
+/// Compare all TOML keys/values, including unknown future fields, while
+/// allowing comments, whitespace, and table/key ordering to differ.
+fn parse_sync_config(bytes: &[u8]) -> Result<toml::Value, DiaryError> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| DiaryError::Git("vault.toml is not valid UTF-8".into()))?;
+    toml::from_str(text)
+        .map_err(|_| DiaryError::Git("vault.toml cannot be parsed for safe sync".into()))
+}
+
+/// Merge validated snapshots. The caller handles backup cleanup/restore.
 fn git_pull_merge_inner(
     vault_dir: &Path,
     config: &VaultConfig,
     vault_path: &Path,
-    bak_path: &Path,
     mac_key: &[u8; 32],
     claude_mode: bool,
+    input: PullInput,
 ) -> Result<MergeResult, DiaryError> {
-    // 1. Fetch from origin.
-    let fetch_out = run_git_command(vault_dir, &["fetch", "origin"])?;
-    if !fetch_out.status.success() {
-        return Err(DiaryError::Git(format!(
-            "git fetch origin failed: {}",
-            String::from_utf8_lossy(&fetch_out.stderr)
-        )));
-    }
-
-    // 2. Resolve the remote tracking branch (e.g. "origin/main").
-    let tracking_ref = get_tracking_ref(vault_dir)?;
-
-    // 3. Count commits on remote that are not in local HEAD.
-    let count_arg = format!("HEAD..{tracking_ref}");
-    let count_out = run_git_command(vault_dir, &["rev-list", &count_arg, "--count"])?;
-    // Parse failure (non-numeric output) is treated as 0 (no remote changes).
-    // This can happen on detached HEAD or other unusual repo states where
-    // rev-list returns unexpected output.
-    let count: u64 = if count_out.status.success() {
-        String::from_utf8_lossy(&count_out.stdout)
-            .trim()
-            .parse()
-            .unwrap_or(0)
-    } else {
-        0
-    };
-
-    // No-op when remote has no new commits.
-    if count == 0 {
-        return Ok(MergeResult {
-            added: 0,
-            updated: 0,
-            deleted: 0,
-            conflicts: Vec::new(),
-        });
-    }
-
-    // 4. Overwrite vault.pqd with the remote version.
-    let checkout_out = run_git_command(vault_dir, &["checkout", &tracking_ref, "--", "vault.pqd"])?;
-    if !checkout_out.status.success() {
-        return Err(DiaryError::Git(format!(
-            "git checkout {tracking_ref} -- vault.pqd failed: {}",
-            String::from_utf8_lossy(&checkout_out.stderr)
-        )));
-    }
-
-    // 5. Verify and read remote entries.
-    verify_vault_integrity(vault_path, mac_key)
-        .map_err(|e| DiaryError::Git(format!("remote vault.pqd failed integrity check: {e}")))?;
-    let (_remote_header, remote_entries) = read_vault(vault_path)
-        .map_err(|e| DiaryError::Git(format!("failed to read remote vault.pqd: {e}")))?;
-
-    // 6. Restore the local vault.pqd from backup.
-    std::fs::copy(bak_path, vault_path).map_err(DiaryError::Io)?;
-
-    // 7. Verify and read local entries.
-    verify_vault_integrity(vault_path, mac_key)
-        .map_err(|e| DiaryError::Git(format!("local vault.pqd failed integrity check: {e}")))?;
-    let (local_header, local_entries) = read_vault(vault_path)
-        .map_err(|e| DiaryError::Git(format!("failed to read local vault.pqd: {e}")))?;
-
-    // 8. Build UUID → EntryRecord maps and run the 3-way merge.
+    let PullInput {
+        local_header,
+        local_entries,
+        remote_entries,
+    } = input;
+    // Build UUID → EntryRecord maps for the entry-level merge.
     let local_map: HashMap<[u8; 16], EntryRecord> =
         local_entries.into_iter().map(|e| (e.uuid, e)).collect();
     let remote_map: HashMap<[u8; 16], EntryRecord> =
@@ -666,18 +786,11 @@ fn git_pull_merge_inner(
         }
     }
 
-    // 9. Atomically write merged entries with a vault-level MAC (REQ-028).
-    write_vault_authenticated(vault_path, local_header, &merged, mac_key)?;
+    // Atomically write merged entries with a vault-level MAC (REQ-028).
+    write_vault_with_attachments_authenticated(vault_path, local_header, &merged, &[], mac_key)?;
 
-    // 10. Stage and commit with the privacy pipeline.
-    let add_out = run_git_command(vault_dir, &["add", "vault.pqd"])?;
-    if !add_out.status.success() {
-        return Err(DiaryError::Git(format!(
-            "git add failed after merge: {}",
-            String::from_utf8_lossy(&add_out.stderr)
-        )));
-    }
-
+    // Commit only the vault. Git's temporary index preserves unrelated staging
+    // and leaves the original index intact if the commit is rejected.
     let prev_ts = get_last_commit_timestamp(vault_dir);
     let fuzz_hours = config.git.privacy.timestamp_fuzz_hours;
     let fuzzed_ts = fuzz_timestamp(prev_ts, fuzz_hours);
@@ -691,10 +804,13 @@ fn git_pull_merge_inner(
         .arg(format!("user.email={}", config.git.author_email))
         .args([
             "commit",
+            "--only",
             "--date",
             &ts_str,
             "-m",
             &config.git.commit_message,
+            "--",
+            "vault.pqd",
         ])
         .env("GIT_AUTHOR_DATE", &ts_str)
         .env("GIT_COMMITTER_DATE", &ts_str)
@@ -702,14 +818,10 @@ fn git_pull_merge_inner(
         .map_err(|e| DiaryError::Git(format!("failed to spawn git commit: {e}")))?;
 
     if !commit_out.status.success() {
-        let stderr = String::from_utf8_lossy(&commit_out.stderr);
-        let stdout = String::from_utf8_lossy(&commit_out.stdout);
-        // "nothing to commit" is acceptable (merged result identical to HEAD).
-        if !stderr.contains("nothing to commit") && !stdout.contains("nothing to commit") {
-            return Err(DiaryError::Git(format!(
-                "git commit failed after merge: {stderr}"
-            )));
-        }
+        return Err(DiaryError::Git(format!(
+            "git commit failed after merge: {}",
+            String::from_utf8_lossy(&commit_out.stderr)
+        )));
     }
 
     Ok(MergeResult {
@@ -775,6 +887,19 @@ fn get_tracking_ref(vault_dir: &Path) -> Result<String, DiaryError> {
     Ok(format!("origin/{branch}"))
 }
 
+/// Run a checked Git command, retaining stderr on failure.
+fn git_stdout(vault_dir: &Path, args: &[&str]) -> Result<Vec<u8>, DiaryError> {
+    let output = run_git_command(vault_dir, args)?;
+    if !output.status.success() {
+        return Err(DiaryError::Git(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(output.stdout)
+}
+
 /// Run a Git command in `vault_dir` with the specified `args`.
 ///
 /// Returns the [`std::process::Output`] from the Git process.
@@ -797,6 +922,8 @@ fn run_git_command(vault_dir: &Path, args: &[&str]) -> Result<std::process::Outp
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vault::reader::{read_vault, verify_vault_integrity};
+    use crate::vault::writer::write_vault_authenticated;
     use tempfile::tempdir;
 
     const TEST_MAC_KEY: [u8; 32] = [0x42; 32];
@@ -1728,6 +1855,381 @@ mod tests {
     // =========================================================================
     // TASK-0077 tests
     // =========================================================================
+
+    #[test]
+    fn push_creates_initial_commit_from_new_allowlisted_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault_dir = tmp.path().join("vault");
+        let bare_dir = tmp.path().join("bare.git");
+        std::fs::create_dir(&vault_dir).unwrap();
+        assert!(
+            run_git_command(tmp.path(), &["init", "--bare", bare_dir.to_str().unwrap()])
+                .unwrap()
+                .status
+                .success()
+        );
+        let config = make_git_push_config("pq-diary", "test@localhost", "Update vault", 0, 0);
+        config.to_file(&vault_dir.join("vault.toml")).unwrap();
+        let vault_path = vault_dir.join("vault.pqd");
+        crate::vault::writer::write_vault(&vault_path, VaultHeader::new(), &[]).unwrap();
+        git_init(&vault_dir, Some(bare_dir.to_str().unwrap())).unwrap();
+
+        git_push(&vault_dir, &config, &vault_path, &TEST_MAC_KEY).unwrap();
+        let remote_files =
+            run_git_command(&bare_dir, &["ls-tree", "-r", "--name-only", "HEAD"]).unwrap();
+        assert!(remote_files.status.success());
+        assert_eq!(remote_files.stdout, b".gitignore\nvault.pqd\nvault.toml\n");
+    }
+
+    #[test]
+    fn push_does_not_publish_unrelated_staged_file() {
+        let config = make_git_push_config("pq-diary", "test@localhost", "Update vault", 0, 0);
+        let (tmp, vault_dir, vault_path) = setup_vault_with_remote(&config);
+        std::fs::write(
+            vault_dir.join("unrelated.txt"),
+            b"private plaintext fixture",
+        )
+        .unwrap();
+        assert!(run_git_command(&vault_dir, &["add", "unrelated.txt"])
+            .unwrap()
+            .status
+            .success());
+
+        git_push(&vault_dir, &config, &vault_path, &TEST_MAC_KEY).unwrap();
+        let remote_files = run_git_command(
+            &tmp.path().join("bare.git"),
+            &["ls-tree", "-r", "--name-only", "HEAD"],
+        )
+        .unwrap();
+        assert!(remote_files.status.success());
+        assert_eq!(remote_files.stdout, b".gitignore\nvault.pqd\nvault.toml\n");
+        let staged = run_git_command(&vault_dir, &["diff", "--cached", "--name-only"]).unwrap();
+        assert!(staged.status.success());
+        assert_eq!(staged.stdout, b"unrelated.txt\n");
+        assert_eq!(
+            std::fs::read(vault_dir.join("unrelated.txt")).unwrap(),
+            b"private plaintext fixture"
+        );
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct LocalGitState {
+        vault: Vec<u8>,
+        config: Vec<u8>,
+        index: Vec<u8>,
+        head: Vec<u8>,
+    }
+
+    fn local_git_state(vault_dir: &Path) -> LocalGitState {
+        let head = run_git_command(vault_dir, &["rev-parse", "HEAD"]).unwrap();
+        assert!(head.status.success());
+        LocalGitState {
+            vault: std::fs::read(vault_dir.join("vault.pqd")).unwrap(),
+            config: std::fs::read(vault_dir.join("vault.toml")).unwrap(),
+            index: std::fs::read(vault_dir.join(".git/index")).unwrap(),
+            head: head.stdout,
+        }
+    }
+
+    fn publish_contributor_fixture(contributor_dir: &Path) {
+        for args in [
+            vec!["add", "--all"],
+            vec!["commit", "-m", "remote test fixture"],
+            vec!["push", "origin", "HEAD"],
+        ] {
+            let output = run_git_command(contributor_dir, &args).expect("run fixture git");
+            assert!(output.status.success(), "{output:?}");
+        }
+    }
+
+    fn add_attachment_fixture(vault_path: &Path) {
+        use crate::vault::format::{AttachmentRecord, RECORD_TYPE_ATTACHMENT};
+        use crate::vault::writer::write_vault_with_attachments_authenticated;
+
+        let (header, entries) = read_vault(vault_path).unwrap();
+        let attachment = AttachmentRecord {
+            record_type: RECORD_TYPE_ATTACHMENT,
+            uuid: [0xCD; 16],
+            iv: [0x02; 12],
+            ciphertext: vec![0xAA, 0xBB],
+            signature: vec![0xCC],
+            content_hmac: [0x7E; 32],
+            legacy_flag: 0,
+            legacy_key_block: vec![],
+            padding: vec![],
+        };
+        write_vault_with_attachments_authenticated(
+            vault_path,
+            header,
+            &entries,
+            &[attachment],
+            &TEST_MAC_KEY,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn pull_preflight_rejects_incompatible_remote_without_mutation() {
+        for change in [
+            "malformed",
+            "mac",
+            "salt",
+            "key",
+            "config",
+            "policy",
+            "kdf",
+            "unknown_config",
+            "attachments",
+            "blobs",
+        ] {
+            let local_entry = make_entry(0xA0, 0x01, 100);
+            let remote_entry = make_entry(0xB0, 0x02, 200);
+            let (tmp, vault_dir, vault_path, config) =
+                setup_pull_test(&[remote_entry], &[local_entry]);
+            let contributor_dir = tmp.path().join("contributor");
+            let remote_path = contributor_dir.join("vault.pqd");
+            let (mut header, entries) = read_vault(&remote_path).unwrap();
+            let expected_error = match change {
+                "malformed" => {
+                    std::fs::write(&remote_path, b"invalid remote vault").unwrap();
+                    "integrity"
+                }
+                "mac" => {
+                    write_vault_authenticated(&remote_path, header, &entries, &TEST_MAC_KEY)
+                        .unwrap();
+                    let mut bytes = std::fs::read(&remote_path).unwrap();
+                    *bytes.last_mut().unwrap() ^= 1;
+                    std::fs::write(&remote_path, bytes).unwrap();
+                    "integrity"
+                }
+                "salt" | "key" => {
+                    if change == "salt" {
+                        header.kdf_salt[0] ^= 1;
+                    } else {
+                        header.kem_encrypted_sk.push(0xAB);
+                    }
+                    crate::vault::writer::write_vault(&remote_path, header, &entries).unwrap();
+                    "header"
+                }
+                "config" => {
+                    std::fs::write(contributor_dir.join("vault.toml"), b"changed configuration")
+                        .unwrap();
+                    "vault.toml"
+                }
+                "policy" | "kdf" | "unknown_config" => {
+                    let path = contributor_dir.join("vault.toml");
+                    let mut value: toml::Value =
+                        toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+                    match change {
+                        "policy" => value["access"]["policy"] = "full".into(),
+                        "kdf" => value["argon2"]["time_cost"] = 4.into(),
+                        _ => {
+                            value
+                                .as_table_mut()
+                                .unwrap()
+                                .insert("future_setting".into(), "different".into());
+                        }
+                    }
+                    std::fs::write(path, toml::to_string(&value).unwrap()).unwrap();
+                    "vault.toml"
+                }
+                "attachments" => {
+                    add_attachment_fixture(&remote_path);
+                    "attachment"
+                }
+                "blobs" => {
+                    std::fs::create_dir(contributor_dir.join(".attachments")).unwrap();
+                    std::fs::write(
+                        contributor_dir.join(".attachments/blob.bin"),
+                        b"encrypted fixture",
+                    )
+                    .unwrap();
+                    "attachment"
+                }
+                _ => unreachable!(),
+            };
+            publish_contributor_fixture(&contributor_dir);
+            let original = local_git_state(&vault_dir);
+            let backup_path = vault_dir.join("vault.pqd.bak");
+            std::fs::write(&backup_path, b"previous recovery backup").unwrap();
+
+            let error = git_pull_merge(&vault_dir, &config, &vault_path, &TEST_MAC_KEY, false)
+                .expect_err(change);
+            assert!(
+                error.to_string().contains(expected_error),
+                "{change}: {error}"
+            );
+            assert_eq!(local_git_state(&vault_dir), original, "{change}");
+            assert_eq!(
+                std::fs::read(backup_path).unwrap(),
+                b"previous recovery backup"
+            );
+        }
+    }
+
+    #[test]
+    fn sync_rejects_local_attachments_before_mutation() {
+        for kind in ["metadata", "entry_count", "blob"] {
+            let (tmp, vault_dir, vault_path, config) =
+                setup_pull_test(&[], &[make_entry(0xA0, 0x01, 100)]);
+            match kind {
+                "metadata" => add_attachment_fixture(&vault_path),
+                "entry_count" => {
+                    let (header, mut entries) = read_vault(&vault_path).unwrap();
+                    entries[0].attachment_count = 1;
+                    crate::vault::writer::write_vault(&vault_path, header, &entries).unwrap();
+                }
+                "blob" => {
+                    std::fs::create_dir(vault_dir.join(".attachments")).unwrap();
+                    std::fs::write(
+                        vault_dir.join(".attachments/blob.bin"),
+                        b"encrypted fixture",
+                    )
+                    .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let original = local_git_state(&vault_dir);
+            let remote_before =
+                run_git_command(&tmp.path().join("bare.git"), &["rev-parse", "HEAD"]).unwrap();
+            let error = git_pull_merge(&vault_dir, &config, &vault_path, &TEST_MAC_KEY, false)
+                .expect_err(kind);
+            assert!(error.to_string().contains("attachment"), "{error}");
+            assert_eq!(local_git_state(&vault_dir), original);
+            assert!(!vault_dir.join("vault.pqd.bak").exists());
+            let error = git_push(&vault_dir, &config, &vault_path, &TEST_MAC_KEY).expect_err(kind);
+            assert!(error.to_string().contains("attachment"), "{error}");
+            assert_eq!(local_git_state(&vault_dir), original);
+            let remote_after =
+                run_git_command(&tmp.path().join("bare.git"), &["rev-parse", "HEAD"]).unwrap();
+            assert!(remote_before.status.success() && remote_after.status.success());
+            assert_eq!(remote_before.stdout, remote_after.stdout);
+        }
+    }
+
+    #[test]
+    fn pull_preflight_rejects_missing_tracking_ref() {
+        let (_tmp, vault_dir, vault_path, config) = setup_pull_test(&[], &[]);
+        for args in [
+            vec!["branch", "--unset-upstream"],
+            vec!["branch", "-m", "local-only-branch"],
+        ] {
+            assert!(run_git_command(&vault_dir, &args).unwrap().status.success());
+        }
+        let original = local_git_state(&vault_dir);
+        assert!(git_pull_merge(&vault_dir, &config, &vault_path, &TEST_MAC_KEY, false).is_err());
+        assert_eq!(local_git_state(&vault_dir), original);
+        assert!(!vault_dir.join("vault.pqd.bak").exists());
+    }
+
+    #[test]
+    fn pull_preserves_existing_recovery_backup() {
+        let (_tmp, vault_dir, vault_path, config) = setup_pull_test(&[], &[]);
+        let original = local_git_state(&vault_dir);
+        let backup_path = vault_dir.join("vault.pqd.bak");
+        std::fs::write(&backup_path, b"previous recovery backup").unwrap();
+        assert!(git_pull_merge(&vault_dir, &config, &vault_path, &TEST_MAC_KEY, false).is_err());
+        assert_eq!(local_git_state(&vault_dir), original);
+        assert_eq!(
+            std::fs::read(backup_path).unwrap(),
+            b"previous recovery backup"
+        );
+    }
+
+    #[test]
+    fn pull_no_op_preserves_existing_recovery_backup() {
+        let config = make_git_push_config("pq-diary", "test@localhost", "Update vault", 0, 0);
+        let (_tmp, vault_dir, vault_path) = setup_vault_with_remote(&config);
+        let original = local_git_state(&vault_dir);
+        let backup_path = vault_dir.join("vault.pqd.bak");
+        std::fs::write(&backup_path, b"previous recovery backup").unwrap();
+        let result =
+            git_pull_merge(&vault_dir, &config, &vault_path, &TEST_MAC_KEY, false).unwrap();
+        assert_eq!(result.added, 0);
+        assert_eq!(local_git_state(&vault_dir), original);
+        assert_eq!(
+            std::fs::read(backup_path).unwrap(),
+            b"previous recovery backup"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pull_failed_commit_preserves_vault_head_and_index() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_tmp, vault_dir, vault_path, config) = setup_pull_test(&[], &[]);
+        std::fs::write(vault_dir.join("unrelated.txt"), b"staged user change").unwrap();
+        assert!(run_git_command(&vault_dir, &["add", "unrelated.txt"])
+            .unwrap()
+            .status
+            .success());
+        let hook = vault_dir.join(".git/hooks/pre-commit");
+        std::fs::write(&hook, b"#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let original = local_git_state(&vault_dir);
+
+        assert!(git_pull_merge(&vault_dir, &config, &vault_path, &TEST_MAC_KEY, false).is_err());
+        assert_eq!(local_git_state(&vault_dir), original);
+        assert_eq!(
+            std::fs::read(vault_dir.join("vault.pqd.bak")).unwrap(),
+            original.vault
+        );
+    }
+
+    #[test]
+    fn pull_accepts_equivalent_config_without_committing_unrelated_files() {
+        let local_entry = make_entry(0xA0, 0x01, 100);
+        let remote_entry = make_entry(0xB0, 0x02, 200);
+        let (tmp, vault_dir, vault_path, config) = setup_pull_test(&[remote_entry], &[local_entry]);
+        let contributor_dir = tmp.path().join("contributor");
+        // Exercise the successful production MAC path on both snapshots.
+        for path in [&vault_path, &contributor_dir.join("vault.pqd")] {
+            let (header, entries) = read_vault(path).unwrap();
+            write_vault_authenticated(path, header, &entries, &TEST_MAC_KEY).unwrap();
+        }
+        let original_config = std::fs::read(vault_dir.join("vault.toml")).unwrap();
+        let parsed: toml::Value =
+            toml::from_str(std::str::from_utf8(&original_config).unwrap()).unwrap();
+        let formatted = format!(
+            "# equivalent config, different formatting\n{}",
+            toml::to_string(&parsed).unwrap()
+        );
+        std::fs::write(contributor_dir.join("vault.toml"), formatted).unwrap();
+        publish_contributor_fixture(&contributor_dir);
+        std::fs::write(vault_dir.join("unrelated.txt"), b"staged user change").unwrap();
+        assert!(run_git_command(&vault_dir, &["add", "unrelated.txt"])
+            .unwrap()
+            .status
+            .success());
+
+        let result =
+            git_pull_merge(&vault_dir, &config, &vault_path, &TEST_MAC_KEY, false).unwrap();
+        assert_eq!(result.added, 1);
+        assert!(result.conflicts.is_empty());
+        let (_, entries) = read_vault(&vault_path).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries
+            .iter()
+            .any(|entry| entry.uuid[0] == 0xA0 && entry.content_hmac == [0x01; 32]));
+        assert!(entries
+            .iter()
+            .any(|entry| entry.uuid[0] == 0xB0 && entry.content_hmac == [0x02; 32]));
+        assert_eq!(
+            std::fs::read(vault_dir.join("vault.toml")).unwrap(),
+            original_config
+        );
+        verify_vault_integrity(&vault_path, &TEST_MAC_KEY).unwrap();
+        let staged = run_git_command(&vault_dir, &["diff", "--cached", "--name-only"]).unwrap();
+        assert!(staged.status.success());
+        assert_eq!(staged.stdout, b"unrelated.txt\n");
+        assert!(
+            !run_git_command(&vault_dir, &["show", "HEAD:unrelated.txt"])
+                .unwrap()
+                .status
+                .success()
+        );
+    }
 
     /// TC-S8-077-01: git_pull_merge returns no-op when remote has no new commits (EDGE-004).
     #[test]

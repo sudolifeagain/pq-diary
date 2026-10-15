@@ -1948,26 +1948,17 @@ fn vault_dir_from_path(vault_path: &std::path::Path) -> anyhow::Result<PathBuf> 
     }
 }
 
-/// Apply conflict resolutions chosen interactively by the user.
-///
-/// For each conflict where the user chooses `r` (remote), overwrites the
-/// local provisional entry in the vault with the remote version and commits
-/// the change using the vault's privacy pipeline.
-///
-/// `reader` is injected so that tests can supply pre-programmed responses
-/// instead of reading from the real stdin.
-fn resolve_conflicts_interactive(
+/// Collect choices and apply them only to the authenticated current snapshot.
+/// Returns whether remote choices were written; local-only choices are a no-op.
+fn apply_conflict_choices(
     conflicts: &[pq_diary_core::git::MergeConflict],
-    vault_dir: &std::path::Path,
-    config: &pq_diary_core::vault::config::VaultConfig,
     vault_path: &std::path::Path,
     mac_key: &[u8; 32],
     reader: &mut impl std::io::BufRead,
-) -> anyhow::Result<()> {
-    use pq_diary_core::git::{fuzz_timestamp, get_last_commit_timestamp};
+) -> anyhow::Result<bool> {
     use pq_diary_core::vault::{
-        reader::{read_vault, verify_vault_integrity},
-        writer::write_vault_authenticated,
+        reader::read_vault_with_attachments_authenticated,
+        writer::write_vault_with_attachments_authenticated,
     };
     use std::io::Write as _;
 
@@ -1995,21 +1986,60 @@ fn resolve_conflicts_interactive(
     }
 
     if remote_uuids.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
 
-    // Apply "keep remote" choices: swap entries in vault.pqd.
-    verify_vault_integrity(vault_path, mac_key).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let (header, mut entries) = read_vault(vault_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Authenticate and parse one post-prompt snapshot, including attachments.
+    // This preserves unrelated edits made while the user was choosing. It is
+    // not a cross-process lock: another writer can still race after this read.
+    let (header, mut entries, attachments) =
+        read_vault_with_attachments_authenticated(vault_path, mac_key)?;
     for uuid in &remote_uuids {
         if let Some(conflict) = conflicts.iter().find(|c| &c.uuid == uuid) {
-            if let Some(pos) = entries.iter().position(|e| e.uuid == *uuid) {
-                entries[pos] = conflict.remote.clone();
+            let pos = entries
+                .iter()
+                .position(|e| e.uuid == *uuid)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Conflict entry disappeared while prompting; retry the merge")
+                })?;
+            if entries[pos] != conflict.local {
+                anyhow::bail!("Conflict entry changed while prompting; retry the merge");
             }
+            entries[pos] = conflict.remote.clone();
         }
     }
-    write_vault_authenticated(vault_path, header, &entries, mac_key)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // No write occurs unless every selected local version still matches.
+    write_vault_with_attachments_authenticated(
+        vault_path,
+        header,
+        &entries,
+        &attachments,
+        mac_key,
+    )?;
+    Ok(true)
+}
+
+/// Apply conflict resolutions chosen interactively by the user.
+///
+/// For each conflict where the user chooses `r` (remote), overwrites the
+/// local provisional entry in the vault with the remote version and commits
+/// the change using the vault's privacy pipeline.
+///
+/// `reader` is injected so that tests can supply pre-programmed responses
+/// instead of reading from the real stdin.
+fn resolve_conflicts_interactive(
+    conflicts: &[pq_diary_core::git::MergeConflict],
+    vault_dir: &std::path::Path,
+    config: &pq_diary_core::vault::config::VaultConfig,
+    vault_path: &std::path::Path,
+    mac_key: &[u8; 32],
+    reader: &mut impl std::io::BufRead,
+) -> anyhow::Result<()> {
+    use pq_diary_core::git::{fuzz_timestamp, get_last_commit_timestamp};
+
+    if !apply_conflict_choices(conflicts, vault_path, mac_key, reader)? {
+        return Ok(());
+    }
 
     // Commit the updated vault using the privacy pipeline.
     let prev_ts = get_last_commit_timestamp(vault_dir);
@@ -11280,6 +11310,230 @@ parallelism = 1
                 s.chars().nth(4) == Some('-') && s.chars().nth(7) == Some('-'),
                 "expected date prefix in {s}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod conflict_snapshot_tests {
+    use super::apply_conflict_choices;
+    use pq_diary_core::{
+        git::MergeConflict,
+        vault::{
+            format::{
+                AttachmentRecord, EntryRecord, VaultHeader, RECORD_TYPE_ATTACHMENT,
+                RECORD_TYPE_ENTRY,
+            },
+            reader::read_vault_with_attachments_authenticated,
+            writer::{write_header, write_vault_with_attachments_authenticated},
+        },
+    };
+    use std::io::{self, BufRead, Read};
+
+    const KEY: [u8; 32] = [42; 32];
+
+    // Simulate another writer during the prompt without timing or real Git.
+    struct Prompt<F> {
+        input: io::Cursor<&'static str>,
+        during_prompt: Option<F>,
+    }
+    impl<F: FnOnce()> Read for Prompt<F> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.input.read(buf)
+        }
+    }
+    impl<F: FnOnce()> BufRead for Prompt<F> {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            self.input.fill_buf()
+        }
+        fn consume(&mut self, amount: usize) {
+            self.input.consume(amount);
+        }
+        fn read_line(&mut self, line: &mut String) -> io::Result<usize> {
+            if let Some(callback) = self.during_prompt.take() {
+                callback();
+            }
+            self.input.read_line(line)
+        }
+    }
+
+    fn entry(id: u8) -> EntryRecord {
+        EntryRecord {
+            record_type: RECORD_TYPE_ENTRY,
+            uuid: [id; 16],
+            created_at: 10,
+            updated_at: 20,
+            iv: [1; 12],
+            ciphertext: vec![2; 32],
+            signature: vec![3; 32],
+            content_hmac: [4; 32],
+            legacy_flag: 0,
+            legacy_key_block: vec![],
+            attachment_count: 0,
+            attachment_offset: 0,
+            padding: vec![5],
+        }
+    }
+
+    fn conflict(id: u8) -> MergeConflict {
+        let local = entry(id);
+        let mut remote = local.clone();
+        remote.content_hmac = [6; 32];
+        remote.ciphertext = vec![7; 32];
+        MergeConflict {
+            uuid: local.uuid,
+            local,
+            remote,
+        }
+    }
+
+    fn save(path: &std::path::Path, entries: &[EntryRecord], attachments: &[AttachmentRecord]) {
+        write_vault_with_attachments_authenticated(
+            path,
+            VaultHeader::new(),
+            entries,
+            attachments,
+            &KEY,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn conflict_snapshot_rejects_changed_or_missing_selected_entry_without_writes() {
+        // Changes with unchanged content HMAC and timestamp must also be caught.
+        for mutation in 0..5 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("vault.pqd");
+            let conflicts = [conflict(11), conflict(12)];
+            let original = vec![conflicts[0].local.clone(), conflicts[1].local.clone()];
+            save(&path, &original, &[]);
+            let mut current = original.clone();
+            match mutation {
+                0 => current[1].updated_at += 1,
+                1 => current[1].ciphertext[0] ^= 1,
+                2 => current[1].legacy_flag = 1,
+                3 => current[1].signature[0] ^= 1,
+                _ => {
+                    current.remove(1);
+                }
+            }
+            let mut after_prompt = Vec::new();
+            let mut prompt = Prompt {
+                input: io::Cursor::new("r\nremote\n"),
+                during_prompt: Some(|| {
+                    save(&path, &current, &[]);
+                    after_prompt = std::fs::read(&path).unwrap();
+                }),
+            };
+            let error = apply_conflict_choices(&conflicts, &path, &KEY, &mut prompt).unwrap_err();
+            assert!(
+                error.to_string().contains(if mutation == 4 {
+                    "disappeared"
+                } else {
+                    "changed"
+                }),
+                "{error}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), after_prompt);
+            let (_, records, _) = read_vault_with_attachments_authenticated(&path, &KEY).unwrap();
+            assert_eq!(records, current);
+        }
+    }
+
+    #[test]
+    fn conflict_snapshot_rejects_corrupt_metadata_without_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.pqd");
+        let conflicts = [conflict(11)];
+        save(&path, &[conflicts[0].local.clone()], &[]);
+        let (header, _, _) = read_vault_with_attachments_authenticated(&path, &KEY).unwrap();
+        let mut encoded_header = Vec::new();
+        write_header(&mut encoded_header, &header).unwrap();
+        let mut corrupted = std::fs::read(&path).unwrap();
+        // Length prefix + record type + UUID + creation timestamp.
+        corrupted[encoded_header.len() + 4 + 1 + 16 + 8] ^= 1;
+        let mut prompt = Prompt {
+            input: io::Cursor::new("r\n"),
+            during_prompt: Some(|| std::fs::write(&path, &corrupted).unwrap()),
+        };
+        let error = apply_conflict_choices(&conflicts, &path, &KEY, &mut prompt).unwrap_err();
+        assert!(
+            error.to_string().contains("integrity verification failed"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), corrupted);
+    }
+
+    #[test]
+    fn conflict_snapshot_preserves_post_prompt_unrelated_records_and_attachments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.pqd");
+        let conflicts = [conflict(11), conflict(12)];
+        save(
+            &path,
+            &[conflicts[0].local.clone(), conflicts[1].local.clone()],
+            &[],
+        );
+        let attachment = AttachmentRecord {
+            record_type: RECORD_TYPE_ATTACHMENT,
+            uuid: [13; 16],
+            iv: [14; 12],
+            ciphertext: vec![15; 32],
+            signature: vec![16; 32],
+            content_hmac: [17; 32],
+            legacy_flag: 0,
+            legacy_key_block: vec![],
+            padding: vec![18],
+        };
+        let mut unrelated = conflicts[1].local.clone();
+        unrelated.updated_at += 1;
+        let new_entry = entry(19);
+        let mut expected_attachments = Vec::new();
+        pq_diary_core::vault::writer::write_attachments(
+            &mut expected_attachments,
+            std::slice::from_ref(&attachment),
+        )
+        .unwrap();
+        let mut prompt = Prompt {
+            input: io::Cursor::new(" REMOTE \nl\n"),
+            during_prompt: Some(|| {
+                save(
+                    &path,
+                    &[
+                        conflicts[0].local.clone(),
+                        unrelated.clone(),
+                        new_entry.clone(),
+                    ],
+                    &[attachment],
+                )
+            }),
+        };
+        assert!(apply_conflict_choices(&conflicts, &path, &KEY, &mut prompt).unwrap());
+        let (_, entries, attachments) =
+            read_vault_with_attachments_authenticated(&path, &KEY).unwrap();
+        assert_eq!(
+            entries,
+            vec![conflicts[0].remote.clone(), unrelated, new_entry]
+        );
+        let mut actual_attachments = Vec::new();
+        pq_diary_core::vault::writer::write_attachments(&mut actual_attachments, &attachments)
+            .unwrap();
+        assert_eq!(actual_attachments, expected_attachments);
+    }
+
+    #[test]
+    fn conflict_snapshot_local_unknown_and_eof_choices_are_noops() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.pqd");
+        let conflicts = [conflict(11)];
+        save(&path, &[conflicts[0].local.clone()], &[]);
+        let before = std::fs::read(&path).unwrap();
+        for input in ["l\n", "local\n", "unknown\n", ""] {
+            assert!(
+                !apply_conflict_choices(&conflicts, &path, &KEY, &mut io::Cursor::new(input))
+                    .unwrap()
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before);
         }
     }
 }

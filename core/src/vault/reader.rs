@@ -13,22 +13,12 @@ use std::path::Path;
 use crate::crypto::hmac_util;
 use crate::error::DiaryError;
 use crate::vault::format::{
-    AttachmentRecord, EntryRecord, VaultHeader, FLAG_INTEGRITY, MAGIC, MAX_FIELD_SIZE,
+    check_field_size, AttachmentRecord, EntryRecord, VaultHeader, FLAG_INTEGRITY, MAGIC,
     RECORD_TYPE_ATTACHMENT, SCHEMA_VERSION, SCHEMA_VERSION_MIN, VAULT_MAC_LEN,
 };
 
 /// Fixed size of the on-disk verification-token ciphertext field (bytes 92–140).
 const VERIFICATION_CT_LEN: usize = 48;
-
-/// Return `DiaryError::Vault` if `len` exceeds [`MAX_FIELD_SIZE`].
-fn check_field_size(len: usize) -> Result<(), DiaryError> {
-    if len > MAX_FIELD_SIZE {
-        return Err(DiaryError::Vault(format!(
-            "field size {len} exceeds 16MiB maximum"
-        )));
-    }
-    Ok(())
-}
 
 /// Parse a [`VaultHeader`] from `reader`.
 ///

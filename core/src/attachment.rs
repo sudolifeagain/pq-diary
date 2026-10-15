@@ -308,10 +308,13 @@ fn add_attachment_before_commit(
         } else {
             // Generate a fresh blob.
             let mut new_blob = [0u8; 16];
-            OsRng.fill_bytes(&mut new_blob);
-            let mut new_key_bytes = [0u8; 32];
-            OsRng.fill_bytes(&mut new_key_bytes);
-            let new_key = Zeroizing::new(new_key_bytes);
+            OsRng
+                .try_fill_bytes(&mut new_blob)
+                .map_err(std::io::Error::other)?;
+            let mut new_key = Zeroizing::new([0u8; 32]);
+            OsRng
+                .try_fill_bytes(new_key.as_mut())
+                .map_err(std::io::Error::other)?;
 
             std::fs::create_dir_all(attachments_dir(vault_dir))?;
             let bin_path = blob_path(vault_dir, &new_blob);
@@ -948,8 +951,7 @@ fn verify_master(
 }
 
 fn verify_hmac(expected: &[u8; 32], data: &[u8], key: &[u8; 32]) -> Result<(), DiaryError> {
-    let actual = hmac_util::compute(key, data)?;
-    if &actual != expected {
+    if !hmac_util::verify_hmac(key, data, expected)? {
         return Err(DiaryError::Crypto(
             "attachment content_hmac mismatch".to_string(),
         ));

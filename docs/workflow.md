@@ -133,6 +133,25 @@ PRテンプレートに環境（OS/Rust）、コマンド、結果、実測時�
 未実施の検証と理由を書く。秒数の上限を根拠なく設けず、実測を比較して
 重複jobや不要な再ビルドから減らす。GitHub Actionsのstep所要時間も測定に使える。
 
+### 回帰テストの隔離と実バイナリ
+
+- 環境変数を検証するテストは子プロセスの `Command::env` / `env_remove` と専用tempdirで隔離する（`cli/tests/vault_resolution.rs` 参照）。並列テスト中に親プロセスの環境を変更しない
+- 並行worktreeにはそれぞれ専用の `CARGO_TARGET_DIR` を指定する。実CLIテスト・smokeの前に、そのworktreeで明示的にbuildし、同じtargetのバイナリを使う。別ブランチの成果物や古いdebugバイナリを検証根拠にしない
+- fixtureは対象OSで利用可能なものを選ぶ。Unixのno-op editorは `cli/tests/editor_roundtrip.rs` の `EDITOR=true` のようにPATHで解決し、`/bin/true` を固定しない。OS依存fixtureはcfgと実行条件を明示する
+
+専用targetでの例（同時作業するworktreeごとに異なるディレクトリを使う）:
+
+```bash
+export CARGO_TARGET_DIR="$PWD/target-review"
+cargo build --workspace --locked
+cargo test -p pq-diary --locked --test editor_roundtrip
+bash ci/smoke-test.sh "$CARGO_TARGET_DIR/debug/pq-diary"
+```
+
+I/O変更のレビューは [AGENTS.mdの契約](../AGENTS.md#io変更時の契約) と
+[DoD](definition-of-done.md) の該当項目を確認する。全テスト成功は、未検証の経路も含めて
+「不具合を全て除去した」という根拠にはしない。
+
 ### Rustの判断根拠
 
 - [Rust Book: panicとResultの使い分け](https://doc.rust-lang.org/book/ch09-03-to-panic-or-not-to-panic.html)

@@ -157,6 +157,17 @@ impl LinkIndex {
     /// Entries whose `uuid_hex` cannot be parsed as 32 lowercase hex characters
     /// are silently skipped.
     pub fn build(entries: &[(EntryMeta, String)]) -> Self {
+        Self::build_from_entries(entries.iter().map(|(meta, body)| (meta, body.as_str())))
+    }
+
+    /// Build directly from protected bodies without allocating unprotected copies.
+    pub(crate) fn build_protected(entries: &[(EntryMeta, zeroize::Zeroizing<String>)]) -> Self {
+        Self::build_from_entries(entries.iter().map(|(meta, body)| (meta, body.as_str())))
+    }
+
+    fn build_from_entries<'a>(
+        entries: impl Iterator<Item = (&'a EntryMeta, &'a str)> + Clone,
+    ) -> Self {
         let mut index = LinkIndex {
             title_to_uuids: HashMap::new(),
             uuid_to_backlinks: HashMap::new(),
@@ -165,7 +176,7 @@ impl LinkIndex {
         };
 
         // First pass: build forward map (title → UUID) and timestamp map.
-        for (meta, _body) in entries {
+        for (meta, _body) in entries.clone() {
             let Ok(uuid_bytes) = uuid_hex_to_bytes(&meta.uuid_hex) else {
                 continue;
             };

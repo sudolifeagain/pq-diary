@@ -490,6 +490,7 @@ mod tests {
         assert_eq!(attachments_after, attachments_before);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn replacement_io_failure_preserves_original() {
         let dir = tempdir().expect("tempdir");
@@ -498,10 +499,16 @@ mod tests {
         init_test_vault(&path);
         create_template(&path, &engine, &daily_template("original")).expect("template");
         let before = std::fs::read(&path).expect("snapshot");
-        std::fs::create_dir(path.with_file_name("vault.pqd.tmp")).expect("block temporary write");
+        // procfs permits reading this open synthetic vault but cannot create
+        // a UUID sibling. This fails even when tests run as root and does not
+        // depend on the writer's private temporary filename.
+        use std::os::fd::AsRawFd;
+        let file = std::fs::File::open(&path).expect("open original");
+        let read_only_path =
+            std::path::PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
 
         assert!(matches!(
-            replace_template(&path, &engine, &daily_template("replacement")),
+            replace_template(&read_only_path, &engine, &daily_template("replacement")),
             Err(DiaryError::Io(_))
         ));
         assert_eq!(std::fs::read(&path).expect("vault"), before);

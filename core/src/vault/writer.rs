@@ -8,7 +8,7 @@
 //! - `write_vault`: write a complete vault file to a `Path` with random tail padding
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rand::Rng;
 
@@ -282,28 +282,67 @@ pub fn write_attachments<W: Write>(
     Ok(())
 }
 
-/// Create the `.tmp` file for an atomic vault write, applying owner-only
-/// (`0o600`) permissions on Unix at creation time so the encrypted vault and
-/// its key blobs are never briefly world-readable (REQ-611 / audit M1).
-///
-/// On non-Unix platforms the file is created normally; directory-level ACLs
-/// (applied elsewhere) provide the equivalent restriction on Windows.
-fn create_temp_file(temp_path: &Path) -> Result<std::fs::File, DiaryError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(temp_path)
-            .map_err(DiaryError::Io)
+/// Owns only a sibling successfully created with exclusive creation. The file
+/// handle is closed before rename/removal, including on Windows. Cleanup is
+/// best effort; this is not a physical-erasure or crash-durability guarantee.
+struct VaultTemp {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl VaultTemp {
+    fn create(path: PathBuf) -> Result<(Self, std::fs::File), DiaryError> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // Apply permissions before any vault bytes reach the file. Windows
+        // continues to rely on the vault directory's ACLs.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&path)?;
+        Ok((Self { path, armed: true }, file))
     }
-    #[cfg(not(unix))]
-    {
-        std::fs::File::create(temp_path).map_err(DiaryError::Io)
+}
+
+impl Drop for VaultTemp {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Err(error) = std::fs::remove_file(&self.path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    // Drop must not panic if stderr is closed or broken,
+                    // especially while unwinding another failure.
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "Warning: failed to remove temporary vault file: {error}"
+                    );
+                }
+            }
+        }
     }
+}
+
+fn write_atomic(
+    path: &Path,
+    write_and_sync: impl FnOnce(&mut std::fs::File) -> Result<(), DiaryError>,
+) -> Result<(), DiaryError> {
+    let mut name = path
+        .file_name()
+        .ok_or_else(|| DiaryError::Vault("vault path has no file name".to_string()))?
+        .to_os_string();
+    name.push(format!(".tmp.{}", uuid::Uuid::new_v4()));
+    // A collision fails closed: no ownership guard exists until create_new
+    // succeeds, so an existing file, directory or symlink cannot be cleaned up.
+    let (mut temp, mut file) = VaultTemp::create(path.with_file_name(name))?;
+    let result = write_and_sync(&mut file);
+    drop(file);
+    result?;
+    // Keep the platform's existing atomic-replacement semantics. Do not delete
+    // the destination first or fall back to copying over it.
+    std::fs::rename(&temp.path, path)?;
+    temp.armed = false;
+    Ok(())
 }
 
 /// Write a complete vault to `path` *without* a vault-level integrity MAC.
@@ -474,47 +513,14 @@ fn write_vault_inner(
         None => None,
     };
 
-    // Derive the temporary file path (same directory, same name with ".tmp" appended).
-    let mut temp_name = path
-        .file_name()
-        .ok_or_else(|| DiaryError::Vault("vault path has no file name".to_string()))?
-        .to_os_string();
-    temp_name.push(".tmp");
-    let temp_path = path.with_file_name(temp_name);
-
-    // Write body (+ optional MAC trailer) to the temporary file.
-    let write_result = (|| -> Result<(), DiaryError> {
-        let mut file = create_temp_file(&temp_path)?;
+    write_atomic(path, |file| {
         file.write_all(&body)?;
         if let Some(mac) = mac.as_ref() {
             file.write_all(mac)?;
         }
         file.sync_all()?;
         Ok(())
-    })();
-
-    if let Err(e) = write_result {
-        // Best-effort cleanup of the temporary file on write failure.
-        if let Err(rm_err) = std::fs::remove_file(&temp_path) {
-            if rm_err.kind() != std::io::ErrorKind::NotFound {
-                eprintln!("Warning: failed to remove temporary vault file: {rm_err}");
-            }
-        }
-        return Err(e);
-    }
-
-    // Atomically replace the target file with the fully written temporary file.
-    if let Err(e) = std::fs::rename(&temp_path, path) {
-        // Best-effort cleanup of the temporary file on rename failure.
-        if let Err(rm_err) = std::fs::remove_file(&temp_path) {
-            if rm_err.kind() != std::io::ErrorKind::NotFound {
-                eprintln!("Warning: failed to remove temporary vault file: {rm_err}");
-            }
-        }
-        return Err(DiaryError::Io(e));
-    }
-
-    Ok(())
+    })
 }
 
 // =============================================================================
@@ -528,6 +534,141 @@ mod tests {
         AttachmentRecord, EntryRecord, VaultHeader, MAGIC, MAX_FIELD_SIZE, RECORD_TYPE_ATTACHMENT,
         RECORD_TYPE_ENTRY, RECORD_TYPE_TEMPLATE,
     };
+
+    fn assert_no_owned_temps(path: &Path) {
+        let prefix = format!("{}.tmp.", path.file_name().unwrap().to_string_lossy());
+        for entry in std::fs::read_dir(path.parent().unwrap()).unwrap() {
+            assert!(!entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(&prefix));
+        }
+    }
+
+    #[test]
+    fn predictable_existing_temp_is_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.pqd");
+        let old_temp = dir.path().join("vault.pqd.tmp");
+        std::fs::write(&old_temp, b"unrelated file").unwrap();
+        write_vault(&path, VaultHeader::new(), &[]).unwrap();
+        assert_eq!(std::fs::read(&old_temp).unwrap(), b"unrelated file");
+        crate::vault::reader::read_vault(&path).unwrap();
+        assert_no_owned_temps(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn predictable_symlink_cannot_modify_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.pqd");
+        let target = dir.path().join("unrelated");
+        let link = dir.path().join("vault.pqd.tmp");
+        std::fs::write(&target, b"synthetic unrelated data").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        write_vault(&path, VaultHeader::new(), &[]).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"synthetic unrelated data");
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+        crate::vault::reader::read_vault(&path).unwrap();
+        assert_no_owned_temps(&path);
+    }
+
+    #[test]
+    fn exclusive_collision_preserves_existing_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.pqd.tmp.collision");
+        std::fs::write(&path, b"existing file").unwrap();
+        assert!(VaultTemp::create(path.clone()).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing file");
+        let directory = dir.path().join("directory");
+        std::fs::create_dir(&directory).unwrap();
+        assert!(VaultTemp::create(directory.clone()).is_err());
+        assert!(directory.is_dir());
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            assert!(VaultTemp::create(link.clone()).is_err());
+            assert_eq!(std::fs::read_link(&link).unwrap(), path);
+            assert_eq!(std::fs::read(&path).unwrap(), b"existing file");
+            let dangling = dir.path().join("dangling");
+            std::os::unix::fs::symlink(dir.path().join("absent"), &dangling).unwrap();
+            assert!(VaultTemp::create(dangling.clone()).is_err());
+            assert!(std::fs::symlink_metadata(dangling).unwrap().is_symlink());
+            assert!(!dir.path().join("absent").exists());
+        }
+    }
+
+    #[test]
+    fn partial_write_and_sync_errors_preserve_readable_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.pqd");
+        let key = [0x42; 32];
+        let before = existing_vault(&path, &key);
+        let old_temp = dir.path().join("vault.pqd.tmp");
+        std::fs::write(&old_temp, b"unowned").unwrap();
+        for stage in ["partial write", "sync"] {
+            let result = write_atomic(&path, |file| {
+                file.write_all(b"synthetic partial new vault")?;
+                if stage == "sync" {
+                    file.flush()?;
+                }
+                Err(std::io::Error::other(format!("injected {stage} failure")).into())
+            });
+            assert!(matches!(result, Err(DiaryError::Io(_))));
+            assert_preserved_vault(&path, &before, &key);
+            assert_eq!(std::fs::read(&old_temp).unwrap(), b"unowned");
+        }
+    }
+
+    #[test]
+    fn unwinding_closes_and_removes_owned_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.pqd");
+        let key = [0x42; 32];
+        let before = existing_vault(&path, &key);
+        let result = std::panic::catch_unwind(|| {
+            let _ = write_atomic(&path, |file| {
+                file.write_all(b"synthetic partial vault")?;
+                panic!("injected unwinding failure");
+            });
+        });
+        assert!(result.is_err());
+        assert_preserved_vault(&path, &before, &key);
+    }
+
+    #[test]
+    fn rename_failure_preserves_destination_and_removes_owned_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.pqd");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("keep"), b"original").unwrap();
+        assert!(write_vault(&path, VaultHeader::new(), &[]).is_err());
+        assert_eq!(std::fs::read(path.join("keep")).unwrap(), b"original");
+        assert_no_owned_temps(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temp_is_owner_only_before_writing_and_after_rename() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.pqd");
+        write_atomic(&path, |file| {
+            assert_eq!(file.metadata()?.permissions().mode() & 0o777, 0o600);
+            assert_eq!(file.metadata()?.len(), 0);
+            file.write_all(b"synthetic")?;
+            file.sync_all()?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_no_owned_temps(&path);
+    }
 
     /// Build a minimal [`EntryRecord`] with known content for testing.
     fn make_test_entry() -> EntryRecord {
@@ -571,7 +712,7 @@ mod tests {
         assert_eq!(attachments.len(), 1);
         assert_eq!(attachments[0].uuid, make_test_attachment().uuid);
         crate::vault::reader::verify_vault_integrity(path, key).unwrap();
-        assert!(!path.with_file_name("vault.pqd.tmp").exists());
+        assert_no_owned_temps(path);
     }
 
     fn existing_vault(path: &Path, key: &[u8; 32]) -> Vec<u8> {
@@ -905,19 +1046,15 @@ mod tests {
     /// TC-A05-01: no temporary file exists after a successful write_vault call.
     ///
     /// Given a valid vault path, when write_vault succeeds, then the temporary
-    /// file (`<name>.tmp`) must not exist in the same directory.
+    /// file (`<name>.tmp.<uuid>`) must not exist in the same directory.
     #[test]
     fn test_tc_a05_01_no_temp_file_after_write() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("vault.pqd");
-        let temp_path = dir.path().join("vault.pqd.tmp");
 
         write_vault(&path, VaultHeader::new(), &[]).expect("write_vault must not fail");
 
-        assert!(
-            !temp_path.exists(),
-            "temp file must not exist after write_vault completes"
-        );
+        assert_no_owned_temps(&path);
         assert!(path.exists(), "vault.pqd must exist after write_vault");
     }
 

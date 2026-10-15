@@ -1115,7 +1115,11 @@ where
                 vars.insert(BUILTIN_TITLE.to_string(), today.to_string());
                 expand(&tmpl.body, &vars)
             }
-            Err(_) => String::new(),
+            Err(pq_diary_core::DiaryError::TemplateNotFound(_)) => String::new(),
+            Err(e) => {
+                let message = format!("Failed to look up daily template: {e}");
+                return Err(anyhow::Error::new(e).context(message));
+            }
         };
 
         // Create the entry.
@@ -5365,6 +5369,58 @@ mod tests {
         let (_, plaintext) = core.get_entry(&prefix).expect("get_entry");
         core.lock();
         Some(plaintext)
+    }
+
+    /// A valid encrypted entry payload is not a valid template payload. Re-signing
+    /// the container isolates template deserialization from unlock integrity checks.
+    fn seed_malformed_template(vault_dir: &std::path::Path) {
+        use pq_diary_core::vault::{
+            format::RECORD_TYPE_TEMPLATE, reader::read_vault, writer::write_vault_authenticated,
+        };
+        let path = vault_dir.join("vault.pqd");
+        let mut core = DiaryCore::new(path.to_str().unwrap()).unwrap();
+        core.unlock(secrecy::SecretString::new("password".into()))
+            .unwrap();
+        core.new_entry("daily", "S47_PRIVATE_BODY", vec![]).unwrap();
+        let key = core.vault_mac_key().unwrap();
+        let (header, mut records) = read_vault(&path).unwrap();
+        records[0].record_type = RECORD_TYPE_TEMPLATE;
+        write_vault_authenticated(&path, header, &records, &key).unwrap();
+    }
+
+    #[test]
+    fn today_rejects_malformed_template_without_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault_dir = setup_vault(&dir);
+        seed_malformed_template(&vault_dir);
+        let path = vault_dir.join("vault.pqd");
+        let before = std::fs::read(&path).unwrap();
+        let config = std::fs::read(vault_dir.join("vault.toml")).unwrap();
+        let cli = make_today_cli(vault_dir.to_str().unwrap(), Some("password"));
+        let mut launched = false;
+        let result = cmd_today_impl(&cli, "2099-01-02", |_, _| {
+            launched = true;
+            Ok(())
+        });
+        assert!(
+            result.is_err(),
+            "malformed template must not become an empty daily entry"
+        );
+        let error = result.unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<pq_diary_core::DiaryError>(),
+            Some(pq_diary_core::DiaryError::Template(_))
+        ));
+        assert!(error
+            .to_string()
+            .starts_with("Failed to look up daily template:"));
+        let diagnostic = format!("{error:?}");
+        assert!(!diagnostic.contains("S47_PRIVATE_BODY"));
+        assert!(!diagnostic.contains("password"));
+        assert!(!launched);
+        assert_eq!(std::fs::read(path).unwrap(), before);
+        assert_eq!(std::fs::read(vault_dir.join("vault.toml")).unwrap(), config);
+        assert!(read_entry_by_title(&vault_dir, "2099-01-02").is_none());
     }
 
     /// TC-049-01: Empty vault, no template → creates entry with today's title and empty body.
@@ -10742,6 +10798,79 @@ parallelism = 1
         assert_eq!(yaml_escape("a\\b"), "a\\\\b");
         assert_eq!(yaml_escape("a\nb"), "a\\nb");
         assert_eq!(yaml_escape("a\x07b"), "ab");
+    }
+
+    #[test]
+    fn exported_frontmatter_roundtrips_without_literal_escapes() {
+        for title in [
+            "a\"b\\c\n日本語🦀",
+            "",
+            " leading and trailing ",
+            "'quoted'",
+        ] {
+            let meta = EntryMeta {
+                uuid_hex: "0123456789abcdef0123456789abcdef".into(),
+                title: title.into(),
+                tags: vec![
+                    "a,b".into(),
+                    "a\"b\\c\n日本語🦀".into(),
+                    "".into(),
+                    "'tag'".into(),
+                ],
+                created_at: 0,
+                updated_at: 0,
+            };
+            let exported = build_export_content(&meta, "body");
+            let (imported, _, _) =
+                pq_diary_core::importer::parse_markdown(&exported, "fallback.md").unwrap();
+            assert_eq!(imported.title, meta.title);
+            assert_eq!(imported.tags, meta.tags);
+        }
+    }
+
+    #[test]
+    fn exported_frontmatter_survives_import_and_reopen() {
+        let source = tempfile::tempdir().unwrap();
+        let source_vault = setup_vault(&source);
+        let title = "a\"b\\c\n日本語🦀";
+        let tags = vec!["comma,tag".to_string(), "'quote'".into(), "".into()];
+        let body = "literal #123 and `#code`";
+        {
+            let mut core =
+                DiaryCore::new(source_vault.join("vault.pqd").to_str().unwrap()).unwrap();
+            core.unlock(secrecy::SecretBox::new(Box::from("password")))
+                .unwrap();
+            core.new_entry(title, body, tags.clone()).unwrap();
+        }
+        let exported = tempfile::tempdir().unwrap();
+        let cli = make_cli_plain(&[
+            "-v",
+            source_vault.to_str().unwrap(),
+            "--password",
+            "password",
+            "export",
+            exported.path().to_str().unwrap(),
+        ]);
+        cmd_export_impl(
+            &cli,
+            exported.path().to_path_buf(),
+            &mut std::io::Cursor::new("y\n"),
+        )
+        .unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let destination_vault = setup_vault(&destination);
+        {
+            let mut core =
+                DiaryCore::new(destination_vault.join("vault.pqd").to_str().unwrap()).unwrap();
+            core.unlock(secrecy::SecretBox::new(Box::from("password")))
+                .unwrap();
+            assert_eq!(core.import(exported.path(), false).unwrap().imported, 1);
+        }
+        let imported = read_first_entry_plaintext(&destination_vault);
+        assert_eq!(imported.title, title);
+        assert_eq!(imported.tags, tags);
+        // Export deliberately separates frontmatter from the original body.
+        assert_eq!(imported.body, format!("\n{body}"));
     }
 
     /// TC-501-Fname: build_export_filename produces YYYY-MM-DD-slug-id8.md.

@@ -15,6 +15,7 @@ the **History** table at the bottom for git-tag pointers.
 - Import complete hyphenated, nested and Unicode symbol/emoji tags; preserve numeric-only hashes as text, matching Obsidian's tag format.
 
 ### Security (review follow-up)
+- Generate attachment file keys directly in protected storage, propagate OS randomness failures, and verify attachment HMACs with constant-time comparison.
 - Reject edits to INHERIT entries when the legacy key is unavailable, preserving the owner's content and the separate heir-recovery payload. Create a separate entry for revisions instead.
 - Direct attachment and master-password legacy APIs verify vault integrity before using records or changing files; these APIs and password rotation authenticate the same byte snapshot they parse.
 - Keep attachment API master-key copies in zeroize-on-drop storage through success and error paths.

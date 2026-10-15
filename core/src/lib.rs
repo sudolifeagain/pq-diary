@@ -261,12 +261,15 @@ impl DiaryCore {
     ///
     /// The entry UUID and `created_at` timestamp are preserved; only the
     /// encrypted payload, signature, HMAC, and `updated_at` are changed.
+    /// INHERIT entries are rejected unchanged because this API has no legacy key
+    /// to refresh their separately encrypted recovery payload.
     ///
     /// # Errors
     ///
     /// Returns [`DiaryError::NotUnlocked`] if the vault is locked.
     /// Returns [`DiaryError::InvalidArgument`] if `id` is not a valid hex prefix.
     /// Returns [`DiaryError::Entry`] if the entry is not found or multiple match.
+    /// Returns [`DiaryError::Entry`] if the entry is INHERIT.
     /// Returns [`DiaryError::Crypto`] on re-encryption failure.
     /// Returns [`DiaryError::Io`] on vault file I/O failure.
     pub fn update_entry(

@@ -138,11 +138,12 @@ try {
     New-Item -ItemType Directory -Path $outDir | Out-Null
     $env:PQ_DIARY_PASSWORD = "SmokeTest123!"
     "y" | & $Bin --vault $vaultDir export $outDir *> $null
+    $exportStatus = $LASTEXITCODE
     $count = (Get-ChildItem -Path $outDir -File -ErrorAction SilentlyContinue | Measure-Object).Count
-    if ($count -eq 1) {
+    if ($exportStatus -eq 0 -and $count -eq 1) {
         Assert-Pass "E2E: export 1 file"
     } else {
-        Assert-Fail "E2E: export (expected 1 file, got $count)"
+        Assert-Fail "E2E: export (exit $exportStatus; expected 1 file, got $count)"
     }
 }
 finally {

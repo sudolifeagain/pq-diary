@@ -130,12 +130,13 @@ fi
 
 mkdir -p "$TMPDIR/out"
 export PQ_DIARY_PASSWORD="SmokeTest123!"
-echo y | "$BIN" --vault "$VAULT_DIR" export "$TMPDIR/out" >/dev/null 2>&1 || true
+EXPORT_STATUS=0
+echo y | "$BIN" --vault "$VAULT_DIR" export "$TMPDIR/out" >/dev/null 2>&1 || EXPORT_STATUS=$?
 EXPORT_COUNT=$(find "$TMPDIR/out" -maxdepth 1 -type f | wc -l | tr -d ' ')
-if [ "$EXPORT_COUNT" -eq 1 ]; then
+if [ "$EXPORT_STATUS" -eq 0 ] && [ "$EXPORT_COUNT" -eq 1 ]; then
   pass "E2E: export 1 file"
 else
-  fail "E2E: export (expected 1 file, got $EXPORT_COUNT)"
+  fail "E2E: export (exit $EXPORT_STATUS; expected 1 file, got $EXPORT_COUNT)"
 fi
 
 # ---------------------------------------------------------------------------

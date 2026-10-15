@@ -913,8 +913,16 @@ where
 ///
 /// # Errors
 ///
-/// Returns an error if password acquisition, vault unlock, or template listing fails.
+/// Returns an error if password acquisition, vault unlock, template listing, or output fails.
 pub fn cmd_template_list(cli: &Cli) -> anyhow::Result<()> {
+    cmd_template_list_with_writer(cli, &mut std::io::stdout().lock())
+}
+
+fn cmd_template_list_with_writer(
+    cli: &Cli,
+    output: &mut impl std::io::Write,
+) -> anyhow::Result<()> {
+    use anyhow::Context as _;
     use pq_diary_core::policy::OperationType;
 
     // Policy check before any password prompt or vault decryption.
@@ -932,8 +940,9 @@ pub fn cmd_template_list(cli: &Cli) -> anyhow::Result<()> {
     templates.sort_by(|a, b| a.name.cmp(&b.name));
 
     for meta in &templates {
-        println!("{}", meta.name);
+        writeln!(output, "{}", meta.name).context("Failed to write template output")?;
     }
+    output.flush().context("Failed to flush template output")?;
 
     // guard drops here, automatically calling lock().
     Ok(())
@@ -945,10 +954,19 @@ pub fn cmd_template_list(cli: &Cli) -> anyhow::Result<()> {
 ///
 /// # Errors
 ///
-/// Returns an error if password acquisition, vault unlock, or template lookup fails.
+/// Returns an error if password acquisition, vault unlock, template lookup, or output fails.
 /// Returns `DiaryError::TemplateNotFound` (wrapped in anyhow) when no template
 /// with the given name exists.
 pub fn cmd_template_show(cli: &Cli, name: String) -> anyhow::Result<()> {
+    cmd_template_show_with_writer(cli, name, &mut std::io::stdout().lock())
+}
+
+fn cmd_template_show_with_writer(
+    cli: &Cli,
+    name: String,
+    output: &mut impl std::io::Write,
+) -> anyhow::Result<()> {
+    use anyhow::Context as _;
     use pq_diary_core::policy::OperationType;
 
     // Policy check before any password prompt or vault decryption.
@@ -963,7 +981,10 @@ pub fn cmd_template_show(cli: &Cli, name: String) -> anyhow::Result<()> {
     let plaintext = guard
         .get_template(&name)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    print!("{}", plaintext.body);
+    output
+        .write_all(plaintext.body.as_bytes())
+        .context("Failed to write template output")?;
+    output.flush().context("Failed to flush template output")?;
 
     // guard drops here, automatically calling lock().
     Ok(())
@@ -4851,6 +4872,63 @@ mod tests {
         core.lock();
         metas.sort_by(|a, b| a.name.cmp(&b.name));
         metas.into_iter().map(|m| m.name).collect()
+    }
+
+    #[test]
+    fn template_output_propagates_write_and_flush_errors() {
+        use std::io::{self, Write};
+
+        struct FailingWriter {
+            fail_write: bool,
+            kind: io::ErrorKind,
+        }
+        impl Write for FailingWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.fail_write {
+                    Err(io::Error::from(self.kind))
+                } else {
+                    Ok(bytes.len())
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::from(self.kind))
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        seed_templates(&vault_dir, &[("daily", "private body without newline")]);
+        let before = std::fs::read(vault_dir.join("vault.pqd")).expect("snapshot");
+        let cli = make_template_list_cli(vault_dir.to_str().expect("path"), Some("password"));
+        for fail_write in [true, false] {
+            for kind in [io::ErrorKind::Other, io::ErrorKind::BrokenPipe] {
+                for show in [false, true] {
+                    let mut writer = FailingWriter { fail_write, kind };
+                    let result = if show {
+                        cmd_template_show_with_writer(&cli, "daily".into(), &mut writer)
+                    } else {
+                        cmd_template_list_with_writer(&cli, &mut writer)
+                    };
+                    let err = result.expect_err("output failure must propagate");
+                    assert_eq!(
+                        err.downcast_ref::<io::Error>().expect("I/O source").kind(),
+                        kind
+                    );
+                    let message = format!("{err:#}");
+                    assert!(message.contains(if fail_write {
+                        "write template output"
+                    } else {
+                        "flush template output"
+                    }));
+                    assert!(!message.contains("private body"));
+                    assert_eq!(
+                        std::fs::read(vault_dir.join("vault.pqd")).expect("vault"),
+                        before
+                    );
+                }
+            }
+        }
+        assert_eq!(read_template_names_sorted(&vault_dir), vec!["daily"]);
     }
 
     /// TC-047-01: cmd_template_list returns Ok and templates are in alphabetical order.

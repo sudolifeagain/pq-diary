@@ -4,6 +4,9 @@
 //! `main.rs`.  Handlers in this module may return `anyhow::Result` so that
 //! arbitrary error sources can be propagated through the main entry-point.
 
+mod session;
+use session::VaultGuard;
+
 use crate::editor::{self, EditorConfig};
 use crate::password::{get_password, PasswordSource};
 use crate::Cli;
@@ -155,40 +158,6 @@ fn check_claude_policy(
 }
 
 // ---------------------------------------------------------------------------
-// VaultGuard — RAII drop guard for vault lock/unlock lifecycle
-// ---------------------------------------------------------------------------
-
-/// RAII guard that automatically calls [`DiaryCore::lock`] when dropped.
-///
-/// Create this guard immediately after a successful [`DiaryCore::unlock`] call.
-/// The guard borrows the core mutably, so all vault operations must be
-/// performed through `Deref` coercion (`guard.method()` instead of
-/// `core.method()`).  When the guard goes out of scope — on success, on `?`
-/// early return, or on panic — `lock()` is guaranteed to be called, securely
-/// erasing the master key from memory.
-struct VaultGuard<'a>(&'a mut DiaryCore);
-
-impl<'a> VaultGuard<'a> {
-    /// Wrap an already-unlocked `DiaryCore` in a guard.
-    fn new(core: &'a mut DiaryCore) -> Self {
-        Self(core)
-    }
-}
-
-impl Drop for VaultGuard<'_> {
-    fn drop(&mut self) {
-        self.0.lock();
-    }
-}
-
-impl std::ops::Deref for VaultGuard<'_> {
-    type Target = DiaryCore;
-    fn deref(&self) -> &DiaryCore {
-        self.0
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Public command handlers
 // ---------------------------------------------------------------------------
 
@@ -248,6 +217,7 @@ pub fn cmd_new_with_attach(
     }
 
     // Step 1: Obtain password and unlock the vault.
+    // Keep the source for the separate attachment session below.
     let password_source =
         get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -407,7 +377,6 @@ pub fn cmd_list(
     number: usize,
 ) -> anyhow::Result<()> {
     use pq_diary_core::policy::OperationType;
-    use secrecy::{ExposeSecret as _, SecretBox};
 
     // Policy check before any password prompt or vault decryption.
     check_claude_policy(cli, OperationType::Read)?;
@@ -415,18 +384,8 @@ pub fn cmd_list(
     let password_source =
         get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let vault_path = resolve_vault_path(cli)?;
-    let vault_str = vault_path
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("Vault path contains non-UTF-8 characters"))?;
-
-    let mut core = DiaryCore::new(vault_str).map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    let secret_password: secrecy::SecretString =
-        SecretBox::new(Box::from(password_source.secret().expose_secret()));
-    core.unlock(secret_password)
-        .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
-    let guard = VaultGuard::new(&mut core);
+    let mut core = session::locked_core(cli)?;
+    let guard = session::unlock(&mut core, password_source.into_secret())?;
 
     let entries = guard
         .list_entries(None)
@@ -481,6 +440,7 @@ fn cmd_show_impl(cli: &Cli, id: String, out: &mut dyn std::io::Write) -> anyhow:
     // Policy check before any password prompt or vault decryption.
     check_claude_policy(cli, OperationType::Read)?;
 
+    // Keep the source for the separate attachment-listing session below.
     let password_source =
         get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -656,7 +616,6 @@ where
     F: FnOnce(&std::path::Path, &EditorConfig) -> Result<(), pq_diary_core::DiaryError>,
 {
     use pq_diary_core::policy::OperationType;
-    use secrecy::{ExposeSecret as _, SecretBox};
 
     // Policy check before any password prompt or vault decryption.
     check_claude_policy(cli, OperationType::Write)?;
@@ -664,18 +623,8 @@ where
     let password_source =
         get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let vault_path = resolve_vault_path(cli)?;
-    let vault_str = vault_path
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("Vault path contains non-UTF-8 characters"))?;
-
-    let mut core = DiaryCore::new(vault_str).map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    let secret_password: secrecy::SecretString =
-        SecretBox::new(Box::from(password_source.secret().expose_secret()));
-    core.unlock(secret_password)
-        .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
-    let guard = VaultGuard::new(&mut core);
+    let mut core = session::locked_core(cli)?;
+    let guard = session::unlock(&mut core, password_source.into_secret())?;
 
     let (_record, original) = guard.get_entry(&id).map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -806,7 +755,6 @@ fn cmd_delete_impl(
     reader: &mut impl std::io::BufRead,
 ) -> anyhow::Result<()> {
     use pq_diary_core::policy::OperationType;
-    use secrecy::{ExposeSecret as _, SecretBox};
 
     // Policy check before any password prompt or vault decryption.
     check_claude_policy(cli, OperationType::Write)?;
@@ -814,18 +762,8 @@ fn cmd_delete_impl(
     let password_source =
         get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let vault_path = resolve_vault_path(cli)?;
-    let vault_str = vault_path
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("Vault path contains non-UTF-8 characters"))?;
-
-    let mut core = DiaryCore::new(vault_str).map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    let secret_password: secrecy::SecretString =
-        SecretBox::new(Box::from(password_source.secret().expose_secret()));
-    core.unlock(secret_password)
-        .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
-    let guard = VaultGuard::new(&mut core);
+    let mut core = session::locked_core(cli)?;
+    let guard = session::unlock(&mut core, password_source.into_secret())?;
 
     let (record, plaintext) = guard.get_entry(&id).map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -909,7 +847,6 @@ where
     F: FnOnce(&std::path::Path, &EditorConfig) -> Result<(), pq_diary_core::DiaryError>,
 {
     use pq_diary_core::policy::OperationType;
-    use secrecy::{ExposeSecret as _, SecretBox};
 
     // Policy check before any password prompt or vault decryption.
     check_claude_policy(cli, OperationType::Write)?;
@@ -917,18 +854,8 @@ where
     let password_source =
         get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let vault_path = resolve_vault_path(cli)?;
-    let vault_str = vault_path
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("Vault path contains non-UTF-8 characters"))?;
-
-    let mut core = DiaryCore::new(vault_str).map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    let secret_password: secrecy::SecretString =
-        SecretBox::new(Box::from(password_source.secret().expose_secret()));
-    core.unlock(secret_password)
-        .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
-    let guard = VaultGuard::new(&mut core);
+    let mut core = session::locked_core(cli)?;
+    let guard = session::unlock(&mut core, password_source.into_secret())?;
 
     // Check for an existing template with the same name.
     let already_exists = match guard.get_template(&name) {
@@ -989,7 +916,6 @@ where
 /// Returns an error if password acquisition, vault unlock, or template listing fails.
 pub fn cmd_template_list(cli: &Cli) -> anyhow::Result<()> {
     use pq_diary_core::policy::OperationType;
-    use secrecy::{ExposeSecret as _, SecretBox};
 
     // Policy check before any password prompt or vault decryption.
     check_claude_policy(cli, OperationType::Read)?;
@@ -997,18 +923,8 @@ pub fn cmd_template_list(cli: &Cli) -> anyhow::Result<()> {
     let password_source =
         get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let vault_path = resolve_vault_path(cli)?;
-    let vault_str = vault_path
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("Vault path contains non-UTF-8 characters"))?;
-
-    let mut core = DiaryCore::new(vault_str).map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    let secret_password: secrecy::SecretString =
-        SecretBox::new(Box::from(password_source.secret().expose_secret()));
-    core.unlock(secret_password)
-        .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
-    let guard = VaultGuard::new(&mut core);
+    let mut core = session::locked_core(cli)?;
+    let guard = session::unlock(&mut core, password_source.into_secret())?;
 
     let mut templates = guard
         .list_templates()
@@ -1034,7 +950,6 @@ pub fn cmd_template_list(cli: &Cli) -> anyhow::Result<()> {
 /// with the given name exists.
 pub fn cmd_template_show(cli: &Cli, name: String) -> anyhow::Result<()> {
     use pq_diary_core::policy::OperationType;
-    use secrecy::{ExposeSecret as _, SecretBox};
 
     // Policy check before any password prompt or vault decryption.
     check_claude_policy(cli, OperationType::Read)?;
@@ -1042,18 +957,8 @@ pub fn cmd_template_show(cli: &Cli, name: String) -> anyhow::Result<()> {
     let password_source =
         get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let vault_path = resolve_vault_path(cli)?;
-    let vault_str = vault_path
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("Vault path contains non-UTF-8 characters"))?;
-
-    let mut core = DiaryCore::new(vault_str).map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    let secret_password: secrecy::SecretString =
-        SecretBox::new(Box::from(password_source.secret().expose_secret()));
-    core.unlock(secret_password)
-        .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
-    let guard = VaultGuard::new(&mut core);
+    let mut core = session::locked_core(cli)?;
+    let guard = session::unlock(&mut core, password_source.into_secret())?;
 
     let plaintext = guard
         .get_template(&name)
@@ -1091,7 +996,6 @@ fn cmd_template_delete_impl(
     reader: &mut impl std::io::BufRead,
 ) -> anyhow::Result<()> {
     use pq_diary_core::policy::OperationType;
-    use secrecy::{ExposeSecret as _, SecretBox};
 
     // Policy check before any password prompt or vault decryption.
     check_claude_policy(cli, OperationType::Write)?;
@@ -1099,18 +1003,8 @@ fn cmd_template_delete_impl(
     let password_source =
         get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let vault_path = resolve_vault_path(cli)?;
-    let vault_str = vault_path
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("Vault path contains non-UTF-8 characters"))?;
-
-    let mut core = DiaryCore::new(vault_str).map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    let secret_password: secrecy::SecretString =
-        SecretBox::new(Box::from(password_source.secret().expose_secret()));
-    core.unlock(secret_password)
-        .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
-    let guard = VaultGuard::new(&mut core);
+    let mut core = session::locked_core(cli)?;
+    let guard = session::unlock(&mut core, password_source.into_secret())?;
 
     // Verify the template exists.
     guard
@@ -1171,7 +1065,6 @@ where
 {
     use pq_diary_core::policy::OperationType;
     use pq_diary_core::template_engine::{expand, BUILTIN_DATE, BUILTIN_TITLE};
-    use secrecy::{ExposeSecret as _, SecretBox};
     use std::collections::HashMap;
 
     // Policy check before any password prompt or vault decryption.
@@ -1180,18 +1073,8 @@ where
     let password_source =
         get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let vault_path = resolve_vault_path(cli)?;
-    let vault_str = vault_path
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("Vault path contains non-UTF-8 characters"))?;
-
-    let mut core = DiaryCore::new(vault_str).map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    let secret_password: secrecy::SecretString =
-        SecretBox::new(Box::from(password_source.secret().expose_secret()));
-    core.unlock(secret_password)
-        .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
-    let guard = VaultGuard::new(&mut core);
+    let mut core = session::locked_core(cli)?;
+    let guard = session::unlock(&mut core, password_source.into_secret())?;
 
     // Search for today's entry by exact title match.
     let entries = guard
@@ -1292,7 +1175,6 @@ pub(crate) fn cmd_search_to(
 ) -> anyhow::Result<()> {
     use pq_diary_core::policy::OperationType;
     use pq_diary_core::search::SearchQuery;
-    use secrecy::{ExposeSecret as _, SecretBox};
 
     // Policy check before any password prompt or vault decryption.
     check_claude_policy(cli, OperationType::Read)?;
@@ -1300,18 +1182,8 @@ pub(crate) fn cmd_search_to(
     let password_source =
         get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let vault_path = resolve_vault_path(cli)?;
-    let vault_str = vault_path
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("Vault path contains non-UTF-8 characters"))?;
-
-    let mut core = DiaryCore::new(vault_str).map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    let secret_password: secrecy::SecretString =
-        SecretBox::new(Box::from(password_source.secret().expose_secret()));
-    core.unlock(secret_password)
-        .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
-    let guard = VaultGuard::new(&mut core);
+    let mut core = session::locked_core(cli)?;
+    let guard = session::unlock(&mut core, password_source.into_secret())?;
 
     let query = SearchQuery {
         pattern: args.pattern.clone(),
@@ -1398,7 +1270,6 @@ pub(crate) fn cmd_stats_to(
     out: &mut dyn std::io::Write,
 ) -> anyhow::Result<()> {
     use pq_diary_core::policy::OperationType;
-    use secrecy::{ExposeSecret as _, SecretBox};
 
     // Policy check before any password prompt or vault decryption.
     check_claude_policy(cli, OperationType::Read)?;
@@ -1406,18 +1277,8 @@ pub(crate) fn cmd_stats_to(
     let password_source =
         get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let vault_path = resolve_vault_path(cli)?;
-    let vault_str = vault_path
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("Vault path contains non-UTF-8 characters"))?;
-
-    let mut core = DiaryCore::new(vault_str).map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    let secret_password: secrecy::SecretString =
-        SecretBox::new(Box::from(password_source.secret().expose_secret()));
-    core.unlock(secret_password)
-        .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
-    let guard = VaultGuard::new(&mut core);
+    let mut core = session::locked_core(cli)?;
+    let guard = session::unlock(&mut core, password_source.into_secret())?;
 
     let stats = guard.stats().map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -1607,7 +1468,7 @@ pub(crate) fn cmd_import_to(
         check_claude_policy(cli, OperationType::Write)?;
     }
 
-    // 3. Acquire password.
+    // 3. Acquire password; attachments reuse it after the guarded entry import.
     let password_source =
         get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -3638,6 +3499,43 @@ mod tests {
     use clap::Parser as _;
     use std::path::Path;
 
+    #[test]
+    fn ordinary_commands_deny_before_credentials_or_unreadable_vault() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = setup_vault_with_policy(&dir, pq_diary_core::policy::AccessPolicy::None);
+        // Keep policy readable but remove encrypted data. No environment mutation
+        // is needed: policy must win even if another test supplies credentials.
+        std::fs::remove_file(vault.join("vault.pqd")).unwrap();
+        let cli = make_cli_claude(vault.to_str().unwrap(), None);
+        let search = crate::SearchArgs {
+            pattern: "x".into(),
+            tag: None,
+            context: 0,
+            count: false,
+        };
+        let stats = crate::StatsArgs {
+            json: false,
+            heatmap: false,
+        };
+        let results = [
+            cmd_list(&cli, None, None, 10),
+            cmd_show(&cli, "id".into()),
+            cmd_edit(&cli, "id".into(), None, vec![], vec![]),
+            cmd_delete(&cli, "id".into(), true),
+            cmd_template_add(&cli, "name".into()),
+            cmd_template_list(&cli),
+            cmd_template_show(&cli, "name".into()),
+            cmd_template_delete(&cli, "name".into(), true),
+            cmd_today(&cli),
+            cmd_search(&cli, &search),
+            cmd_stats(&cli, &stats),
+        ];
+        for (index, result) in results.into_iter().enumerate() {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("Access denied"), "handler {index}: {error}");
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Test helpers
     // -------------------------------------------------------------------------
@@ -3653,7 +3551,7 @@ mod tests {
     /// Initialise a test vault and return the vault **directory** path.
     ///
     /// The vault is created with the password `"password"`.
-    fn setup_vault(dir: &tempfile::TempDir) -> PathBuf {
+    pub(super) fn setup_vault(dir: &tempfile::TempDir) -> PathBuf {
         use pq_diary_core::vault::init::VaultManager;
         let mgr = VaultManager::new(dir.path().to_path_buf())
             .expect("VaultManager::new")
@@ -5762,69 +5660,6 @@ mod tests {
         assert!(
             !output.contains("--- Links ---"),
             "output must NOT contain '--- Links ---' for an entry with no links, got:\n{output}"
-        );
-    }
-
-    // =========================================================================
-    // TC-A13: VaultGuard drop guard tests (TASK-0056)
-    // =========================================================================
-
-    /// TC-A13-01: VaultGuard drop calls lock() on the underlying DiaryCore.
-    ///
-    /// After the guard goes out of scope, the vault must be locked: any
-    /// attempt to call a vault operation should return `NotUnlocked`.
-    #[test]
-    fn tc_a13_01_vault_guard_drop_calls_lock() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let vault_dir = setup_vault(&dir);
-        let vault_pqd = vault_dir.join("vault.pqd");
-        let vault_str = vault_pqd.to_str().expect("utf8");
-
-        let mut core = DiaryCore::new(vault_str).expect("DiaryCore::new");
-        let pw: secrecy::SecretString = secrecy::SecretBox::new(Box::from("password"));
-        core.unlock(pw).expect("unlock");
-
-        {
-            let _guard = VaultGuard::new(&mut core);
-            // guard is alive; vault is unlocked
-        }
-        // guard dropped here — lock() must have been called
-
-        let result = core.list_entries(None);
-        assert!(
-            result.is_err(),
-            "core must be locked after VaultGuard drop; list_entries should fail"
-        );
-    }
-
-    /// TC-A13-02: VaultGuard calls lock() even when an early return (error path) occurs.
-    ///
-    /// Uses a closure that creates a VaultGuard and then returns `Err(...)` via `?`.
-    /// The guard's Drop must run before the closure exits, ensuring lock() is called.
-    #[test]
-    fn tc_a13_02_error_path_calls_lock() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let vault_dir = setup_vault(&dir);
-        let vault_pqd = vault_dir.join("vault.pqd");
-        let vault_str = vault_pqd.to_str().expect("utf8");
-
-        let mut core = DiaryCore::new(vault_str).expect("DiaryCore::new");
-        let pw: secrecy::SecretString = secrecy::SecretBox::new(Box::from("password"));
-        core.unlock(pw).expect("unlock");
-
-        // Simulate an error path: guard is created, then ? causes early return.
-        let result: anyhow::Result<()> = (|| {
-            let _guard = VaultGuard::new(&mut core);
-            anyhow::bail!("simulated error to trigger early return");
-        })();
-
-        assert!(result.is_err(), "closure must propagate the error");
-
-        // Even though the closure returned Err, lock() must have been called.
-        let list_result = core.list_entries(None);
-        assert!(
-            list_result.is_err(),
-            "core must be locked after VaultGuard drop on error path"
         );
     }
 

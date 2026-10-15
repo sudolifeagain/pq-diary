@@ -225,7 +225,11 @@ fn re_encrypt_entry(
             let _check: TemplatePlaintext = serde_json::from_slice(plain.as_ref())
                 .map_err(|e| DiaryError::Template(format!("deserialization failed: {e}")))?;
         }
-        other => return Err(DiaryError::Vault(format!("unsupported record type: {other}"))),
+        other => {
+            return Err(DiaryError::Vault(format!(
+                "unsupported record type: {other}"
+            )))
+        }
     }
 
     // Re-encrypt with the new symmetric key.
@@ -327,8 +331,10 @@ mod tests {
         let entry_id = {
             let mut core = DiaryCore::new(path).expect("open");
             core.unlock(make_secret("Old123!")).expect("unlock");
-            core.new_template("daily", "## {{date}}\n今日の日記").expect("template");
-            core.new_entry("日記", "本文", vec!["daily".into()]).expect("entry")
+            core.new_template("daily", "## {{date}}\n今日の日記")
+                .expect("template");
+            core.new_entry("日記", "本文", vec!["daily".into()])
+                .expect("entry")
         };
 
         re_encrypt_vault(&vault_dir, &make_secret("Old123!"), &make_secret("New456!"))

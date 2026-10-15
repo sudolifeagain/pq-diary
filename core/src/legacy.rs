@@ -1646,7 +1646,10 @@ mod tests {
             vault_before == std::fs::read(vault_dir.join("vault.pqd")).unwrap(),
             "failed backup rename must leave the original vault byte-for-byte intact"
         );
-        assert_eq!(config_before, std::fs::read(vault_dir.join("vault.toml")).unwrap());
+        assert_eq!(
+            config_before,
+            std::fs::read(vault_dir.join("vault.toml")).unwrap()
+        );
         assert!(!vault_dir.join("vault.pqd.tmp.legacy").exists());
         assert!(!vault_dir.join("vault.toml.tmp.legacy").exists());
 

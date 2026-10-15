@@ -333,37 +333,15 @@ pub fn cmd_new_with_attach(
             body: String::new(),
         };
 
-        let tmpfile = editor::write_header_file(&config.secure_tmpdir, &initial)
+        let mut session = editor::EditorSession::header(&config.secure_tmpdir, &initial)
             .map_err(|e| anyhow::anyhow!("Failed to write temp file: {e}"))?;
 
-        // Inject vim completion for [[title]] links (vim/nvim only).
-        let is_vim = !config.vim_options.is_empty();
-        let completion_file = if is_vim {
+        // Inject optional vim completion for [[title]] links.
+        if !config.vim_options.is_empty() {
             let titles = guard.all_titles().unwrap_or_default();
-            editor::write_completion_file(&config.secure_tmpdir, &titles).ok()
-        } else {
-            None
-        };
-        if let Some(ref cp) = completion_file {
-            config
-                .vim_options
-                .extend(editor::vim_completion_options(cp));
+            session.add_completion(&mut config, &titles);
         }
-
-        // Launch editor and read result; always delete temp files afterward.
-        let edit_result = editor::launch_editor(&tmpfile, &config);
-        let read_result = editor::read_header_file(&tmpfile);
-        if let Err(e) = editor::cleanup_tmpfile(&tmpfile) {
-            eprintln!("Warning: failed to securely delete temp file: {e}");
-        }
-        if let Some(cp) = completion_file {
-            if let Err(e) = editor::secure_delete(&cp) {
-                eprintln!("Warning: failed to securely delete completion file: {e}");
-            }
-        }
-
-        edit_result.map_err(|e| anyhow::anyhow!("Editor failed: {e}"))?;
-        let header = read_result.map_err(|e| anyhow::anyhow!("Failed to read temp file: {e}"))?;
+        let header = session.finish(&config, editor::launch_editor, editor::read_header_file)?;
 
         // Prefer header-parsed title/tags over CLI-supplied values.
         let new_title = header.title.or(title);
@@ -734,37 +712,15 @@ where
         // Editor mode: write header-comment temp file, launch editor, parse result.
         let mut config = EditorConfig::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        let tmpfile = editor::write_header_file(&config.secure_tmpdir, &original)
+        let mut session = editor::EditorSession::header(&config.secure_tmpdir, &original)
             .map_err(|e| anyhow::anyhow!("Failed to write temp file: {e}"))?;
 
-        // Inject vim completion for [[title]] links (vim/nvim only).
-        let is_vim = !config.vim_options.is_empty();
-        let completion_file = if is_vim {
+        // Inject optional vim completion for [[title]] links.
+        if !config.vim_options.is_empty() {
             let titles = guard.all_titles().unwrap_or_default();
-            editor::write_completion_file(&config.secure_tmpdir, &titles).ok()
-        } else {
-            None
-        };
-        if let Some(ref cp) = completion_file {
-            config
-                .vim_options
-                .extend(editor::vim_completion_options(cp));
+            session.add_completion(&mut config, &titles);
         }
-
-        // Always delete temp files regardless of editor/read success.
-        let edit_result = launch_fn(&tmpfile, &config);
-        let read_result = editor::read_header_file(&tmpfile);
-        if let Err(e) = editor::cleanup_tmpfile(&tmpfile) {
-            eprintln!("Warning: failed to securely delete temp file: {e}");
-        }
-        if let Some(cp) = completion_file {
-            if let Err(e) = editor::secure_delete(&cp) {
-                eprintln!("Warning: failed to securely delete completion file: {e}");
-            }
-        }
-
-        edit_result.map_err(|e| anyhow::anyhow!("Editor failed: {e}"))?;
-        let header = read_result.map_err(|e| anyhow::anyhow!("Failed to read temp file: {e}"))?;
+        let header = session.finish(&config, launch_fn, editor::read_header_file)?;
 
         // On header parse error, fall back to the original metadata.
         let (new_title, new_tags) = match (header.title, header.tags) {
@@ -1002,17 +958,9 @@ where
     let config = editor::EditorConfig::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // Write a blank temp file and launch editor.
-    let tmpfile = editor::write_template_file(&config.secure_tmpdir)
+    let session = editor::EditorSession::template(&config.secure_tmpdir)
         .map_err(|e| anyhow::anyhow!("Failed to write temp file: {e}"))?;
-
-    let edit_result = launch_fn(&tmpfile, &config);
-    let read_result = editor::read_template_file(&tmpfile);
-    if let Err(e) = editor::cleanup_tmpfile(&tmpfile) {
-        eprintln!("Warning: failed to securely delete temp file: {e}");
-    }
-
-    edit_result.map_err(|e| anyhow::anyhow!("Editor failed: {e}"))?;
-    let body = read_result.map_err(|e| anyhow::anyhow!("Failed to read temp file: {e}"))?;
+    let body = session.finish(&config, launch_fn, editor::read_template_file)?;
 
     // Commit an overwrite once, so a failed replacement retains the original.
     if already_exists {
@@ -1280,36 +1228,15 @@ where
 
     let mut config = EditorConfig::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let tmpfile = editor::write_header_file(&config.secure_tmpdir, &original)
+    let mut session = editor::EditorSession::header(&config.secure_tmpdir, &original)
         .map_err(|e| anyhow::anyhow!("Failed to write temp file: {e}"))?;
 
-    // Inject vim completion for [[title]] links (vim/nvim only).
-    let is_vim = !config.vim_options.is_empty();
-    let completion_file = if is_vim {
+    // Inject optional vim completion for [[title]] links.
+    if !config.vim_options.is_empty() {
         let titles = guard.all_titles().unwrap_or_default();
-        editor::write_completion_file(&config.secure_tmpdir, &titles).ok()
-    } else {
-        None
-    };
-    if let Some(ref cp) = completion_file {
-        config
-            .vim_options
-            .extend(editor::vim_completion_options(cp));
+        session.add_completion(&mut config, &titles);
     }
-
-    let edit_result = launch_fn(&tmpfile, &config);
-    let read_result = editor::read_header_file(&tmpfile);
-    if let Err(e) = editor::cleanup_tmpfile(&tmpfile) {
-        eprintln!("Warning: failed to securely delete temp file: {e}");
-    }
-    if let Some(cp) = completion_file {
-        if let Err(e) = editor::secure_delete(&cp) {
-            eprintln!("Warning: failed to securely delete completion file: {e}");
-        }
-    }
-
-    edit_result.map_err(|e| anyhow::anyhow!("Editor failed: {e}"))?;
-    let header = read_result.map_err(|e| anyhow::anyhow!("Failed to read temp file: {e}"))?;
+    let header = session.finish(&config, launch_fn, editor::read_header_file)?;
 
     let (new_title, new_tags) = match (header.title, header.tags) {
         (Some(t), Some(tags)) => (t, tags),
@@ -4470,6 +4397,41 @@ mod tests {
         assert_eq!(plaintext.title, "Title");
         assert_eq!(plaintext.body, "body text");
         assert_eq!(plaintext.tags, vec!["tag1".to_string()]);
+    }
+
+    #[test]
+    fn editor_failure_or_invalid_read_never_saves_entry() {
+        for launch_fails in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (vault_dir, prefix) =
+                setup_vault_with_entry(&dir, "Keep Title", "keep body", vec!["keep_tag"]);
+            let cli = make_edit_cli(vault_dir.to_str().unwrap(), Some("password"), &prefix);
+            let vault = vault_dir.join("vault.pqd");
+            let before = std::fs::read(&vault).unwrap();
+            let mut temp_path = None;
+            let result = cmd_edit_impl(&cli, prefix, None, vec![], vec![], |path, _| {
+                temp_path = Some(path.to_path_buf());
+                if launch_fails {
+                    std::fs::write(path, "# Title: Changed\n# Tags: changed\n# ---\n\nchanged")?;
+                    Err(pq_diary_core::DiaryError::Editor("launch failure".into()))
+                } else {
+                    std::fs::write(path, [0xff])?;
+                    Ok(())
+                }
+            });
+            let error = result.unwrap_err().to_string();
+            assert!(error.starts_with(if launch_fails {
+                "Editor failed:"
+            } else {
+                "Failed to read temp file:"
+            }));
+            assert!(!temp_path.unwrap().exists());
+            assert_eq!(std::fs::read(vault).unwrap(), before);
+            let plaintext = read_first_entry_plaintext(&vault_dir);
+            assert_eq!(plaintext.title, "Keep Title");
+            assert_eq!(plaintext.body, "keep body");
+            assert_eq!(plaintext.tags, ["keep_tag"]);
+        }
     }
 
     /// TC-0039-08: Editor mode with mock that modifies content → entry is updated.

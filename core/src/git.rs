@@ -1092,18 +1092,17 @@ mod tests {
     }
 
     /// TC-S8-074-09: check_git_available returns useful error when git is not installed (EDGE-001).
-    ///
-    /// This test modifies the process-wide PATH environment variable and must
-    /// be run in isolation. Execute with: `cargo test -- --ignored tc_s8_074_09`
+    /// Runs in an isolated subprocess so unrelated tests keep their PATH.
     #[test]
-    #[ignore = "requires environment without git in PATH; run: cargo test -- --ignored"]
     fn tc_s8_074_09_git_not_installed_error_message() {
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         // Temporarily clear PATH so git cannot be found.
-        // WARNING: modifies process-wide environment; do not run in parallel.
-        let original_path = std::env::var_os("PATH").unwrap_or_default();
+        // Only this exact test runs in the child process.
         std::env::set_var("PATH", "");
         let result = check_git_available();
-        std::env::set_var("PATH", original_path);
 
         match result {
             Err(DiaryError::Git(msg)) => {

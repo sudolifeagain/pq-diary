@@ -340,7 +340,8 @@ pub struct SkipDetail {
 ///
 /// # Errors
 ///
-/// Returns [`DiaryError::Import`] for malformed supported frontmatter scalars or lists.
+/// Returns [`DiaryError::Import`] for malformed supported frontmatter scalars/lists
+/// or if an internal rewrite regex fails to compile.
 pub fn parse_markdown(
     content: &str,
     filename: &str,
@@ -362,6 +363,9 @@ pub fn parse_markdown(
 
     // 3. Convert wiki-links in body
     let (body_after_links, links_converted) = convert_wiki_links(body_raw)?;
+    // This intermediate body is replaced by tag extraction; wipe its allocation
+    // when it is discarded, including if a later rewrite fails.
+    let body_after_links = Zeroizing::new(body_after_links);
 
     // 4. Extract inline #tags from body
     let (extracted_tags, body_final, tags_converted) = extract_tags(&body_after_links)?;

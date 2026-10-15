@@ -48,6 +48,22 @@ Phase 2 中核 (legacy / attachments) を完了。残候補は Bases like ビュ
 - `docs/backlog.md` 古い `[ ]` 表現を実装状態に補正 (S4 / S5 全項目、M-5 / H-3、S13 v4 → v5 と Phase 4 v5 → v6 の整理)。
 - `requirements.md` を v5 対応に更新 (§6 / §5.4 / §Phase 4)。
 
+### Git sync safety
+
+- Pull validates fetched vault bytes without checking them out into the local
+  vault/index. Incompatible headers/keys or `vault.toml` changes are rejected
+  before local data is changed
+- Git reads authenticate and parse the same snapshot; writes use its validated
+  records without reopening the destination for attachment metadata
+- Push and pull reject attachment-bearing vaults until attachment metadata and
+  encrypted blob sync are supported together
+- Push and pull commit only their allowlisted vault paths, keeping unrelated
+  staged files out of published history
+- Pull preserves existing recovery backups; a failed commit restores the local
+  vault without changing its original index
+- Remote ancestry and deletion reconciliation remain open work; an ordinary
+  push after a remote advance can still fail with a non-fast-forward rejection
+
 ### Phase 1 (完了済み)
 
 PRD §15 で定義された Phase 1 を 2026-04-11 (s9) → 2026-05-17 (s11) で完走。

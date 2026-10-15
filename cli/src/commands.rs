@@ -7871,6 +7871,20 @@ parallelism = 1
         vault_dir
     }
 
+    /// Rewrite a cloned fixture without replacing its encryption context.
+    fn write_empty_contributor_vault(contributor_dir: &std::path::Path) {
+        use pq_diary_core::vault::{reader::read_vault, writer::write_vault_authenticated};
+
+        let path = contributor_dir.join("vault.pqd");
+        let mut core = pq_diary_core::DiaryCore::new(path.to_str().unwrap()).unwrap();
+        core.unlock(secrecy::SecretString::new("password".into()))
+            .unwrap();
+        let mac_key = core.vault_mac_key().unwrap();
+        let (header, _) = read_vault(&path).unwrap();
+        write_vault_authenticated(&path, header, &[], &mac_key).unwrap();
+        core.lock();
+    }
+
     // -------------------------------------------------------------------------
     // TC-S8-078-01: cmd_git_init creates .git and updates vault.toml
     // -------------------------------------------------------------------------
@@ -8324,12 +8338,8 @@ parallelism = 1
                 .expect("git config contributor");
         }
 
-        // Write an empty (structurally valid) vault as the "remote" vault.pqd.
-        {
-            use pq_diary_core::vault::{format::VaultHeader, writer::write_vault};
-            let contrib_vault = contributor_dir.join("vault.pqd");
-            write_vault(&contrib_vault, VaultHeader::new(), &[]).expect("write contributor vault");
-        }
+        // Write an authenticated empty vault retaining the cloned key context.
+        write_empty_contributor_vault(&contributor_dir);
 
         let out = std::process::Command::new("git")
             .current_dir(&contributor_dir)
@@ -8584,11 +8594,7 @@ parallelism = 1
                 .expect("git config contributor");
         }
 
-        {
-            use pq_diary_core::vault::{format::VaultHeader, writer::write_vault};
-            let contrib_vault = contributor_dir.join("vault.pqd");
-            write_vault(&contrib_vault, VaultHeader::new(), &[]).expect("write contributor vault");
-        }
+        write_empty_contributor_vault(&contributor_dir);
 
         let out = std::process::Command::new("git")
             .current_dir(&contributor_dir)
@@ -8786,15 +8792,13 @@ parallelism = 1
                 .expect("git config contributor");
         }
 
-        {
-            use pq_diary_core::vault::{format::VaultHeader, writer::write_vault};
-            let contrib_vault = contributor_dir.join("vault.pqd");
-            write_vault(&contrib_vault, VaultHeader::new(), &[]).expect("write contributor vault");
-        }
+        // This case tests non-interactive entry merging, not policy migration.
+        config.to_file(&contributor_dir.join("vault.toml")).unwrap();
+        write_empty_contributor_vault(&contributor_dir);
 
         let out = std::process::Command::new("git")
             .current_dir(&contributor_dir)
-            .args(["add", "vault.pqd"])
+            .args(["add", "vault.pqd", "vault.toml"])
             .output()
             .expect("contributor git add");
         assert!(out.status.success());

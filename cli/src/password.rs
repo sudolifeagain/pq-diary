@@ -30,6 +30,13 @@ pub enum PasswordSource {
 }
 
 impl PasswordSource {
+    /// Move the existing protected allocation out of its source without copying.
+    pub fn into_secret(self) -> SecretString {
+        match self {
+            Self::Flag(secret) | Self::Env(secret) | Self::Tty(secret) => secret,
+        }
+    }
+
     /// Returns a reference to the underlying [`SecretString`].
     pub fn secret(&self) -> &SecretString {
         match self {
@@ -321,6 +328,22 @@ fn read_password_tty(_prompt: &str) -> Result<SecretString, DiaryError> {
 mod tests {
     use super::*;
     use secrecy::ExposeSecret;
+
+    #[test]
+    fn into_secret_preserves_allocation_for_every_source() {
+        for wrap in [
+            PasswordSource::Flag,
+            PasswordSource::Env,
+            PasswordSource::Tty,
+        ] {
+            let source = wrap(make_secret("synthetic protected password"));
+            let address = source.secret().expose_secret().as_ptr();
+            let secret = source.into_secret();
+            assert_eq!(secret.expose_secret(), "synthetic protected password");
+            assert_eq!(secret.expose_secret().as_ptr(), address);
+            assert!(!format!("{secret:?}").contains("synthetic protected password"));
+        }
+    }
 
     /// Mutex to serialize tests that read/write the `PQ_DIARY_PASSWORD`
     /// environment variable.  Env vars are process-global state, so concurrent

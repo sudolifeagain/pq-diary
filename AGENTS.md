@@ -15,6 +15,7 @@ Rust製・耐量子暗号CLIジャーナルツール。詳細は `requirements.m
 - Cargo workspaceの共有lintを各crateで継承し、`unsafe_code` / `unsafe_op_in_unsafe_fn` / `clippy::undocumented_unsafe_blocks` を deny（integration testなど別targetも対象）。例外は必要なOS呼出し境界だけに局所化し、各ブロックに `SAFETY:` で有効期間・境界・所有権などの根拠を書く。テストも例外にしない
 - 許可するOS API: `mlock` / `munlock`、`VirtualLock` / `VirtualUnlock`、`prctl(PR_SET_DUMPABLE)`、`IsDebuggerPresent`、`GetErrorMode` / `SetErrorMode`、`GetStdHandle` / `GetConsoleMode` / `SetConsoleMode` / `ReadConsoleW`。これ以外の `unsafe` や、解放済みメモリを読むテストは禁止
 - 秘密値の所有者は `Zeroizing` / `SecretString` / `SecureBuffer` / `ZeroizeOnDrop` 実装型で保護する。借用は必要な範囲に限定し、通常の `String` / `Vec<u8>` への複製や所有権移動で保護を失わない。秘密型の `Debug` は内容を伏せる
+- 一時平文ファイルは作成時点から所有者を持たせる。cleanup失敗の警告と元のエラーの優先順位を、成功経路だけでなく失敗・早期return・unwindでもテストする
 - 外部入力・I/Oなどの失敗は `Result` で返す。`unwrap()` / `expect()` はテストのみ許可し、本番コードでは禁止する。`unwrap_or_else(|_| unreachable!())` への書換えで規約を回避しない。失敗しないgetterまで `Result` 化しない
 - エラーは `thiserror` で定義。`anyhow` はcli/のみ許可。失敗時に半端な状態や秘密値を残さず、検証が完了してから状態を反映する
 - プラットフォーム分岐は `#[cfg()]` で。core/ にプラットフォーム依存UIコードを入れない

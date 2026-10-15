@@ -245,9 +245,7 @@ pub fn cmd_new_with_attach(
         };
         use std::collections::{HashMap, HashSet};
 
-        let tmpl = guard
-            .get_template(&tmpl_name)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let tmpl = guard.get_template(&tmpl_name)?;
 
         let var_refs = extract_variables(&tmpl.body);
 
@@ -814,6 +812,13 @@ fn confirm_template_delete(name: &str, reader: &mut impl std::io::BufRead) -> an
     Ok(trimmed == "y" || trimmed == "Y")
 }
 
+/// Preserve the existing one-line diagnostic and the inspectable core source.
+/// Debug/CLI error-chain rendering may additionally print a `Caused by` line.
+fn template_command_error(context: &str, error: pq_diary_core::DiaryError) -> anyhow::Error {
+    let message = format!("{context}: {error}");
+    anyhow::Error::new(error).context(message)
+}
+
 /// Execute the `pq-diary template add` command.
 ///
 /// Opens `$EDITOR` with a blank temporary file; on save, stores the file
@@ -861,7 +866,7 @@ where
     let already_exists = match guard.get_template(&name) {
         Ok(_) => true,
         Err(pq_diary_core::DiaryError::TemplateNotFound(_)) => false,
-        Err(e) => return Err(anyhow::anyhow!("Failed to look up template: {e}")),
+        Err(e) => return Err(template_command_error("Failed to look up template", e)),
     };
     if already_exists && !cli.claude {
         use std::io::Write as _;
@@ -893,12 +898,12 @@ where
     if already_exists {
         guard
             .replace_template(&name, &body)
-            .map_err(|e| anyhow::anyhow!("Failed to replace template: {e}"))?;
+            .map_err(|e| template_command_error("Failed to replace template", e))?;
         println!("Template replaced: \"{name}\"");
     } else {
         guard
             .new_template(&name, &body)
-            .map_err(|e| anyhow::anyhow!("Failed to create template: {e}"))?;
+            .map_err(|e| template_command_error("Failed to create template", e))?;
         println!("Template created: \"{name}\"");
     }
 
@@ -913,8 +918,16 @@ where
 ///
 /// # Errors
 ///
-/// Returns an error if password acquisition, vault unlock, or template listing fails.
+/// Returns an error if password acquisition, vault unlock, template listing, or output fails.
 pub fn cmd_template_list(cli: &Cli) -> anyhow::Result<()> {
+    cmd_template_list_with_writer(cli, &mut std::io::stdout().lock())
+}
+
+fn cmd_template_list_with_writer(
+    cli: &Cli,
+    output: &mut impl std::io::Write,
+) -> anyhow::Result<()> {
+    use anyhow::Context as _;
     use pq_diary_core::policy::OperationType;
 
     // Policy check before any password prompt or vault decryption.
@@ -928,12 +941,13 @@ pub fn cmd_template_list(cli: &Cli) -> anyhow::Result<()> {
 
     let mut templates = guard
         .list_templates()
-        .map_err(|e| anyhow::anyhow!("Failed to list templates: {e}"))?;
+        .map_err(|e| template_command_error("Failed to list templates", e))?;
     templates.sort_by(|a, b| a.name.cmp(&b.name));
 
     for meta in &templates {
-        println!("{}", meta.name);
+        writeln!(output, "{}", meta.name).context("Failed to write template output")?;
     }
+    output.flush().context("Failed to flush template output")?;
 
     // guard drops here, automatically calling lock().
     Ok(())
@@ -945,10 +959,19 @@ pub fn cmd_template_list(cli: &Cli) -> anyhow::Result<()> {
 ///
 /// # Errors
 ///
-/// Returns an error if password acquisition, vault unlock, or template lookup fails.
+/// Returns an error if password acquisition, vault unlock, template lookup, or output fails.
 /// Returns `DiaryError::TemplateNotFound` (wrapped in anyhow) when no template
 /// with the given name exists.
 pub fn cmd_template_show(cli: &Cli, name: String) -> anyhow::Result<()> {
+    cmd_template_show_with_writer(cli, name, &mut std::io::stdout().lock())
+}
+
+fn cmd_template_show_with_writer(
+    cli: &Cli,
+    name: String,
+    output: &mut impl std::io::Write,
+) -> anyhow::Result<()> {
+    use anyhow::Context as _;
     use pq_diary_core::policy::OperationType;
 
     // Policy check before any password prompt or vault decryption.
@@ -960,10 +983,11 @@ pub fn cmd_template_show(cli: &Cli, name: String) -> anyhow::Result<()> {
     let mut core = session::locked_core(cli)?;
     let guard = session::unlock(&mut core, password_source.into_secret())?;
 
-    let plaintext = guard
-        .get_template(&name)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    print!("{}", plaintext.body);
+    let plaintext = guard.get_template(&name)?;
+    output
+        .write_all(plaintext.body.as_bytes())
+        .context("Failed to write template output")?;
+    output.flush().context("Failed to flush template output")?;
 
     // guard drops here, automatically calling lock().
     Ok(())
@@ -1007,9 +1031,7 @@ fn cmd_template_delete_impl(
     let guard = session::unlock(&mut core, password_source.into_secret())?;
 
     // Verify the template exists.
-    guard
-        .get_template(&name)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    guard.get_template(&name)?;
 
     // Determine whether to skip confirmation.
     let skip_confirm = force || cli.claude;
@@ -1022,7 +1044,7 @@ fn cmd_template_delete_impl(
     if do_delete {
         guard
             .delete_template(&name)
-            .map_err(|e| anyhow::anyhow!("Failed to delete template: {e}"))?;
+            .map_err(|e| template_command_error("Failed to delete template", e))?;
         println!("Deleted template: \"{name}\"");
     } else {
         println!("キャンセルしました");
@@ -4853,6 +4875,63 @@ mod tests {
         metas.into_iter().map(|m| m.name).collect()
     }
 
+    #[test]
+    fn template_output_propagates_write_and_flush_errors() {
+        use std::io::{self, Write};
+
+        struct FailingWriter {
+            fail_write: bool,
+            kind: io::ErrorKind,
+        }
+        impl Write for FailingWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.fail_write {
+                    Err(io::Error::from(self.kind))
+                } else {
+                    Ok(bytes.len())
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::from(self.kind))
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        seed_templates(&vault_dir, &[("daily", "private body without newline")]);
+        let before = std::fs::read(vault_dir.join("vault.pqd")).expect("snapshot");
+        let cli = make_template_list_cli(vault_dir.to_str().expect("path"), Some("password"));
+        for fail_write in [true, false] {
+            for kind in [io::ErrorKind::Other, io::ErrorKind::BrokenPipe] {
+                for show in [false, true] {
+                    let mut writer = FailingWriter { fail_write, kind };
+                    let result = if show {
+                        cmd_template_show_with_writer(&cli, "daily".into(), &mut writer)
+                    } else {
+                        cmd_template_list_with_writer(&cli, &mut writer)
+                    };
+                    let err = result.expect_err("output failure must propagate");
+                    assert_eq!(
+                        err.downcast_ref::<io::Error>().expect("I/O source").kind(),
+                        kind
+                    );
+                    let message = format!("{err:#}");
+                    assert!(message.contains(if fail_write {
+                        "write template output"
+                    } else {
+                        "flush template output"
+                    }));
+                    assert!(!message.contains("private body"));
+                    assert_eq!(
+                        std::fs::read(vault_dir.join("vault.pqd")).expect("vault"),
+                        before
+                    );
+                }
+            }
+        }
+        assert_eq!(read_template_names_sorted(&vault_dir), vec!["daily"]);
+    }
+
     /// TC-047-01: cmd_template_list returns Ok and templates are in alphabetical order.
     ///
     /// Given "weekly", "daily", "meeting" seeded (insertion order out of alpha),
@@ -5138,6 +5217,11 @@ mod tests {
             &mut std::io::Cursor::new("y\n"),
         )
         .expect_err("integrity failure");
+        assert!(matches!(
+            error.downcast_ref::<pq_diary_core::DiaryError>(),
+            Some(pq_diary_core::DiaryError::Crypto(_))
+        ));
+        assert!(error.to_string().starts_with("Failed to replace template:"));
         assert!(
             error.to_string().contains("integrity verification failed"),
             "{error}"
@@ -5229,7 +5313,12 @@ mod tests {
         let cli = make_cli(vault_dir_str, Some("password"));
         let result = cmd_new(&cli, None, None, vec![], Some("nonexistent".to_string()));
         assert!(result.is_err(), "Expected error for nonexistent template");
-        let err_msg = result.unwrap_err().to_string();
+        let error = result.unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<pq_diary_core::DiaryError>(),
+            Some(pq_diary_core::DiaryError::TemplateNotFound(_))
+        ));
+        let err_msg = error.to_string();
         assert!(
             err_msg.contains("nonexistent"),
             "error must mention the template name, got: {err_msg:?}"
@@ -5291,6 +5380,114 @@ mod tests {
         let (_, plaintext) = core.get_entry(&prefix).expect("get_entry");
         core.lock();
         Some(plaintext)
+    }
+
+    #[test]
+    fn template_context_preserves_io_source_and_diagnostic() {
+        for prefix in [
+            "Failed to look up template",
+            "Failed to list templates",
+            "Failed to create template",
+            "Failed to replace template",
+            "Failed to delete template",
+        ] {
+            let error = template_command_error(
+                prefix,
+                pq_diary_core::DiaryError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "synthetic read failure",
+                )),
+            );
+            assert_eq!(
+                error.to_string(),
+                format!("{prefix}: I/O error: synthetic read failure")
+            );
+            assert!(matches!(
+                error.downcast_ref::<pq_diary_core::DiaryError>(),
+                Some(pq_diary_core::DiaryError::Io(_))
+            ));
+            assert!(error.chain().any(|cause| cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)));
+        }
+    }
+
+    #[test]
+    fn template_commands_preserve_lookup_error_types() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault_dir = setup_vault(&dir);
+        let cli = make_template_show_cli(vault_dir.to_str().unwrap(), Some("password"), "daily");
+        for error in [
+            cmd_template_show(&cli, "daily".into()).unwrap_err(),
+            cmd_template_delete_impl(&cli, "daily".into(), true, &mut std::io::Cursor::new(""))
+                .unwrap_err(),
+        ] {
+            assert!(matches!(
+                error.downcast_ref::<pq_diary_core::DiaryError>(),
+                Some(pq_diary_core::DiaryError::TemplateNotFound(_))
+            ));
+            assert_eq!(error.to_string(), "template not found: daily");
+        }
+        seed_malformed_template(&vault_dir);
+        let before = std::fs::read(vault_dir.join("vault.pqd")).unwrap();
+        for (error, prefix) in [
+            (
+                cmd_template_list(&cli).unwrap_err(),
+                "Failed to list templates:",
+            ),
+            (
+                cmd_template_show(&cli, "daily".into()).unwrap_err(),
+                "template error:",
+            ),
+            (
+                cmd_template_delete_impl(&cli, "daily".into(), true, &mut std::io::Cursor::new(""))
+                    .unwrap_err(),
+                "template error:",
+            ),
+            (
+                cmd_template_add_impl(
+                    &cli,
+                    "daily".into(),
+                    |_, _| panic!("must not launch editor"),
+                    &mut std::io::Cursor::new(""),
+                )
+                .unwrap_err(),
+                "Failed to look up template:",
+            ),
+        ] {
+            assert!(matches!(
+                error.downcast_ref::<pq_diary_core::DiaryError>(),
+                Some(pq_diary_core::DiaryError::Template(_))
+            ));
+            assert!(error
+                .chain()
+                .any(|cause| cause.is::<pq_diary_core::DiaryError>()));
+            assert!(error.to_string().starts_with(prefix));
+            assert!(!format!("{error:?}").contains("S47_PRIVATE_BODY"));
+            assert!(!format!("{error:?}").contains("password"));
+            assert_eq!(std::fs::read(vault_dir.join("vault.pqd")).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn template_create_preserves_invalid_name_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault_dir = setup_vault(&dir);
+        let before = std::fs::read(vault_dir.join("vault.pqd")).unwrap();
+        let cli = make_template_list_cli(vault_dir.to_str().unwrap(), Some("password"));
+        let error = cmd_template_add_impl(
+            &cli,
+            "bad name".into(),
+            |_, _| Ok(()),
+            &mut std::io::Cursor::new(""),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<pq_diary_core::DiaryError>(),
+            Some(pq_diary_core::DiaryError::InvalidTemplateName(_))
+        ));
+        assert!(error.to_string().starts_with("Failed to create template:"));
+        assert_eq!(std::fs::read(vault_dir.join("vault.pqd")).unwrap(), before);
     }
 
     /// A valid encrypted entry payload is not a valid template payload. Re-signing
@@ -10720,6 +10917,79 @@ parallelism = 1
         assert_eq!(yaml_escape("a\\b"), "a\\\\b");
         assert_eq!(yaml_escape("a\nb"), "a\\nb");
         assert_eq!(yaml_escape("a\x07b"), "ab");
+    }
+
+    #[test]
+    fn exported_frontmatter_roundtrips_without_literal_escapes() {
+        for title in [
+            "a\"b\\c\n日本語🦀",
+            "",
+            " leading and trailing ",
+            "'quoted'",
+        ] {
+            let meta = EntryMeta {
+                uuid_hex: "0123456789abcdef0123456789abcdef".into(),
+                title: title.into(),
+                tags: vec![
+                    "a,b".into(),
+                    "a\"b\\c\n日本語🦀".into(),
+                    "".into(),
+                    "'tag'".into(),
+                ],
+                created_at: 0,
+                updated_at: 0,
+            };
+            let exported = build_export_content(&meta, "body");
+            let (imported, _, _) =
+                pq_diary_core::importer::parse_markdown(&exported, "fallback.md").unwrap();
+            assert_eq!(imported.title, meta.title);
+            assert_eq!(imported.tags, meta.tags);
+        }
+    }
+
+    #[test]
+    fn exported_frontmatter_survives_import_and_reopen() {
+        let source = tempfile::tempdir().unwrap();
+        let source_vault = setup_vault(&source);
+        let title = "a\"b\\c\n日本語🦀";
+        let tags = vec!["comma,tag".to_string(), "'quote'".into(), "".into()];
+        let body = "literal #123 and `#code`";
+        {
+            let mut core =
+                DiaryCore::new(source_vault.join("vault.pqd").to_str().unwrap()).unwrap();
+            core.unlock(secrecy::SecretBox::new(Box::from("password")))
+                .unwrap();
+            core.new_entry(title, body, tags.clone()).unwrap();
+        }
+        let exported = tempfile::tempdir().unwrap();
+        let cli = make_cli_plain(&[
+            "-v",
+            source_vault.to_str().unwrap(),
+            "--password",
+            "password",
+            "export",
+            exported.path().to_str().unwrap(),
+        ]);
+        cmd_export_impl(
+            &cli,
+            exported.path().to_path_buf(),
+            &mut std::io::Cursor::new("y\n"),
+        )
+        .unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let destination_vault = setup_vault(&destination);
+        {
+            let mut core =
+                DiaryCore::new(destination_vault.join("vault.pqd").to_str().unwrap()).unwrap();
+            core.unlock(secrecy::SecretBox::new(Box::from("password")))
+                .unwrap();
+            assert_eq!(core.import(exported.path(), false).unwrap().imported, 1);
+        }
+        let imported = read_first_entry_plaintext(&destination_vault);
+        assert_eq!(imported.title, title);
+        assert_eq!(imported.tags, tags);
+        // Export deliberately separates frontmatter from the original body.
+        assert_eq!(imported.body, format!("\n{body}"));
     }
 
     /// TC-501-Fname: build_export_filename produces YYYY-MM-DD-slug-id8.md.

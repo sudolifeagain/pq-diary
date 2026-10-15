@@ -14,7 +14,7 @@ use crate::{
 };
 use chrono::DateTime;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 // =============================================================================
@@ -139,8 +139,11 @@ pub fn collect_stats(vault_path: &Path, engine: &CryptoEngine) -> Result<VaultSt
             max_chars = char_count;
         }
 
+        let mut entry_tags = HashSet::new();
         for tag in &plaintext.tags {
-            *tag_counts.entry(tag.clone()).or_insert(0) += 1;
+            if entry_tags.insert(tag) {
+                *tag_counts.entry(tag.clone()).or_insert(0) += 1;
+            }
         }
 
         let date_str = unix_ts_to_date_str(record.created_at);
@@ -449,6 +452,51 @@ mod tests {
                 "tag_distribution must be sorted descending at index {i}"
             );
         }
+    }
+
+    #[test]
+    fn tag_distribution_counts_each_tag_once_per_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_pqd = setup_test_vault(&dir);
+        let mut core = DiaryCore::new(vault_pqd.to_str().expect("utf8")).expect("DiaryCore::new");
+        core.unlock(secret("password")).expect("unlock");
+
+        core.new_entry(
+            "Repeated tags",
+            "body",
+            vec!["work/rust".into(), "work".into(), "work/rust".into()],
+        )
+        .expect("new_entry");
+        let stats = core.stats().expect("stats");
+        assert_eq!(stats.tag_count, 2);
+        assert_eq!(
+            stats
+                .tag_distribution
+                .iter()
+                .map(|t| (t.tag.as_str(), t.count))
+                .collect::<Vec<_>>(),
+            vec![("work", 1), ("work/rust", 1)]
+        );
+
+        core.new_entry(
+            "Another entry",
+            "body",
+            vec!["work/rust".into(), "work/rust".into()],
+        )
+        .expect("new_entry");
+        core.new_entry("No tags", "body", vec![])
+            .expect("new_entry");
+        let stats = core.stats().expect("stats");
+        assert_eq!(stats.entry_count, 3);
+        assert_eq!(stats.tag_count, 2);
+        assert_eq!(
+            stats
+                .tag_distribution
+                .iter()
+                .map(|t| (t.tag.as_str(), t.count))
+                .collect::<Vec<_>>(),
+            vec![("work/rust", 2), ("work", 1)]
+        );
     }
 
     // -------------------------------------------------------------------------

@@ -13,6 +13,7 @@ the **History** table at the bottom for git-tag pointers.
 ### Fixed (S17)
 - Legacy access preserves the original vault and configuration when either backup rename fails; old backups are wiped only after both replacements succeed.
 - Password changes accept template payloads as templates, preserving mixed diary/template vaults.
+- Password changes verify the existing vault integrity MAC before rewriting any data, rejecting authenticated metadata tampering.
 
 ### Phase 2 (in progress)
 

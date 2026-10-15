@@ -1137,6 +1137,13 @@ mod tests {
                 config_before,
                 "{operation}"
             );
+            assert!(!std::fs::read_dir(&vault_dir).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("vault.pqd.tmp.")
+            }));
             for sidecar in [
                 "vault.pqd.tmp",
                 "vault.pqd.tmp.rotate",

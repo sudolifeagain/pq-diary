@@ -1360,11 +1360,18 @@ pub(crate) fn cmd_stats_to(
 /// - `▓` — 2–3 entries
 /// - `█` — 4 or more entries
 ///
-/// The grid covers the last 52 weeks (364 days) ending today.  Rows are
-/// weekdays (Mon–Sun) and columns are calendar weeks (oldest left, newest
-/// right).  A month-abbreviation header and a legend line are appended.
+/// The grid covers the current UTC calendar week and the preceding 51 weeks.
+/// Rows are weekdays (Mon–Sun), with the oldest week on the left. Future
+/// days in the current week are blank. A month header and legend are appended.
 fn render_heatmap(daily_activity: &[pq_diary_core::stats::DailyActivity]) -> String {
-    use chrono::{Datelike as _, Duration, Utc};
+    render_heatmap_at(daily_activity, chrono::Utc::now().date_naive())
+}
+
+fn render_heatmap_at(
+    daily_activity: &[pq_diary_core::stats::DailyActivity],
+    today: chrono::NaiveDate,
+) -> String {
+    use chrono::{Datelike as _, Duration};
     use std::collections::HashMap;
 
     let activity_map: HashMap<String, usize> = daily_activity
@@ -1372,25 +1379,21 @@ fn render_heatmap(daily_activity: &[pq_diary_core::stats::DailyActivity]) -> Str
         .map(|a| (a.date.clone(), a.count))
         .collect();
 
-    let today = Utc::now().date_naive();
-    let start_date = today - Duration::days(363);
-
     const WEEKS: usize = 52;
-    // grid[weekday][week]: weekday 0 = Mon … 6 = Sun
-    let mut grid = [[0usize; WEEKS]; 7];
+    // Anchor the last column to this week's Monday, rather than aligning a
+    // trailing 364-day interval that can spill into a 53rd column.
+    let current_monday = today - Duration::days(today.weekday().num_days_from_monday().into());
+    let start_date = current_monday - Duration::weeks((WEEKS - 1) as i64);
 
-    // Align grid to calendar week boundaries: Monday is always row 0.
-    let start_weekday = start_date.weekday().num_days_from_monday() as usize; // 0=Mon
-    for day_offset in 0..364i64 {
-        let date = start_date + Duration::days(day_offset);
-        let adjusted_offset = day_offset as usize + start_weekday;
-        let week = adjusted_offset / 7;
-        let weekday = adjusted_offset % 7;
-        let date_str = date.format("%Y-%m-%d").to_string();
-        let count = activity_map.get(&date_str).copied().unwrap_or(0);
-        if week < WEEKS {
-            grid[weekday][week] = count;
+    // None marks a future date, distinct from a past day with no entries.
+    let mut grid = [[None; WEEKS]; 7];
+    for day_offset in 0..(WEEKS * 7) {
+        let date = start_date + Duration::days(day_offset as i64);
+        if date > today {
+            break;
         }
+        let count = activity_map.get(&date.to_string()).copied().unwrap_or(0);
+        grid[day_offset % 7][day_offset / 7] = Some(count);
     }
 
     let count_to_char = |c: usize| -> char {
@@ -1412,8 +1415,8 @@ fn render_heatmap(daily_activity: &[pq_diary_core::stats::DailyActivity]) -> Str
     let mut header_chars: Vec<char> = std::iter::repeat_n(' ', 5 + WEEKS).collect();
     let mut last_month: u32 = 0;
     for week in 0..WEEKS {
-        // The Monday (row 0) of each grid column: offset back by start_weekday.
-        let date = start_date + Duration::days((week * 7) as i64 - start_weekday as i64);
+        // The Monday (row 0) of each grid column.
+        let date = start_date + Duration::days((week * 7) as i64);
         let month = date.month();
         if month != last_month {
             let m_str = MONTH_NAMES[(month - 1) as usize];
@@ -1433,7 +1436,7 @@ fn render_heatmap(daily_activity: &[pq_diary_core::stats::DailyActivity]) -> Str
     for (weekday, week_counts) in grid.iter().enumerate() {
         let mut row = format!("{} ", day_labels[weekday]);
         for &count in week_counts.iter() {
-            row.push(count_to_char(count));
+            row.push(count.map(count_to_char).unwrap_or(' '));
         }
         lines.push(row);
     }
@@ -3837,7 +3840,10 @@ mod tests {
     /// TC-0037-10: No flag uses the same configured target as info/password.
     #[test]
     fn tc_0037_10_resolve_vault_path_default() {
-        let _lock = lock_home();
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeOverride::new(dir.path());
         let root = dir.path().join(".pq-diary");
@@ -8390,19 +8396,18 @@ parallelism = 1
 
     /// TC-S8-078-07: When `git` is not in PATH, all git subcommands fail with
     /// an appropriate error.
-    ///
-    /// **Ignored** because it modifies the process-wide PATH environment
-    /// variable and must not run concurrently with other tests.
-    /// Run with: `cargo test -- --ignored tc_s8_078_07`
+    /// Runs in an isolated subprocess so unrelated tests keep their PATH.
     #[test]
-    #[ignore = "requires environment without git in PATH; run: cargo test -- --ignored"]
     fn tc_s8_078_07_all_git_commands_fail_when_git_not_installed() {
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let vault_dir = setup_vault_for_git(&dir);
         let vault_dir_str = vault_dir.to_str().expect("utf8");
 
         // Temporarily clear PATH so git cannot be found.
-        let original_path = std::env::var_os("PATH").unwrap_or_default();
         std::env::set_var("PATH", "");
 
         let cli_init = make_git_cli(&["pq-diary", "-v", vault_dir_str, "git-init"]);
@@ -8439,8 +8444,6 @@ parallelism = 1
             cmd_git_pull(&cli_pull),
             cmd_git_sync(&cli_sync),
         ];
-
-        std::env::set_var("PATH", original_path);
 
         for (i, result) in results.iter().enumerate() {
             assert!(
@@ -9107,24 +9110,21 @@ parallelism = 1
 
     /// TC-S8-INT-E01: When `git` is absent from PATH, all git commands fail
     /// with a "not installed" or "not found" error message.
-    ///
-    /// **Ignored** — modifies the process-wide PATH variable and must not run
-    /// concurrently with other tests.
-    /// Run with: `cargo test -- --ignored tc_s8_int_e01`
+    /// Runs in an isolated subprocess so unrelated tests keep their PATH.
     #[test]
-    #[ignore = "requires environment without git in PATH; run: cargo test -- --ignored"]
     fn tc_s8_int_e01_git_not_installed_error() {
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let vault_dir = setup_vault_for_git(&dir);
         let vault_dir_str = vault_dir.to_str().expect("utf8");
 
-        let original_path = std::env::var_os("PATH").unwrap_or_default();
         std::env::set_var("PATH", "");
 
         let cli = make_git_cli(&["pq-diary", "-v", vault_dir_str, "git-init"]);
         let result = cmd_git_init(&cli, None);
-
-        std::env::set_var("PATH", original_path);
 
         assert!(
             result.is_err(),
@@ -10319,21 +10319,13 @@ parallelism = 1
     // S10 Phase 2 tests — init / sync / info / change-password / export
     // =========================================================================
 
-    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn lock_home() -> std::sync::MutexGuard<'static, ()> {
-        match HOME_LOCK.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        }
-    }
-
     struct HomeOverride {
         previous: Option<std::ffi::OsString>,
     }
 
     impl HomeOverride {
         fn new(new_home: &std::path::Path) -> Self {
+            crate::test_environment::assert_isolated();
             let previous = std::env::var_os("PQ_DIARY_HOME");
             let root = new_home.join(".pq-diary");
             std::env::set_var("PQ_DIARY_HOME", &root);
@@ -10348,6 +10340,21 @@ parallelism = 1
                 None => std::env::remove_var("PQ_DIARY_HOME"),
             }
         }
+    }
+
+    #[test]
+    fn home_override_refuses_parallel_parent_mutation() {
+        let before = std::env::var_os("PQ_DIARY_HOME");
+        let dir = tempfile::tempdir().unwrap();
+        let result = std::panic::catch_unwind(|| HomeOverride::new(dir.path()));
+        assert!(
+            result.is_err(),
+            "override must refuse a parallel parent harness"
+        );
+        assert!(
+            std::env::var_os("PQ_DIARY_HOME") == before,
+            "override changed parent environment (values redacted)"
+        );
     }
 
     fn make_cli_plain(args: &[&str]) -> crate::Cli {
@@ -10372,9 +10379,12 @@ parallelism = 1
     /// TC-101-01: clean environment → config.toml and default vault are created.
     #[test]
     fn tc_101_01_init_creates_config_and_vault() {
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         use pq_diary_core::vault::config::AppConfig;
 
-        let _lock = lock_home();
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeOverride::new(dir.path());
 
@@ -10409,7 +10419,10 @@ parallelism = 1
     /// TC-101-E01: existing config.toml → init refuses to run.
     #[test]
     fn tc_101_e01_init_refuses_when_already_initialized() {
-        let _lock = lock_home();
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeOverride::new(dir.path());
 
@@ -10432,7 +10445,10 @@ parallelism = 1
     /// TC-101-E02: empty password → init rejected and no files created.
     #[test]
     fn tc_101_e02_init_rejects_empty_password() {
-        let _lock = lock_home();
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeOverride::new(dir.path());
 
@@ -10449,10 +10465,12 @@ parallelism = 1
     }
 
     fn assert_failed_init_preserves_existing_default(manager_config_invalid: bool) {
+        if crate::test_environment::isolated() {
+            return;
+        }
         use pq_diary_core::policy::AccessPolicy;
         use pq_diary_core::vault::init::VaultManager;
 
-        let _lock = lock_home();
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeOverride::new(dir.path());
         let pq_root = dir.path().join(".pq-diary");
@@ -10527,9 +10545,12 @@ parallelism = 1
     #[cfg(unix)]
     #[test]
     fn init_failure_preserves_dangling_default_symlink() {
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         use std::os::unix::fs::symlink;
 
-        let _lock = lock_home();
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeOverride::new(dir.path());
         let pq_root = dir.path().join(".pq-diary");
@@ -10556,9 +10577,12 @@ parallelism = 1
     #[cfg(unix)]
     #[test]
     fn init_refuses_dangling_config_symlink() {
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         use std::os::unix::fs::symlink;
 
-        let _lock = lock_home();
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeOverride::new(dir.path());
         let pq_root = dir.path().join(".pq-diary");
@@ -10585,7 +10609,10 @@ parallelism = 1
     /// TC-201-E01: unknown sync_backend → error.
     #[test]
     fn tc_201_e01_sync_unknown_backend_errors() {
-        let _lock = lock_home();
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeOverride::new(dir.path());
 
@@ -10608,7 +10635,10 @@ parallelism = 1
     /// TC-201-E02: AppConfig missing → init guidance error.
     #[test]
     fn tc_201_e02_sync_without_config_returns_init_guidance() {
-        let _lock = lock_home();
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeOverride::new(dir.path());
 
@@ -10620,7 +10650,10 @@ parallelism = 1
     /// TC-201-E03: malformed config.toml → Invalid config.toml error.
     #[test]
     fn tc_201_e03_sync_invalid_toml_errors() {
-        let _lock = lock_home();
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeOverride::new(dir.path());
 
@@ -11534,6 +11567,83 @@ mod conflict_snapshot_tests {
                     .unwrap()
             );
             assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
+}
+
+#[cfg(test)]
+mod heatmap_window_tests {
+    use super::render_heatmap_at;
+    use chrono::{Datelike as _, Duration, NaiveDate};
+    use pq_diary_core::stats::DailyActivity;
+
+    fn activity(date: NaiveDate, count: usize) -> DailyActivity {
+        DailyActivity {
+            date: date.to_string(),
+            count,
+        }
+    }
+
+    fn cells(output: &str) -> Vec<Vec<char>> {
+        output
+            .lines()
+            .skip(1)
+            .take(7)
+            .map(|line| {
+                let row: Vec<_> = line.chars().skip(4).collect();
+                assert_eq!(row.len(), 52);
+                row
+            })
+            .collect()
+    }
+
+    #[test]
+    fn heatmap_today_is_visible_for_every_weekday() {
+        let monday = NaiveDate::from_ymd_opt(2026, 10, 12).unwrap();
+        for offset in 0..7 {
+            let today = monday + Duration::days(offset);
+            let output = render_heatmap_at(&[activity(today, 1)], today);
+            let grid = cells(&output);
+            assert_eq!(grid[offset as usize][51], '▒', "today={today}");
+            for row in grid.iter().skip(offset as usize + 1) {
+                assert_eq!(row[51], ' ', "future cell: today={today}");
+            }
+        }
+    }
+
+    #[test]
+    fn heatmap_window_boundaries_leap_day_and_year_rollover() {
+        for (year, month, day) in [(2026, 10, 15), (2026, 10, 18), (2024, 2, 29), (2025, 1, 1)] {
+            let today = NaiveDate::from_ymd_opt(year, month, day).unwrap();
+            let weekday = today.weekday().num_days_from_monday() as usize;
+            let start = today - Duration::days(weekday as i64 + 51 * 7);
+            let activities = [
+                activity(start - Duration::days(1), 4),
+                activity(start, 2),
+                activity(today, 1),
+                activity(today + Duration::days(1), 4),
+            ];
+            let output = render_heatmap_at(&activities, today);
+            let grid = cells(&output);
+            assert_eq!(grid[0][0], '▓', "start={start}");
+            assert_eq!(grid[weekday][51], '▒', "today={today}");
+            assert_eq!(grid.iter().flatten().filter(|&&c| c == '▓').count(), 1);
+            assert_eq!(grid.iter().flatten().filter(|&&c| c == '▒').count(), 1);
+            assert!(!grid.iter().flatten().any(|&c| c == '█'));
+            for (row, counts) in grid.iter().enumerate() {
+                for (week, &cell) in counts.iter().enumerate() {
+                    if (row, week) != (0, 0) && (row, week) != (weekday, 51) {
+                        assert_eq!(
+                            cell,
+                            if week == 51 && row > weekday {
+                                ' '
+                            } else {
+                                '░'
+                            }
+                        );
+                    }
+                }
+            }
         }
     }
 }

@@ -238,3 +238,42 @@ type:
 **S14 以降の運用**: スプリント単位の `s{N}-done` タグは廃止。スプリント完了の証跡は
 PR マージコミット (`git log --merges`) と `CHANGELOG.md` で担保する。Phase 全完了時のみ
 `phaseN-done` タグを切る。
+
+### Environment-sensitive Rust tests
+
+Process environment is shared by every test thread, including unrelated library
+readers and subprocess launches. A mutex used only by writers is insufficient.
+Do not add `set_var` / `remove_var` to a parallel parent test harness.
+
+- Prefer exercising the CLI with `Command::env` / `env_remove`, explicit temporary
+  vault paths, synthetic passwords, and noninteractive stdin. The password
+  integration tests cover real environment selection and flag precedence this way.
+- For unit coverage requiring process environment changes, call
+  `crate::test_environment::isolated()` first and return when it returns `true`.
+  The shared `test-support/environment.rs` re-executes only that exact test in a
+  child. It sets temporary HOME/USERPROFILE/config directories and PQ_DIARY_HOME,
+  removes inherited PQ_DIARY_PASSWORD/EDITOR, and closes stdin before execution.
+  Construct fixtures only after this boundary. This uses `Command`, not raw fork.
+  Dispatch mismatches fail closed instead of recursing; the parent requires one
+  passing, non-ignored child test so an empty selection cannot silently pass.
+- Keep normal workspace parallelism. The child's single-test harness does not
+  serialize other tests. A child panic fails the parent test without leaking
+  environment changes; the temporary home remains owned by the waiting parent.
+  HomeOverride also refuses use outside its isolated test process.
+- PATH mutation tests now run normally instead of being ignored. PATH stays
+  intact while creating their fixture and is cleared only inside the child.
+  Password environment removal in production remains tested in that child.
+- Audit completed: the former HOME_LOCK callers (including the shared init
+  rollback fixture), password unit ENV_LOCK callers, and all three missing-git
+  PATH tests are isolated. The config-root tests explicitly cover unset and custom
+  PQ_DIARY_HOME values in isolated children. The two integration-test-local ENV_LOCK instances were
+  unrelated locks and are removed. Resolver/config readers, other git tests,
+  editor environment reads, and the existing stderr subprocess test no longer
+  race with these parent-process writers. Production password consumption is
+  unchanged. No new test framework or broader CI matrix is required.
+
+Optional local stress check (not added to normal CI): repeat
+`cargo test -p pq-diary --bin pq-diary -- --test-threads=16` with a temporary
+HOME/USERPROFILE/PQ_DIARY_HOME and a synthetic PQ_DIARY_PASSWORD supplied to the
+cargo command. Preserve explicit CARGO_HOME/RUSTUP_HOME if changing HOME would
+otherwise hide your toolchain. Never use actual vaults or credentials.

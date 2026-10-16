@@ -1570,6 +1570,79 @@ mod tests {
 
     // ── initialize_legacy ─────────────────────────────────────────────────
 
+    fn assert_legacy_init_preserves_unused_tmp(create_collision: impl Fn(&Path, &Path)) {
+        let dir = tempdir().unwrap();
+        let vault_dir = setup_vault(&dir, b"master-pw");
+        let vault_path = vault_dir.join("vault.pqd");
+        let vault_before = std::fs::read(&vault_path).unwrap();
+        let unused_tmp = vault_dir.join("vault.toml.tmp");
+        let target = dir.path().join("unrelated");
+        std::fs::write(&target, b"unrelated recovery data").unwrap();
+        create_collision(&unused_tmp, &target);
+        let metadata_before = std::fs::symlink_metadata(&unused_tmp).unwrap();
+        let link_before = std::fs::read_link(&unused_tmp).ok();
+
+        initialize_legacy(
+            &vault_dir,
+            &secret("master-pw"),
+            &secret("legacy-code"),
+            ConfirmationMode::Yn,
+            &fast_deriver(),
+        )
+        .unwrap();
+
+        let metadata_after = std::fs::symlink_metadata(&unused_tmp).unwrap();
+        assert_eq!(metadata_after.file_type(), metadata_before.file_type());
+        assert_eq!(std::fs::read_link(&unused_tmp).ok(), link_before);
+        assert_eq!(std::fs::read(&target).unwrap(), b"unrelated recovery data");
+        assert!(!target.with_extension("absent").exists());
+        if metadata_before.is_file() {
+            assert_eq!(std::fs::read(&unused_tmp).unwrap(), b"existing sidecar");
+        }
+        if metadata_before.is_dir() {
+            assert_eq!(
+                std::fs::read(unused_tmp.join("sentinel")).unwrap(),
+                b"directory contents"
+            );
+        }
+        assert_eq!(std::fs::read(&vault_path).unwrap(), vault_before);
+        let config = VaultConfig::from_file(&vault_dir.join("vault.toml")).unwrap();
+        assert!(config.legacy.initialized);
+        let (header, _) = read_vault(&vault_path).unwrap();
+        let key = fast_deriver()
+            .derive(b"legacy-code", &header.legacy_salt)
+            .unwrap();
+        verify_legacy_code(&config, &key).unwrap();
+        let mut core = DiaryCore::new(&vault_pqd_str(&vault_dir)).unwrap();
+        core.unlock(secret("master-pw")).unwrap();
+    }
+
+    #[test]
+    fn legacy_init_preserves_unused_tmp_file() {
+        assert_legacy_init_preserves_unused_tmp(|path, _| {
+            std::fs::write(path, b"existing sidecar").unwrap();
+        });
+    }
+
+    #[test]
+    fn legacy_init_preserves_unused_tmp_directory() {
+        assert_legacy_init_preserves_unused_tmp(|path, _| {
+            std::fs::create_dir(path).unwrap();
+            std::fs::write(path.join("sentinel"), b"directory contents").unwrap();
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_init_preserves_unused_tmp_symlinks() {
+        assert_legacy_init_preserves_unused_tmp(|path, target| {
+            std::os::unix::fs::symlink(target, path).unwrap();
+        });
+        assert_legacy_init_preserves_unused_tmp(|path, target| {
+            std::os::unix::fs::symlink(target.with_extension("absent"), path).unwrap();
+        });
+    }
+
     /// TC-S12-003-01: initialize_legacy stamps vault.toml with initialized=true
     /// and a verification token.
     #[test]

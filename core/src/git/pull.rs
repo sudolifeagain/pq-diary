@@ -37,6 +37,7 @@ pub(super) fn merge(
     // turn missing/MAC-free deletion evidence into an apparently successful sync.
     let committed=read_committed_inputs(dir,&local_commit,&remote_commit,key).map_err(|error|
         DiaryError::Git(format!("Cannot safely reconcile Git history: {error}. Synchronization stopped; preserve both copies and review the history manually before retrying. No vault data was changed.")))?;
+    transaction::validate_remote_tree(dir, &committed.base_commit, &remote_commit)?;
     let mut plan = plan_merge(&committed.base, &working, &committed.remote)?;
     let ts = fuzz_timestamp(
         get_last_commit_timestamp(dir),
@@ -115,61 +116,46 @@ pub(super) fn merge(
         && records
             .iter()
             .all(|r| original.get(&r.uuid).is_some_and(|old| same_record(old, r)));
-    if unchanged {
+    let merge = transaction::ancestry_needed(dir, &local_commit, &remote_commit)?;
+    if unchanged && !merge {
         return Ok(result);
     }
-    let backup_path = path.with_file_name("vault.pqd.bak");
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut backup = options.open(&backup_path).map_err(|e| {
-        DiaryError::Git(format!(
-            "cannot create new vault backup; preserve any existing backup before retrying: {e}"
-        ))
-    })?;
-    let saved = backup
-        .write_all(&vault_bytes)
-        .and_then(|_| backup.sync_all());
-    drop(backup);
-    if let Err(error) = saved {
-        let _ = std::fs::remove_file(&backup_path);
-        return Err(DiaryError::Io(error));
-    }
-    let applied = (|| {
-        write_vault_with_attachments_authenticated(path, working.header, &records, &[], key)?;
-        let output = std::process::Command::new("git")
-            .current_dir(dir)
-            .arg("-c")
-            .arg(format!("user.name={}", config.git.author_name))
-            .arg("-c")
-            .arg(format!("user.email={}", config.git.author_email))
-            .args([
-                "commit",
-                "--only",
-                "--date",
-                &ts,
-                "-m",
-                &config.git.commit_message,
-                "--",
-                "vault.pqd",
-            ])
-            .env("GIT_AUTHOR_DATE", &ts)
-            .env("GIT_COMMITTER_DATE", &ts)
-            .output()
-            .map_err(|e| DiaryError::Git(format!("failed to spawn git commit: {e}")))?;
-        if !output.status.success() {
-            return Err(DiaryError::Git(format!(
-                "git commit failed after merge: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )));
-        }
-        Ok(result)
-    })();
-    finish_pull(applied, &backup_path, path, &mut std::io::stderr().lock())
+    transaction::apply(
+        transaction::Commit {
+            dir,
+            path,
+            local: &local_commit,
+            remote: &remote_commit,
+            config,
+            timestamp: &ts,
+            original: &vault_bytes,
+            merge,
+        },
+        || {
+            revalidate(
+                dir,
+                path,
+                &tracking,
+                &local_commit,
+                &remote_commit,
+                &vault_bytes,
+                &config_bytes,
+            )
+        },
+        || {
+            if !unchanged {
+                write_vault_with_attachments_authenticated(
+                    path,
+                    working.header,
+                    &records,
+                    &[],
+                    key,
+                )?;
+            }
+            Ok(())
+        },
+    )?;
+    Ok(result)
 }
 
 fn revalidate(

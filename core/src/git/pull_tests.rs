@@ -413,3 +413,292 @@ fn invalid_timestamp_and_tampered_working_snapshot_fail_before_prompt() {
         assert!(!f.local.join("vault.pqd.bak").exists());
     }
 }
+
+#[test]
+fn pull_records_both_parents_and_allows_ordinary_push() {
+    let f = Fixture::new(&[record(1, 1)]);
+    f.local(&[record(1, 1), record(2, 1)]);
+    git(&f.local, &["add", "vault.pqd"]);
+    git(&f.local, &["commit", "-m", "local"]);
+    let local = git(&f.local, &["rev-parse", "HEAD"]);
+    f.publish(&[record(1, 1), record(3, 1)]);
+    let remote = git(&f.remote, &["rev-parse", "HEAD"]);
+    f.pull().unwrap();
+    assert_eq!(git(&f.local, &["rev-parse", "HEAD^1"]), local);
+    assert_eq!(git(&f.local, &["rev-parse", "HEAD^2"]), remote);
+    git(&f.local, &["push"]);
+    let head = git(&f.local, &["rev-parse", "HEAD"]);
+    let vault = std::fs::read(f.local.join("vault.pqd")).unwrap();
+    let index = std::fs::read(f.local.join(".git/index")).unwrap();
+    f.pull().unwrap();
+    assert_eq!(git(&f.local, &["rev-parse", "HEAD"]), head);
+    assert_eq!(std::fs::read(f.local.join("vault.pqd")).unwrap(), vault);
+    assert_eq!(std::fs::read(f.local.join(".git/index")).unwrap(), index);
+}
+
+#[test]
+fn unchanged_records_still_record_remote_ancestry() {
+    let f = Fixture::new(&[record(1, 1)]);
+    let local = git(&f.local, &["rev-parse", "HEAD"]);
+    f.publish(&[record(1, 1)]);
+    let remote = git(&f.remote, &["rev-parse", "HEAD"]);
+    let bytes = std::fs::read(f.local.join("vault.pqd")).unwrap();
+    f.pull().unwrap();
+    assert_eq!(git(&f.local, &["rev-parse", "HEAD^1"]), local);
+    assert_eq!(git(&f.local, &["rev-parse", "HEAD^2"]), remote);
+    assert_eq!(std::fs::read(f.local.join("vault.pqd")).unwrap(), bytes);
+}
+
+#[test]
+fn unsupported_remote_paths_and_existing_operation_state_are_preserved() {
+    for obstacle in [
+        "remote-file",
+        "MERGE_HEAD",
+        "MERGE_MSG",
+        "MERGE_MODE",
+        "index.lock",
+        "rebase-merge",
+        "staged-vault",
+    ] {
+        let f = Fixture::new(&[record(1, 1)]);
+        f.publish(&[record(1, 1), record(2, 1)]);
+        if obstacle == "remote-file" {
+            let remote_path = if cfg!(windows) {
+                "other file"
+            } else {
+                "other\nfile"
+            };
+            std::fs::write(f.remote.join(remote_path), b"remote data").unwrap();
+            git(&f.remote, &["add", "."]);
+            git(&f.remote, &["commit", "-m", "unsupported"]);
+            git(&f.remote, &["push"]);
+        } else if obstacle == "staged-vault" {
+            f.local(&[record(1, 3)]);
+            git(&f.local, &["add", "vault.pqd"]);
+            f.local(&[record(1, 1)]);
+        } else {
+            std::fs::write(f.local.join(".git").join(obstacle), b"existing state").unwrap();
+        }
+        let before = state(&f);
+        assert!(f.pull().is_err(), "{obstacle}");
+        assert_eq!(state(&f), before, "{obstacle}");
+        assert!(!f.local.join("vault.pqd.bak").exists());
+        if !matches!(obstacle, "remote-file" | "staged-vault") {
+            assert_eq!(
+                std::fs::read(f.local.join(".git").join(obstacle)).unwrap(),
+                b"existing state"
+            );
+        }
+    }
+}
+
+#[test]
+fn staged_add_modify_delete_and_unstaged_files_survive_merge() {
+    let f = Fixture::new(&[record(1, 1)]);
+    for path in ["modified", "deleted"] {
+        std::fs::write(f.local.join(path), b"base").unwrap();
+    }
+    git(&f.local, &["add", "."]);
+    git(&f.local, &["commit", "-m", "local files"]);
+    std::fs::write(f.local.join("modified"), b"staged modification").unwrap();
+    std::fs::write(f.local.join("added"), b"staged addition").unwrap();
+    git(&f.local, &["rm", "deleted"]);
+    git(&f.local, &["add", "modified", "added"]);
+    std::fs::write(f.local.join("modified"), b"unstaged modification").unwrap();
+    let staged = git(&f.local, &["diff", "--cached", "--binary"]);
+    f.publish(&[record(1, 1), record(2, 1)]);
+    f.pull().unwrap();
+    assert_eq!(git(&f.local, &["diff", "--cached", "--binary"]), staged);
+    assert_eq!(
+        std::fs::read(f.local.join("modified")).unwrap(),
+        b"unstaged modification"
+    );
+    assert_eq!(git(&f.local, &["show", "HEAD:modified"]), b"base");
+    assert_eq!(git(&f.local, &["show", "HEAD:deleted"]), b"base");
+    assert_eq!(
+        git(
+            &f.local,
+            &[
+                "diff-tree",
+                "--no-commit-id",
+                "--name-only",
+                "-r",
+                "HEAD^1",
+                "HEAD"
+            ]
+        ),
+        b"vault.pqd\n"
+    );
+}
+
+#[test]
+fn linked_worktree_with_spaces_uses_its_effective_index() {
+    let mut f = Fixture::new(&[record(1, 1)]);
+    let linked = f._dir.path().join("linked worktree");
+    git(
+        &f.local,
+        &["worktree", "add", "-b", "linked", linked.to_str().unwrap()],
+    );
+    git(&linked, &["branch", "--set-upstream-to", "origin/main"]);
+    let original_index = std::fs::read(f.local.join(".git/index")).unwrap();
+    f.publish(&[record(1, 1), record(2, 1)]);
+    let main = f.local.clone();
+    f.local = linked;
+    f.pull().unwrap();
+    assert_eq!(
+        std::fs::read(main.join(".git/index")).unwrap(),
+        original_index
+    );
+    assert_eq!(
+        git(&f.local, &["rev-parse", "HEAD^2"]),
+        git(&f.remote, &["rev-parse", "HEAD"])
+    );
+}
+
+#[cfg(unix)]
+fn install_hook(f: &Fixture, name: &str, script: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let path = f.local.join(".git/hooks").join(name);
+    std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn nonzero_after_head_update_is_not_rolled_back() {
+    let f = Fixture::new(&[record(1, 1)]);
+    f.publish(&[record(1, 1), record(2, 1)]);
+    install_hook(&f, "post-commit", "kill -TERM \"$PPID\"");
+    f.pull().unwrap();
+    assert_eq!(
+        git(&f.local, &["rev-parse", "HEAD^2"]),
+        git(&f.remote, &["rev-parse", "HEAD"])
+    );
+    assert_eq!(
+        git(&f.local, &["show", "HEAD:vault.pqd"]),
+        std::fs::read(f.local.join("vault.pqd")).unwrap()
+    );
+    assert!(git(&f.local, &["diff", "--cached", "--name-only"]).is_empty());
+}
+
+#[test]
+#[cfg(unix)]
+fn committed_index_publication_failure_retains_recovery_and_vault() {
+    let f = Fixture::new(&[record(1, 1)]);
+    f.publish(&[record(1, 1), record(2, 1)]);
+    let before = state(&f);
+    install_hook(&f, "post-commit", "mv .git/index .git/index.saved\nmkdir .git/index\nprintf blocked > .git/index/obstacle\nprintf hook-owned > .git/MERGE_MSG");
+    let error = f.pull().unwrap_err().to_string();
+    assert!(
+        error.contains("commit created; index recovery required"),
+        "{error}"
+    );
+    assert_ne!(git(&f.local, &["rev-parse", "HEAD"]), before.head);
+    assert_eq!(
+        git(&f.local, &["show", "HEAD:vault.pqd"]),
+        std::fs::read(f.local.join("vault.pqd")).unwrap()
+    );
+    assert_eq!(
+        std::fs::read(f.local.join("vault.pqd.bak")).unwrap(),
+        before.vault
+    );
+    assert_eq!(
+        std::fs::read(f.local.join(".git/index.saved")).unwrap(),
+        before.index
+    );
+    assert!(f.local.join(".git/index.lock").is_file());
+    assert_eq!(
+        std::fs::read(f.local.join(".git/MERGE_MSG")).unwrap(),
+        b"hook-owned"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn hook_modified_commit_is_not_reported_as_rolled_back() {
+    let f = Fixture::new(&[record(1, 1)]);
+    f.publish(&[record(1, 1), record(2, 1)]);
+    let before = state(&f);
+    install_hook(
+        &f,
+        "pre-commit",
+        "printf hook > hook-file\ngit add hook-file",
+    );
+    let error = f.pull().unwrap_err().to_string();
+    assert!(error.contains("outcome uncertain or unexpected"), "{error}");
+    assert_ne!(git(&f.local, &["rev-parse", "HEAD"]), before.head);
+    assert_eq!(
+        std::fs::read(f.local.join(".git/index")).unwrap(),
+        before.index
+    );
+    assert_eq!(
+        git(&f.local, &["show", "HEAD:vault.pqd"]),
+        std::fs::read(f.local.join("vault.pqd")).unwrap()
+    );
+    assert_eq!(git(&f.local, &["show", "HEAD:hook-file"]), b"hook");
+    assert!(f.local.join("vault.pqd.bak").exists());
+    assert!(f.local.join(".git/index.lock").exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn postcommit_backup_cleanup_failure_remains_success() {
+    for replacement in [
+        "mkdir vault.pqd.bak; printf retained > vault.pqd.bak/keep",
+        "printf retained > vault.pqd.bak",
+    ] {
+        let f = Fixture::new(&[record(1, 1)]);
+        f.publish(&[record(1, 1), record(2, 1)]);
+        install_hook(
+            &f,
+            "post-commit",
+            &format!("mv vault.pqd.bak saved-backup\n{replacement}"),
+        );
+        f.pull().unwrap();
+        assert_eq!(
+            git(&f.local, &["show", "HEAD:vault.pqd"]),
+            std::fs::read(f.local.join("vault.pqd")).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(if f.local.join("vault.pqd.bak").is_dir() {
+                f.local.join("vault.pqd.bak/keep")
+            } else {
+                f.local.join("vault.pqd.bak")
+            })
+            .unwrap(),
+            b"retained"
+        );
+        assert!(!f.local.join(".git/index.lock").exists());
+    }
+}
+
+#[test]
+fn unmerged_index_is_rejected_without_backup_or_mutation() {
+    let f = Fixture::new(&[record(1, 1)]);
+    f.publish(&[record(1, 1), record(2, 1)]);
+    let blob = String::from_utf8(git(&f.local, &["rev-parse", "HEAD:vault.toml"])).unwrap();
+    let mut child = std::process::Command::new("git")
+        .current_dir(&f.local)
+        .args(["update-index", "--index-info"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            format!(
+                "100644 {} 1\tunmerged\n100644 {} 2\tunmerged\n",
+                blob.trim(),
+                blob.trim()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    assert!(child.wait().unwrap().success());
+    let before = state(&f);
+    assert!(f.pull().unwrap_err().to_string().contains("unmerged index"));
+    assert_eq!(state(&f), before);
+    assert!(!f.local.join("vault.pqd.bak").exists());
+}

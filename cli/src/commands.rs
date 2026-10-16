@@ -3361,6 +3361,69 @@ mod tests {
     use clap::Parser as _;
     use std::path::Path;
 
+    struct FailingMutationWriter {
+        fail_write: bool,
+    }
+
+    impl std::io::Write for FailingMutationWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.fail_write {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            } else {
+                Ok(bytes.len())
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+    }
+
+    #[test]
+    fn import_output_failure_keeps_requested_attachments() {
+        for fail_write in [true, false] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let vault_dir = setup_vault(&dir);
+            let config = std::fs::read(vault_dir.join("vault.toml")).expect("config");
+            let source = dir.path().join("source");
+            std::fs::create_dir_all(source.join("attachments")).expect("source directory");
+            std::fs::write(source.join("note.md"), "# Note\n\n![[photo.txt]]\n")
+                .expect("source entry");
+            std::fs::write(source.join("attachments/photo.txt"), b"attachment contents")
+                .expect("source attachment");
+            let cli = parse_import_cli(
+                vault_dir.to_str().expect("vault path"),
+                source.to_str().expect("source path"),
+                &[],
+            );
+            let error = cmd_import_to(
+                &cli,
+                extract_import_args(&cli),
+                &mut FailingMutationWriter { fail_write },
+            )
+            .expect_err("output failure must propagate");
+            assert_eq!(
+                error.downcast_ref::<std::io::Error>().expect("I/O source").kind(),
+                std::io::ErrorKind::BrokenPipe
+            );
+            let entries = read_vault_entries(&vault_dir);
+            assert_eq!(entries.len(), 1, "entry remains committed");
+            let attachments = pq_diary_core::attachment::list_attachments(
+                &vault_dir,
+                &secrecy::SecretBox::new(Box::from("password")),
+                Some(&entries[0].uuid_hex),
+            )
+            .expect("reopen attachments");
+            assert_eq!(attachments.len(), 1, "reporting must not skip attachment work");
+            assert_eq!(attachments[0].filename, "photo.txt");
+            assert_eq!(
+                std::fs::read(vault_dir.join("vault.toml")).expect("config"),
+                config
+            );
+            assert!(source.join("note.md").is_file());
+        }
+    }
+
     #[test]
     fn read_output_propagates_write_and_flush_errors() {
         use std::io::{self, Write};

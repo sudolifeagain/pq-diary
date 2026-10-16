@@ -206,6 +206,27 @@ pub fn cmd_new_with_attach(
     template: Option<String>,
     attach: Vec<PathBuf>,
 ) -> anyhow::Result<()> {
+    cmd_new_with_attach_to(
+        cli,
+        title,
+        body,
+        tags,
+        template,
+        attach,
+        &mut std::io::stdout(),
+    )
+}
+
+fn cmd_new_with_attach_to(
+    cli: &Cli,
+    title: Option<String>,
+    body: Option<String>,
+    tags: Vec<String>,
+    template: Option<String>,
+    attach: Vec<PathBuf>,
+    out: &mut dyn std::io::Write,
+) -> anyhow::Result<()> {
+    use anyhow::Context as _;
     use pq_diary_core::policy::OperationType;
     use secrecy::{ExposeSecret as _, SecretBox};
     use std::io::{BufRead as _, IsTerminal as _, Read as _};
@@ -332,9 +353,9 @@ pub fn cmd_new_with_attach(
         .new_entry(&actual_title, &final_body, final_tags)
         .map_err(|e| anyhow::anyhow!("Failed to create entry: {e}"))?;
 
-    // Step 5: Print success message with an 8-character ID prefix.
+    // Retain result details until attachment processing completes.
     let prefix = &uuid_hex[..8];
-    println!("Created: {prefix} \"{actual_title}\"");
+    let mut attached_files = Vec::new();
 
     // Step 6 (S13): Attach files if --attach was given. Drop the vault guard
     // so that `add_attachment` (which self-locks) gets clean ownership.
@@ -351,12 +372,27 @@ pub fn cmd_new_with_attach(
                         .and_then(|n| n.to_str())
                         .unwrap_or("attachment");
                     let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-                    println!("Attached: {filename} ({})", human_size(size));
+                    attached_files.push((filename, size));
                 }
-                Err(e) => anyhow::bail!("failed to attach {}: {e}", path.display()),
+                Err(e) => {
+                    return Err(anyhow::Error::new(e).context(format!(
+                        "Entry {prefix} was created; failed to attach {}",
+                        path.display()
+                    )));
+                }
             }
         }
     }
+
+    // Output failure must not prevent any of the attachment work above.
+    (|| -> std::io::Result<()> {
+        writeln!(out, "Created: {prefix} \"{actual_title}\"")?;
+        for (filename, size) in attached_files {
+            writeln!(out, "Attached: {filename} ({})", human_size(size))?;
+        }
+        out.flush()
+    })()
+    .with_context(|| format!("Entry {prefix} was created, but failed to report the result"))?;
 
     // guard drops here, automatically calling lock().
     Ok(())
@@ -1226,6 +1262,7 @@ pub(crate) fn cmd_import_to(
     args: &crate::ImportArgs,
     out: &mut dyn std::io::Write,
 ) -> anyhow::Result<()> {
+    use anyhow::Context as _;
     use secrecy::{ExposeSecret as _, SecretBox};
 
     // 1. Validate source directory before touching the vault.
@@ -1322,33 +1359,12 @@ pub(crate) fn cmd_import_to(
         }
     }
 
-    // 6. Display results.
-    if args.dry_run {
-        writeln!(
-            out,
-            "[DRY RUN] Would import {} files from '{}'",
-            result.would_import,
-            args.dir.display()
-        )?;
-        writeln!(out, "  Links to convert: {}", result.links_converted)?;
-        writeln!(out, "  Tags to extract: {}", result.tags_converted)?;
-        writeln!(out, "  Files to skip: {}", result.skipped)?;
-        for detail in &result.skip_details {
-            writeln!(out, "    - {} ({})", detail.path, detail.reason)?;
-        }
-    } else {
-        writeln!(
-            out,
-            "Imported: {}, Skipped: {}, Links converted: {}, Tags converted: {}",
-            result.imported, result.skipped, result.links_converted, result.tags_converted
-        )?;
-    }
-
     // guard drops here, automatically calling lock().
     drop(guard);
 
     // 7. (S13) Apply the queued attachment adds now that the guard is gone —
     // `add_attachment` re-opens the vault with the master password.
+    let mut attachment_warnings = zeroize::Zeroizing::new(Vec::new());
     if !pending_attachments.is_empty() {
         let vault_dir = resolve_legacy_vault_dir(cli)?;
         let master_pwd: secrecy::SecretString =
@@ -1359,21 +1375,56 @@ pub(crate) fn cmd_import_to(
                 Ok(_) => attached += 1,
                 Err(e) => {
                     let filename = src.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-                    writeln!(out, "  warning: failed to attach {filename}: {e}")?;
+                    attachment_warnings
+                        .push(format!("  warning: failed to attach {filename}: {e}"));
                 }
             }
         }
     }
-    if attached > 0 || !skipped_links.is_empty() {
-        writeln!(
-            out,
-            "Attachments: {attached} added, {} unresolved ![[...]] reference(s) left as-is",
-            skipped_links.len()
-        )?;
-        for missing in &skipped_links {
-            writeln!(out, "  unresolved: {missing}")?;
+    // Finish requested mutations before a reporting error can return early.
+    (|| -> std::io::Result<()> {
+        if args.dry_run {
+            writeln!(
+                out,
+                "[DRY RUN] Would import {} files from '{}'",
+                result.would_import,
+                args.dir.display()
+            )?;
+            writeln!(out, "  Links to convert: {}", result.links_converted)?;
+            writeln!(out, "  Tags to extract: {}", result.tags_converted)?;
+            writeln!(out, "  Files to skip: {}", result.skipped)?;
+            for detail in &result.skip_details {
+                writeln!(out, "    - {} ({})", detail.path, detail.reason)?;
+            }
+        } else {
+            writeln!(
+                out,
+                "Imported: {}, Skipped: {}, Links converted: {}, Tags converted: {}",
+                result.imported, result.skipped, result.links_converted, result.tags_converted
+            )?;
         }
-    }
+
+        for warning in attachment_warnings.iter() {
+            writeln!(out, "{warning}")?;
+        }
+        if attached > 0 || !skipped_links.is_empty() {
+            writeln!(
+                out,
+                "Attachments: {attached} added, {} unresolved ![[...]] reference(s) left as-is",
+                skipped_links.len()
+            )?;
+            for missing in &skipped_links {
+                writeln!(out, "  unresolved: {missing}")?;
+            }
+        }
+        out.flush()
+    })()
+    .with_context(|| {
+        format!(
+            "Failed to report import result ({} entries imported, {attached} attachments added)",
+            result.imported
+        )
+    })?;
 
     Ok(())
 }
@@ -3377,6 +3428,142 @@ mod tests {
     use super::*;
     use clap::Parser as _;
     use std::path::Path;
+
+    struct FailingMutationWriter {
+        fail_write: bool,
+    }
+
+    impl std::io::Write for FailingMutationWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.fail_write {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            } else {
+                Ok(bytes.len())
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+    }
+
+    #[test]
+    fn new_output_failure_keeps_requested_attachments() {
+        for fail_write in [true, false] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let vault_dir = setup_vault(&dir);
+            let source = dir.path().join("photo.txt");
+            std::fs::write(&source, b"attachment contents").expect("attachment");
+            let cli = make_cli(vault_dir.to_str().expect("vault path"), Some("password"));
+            let error = cmd_new_with_attach_to(
+                &cli,
+                Some("private title".into()),
+                Some("private body".into()),
+                vec![],
+                None,
+                vec![source],
+                &mut FailingMutationWriter { fail_write },
+            )
+            .expect_err("output failure must propagate");
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .expect("I/O source")
+                    .kind(),
+                std::io::ErrorKind::BrokenPipe
+            );
+            let message = format!("{error:#}");
+            assert!(message.contains("was created"));
+            assert!(!message.contains("private"));
+            let entries = read_vault_entries(&vault_dir);
+            assert_eq!(entries.len(), 1);
+            assert_eq!(read_first_entry_plaintext(&vault_dir).body, "private body");
+            let attachments = pq_diary_core::attachment::list_attachments(
+                &vault_dir,
+                &secrecy::SecretBox::new(Box::from("password")),
+                Some(&entries[0].uuid_hex),
+            )
+            .expect("reopen attachments");
+            assert_eq!(attachments.len(), 1);
+            assert_eq!(attachments[0].filename, "photo.txt");
+        }
+    }
+
+    #[test]
+    fn new_attachment_failure_identifies_committed_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        let cli = make_cli(vault_dir.to_str().expect("vault path"), Some("password"));
+        let mut output = Vec::new();
+        let error = cmd_new_with_attach_to(
+            &cli,
+            Some("fixture".into()),
+            Some("private body".into()),
+            vec![],
+            None,
+            vec![dir.path().join("missing.txt")],
+            &mut output,
+        )
+        .expect_err("missing attachment");
+        let entries = read_vault_entries(&vault_dir);
+        assert_eq!(entries.len(), 1);
+        assert!(error.to_string().contains(&entries[0].uuid_hex[..8]));
+        assert!(error.to_string().contains("was created; failed to attach"));
+        assert!(error.downcast_ref::<pq_diary_core::DiaryError>().is_some());
+        assert!(output.is_empty(), "do not report success before processing");
+    }
+
+    #[test]
+    fn import_output_failure_keeps_requested_attachments() {
+        for fail_write in [true, false] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let vault_dir = setup_vault(&dir);
+            let config = std::fs::read(vault_dir.join("vault.toml")).expect("config");
+            let source = dir.path().join("source");
+            std::fs::create_dir_all(source.join("attachments")).expect("source directory");
+            std::fs::write(source.join("note.md"), "# Note\n\n![[photo.txt]]\n")
+                .expect("source entry");
+            std::fs::write(source.join("attachments/photo.txt"), b"attachment contents")
+                .expect("source attachment");
+            let cli = parse_import_cli(
+                vault_dir.to_str().expect("vault path"),
+                source.to_str().expect("source path"),
+                &[],
+            );
+            let error = cmd_import_to(
+                &cli,
+                extract_import_args(&cli),
+                &mut FailingMutationWriter { fail_write },
+            )
+            .expect_err("output failure must propagate");
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .expect("I/O source")
+                    .kind(),
+                std::io::ErrorKind::BrokenPipe
+            );
+            let entries = read_vault_entries(&vault_dir);
+            assert_eq!(entries.len(), 1, "entry remains committed");
+            let attachments = pq_diary_core::attachment::list_attachments(
+                &vault_dir,
+                &secrecy::SecretBox::new(Box::from("password")),
+                Some(&entries[0].uuid_hex),
+            )
+            .expect("reopen attachments");
+            assert_eq!(
+                attachments.len(),
+                1,
+                "reporting must not skip attachment work"
+            );
+            assert_eq!(attachments[0].filename, "photo.txt");
+            assert_eq!(
+                std::fs::read(vault_dir.join("vault.toml")).expect("config"),
+                config
+            );
+            assert!(source.join("note.md").is_file());
+        }
+    }
 
     #[test]
     fn read_output_propagates_write_and_flush_errors() {

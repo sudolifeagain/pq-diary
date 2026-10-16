@@ -10,6 +10,13 @@ the **History** table at the bottom for git-tag pointers.
 
 ## [Unreleased]
 
+### Current implementation status (2026-10-16)
+
+- Current writer schema is **0x06**; readers accept v0x04–v0x06. S16 v0x07 integration/migration is unfinished. MDK/keyslot primitives are present but are not yet the normal vault create/unlock/data path.
+- Git sync has snapshot validation and fail-closed guards. Common-base deletion/metadata reconciliation, remote ancestry, attachment sync and cross-device key/config migration remain open. The historical “3-way merge” milestone below is not a claim that these cases are complete.
+- Default CI uses Linux check/debug smoke plus audit/deny. Cross-platform check/release smoke remains available through manual `full_matrix=true`.
+- The S13 v5 format notes below describe that historical release stage, not the current writer. See [development inventory](docs/development-inventory.md) for pinned source evidence and verification limits.
+
 ### Markdown import fixes
 - Preserve code, escaped markers, wiki-link targets and URL fragments during inline tag and alias conversion.
 - Import complete hyphenated, nested and Unicode symbol/emoji tags; preserve numeric-only hashes as text, matching Obsidian's tag format.
@@ -96,10 +103,10 @@ PRD §15 で定義された Phase 1 を 2026-04-11 (s9) → 2026-05-17 (s11) で
 `RECORD_TYPE_ATTACHMENT (0x03)` レコードが含まれる場合がある。
 
 - **読み込み**: S13+ クライアントは v4 / v5 両方を受け入れる (`SCHEMA_VERSION_MIN = 0x04`)
-- **書き込み**: 常に v5 を書く → v4 vault は次回 write で自動 v5 化
+- **S13当時の書き込み**: v5を書き、v4 vaultは次回writeでv5化。現行writerはS15で導入したv0x06を使う
 - **古いクライアント (S12 以前) ↔ v5 vault**: `schema_version` チェックで拒絶 — S13+ クライアントのみで開く運用を推奨
 
-将来、HQC ハイブリッド KEM 対応で v5 → v6 を予定 (Phase 4)。
+現在はS15のv0x06が導入済み。次のv0x07移行は未完了のS16で扱う。HQCはS16設計上、schema bumpではなくスロットアルゴリズムの追加を予定する。
 
 ## History
 
@@ -137,4 +144,5 @@ PR マージコミット (`git log --merges`) を参照。S14 以降は個別の
 S14 以降の作業は git tag を打たず、PR マージコミットで追跡:
 
 - S14 (本 PR): Phase 2 棚卸し + CHANGELOG.md 新規作成 — タグなし
-- S15 以降: 未定 (Phase 2 残候補: Bases like ビュー / 固定ブロック OQ-20 / Web Clipper / 鍵素材 XOR 分散 / Unix ソケット + デーモン)
+- S15: v0x06整合性MACなどの硬化。S16: MDK/keyslot基盤まで導入、vault/CLI統合未完了。S17: データ保全・I/O回帰対応を継続。詳細は `docs/sprint-status.md` を参照
+- Phase 2残候補: Bases like ビュー / 固定ブロック OQ-20 / Web Clipper / 鍵素材 XOR 分散 / Unix ソケット + デーモン

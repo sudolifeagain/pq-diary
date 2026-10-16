@@ -292,9 +292,11 @@ mod tests {
                 .unwrap();
             assert!(
                 output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stdout)
+                "stdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
             );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
             return;
         }
         let dir = tempfile::tempdir().unwrap();

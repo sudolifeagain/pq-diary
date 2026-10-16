@@ -2792,7 +2792,10 @@ fn prompt_confirmation_mode_with_io(
     writeln!(out, "Choose confirmation mode for legacy-access:")?;
     writeln!(out, "  [1] timer30 (default) — 30-second timer + y/N")?;
     writeln!(out, "  [2] yn               — immediate y/N")?;
-    writeln!(out, "  [3] phrase           — type 'DESTROY ALL' to confirm")?;
+    writeln!(
+        out,
+        "  [3] phrase           — type 'DESTROY ALL' to confirm"
+    )?;
     write!(out, "Selection [1]: ")?;
     out.flush()?;
     let mut line = String::new();
@@ -3069,12 +3072,21 @@ fn run_destroy_confirmation_with_io(
     use pq_diary_core::vault::config::ConfirmationMode;
 
     writeln!(out)?;
-    writeln!(out, "============================================================")?;
+    writeln!(
+        out,
+        "============================================================"
+    )?;
     writeln!(out, "  WARNING: THIS OPERATION IS IRREVERSIBLE")?;
     writeln!(out, "  - All INHERIT entries will be inherited.")?;
-    writeln!(out, "  - All DESTROY entries (and unconfigured entries) will be")?;
+    writeln!(
+        out,
+        "  - All DESTROY entries (and unconfigured entries) will be"
+    )?;
     writeln!(out, "    PERMANENTLY ERASED with zeroize-overwrite.")?;
-    writeln!(out, "============================================================")?;
+    writeln!(
+        out,
+        "============================================================"
+    )?;
 
     match mode {
         ConfirmationMode::Timer30 => {
@@ -11053,16 +11065,17 @@ mod confirmation_output_tests {
         for answer in ["y", "Y", "yes", "YES", " y \n", "", "n", "Yes", "true"] {
             let mut reader = io::Cursor::new(answer);
             let mut out = Vec::new();
-            let confirmed =
-                prompt_yn_with_io("Proceed? [y/N]: ", &mut reader, &mut out).unwrap();
-            assert_eq!(confirmed, matches!(answer.trim(), "y" | "Y" | "yes" | "YES"));
+            let confirmed = prompt_yn_with_io("Proceed? [y/N]: ", &mut reader, &mut out).unwrap();
+            assert_eq!(
+                confirmed,
+                matches!(answer.trim(), "y" | "Y" | "yes" | "YES")
+            );
             assert_eq!(out, b"Proceed? [y/N]: ");
         }
         for answer in ["DESTROY ALL", " DESTROY ALL\n", "destroy all", ""] {
             let mut reader = io::Cursor::new(answer);
             let mut out = Vec::new();
-            let confirmed =
-                prompt_phrase_with_io("DESTROY ALL", &mut reader, &mut out).unwrap();
+            let confirmed = prompt_phrase_with_io("DESTROY ALL", &mut reader, &mut out).unwrap();
             assert_eq!(confirmed, answer.trim() == "DESTROY ALL");
             assert_eq!(out, b"Type the phrase 'DESTROY ALL' to confirm:\n> ");
         }
@@ -11077,8 +11090,7 @@ mod confirmation_output_tests {
         ] {
             let mut out = Vec::new();
             assert_eq!(
-                prompt_confirmation_mode_with_io(&mut io::Cursor::new(answer), &mut out)
-                    .unwrap(),
+                prompt_confirmation_mode_with_io(&mut io::Cursor::new(answer), &mut out).unwrap(),
                 expected
             );
             assert_eq!(
@@ -11086,19 +11098,20 @@ mod confirmation_output_tests {
                 "Choose confirmation mode for legacy-access:\n  [1] timer30 (default) — 30-second timer + y/N\n  [2] yn               — immediate y/N\n  [3] phrase           — type 'DESTROY ALL' to confirm\nSelection [1]: "
             );
         }
-        assert!(prompt_confirmation_mode_with_io(
-            &mut io::Cursor::new("4"),
-            &mut Vec::new(),
-        )
-        .unwrap_err()
-        .to_string()
-        .contains("Invalid selection '4'"));
+        assert!(
+            prompt_confirmation_mode_with_io(&mut io::Cursor::new("4"), &mut Vec::new(),)
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid selection '4'")
+        );
     }
 
     #[test]
     fn confirmation_output_error_preserves_vault_config_and_attachment() {
         use pq_diary_core::attachment::add_attachment;
-        use pq_diary_core::legacy::{execute_legacy_access, initialize_legacy, Argon2LegacyDeriver};
+        use pq_diary_core::legacy::{
+            execute_legacy_access, initialize_legacy, Argon2LegacyDeriver,
+        };
 
         let dir = tempfile::tempdir().unwrap();
         let vault = test_support::setup_vault(&dir);
@@ -11106,8 +11119,11 @@ mod confirmation_output_tests {
         let code = secrecy::SecretString::new("synthetic legacy code".into());
         let path = vault.join("vault.pqd");
         let mut core = DiaryCore::new(path.to_str().unwrap()).unwrap();
-        core.unlock(secrecy::SecretString::new("password".into())).unwrap();
-        let id = core.new_entry("original", "preserved body", vec![]).unwrap();
+        core.unlock(secrecy::SecretString::new("password".into()))
+            .unwrap();
+        let id = core
+            .new_entry("original", "preserved body", vec![])
+            .unwrap();
         drop(core);
         let source = dir.path().join("fixture.txt");
         std::fs::write(&source, b"synthetic attachment").unwrap();
@@ -11122,7 +11138,7 @@ mod confirmation_output_tests {
         initialize_legacy(&vault, &password, &code, ConfirmationMode::Yn, &deriver).unwrap();
         let before = std::fs::read(&path).unwrap();
         let config_before = std::fs::read(vault.join("vault.toml")).unwrap();
-        let blob_before = std::fs::read(&blob).unwrap();
+        let blob_before = std::fs::read(blob).unwrap();
         let cli = <Cli as clap::Parser>::try_parse_from([
             "pq-diary",
             "--vault",
@@ -11159,10 +11175,14 @@ mod confirmation_output_tests {
             });
             assert_broken_pipe(result.unwrap_err());
             assert_eq!(std::fs::read(&path).unwrap(), before);
-            assert_eq!(std::fs::read(vault.join("vault.toml")).unwrap(), config_before);
-            assert_eq!(std::fs::read(&blob).unwrap(), blob_before);
+            assert_eq!(
+                std::fs::read(vault.join("vault.toml")).unwrap(),
+                config_before
+            );
+            assert_eq!(std::fs::read(blob).unwrap(), blob_before);
             let mut core = DiaryCore::new(path.to_str().unwrap()).unwrap();
-            core.unlock(secrecy::SecretString::new("password".into())).unwrap();
+            core.unlock(secrecy::SecretString::new("password".into()))
+                .unwrap();
             assert_eq!(core.get_entry(&id).unwrap().1.body, "preserved body");
         }
     }

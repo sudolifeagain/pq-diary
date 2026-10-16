@@ -117,6 +117,26 @@ pub fn prompt_password(prompt: &str) -> Result<SecretString, DiaryError> {
     read_password_tty(prompt)
 }
 
+/// Restoration is best effort, including when the diagnostic stream has failed.
+fn warn_restore_failure(
+    warnings: &mut impl std::io::Write,
+    target: &str,
+    error: &impl std::fmt::Display,
+) {
+    let _ = writeln!(warnings, "Warning: Failed to restore {target}: {error}");
+}
+
+/// Report prompt I/O before Windows disables console echo.
+#[cfg(any(windows, test))]
+fn write_console_prompt(
+    writer: &mut impl std::io::Write,
+    prompt: &str,
+) -> Result<(), DiaryError> {
+    write!(writer, "{prompt}")
+        .and_then(|()| writer.flush())
+        .map_err(|e| DiaryError::Password(format!("Cannot write console prompt: {e}")))
+}
+
 // =============================================================================
 // Platform-specific TTY implementations
 // =============================================================================
@@ -166,7 +186,11 @@ fn read_password_tty(prompt: &str) -> Result<SecretString, DiaryError> {
                 nix::sys::termios::SetArg::TCSANOW,
                 &self.old,
             ) {
-                eprintln!("Warning: Failed to restore terminal attributes: {e}");
+                warn_restore_failure(
+                    &mut std::io::stderr().lock(),
+                    "terminal attributes",
+                    &e,
+                );
             }
         }
     }
@@ -250,6 +274,9 @@ fn read_password_tty(prompt: &str) -> Result<SecretString, DiaryError> {
         ));
     }
 
+    // A prompt write/flush failure must return while the original mode is intact.
+    write_console_prompt(&mut std::io::stderr().lock(), prompt)?;
+
     // Disable echo input.
     let new_mode = old_mode & !ENABLE_ECHO_INPUT;
     // SAFETY: handle is a console handle verified by GetConsoleMode; new_mode
@@ -261,9 +288,6 @@ fn read_password_tty(prompt: &str) -> Result<SecretString, DiaryError> {
             "Failed to disable console echo".to_string(),
         ));
     }
-
-    // Print the prompt to stderr so it is always visible.
-    eprint!("{prompt}");
 
     // Read up to 256 UTF-16 code units from the console.
     let mut buf: Zeroizing<[u16; 256]> = Zeroizing::new([0u16; 256]);
@@ -288,9 +312,18 @@ fn read_password_tty(prompt: &str) -> Result<SecretString, DiaryError> {
     #[allow(unsafe_code, reason = "OS console-mode restoration: SetConsoleMode")]
     let mode_restored = unsafe { SetConsoleMode(handle, old_mode) };
     if mode_restored == 0 {
-        eprintln!("Warning: Failed to restore console mode");
+        warn_restore_failure(
+            &mut std::io::stderr().lock(),
+            "console mode",
+            &std::io::Error::last_os_error(),
+        );
     }
-    eprintln!(); // newline after the hidden input
+    // Neither restoration warnings nor the cosmetic newline may panic before
+    // the original ReadConsoleW result is handled.
+    {
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr().lock());
+    }
 
     if ok == 0 {
         return Err(DiaryError::Password(
@@ -328,6 +361,57 @@ fn read_password_tty(_prompt: &str) -> Result<SecretString, DiaryError> {
 mod tests {
     use super::*;
     use secrecy::ExposeSecret;
+
+    struct FailedOutput {
+        fail_flush: bool,
+    }
+
+    impl std::io::Write for FailedOutput {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.fail_flush {
+                Ok(bytes.len())
+            } else {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+    }
+
+    #[test]
+    fn console_prompt_write_and_flush_failures_are_password_errors() {
+        for fail_flush in [false, true] {
+            assert!(matches!(
+                write_console_prompt(&mut FailedOutput { fail_flush }, "Password: "),
+                Err(DiaryError::Password(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn terminal_restore_warning_failure_does_not_panic_during_unwind() {
+        struct RestoreWarning;
+        impl Drop for RestoreWarning {
+            fn drop(&mut self) {
+                warn_restore_failure(
+                    &mut FailedOutput { fail_flush: false },
+                    "terminal attributes",
+                    &std::io::Error::from(std::io::ErrorKind::Other),
+                );
+            }
+        }
+        let result = std::panic::catch_unwind(|| {
+            let _guard = RestoreWarning;
+            panic!("primary password read failure");
+        });
+        let panic = result.unwrap_err();
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"primary password read failure")
+        );
+    }
 
     #[test]
     fn into_secret_preserves_allocation_for_every_source() {

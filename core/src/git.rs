@@ -1619,7 +1619,7 @@ mod tests {
             .output()
             .expect("git log --format=%aI");
         let ts_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        let commit_ts = chrono::DateTime::parse_from_rfc3339(ts_str)
+        let commit_ts = chrono::DateTime::parse_from_rfc3339(&ts_str)
             .expect("parse commit author date")
             .with_timezone(&Utc);
 
@@ -1651,7 +1651,7 @@ mod tests {
             .output()
             .expect("git log --format=%aI");
         let ts_str2 = String::from_utf8_lossy(&out2.stdout).trim().to_string();
-        let commit_ts2 = chrono::DateTime::parse_from_rfc3339(ts_str2)
+        let commit_ts2 = chrono::DateTime::parse_from_rfc3339(&ts_str2)
             .expect("parse commit author date (fuzz=0)")
             .with_timezone(&Utc);
 

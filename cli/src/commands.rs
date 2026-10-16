@@ -19,7 +19,7 @@ use crate::password::{get_password, PasswordSource};
 use crate::Cli;
 use chrono::{DateTime, Local, Utc};
 use pq_diary_core::{DiaryCore, EntryMeta, EntryPlaintext, Tag};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 // ---------------------------------------------------------------------------
 // Private helpers

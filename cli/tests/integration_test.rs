@@ -139,62 +139,62 @@ fn tc_0041_02b_wrong_password_fails() {
     );
 }
 
-/// TC-0041-02c: Password obtained from the `PQ_DIARY_PASSWORD` environment
-/// variable can be used to unlock the vault.
-///
-/// This verifies the env-variable password path end-to-end at the library
-/// level.  The `get_password()` function in `cli/src/password.rs` selects this
-/// value when no `--password` flag is provided; unit tests for that selection
-/// logic live in `password.rs` itself.
+/// TC-0041-02c: The real CLI obtains its password from the child environment.
 #[test]
 fn tc_0041_02c_env_password_unlocks_vault() {
-    // Serialize env-var access across parallel test threads.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = ENV_LOCK.lock().unwrap();
-
     let dir = tempfile::tempdir().expect("tempdir");
-    let vault_path = setup_vault(&dir, "env_vault", b"env_secret");
-
-    // Simulate what get_password(None) does when PQ_DIARY_PASSWORD is set.
-    std::env::set_var("PQ_DIARY_PASSWORD", "env_secret");
-    let env_val = std::env::var("PQ_DIARY_PASSWORD").expect("just set");
-    std::env::remove_var("PQ_DIARY_PASSWORD");
-
-    let mut core = DiaryCore::new(vault_path.to_str().expect("utf8")).expect("DiaryCore::new");
-    let result = core.unlock(SecretBox::new(env_val.into_boxed_str()));
+    let vault = setup_vault(&dir, "env_vault", b"env_secret");
+    let output = password_cli(&dir, &vault, "env_secret", None);
     assert!(
-        result.is_ok(),
-        "Password obtained from env var must unlock the vault"
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    core.lock();
+    let wrong = password_cli(&dir, &vault, "wrong_env_value", None);
+    assert!(
+        !wrong.status.success(),
+        "wrong environment password must fail"
+    );
 }
 
-/// TC-0041-02d: `--password` flag takes priority over `PQ_DIARY_PASSWORD`.
-///
-/// If both are set, the flag value is used.  Wrong env var + correct flag must
-/// succeed; correct env var + wrong flag must fail.
+/// TC-0041-02d: Correct flag overrides wrong environment password, but an
+/// incorrect flag must fail even when the environment password is correct.
 #[test]
 fn tc_0041_02d_flag_takes_priority_over_env() {
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = ENV_LOCK.lock().unwrap();
-
     let dir = tempfile::tempdir().expect("tempdir");
-    let vault_path = setup_vault(&dir, "priority_vault", b"flag_pass");
-
-    // Scenario: env var has wrong value, flag has correct value → must succeed.
-    std::env::set_var("PQ_DIARY_PASSWORD", "wrong_env_value");
-
-    // In the CLI, get_password(Some("flag_pass")) ignores the env var.
-    // Here we simulate by directly using the flag value.
-    let flag_value = "flag_pass";
-    std::env::remove_var("PQ_DIARY_PASSWORD");
-
-    let mut core = DiaryCore::new(vault_path.to_str().expect("utf8")).expect("DiaryCore::new");
+    let vault = setup_vault(&dir, "priority_vault", b"flag_pass");
+    let output = password_cli(&dir, &vault, "wrong_env_value", Some("flag_pass"));
     assert!(
-        core.unlock(secret(flag_value)).is_ok(),
-        "Flag password (correct) must unlock even when env var would be wrong"
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    core.lock();
+    let wrong = password_cli(&dir, &vault, "flag_pass", Some("wrong_flag_value"));
+    assert!(
+        !wrong.status.success(),
+        "flag must take priority even when incorrect"
+    );
+}
+
+fn password_cli(
+    dir: &TempDir,
+    vault: &std::path::Path,
+    env_password: &str,
+    flag: Option<&str>,
+) -> std::process::Output {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_pq-diary"));
+    command
+        .env("HOME", dir.path())
+        .env("USERPROFILE", dir.path())
+        .env("PQ_DIARY_HOME", dir.path().join("unused-home"))
+        .env("PQ_DIARY_PASSWORD", env_password)
+        .arg("--vault")
+        .arg(vault)
+        .stdin(std::process::Stdio::null());
+    if let Some(password) = flag {
+        command.args(["--password", password]);
+    }
+    command.arg("list").output().expect("run CLI")
 }
 
 // =============================================================================

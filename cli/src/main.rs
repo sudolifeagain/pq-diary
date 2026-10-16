@@ -50,7 +50,7 @@ pub struct StatsArgs {
     #[arg(long)]
     pub json: bool,
 
-    /// Show ASCII heatmap of writing activity (last 52 weeks).
+    /// Show ASCII heatmap of writing activity (current UTC week and previous 51 weeks).
     #[arg(long)]
     pub heatmap: bool,
 }
@@ -1108,3 +1108,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../test-support/environment.rs"]
+mod test_environment;

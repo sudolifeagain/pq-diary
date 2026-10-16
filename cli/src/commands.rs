@@ -10570,10 +10570,7 @@ parallelism = 1
     fn export_preserves_destination_created_after_preflight() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("export.md");
-        assert!(
-            !path.exists(),
-            "export preflight sees an available path"
-        );
+        assert!(!path.exists(), "export preflight sees an available path");
         // A competing writer claims the destination after our preflight.
         std::fs::write(&path, b"other writer's contents").expect("competing file");
 

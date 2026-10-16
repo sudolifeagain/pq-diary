@@ -1360,11 +1360,18 @@ pub(crate) fn cmd_stats_to(
 /// - `▓` — 2–3 entries
 /// - `█` — 4 or more entries
 ///
-/// The grid covers the last 52 weeks (364 days) ending today.  Rows are
-/// weekdays (Mon–Sun) and columns are calendar weeks (oldest left, newest
-/// right).  A month-abbreviation header and a legend line are appended.
+/// The grid covers the current UTC calendar week and the preceding 51 weeks.
+/// Rows are weekdays (Mon–Sun), with the oldest week on the left. Future
+/// days in the current week are blank. A month header and legend are appended.
 fn render_heatmap(daily_activity: &[pq_diary_core::stats::DailyActivity]) -> String {
-    use chrono::{Datelike as _, Duration, Utc};
+    render_heatmap_at(daily_activity, chrono::Utc::now().date_naive())
+}
+
+fn render_heatmap_at(
+    daily_activity: &[pq_diary_core::stats::DailyActivity],
+    today: chrono::NaiveDate,
+) -> String {
+    use chrono::{Datelike as _, Duration};
     use std::collections::HashMap;
 
     let activity_map: HashMap<String, usize> = daily_activity
@@ -1372,25 +1379,21 @@ fn render_heatmap(daily_activity: &[pq_diary_core::stats::DailyActivity]) -> Str
         .map(|a| (a.date.clone(), a.count))
         .collect();
 
-    let today = Utc::now().date_naive();
-    let start_date = today - Duration::days(363);
-
     const WEEKS: usize = 52;
-    // grid[weekday][week]: weekday 0 = Mon … 6 = Sun
-    let mut grid = [[0usize; WEEKS]; 7];
+    // Anchor the last column to this week's Monday, rather than aligning a
+    // trailing 364-day interval that can spill into a 53rd column.
+    let current_monday = today - Duration::days(today.weekday().num_days_from_monday().into());
+    let start_date = current_monday - Duration::weeks((WEEKS - 1) as i64);
 
-    // Align grid to calendar week boundaries: Monday is always row 0.
-    let start_weekday = start_date.weekday().num_days_from_monday() as usize; // 0=Mon
-    for day_offset in 0..364i64 {
-        let date = start_date + Duration::days(day_offset);
-        let adjusted_offset = day_offset as usize + start_weekday;
-        let week = adjusted_offset / 7;
-        let weekday = adjusted_offset % 7;
-        let date_str = date.format("%Y-%m-%d").to_string();
-        let count = activity_map.get(&date_str).copied().unwrap_or(0);
-        if week < WEEKS {
-            grid[weekday][week] = count;
+    // None marks a future date, distinct from a past day with no entries.
+    let mut grid = [[None; WEEKS]; 7];
+    for day_offset in 0..(WEEKS * 7) {
+        let date = start_date + Duration::days(day_offset as i64);
+        if date > today {
+            break;
         }
+        let count = activity_map.get(&date.to_string()).copied().unwrap_or(0);
+        grid[day_offset % 7][day_offset / 7] = Some(count);
     }
 
     let count_to_char = |c: usize| -> char {
@@ -1412,8 +1415,8 @@ fn render_heatmap(daily_activity: &[pq_diary_core::stats::DailyActivity]) -> Str
     let mut header_chars: Vec<char> = std::iter::repeat_n(' ', 5 + WEEKS).collect();
     let mut last_month: u32 = 0;
     for week in 0..WEEKS {
-        // The Monday (row 0) of each grid column: offset back by start_weekday.
-        let date = start_date + Duration::days((week * 7) as i64 - start_weekday as i64);
+        // The Monday (row 0) of each grid column.
+        let date = start_date + Duration::days((week * 7) as i64);
         let month = date.month();
         if month != last_month {
             let m_str = MONTH_NAMES[(month - 1) as usize];
@@ -1433,7 +1436,7 @@ fn render_heatmap(daily_activity: &[pq_diary_core::stats::DailyActivity]) -> Str
     for (weekday, week_counts) in grid.iter().enumerate() {
         let mut row = format!("{} ", day_labels[weekday]);
         for &count in week_counts.iter() {
-            row.push(count_to_char(count));
+            row.push(count.map(count_to_char).unwrap_or(' '));
         }
         lines.push(row);
     }
@@ -11280,6 +11283,83 @@ parallelism = 1
                 s.chars().nth(4) == Some('-') && s.chars().nth(7) == Some('-'),
                 "expected date prefix in {s}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod heatmap_window_tests {
+    use super::render_heatmap_at;
+    use chrono::{Datelike as _, Duration, NaiveDate};
+    use pq_diary_core::stats::DailyActivity;
+
+    fn activity(date: NaiveDate, count: usize) -> DailyActivity {
+        DailyActivity {
+            date: date.to_string(),
+            count,
+        }
+    }
+
+    fn cells(output: &str) -> Vec<Vec<char>> {
+        output
+            .lines()
+            .skip(1)
+            .take(7)
+            .map(|line| {
+                let row: Vec<_> = line.chars().skip(4).collect();
+                assert_eq!(row.len(), 52);
+                row
+            })
+            .collect()
+    }
+
+    #[test]
+    fn heatmap_today_is_visible_for_every_weekday() {
+        let monday = NaiveDate::from_ymd_opt(2026, 10, 12).unwrap();
+        for offset in 0..7 {
+            let today = monday + Duration::days(offset);
+            let output = render_heatmap_at(&[activity(today, 1)], today);
+            let grid = cells(&output);
+            assert_eq!(grid[offset as usize][51], '▒', "today={today}");
+            for row in grid.iter().skip(offset as usize + 1) {
+                assert_eq!(row[51], ' ', "future cell: today={today}");
+            }
+        }
+    }
+
+    #[test]
+    fn heatmap_window_boundaries_leap_day_and_year_rollover() {
+        for (year, month, day) in [(2026, 10, 15), (2026, 10, 18), (2024, 2, 29), (2025, 1, 1)] {
+            let today = NaiveDate::from_ymd_opt(year, month, day).unwrap();
+            let weekday = today.weekday().num_days_from_monday() as usize;
+            let start = today - Duration::days(weekday as i64 + 51 * 7);
+            let activities = [
+                activity(start - Duration::days(1), 4),
+                activity(start, 2),
+                activity(today, 1),
+                activity(today + Duration::days(1), 4),
+            ];
+            let output = render_heatmap_at(&activities, today);
+            let grid = cells(&output);
+            assert_eq!(grid[0][0], '▓', "start={start}");
+            assert_eq!(grid[weekday][51], '▒', "today={today}");
+            assert_eq!(grid.iter().flatten().filter(|&&c| c == '▓').count(), 1);
+            assert_eq!(grid.iter().flatten().filter(|&&c| c == '▒').count(), 1);
+            assert!(!grid.iter().flatten().any(|&c| c == '█'));
+            for (row, counts) in grid.iter().enumerate() {
+                for (week, &cell) in counts.iter().enumerate() {
+                    if (row, week) != (0, 0) && (row, week) != (weekday, 51) {
+                        assert_eq!(
+                            cell,
+                            if week == 51 && row > weekday {
+                                ' '
+                            } else {
+                                '░'
+                            }
+                        );
+                    }
+                }
+            }
         }
     }
 }

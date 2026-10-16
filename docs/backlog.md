@@ -1,5 +1,10 @@
 # Product Backlog
 
+## 現在の読み方
+
+チェック済み項目は導入時の実装履歴を含む。現行writerはv0x06、S16 v0x07は基盤のみ。
+最新の制約・回帰対応は [development-inventory.md](development-inventory.md)、Gitの未完了事項は下記「Git sync correctness debt」を参照。通常CIはLinux、全OS/ARM・releaseは手動実行（[workflow.md](workflow.md)）。
+
 ## Phase 1 (Sprint 1-9)
 
 ### S1: 基盤構築
@@ -88,7 +93,8 @@
 - [x] コミットメッセージ定型化 ("update")
 - [x] 末尾ランダムパディング (0-4096B)
 - [x] タイムスタンプファジング (単調増加保証)
-- [x] 3-wayマージ (UUID + content_hmac, last-write-wins)
+- [x] UUID + content_hmac によるレコード照合とlast-write-winsの初期実装
+- [ ] 共通baseに基づく完全な3-wayマージ（削除・メタデータ・remote ancestryは下記 debt を参照）
 - [x] コンフリクト対話式解決 (--claude時ローカル優先自動解決)
 
 ### S9: セキュリティ硬化 + 統合テスト + S1-S6技術的負債残り
@@ -143,7 +149,7 @@
 - [ ] 固定ブロックサイズ化 (64KB単位, OQ-20)
 - [x] 添付ファイル (バイナリ暗号化, v4予約フィールド使用) — S13 で完了 (PR #7 設計 + 実装 PR; schema_version v4 → v5 bump、reader は v4/v5 両受理)
 - [ ] Web Clipper連携 (clip --url / パイプ入力)
-- [ ] Basesライクビュー (list拡張: 複合フィルタ・ソート・JSON出力)
+- [ ] Basesライクビュー (list拡張: 複数条件・選択可能なソート・JSON出力)。既存listはtag + title queryの併用、updated_at降順、件数制限まで。statsのJSON出力は実装済み
 - [x] change-password (全エントリ再暗号化) — S10 で完了
 - [x] info --security — S10 で完了
 - [x] export [DIR] — S10 で完了
@@ -160,7 +166,7 @@
 - [ ] HQC FIPS最終標準確認
 - [ ] RustCrypto品質 pure Rust HQC実装の採用
 - [ ] ML-KEM + HQCハイブリッドKEM
-- [ ] vault.pqd v5 → v6マイグレーション — HQC ハイブリッド KEM 対応時に実施 (S13 の v4 → v5 は添付ファイル対応として完了済み)
+- [ ] HQC対応のスロットアルゴリズム追加 — S16設計ではschema bump不要な追加を予定。現行はv0x06、v0x07移行は未完了のS16で扱う（[issue #19](https://github.com/sudolifeagain/pq-diary/issues/19)）。S13のv4 → v5、S15のv0x06は導入済み
 
 ## Open Questions
 

@@ -8,6 +8,10 @@ Phase 1 全完了 + Phase 2 で legacy (S12) / 添付ファイル (S13 + S13.1) 
 
 残 Phase 2 候補: Bases like ビュー、固定ブロックサイズ化 OQ-20、Web Clipper、鍵素材 XOR 分散、Unix ソケット + ロックデーモン。
 
+現行CI: 通常PR/main pushはLinuxのcheck（fmt/build/test/Clippy/debug smoke）とaudit/deny。全OS check・4環境release smokeは手動 `full_matrix=true`。以下S11のmatrix・trigger記述は導入時の履歴であり現在の常時実行範囲ではない。
+
+Git同期は安全な拒否guardを実装済みだが、共通base・削除・remote ancestry・添付同期は未完了。S8のcompletedは初期実装の履歴として残す。
+
 ## Progress
 
 | Sprint | テーマ | Status | Week |
@@ -88,7 +92,7 @@ Phase 1 全完了 + Phase 2 で legacy (S12) / 添付ファイル (S13 + S13.1) 
 - git CLI同期 (init/push/pull/sync/status)
 - プライバシー強化 (匿名author, 定型メッセージ, パディング)
 - タイムスタンプファジング
-- 3-wayマージ (UUID + content_hmac)
+- UUID + content_hmacによる初期照合。共通baseを使う完全な3-wayマージは未完了
 
 ### S9: セキュリティ硬化 + 統合テスト
 - mlock / VirtualLock
@@ -153,8 +157,8 @@ Phase 1 全完了 + Phase 2 で legacy (S12) / 添付ファイル (S13 + S13.1) 
 - 後続の監査未対応項目: High-2 パスワード強度 (PR #13)・Low-2 署名 fail-open (PR #14)・
   Medium-1 サプライチェーン CI・High-1 ML-KEM load-bearing 化 (S16)
 
-### S16: キースロット封筒 + MDK (要件定義済・実装は下位モデルへ委譲)
-- 監査 High-1 (ML-KEM 未使用) を解消。MDK を per-credential キースロットで封筒化 (v0x07)
+### S16: キースロット封筒 + MDK (基盤実装済・vault/CLI統合は未完了)
+- 目標: 監査 High-1 (ML-KEMの通常データ保護経路への未統合) を解消し、MDKをper-credentialキースロットで封筒化する (v0x07)。現行v0x06の保証として扱わない
 - 設計: ADR-0009 + `docs/design/vault-v6-keyslot-format.md`
 - 要件/受け入れ: `docs/spec/s16-keyslot/{requirements,acceptance-criteria,note}.md`
 - 実装は GitHub issue (S16-1〜S16-5) に分割。FIPS 203 / SP 800-227 / SP 800-56C /

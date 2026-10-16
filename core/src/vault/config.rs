@@ -69,9 +69,23 @@ pub struct GitSection {
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct GitPrivacySection {
     /// Timestamp fuzz range in hours (0 disables fuzzing).
+    /// Must fit a chrono duration including the algorithm's extra second.
     pub timestamp_fuzz_hours: u64,
     /// Maximum extra padding bytes added per commit (0 disables padding).
     pub extra_padding_bytes_max: usize,
+}
+
+/// Largest hour range whose seconds plus one fit chrono's millisecond duration.
+pub const MAX_TIMESTAMP_FUZZ_HOURS: u64 = (i64::MAX as u64 / 1000 - 1) / 3600;
+
+/// Validate arithmetic bounds without imposing a product-specific time limit.
+pub(crate) fn timestamp_fuzz_seconds(hours: u64) -> Result<i64, DiaryError> {
+    if hours > MAX_TIMESTAMP_FUZZ_HOURS {
+        return Err(DiaryError::Config(format!(
+            "git.privacy.timestamp_fuzz_hours must be at most {MAX_TIMESTAMP_FUZZ_HOURS}"
+        )));
+    }
+    Ok((hours * 3600) as i64)
 }
 
 /// `[argon2]` section of `vault.toml`.
@@ -159,10 +173,13 @@ impl VaultConfig {
     /// # Errors
     ///
     /// Returns [`DiaryError::Io`] on file-read failures and
-    /// [`DiaryError::Config`] on TOML parse errors.
+    /// [`DiaryError::Config`] on TOML parse errors or invalid timestamp fuzz bounds.
     pub fn from_file(path: &Path) -> Result<Self, DiaryError> {
         let content = std::fs::read_to_string(path)?;
-        toml::from_str(&content).map_err(|e| DiaryError::Config(e.to_string()))
+        let config: Self =
+            toml::from_str(&content).map_err(|e| DiaryError::Config(e.to_string()))?;
+        timestamp_fuzz_seconds(config.git.privacy.timestamp_fuzz_hours)?;
+        Ok(config)
     }
 
     /// Serialise this [`VaultConfig`] as pretty TOML and write it to `path`.
@@ -334,6 +351,41 @@ impl AppConfig {
 mod tests {
     use super::*;
     use crate::policy::AccessPolicy;
+
+    #[test]
+    fn timestamp_fuzz_config_rejects_extreme_toml_without_modifying_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.toml");
+        let original = toml::to_string(&VaultConfig::default()).unwrap();
+        for hours in [MAX_TIMESTAMP_FUZZ_HOURS + 1, i64::MAX as u64] {
+            let content = original.replace(
+                "timestamp_fuzz_hours = 0",
+                &format!("timestamp_fuzz_hours = {hours}"),
+            );
+            std::fs::write(&path, &content).unwrap();
+            assert!(matches!(
+                VaultConfig::from_file(&path),
+                Err(DiaryError::Config(_))
+            ));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+        }
+        for hours in [0, 6, MAX_TIMESTAMP_FUZZ_HOURS] {
+            let content = original.replace(
+                "timestamp_fuzz_hours = 0",
+                &format!("timestamp_fuzz_hours = {hours}"),
+            );
+            std::fs::write(&path, content).unwrap();
+            assert_eq!(
+                VaultConfig::from_file(&path)
+                    .unwrap()
+                    .git
+                    .privacy
+                    .timestamp_fuzz_hours,
+                hours
+            );
+        }
+        assert!(timestamp_fuzz_seconds(u64::MAX).is_err());
+    }
 
     // Limit only a child process: no unsafe calls or process-global test changes.
     #[cfg(target_os = "linux")]

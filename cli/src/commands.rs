@@ -3041,8 +3041,7 @@ pub fn cmd_legacy_access(cli: &Cli) -> anyhow::Result<()> {
 
     let report = execute_legacy_access(&vault_dir, &legacy_code, &deriver, |mode| {
         run_destroy_confirmation(mode)
-    })
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    })?;
 
     println!(
         "Legacy access complete. {} entries inherited, {} entries destroyed.",

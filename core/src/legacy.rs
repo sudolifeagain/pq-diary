@@ -1072,6 +1072,93 @@ mod tests {
     use secrecy::SecretBox;
     use tempfile::tempdir;
 
+    fn assert_legacy_sidecar_collisions_preserved(
+        create_collision: impl Fn(&Path, &Path),
+    ) {
+        for operation in ["rotate", "access"] {
+            let suffix = if operation == "rotate" { "rotate" } else { "legacy" };
+            for name in [
+                format!("vault.pqd.tmp.{suffix}"),
+                format!("vault.toml.tmp.{suffix}"),
+                format!("vault.pqd.bak.{suffix}"),
+                format!("vault.toml.bak.{suffix}"),
+            ] {
+                let dir = tempdir().unwrap();
+                let (vault_dir, _) = vault_with_one_entry(&dir, 1);
+                let vault_path = vault_dir.join("vault.pqd");
+                let config_path = vault_dir.join("vault.toml");
+                let vault_before = std::fs::read(&vault_path).unwrap();
+                let config_before = std::fs::read(&config_path).unwrap();
+                let collision = vault_dir.join(&name);
+                let unrelated = dir.path().join("unrelated");
+                std::fs::write(&unrelated, b"existing recovery data").unwrap();
+                create_collision(&collision, &unrelated);
+                let metadata_before = std::fs::symlink_metadata(&collision).unwrap();
+                let link_before = std::fs::read_link(&collision).ok();
+
+                let result = if operation == "rotate" {
+                    rotate_legacy_code(
+                        &vault_dir,
+                        &secret("master-pw"),
+                        &secret("legacy-code"),
+                        &secret("new-code"),
+                        &fast_deriver(),
+                    )
+                    .map(|_| ())
+                } else {
+                    execute_legacy_access(
+                        &vault_dir,
+                        &secret("legacy-code"),
+                        &fast_deriver(),
+                        always_confirm,
+                    )
+                    .map(|_| ())
+                };
+                assert!(
+                    matches!(result, Err(DiaryError::Io(_))),
+                    "{operation}: existing {name} must fail closed: {result:?}"
+                );
+                assert_eq!(std::fs::read(&vault_path).unwrap(), vault_before);
+                assert_eq!(std::fs::read(&config_path).unwrap(), config_before);
+                assert_eq!(std::fs::read(&unrelated).unwrap(), b"existing recovery data");
+                let metadata_after = std::fs::symlink_metadata(&collision).unwrap();
+                assert_eq!(metadata_after.file_type(), metadata_before.file_type());
+                assert_eq!(std::fs::read_link(&collision).ok(), link_before);
+                if metadata_before.is_file() {
+                    assert_eq!(std::fs::read(&collision).unwrap(), b"existing recovery data");
+                }
+                let mut core = DiaryCore::new(&vault_pqd_str(&vault_dir)).unwrap();
+                core.unlock(secret("master-pw")).unwrap();
+                assert_eq!(core.list_entries(None).unwrap().len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_transactions_preserve_existing_sidecar_files() {
+        assert_legacy_sidecar_collisions_preserved(|path, _| {
+            std::fs::write(path, b"existing recovery data").unwrap();
+        });
+    }
+
+    #[test]
+    fn legacy_transactions_preserve_existing_sidecar_directories() {
+        assert_legacy_sidecar_collisions_preserved(|path, _| {
+            std::fs::create_dir(path).unwrap();
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_transactions_preserve_existing_sidecar_symlinks() {
+        assert_legacy_sidecar_collisions_preserved(|path, target| {
+            std::os::unix::fs::symlink(target, path).unwrap();
+        });
+        assert_legacy_sidecar_collisions_preserved(|path, target| {
+            std::os::unix::fs::symlink(target.with_extension("absent"), path).unwrap();
+        });
+    }
+
     #[test]
     fn attachment_uuid_parser_accepts_only_ascii_hex() {
         assert_eq!(

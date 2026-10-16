@@ -37,12 +37,14 @@ pub struct VariableRef {
     pub offset: usize,
 }
 
+const VARIABLE_PATTERN: &str = r"\{\{(\w+)\}\}";
+
 /// Returns a reference to the compiled variable regex, initialised at most once.
 fn var_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        // Infallible: pattern is a compile-time literal that always compiles.
-        Regex::new(r"\{\{(\w+)\}\}").unwrap_or_else(|_| unreachable!())
+        // Developer-controlled literal, validated by variable_pattern_compiles.
+        Regex::new(VARIABLE_PATTERN).expect("the hardcoded template-variable pattern must compile")
     })
 }
 
@@ -122,6 +124,11 @@ pub fn expand(body: &str, vars: &HashMap<String, String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn variable_pattern_compiles() {
+        assert!(Regex::new(VARIABLE_PATTERN).is_ok());
+    }
 
     // =========================================================================
     // TC-043-01: 基本変数 {{date}} の抽出

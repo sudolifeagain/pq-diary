@@ -558,14 +558,9 @@ where
             destroyed_attachments += 1;
             continue;
         }
-        let lpt = match crate::attachment::decrypt_attachment_legacy_block(record, &k_legacy) {
-            Ok(v) => v,
-            Err(_) => {
-                // Corrupted legacy block on an INHERIT record — treat as destroy.
-                destroyed_attachments += 1;
-                continue;
-            }
-        };
+        // Corruption is not a DESTROY decision: abort before replacing the
+        // vault or sweeping blobs still recoverable with the master password.
+        let lpt = crate::attachment::decrypt_attachment_legacy_block(record, &k_legacy)?;
         if !inherited_entry_uuids.contains(&lpt.entry_uuid) {
             // REQ-504: parent entry is DESTROY → cascade to attachment.
             destroyed_attachments += 1;
@@ -2197,6 +2192,135 @@ mod tests {
         heir.unlock(secret("legacy-code")).unwrap();
         assert!(heir.list_entries(None).unwrap().is_empty());
         assert!(heir.list_templates().unwrap().is_empty());
+    }
+
+    fn assert_invalid_inherit_attachment_preserves_vault(case: &str) {
+        let dir = tempdir().unwrap();
+        let (vault_dir, ids) = vault_with_one_entry(&dir, 1);
+        let source = dir.path().join("keep.txt");
+        std::fs::write(&source, b"recoverable attachment").unwrap();
+        crate::attachment::add_attachment(&vault_dir, &secret("master-pw"), &ids[0], &source)
+            .unwrap();
+        set_entry_flag(
+            &vault_dir,
+            &secret("master-pw"),
+            Some(&secret("legacy-code")),
+            &ids[0],
+            LegacyFlag::Inherit,
+            &fast_deriver(),
+        )
+        .unwrap();
+        crate::attachment::set_attachment_legacy_flag(
+            &vault_dir,
+            &secret("master-pw"),
+            Some(&secret("legacy-code")),
+            &ids[0],
+            "keep.txt",
+            LegacyFlag::Inherit,
+            &fast_deriver(),
+        )
+        .unwrap();
+
+        let metas =
+            crate::attachment::list_attachments(&vault_dir, &secret("master-pw"), Some(&ids[0]))
+                .unwrap();
+        let blob_path = crate::attachment::blob_path(&vault_dir, &metas[0].blob_uuid);
+        let vault_path = vault_dir.join("vault.pqd");
+        let config_path = vault_dir.join("vault.toml");
+        let (header, entries, mut attachments) =
+            crate::vault::reader::read_vault_with_attachments(&vault_path).unwrap();
+        assert_eq!(attachments.len(), 1);
+        let legacy_key = fast_deriver()
+            .derive(b"legacy-code", &header.legacy_salt)
+            .unwrap();
+        match case {
+            "short nonce" => {
+                attachments[0].legacy_key_block = vec![0; aead::NONCE_SIZE - 1];
+            }
+            "invalid tag" => {
+                attachments[0].legacy_key_block[aead::NONCE_SIZE] ^= 1;
+            }
+            "invalid plaintext" => {
+                attachments[0].legacy_key_block =
+                    encrypt_legacy_block(&legacy_key, b"invalid attachment payload").unwrap();
+            }
+            _ => panic!("unknown corruption case"),
+        }
+        let expected_error =
+            crate::attachment::decrypt_attachment_legacy_block(&attachments[0], &legacy_key)
+                .expect_err("fixture must fail attachment legacy-block validation");
+        let master_key = kdf::derive_key(b"master-pw", &header.kdf_salt, &fast_params()).unwrap();
+        let mac_key = crate::crypto::derive_vault_mac_key(master_key.as_ref()).unwrap();
+        // Keep the whole-vault MAC valid: only legacy access to this attachment
+        // is broken, while the master password can still recover its contents.
+        crate::vault::writer::write_vault_with_attachments_authenticated(
+            &vault_path,
+            header,
+            &entries,
+            &attachments,
+            &mac_key,
+        )
+        .unwrap();
+        crate::vault::reader::verify_vault_integrity(&vault_path, &mac_key).unwrap();
+        let vault_before = std::fs::read(&vault_path).unwrap();
+        let config_before = std::fs::read(&config_path).unwrap();
+        let blob_before = std::fs::read(&blob_path).unwrap();
+
+        let result = execute_legacy_access(
+            &vault_dir,
+            &secret("legacy-code"),
+            &fast_deriver(),
+            always_confirm,
+        );
+        let error = result.expect_err("invalid INHERIT attachment must abort before commit");
+        assert_eq!(
+            std::mem::discriminant(&error),
+            std::mem::discriminant(&expected_error),
+            "{case}: must preserve the original error category"
+        );
+        assert_eq!(error.to_string(), expected_error.to_string(), "{case}");
+        assert_eq!(std::fs::read(&vault_path).unwrap(), vault_before, "{case}");
+        assert_eq!(
+            std::fs::read(&config_path).unwrap(),
+            config_before,
+            "{case}"
+        );
+        assert_eq!(std::fs::read(&blob_path).unwrap(), blob_before, "{case}");
+        crate::vault::reader::verify_vault_integrity(&vault_path, &mac_key).unwrap();
+        for sidecar in [
+            "vault.pqd.tmp.legacy",
+            "vault.toml.tmp.legacy",
+            "vault.pqd.bak.legacy",
+            "vault.toml.bak.legacy",
+        ] {
+            assert!(!vault_dir.join(sidecar).exists(), "{case}: {sidecar}");
+        }
+
+        let restored = dir.path().join("restored.txt");
+        crate::attachment::extract_attachment(
+            &vault_dir,
+            &secret("master-pw"),
+            &ids[0],
+            "keep.txt",
+            &restored,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(restored).unwrap(), b"recoverable attachment");
+    }
+
+    #[test]
+    fn legacy_access_rejects_short_inherit_attachment_block_without_mutation() {
+        assert_invalid_inherit_attachment_preserves_vault("short nonce");
+    }
+
+    #[test]
+    fn legacy_access_rejects_invalid_inherit_attachment_tag_without_mutation() {
+        assert_invalid_inherit_attachment_preserves_vault("invalid tag");
+    }
+
+    #[test]
+    fn legacy_access_rejects_invalid_inherit_attachment_payload_without_mutation() {
+        assert_invalid_inherit_attachment_preserves_vault("invalid plaintext");
     }
 
     /// TC-S13-LEGACY-01: legacy-access carries INHERIT attachments only when

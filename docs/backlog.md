@@ -172,6 +172,12 @@
 
 ### Git sync correctness debt
 
+2026-10-16確認のmainは `6eb1b5c`。下記の未チェック項目はmainへの未提供を示す。
+共通base・削除・同一HMACのメタデータ照合は [PR #94](https://github.com/sudolifeagain/pq-diary/pull/94)、
+remote ancestryと無関係なstagingの保全は [PR #95](https://github.com/sudolifeagain/pq-diary/pull/95) に実装を提出済み（いずれもdraft・未マージ）。
+#95は#94に積まれており、レビュー・base変更後の通常CI・native Windows検証が残る。
+添付同期と鍵/config移行は別の未完了事項。実装候補とmainの区別は [開発棚卸し](development-inventory.md) を参照。
+
 - [ ] Record remote ancestry after a complete, validated merge. The current
   entry-level merge makes a local-only commit, so pull followed by push after a
   remote advance is rejected as non-fast-forward. Never work around this with

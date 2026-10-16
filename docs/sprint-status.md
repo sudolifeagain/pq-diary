@@ -10,7 +10,7 @@ Phase 1 全完了 + Phase 2 で legacy (S12) / 添付ファイル (S13 + S13.1) 
 
 現行CI: 通常PR/main pushはLinuxのcheck（fmt/build/test/Clippy/debug smoke）とaudit/deny。全OS check・4環境release smokeは手動 `full_matrix=true`。以下S11のmatrix・trigger記述は導入時の履歴であり現在の常時実行範囲ではない。
 
-Git同期は安全な拒否guardを実装済みだが、共通base・削除・remote ancestry・添付同期は未完了。S8のcompletedは初期実装の履歴として残す。
+Git同期のmain（2026-10-16確認 `6eb1b5c`）は安全な拒否guardまで。共通base・削除・メタデータ照合は [PR #94](https://github.com/sudolifeagain/pq-diary/pull/94)、remote ancestry・index保全は [PR #95](https://github.com/sudolifeagain/pq-diary/pull/95) に実装を提出済みだが、未マージ。レビュー・必要なCI/対象OS検証は残る。添付同期・鍵/config移行は未完了。[提出状況の詳細](development-inventory.md#提出済み実装とmainの区別2026-10-16-0330-utc確認)を参照。S8のcompletedと以下のスコープは初期実装の履歴として残す。
 
 ## Progress
 

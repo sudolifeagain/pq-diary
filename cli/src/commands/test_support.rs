@@ -66,3 +66,33 @@ pub(super) fn seed_malformed_template(vault_dir: &std::path::Path) {
     records[0].record_type = RECORD_TYPE_TEMPLATE;
     write_vault_authenticated(&path, header, &records, &key).unwrap();
 }
+
+pub(super) struct FailingMutationWriter {
+    pub(super) fail_write: bool,
+}
+
+impl std::io::Write for FailingMutationWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.fail_write {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        } else {
+            Ok(bytes.len())
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+    }
+}
+
+/// Open the test vault and return all entry metadata.
+pub(super) fn read_vault_entries(vault_dir: &std::path::Path) -> Vec<pq_diary_core::EntryMeta> {
+    let vault_pqd = vault_dir.join("vault.pqd");
+    let vault_str = vault_pqd.to_str().expect("utf8");
+    let mut core = DiaryCore::new(vault_str).expect("DiaryCore::new");
+    let pw: secrecy::SecretString = secrecy::SecretBox::new(Box::from("password"));
+    core.unlock(pw).expect("unlock");
+    let entries = core.list_entries(None).expect("list_entries");
+    core.lock();
+    entries
+}

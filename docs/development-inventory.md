@@ -1,8 +1,19 @@
 # 開発棚卸し（2026-10-16 JST）
 
-更新時点: `main` の [`ed77e6cfeafaeaba2ff5f02b65714b18880d6da9`](https://github.com/sudolifeagain/pq-diary/commit/ed77e6cfeafaeaba2ff5f02b65714b18880d6da9)（PR #75 マージ後）。
+旧スナップショットの更新時点: `main` の [`ed77e6cfeafaeaba2ff5f02b65714b18880d6da9`](https://github.com/sudolifeagain/pq-diary/commit/ed77e6cfeafaeaba2ff5f02b65714b18880d6da9)（PR #75 マージ後）。
 以下のベースライン・第1修正単位の実行結果は、旧棚卸し対象 `0e085c06869223d8979ece642f073d0c2bcfe306` からの履歴であり、現在のmainで再実行した件数ではない。今回の更新はソースと既存回帰テストの静的照合のみ。
 この記録は実装の棚卸しであり、完全なセキュリティ監査ではない。
+
+## 提出済み実装とmainの区別（2026-10-16 03:30 UTC確認）
+
+確認したmainは [`6eb1b5c`](https://github.com/sudolifeagain/pq-diary/commit/6eb1b5c09763974da9c283ad2681de55d8b46429)。以下は提出済みdraft PRの状態であり、mainで利用可能になったことを意味しない。レビュー・必要なCI・所有者によるマージを経て完了判定する。
+
+- [PR #94](https://github.com/sudolifeagain/pq-diary/pull/94) は認証した共通baseによる削除・同一HMACのメタデータ変更の照合と、prepare → 選択 → 再検証 → applyを実装済み、未マージ。
+- [PR #95](https://github.com/sudolifeagain/pq-diary/pull/95) は #94 の上に、remoteを第2親に記録するcommitと無関係なstagingを保つindex transactionを実装済み、未マージ。確認headは `5fba931`。#94のマージ後にbaseをmainへ変更して通常CIを確認する必要があり、新transactionのnative Windows検証も未完了。既存mainの全OS成功はこの変更の検証を代替しない。
+- [PR #93](https://github.com/sudolifeagain/pq-diary/pull/93) はexportコマンドのモジュール分離、[PR #96](https://github.com/sudolifeagain/pq-diary/pull/96)・[PR #97](https://github.com/sudolifeagain/pq-diary/pull/97)・[PR #98](https://github.com/sudolifeagain/pq-diary/pull/98)・[PR #99](https://github.com/sudolifeagain/pq-diary/pull/99)・[PR #100](https://github.com/sudolifeagain/pq-diary/pull/100) は対象CLI経路の型付きエラーsource保全を提出済み。いずれも未マージ。#98は#95、#99は#93に積まれている。全経路の負債解消を意味しない。
+- Git添付メタデータ/blob一体同期、header/key/config移行、S16のvault・CLI統合とv0x07移行は引き続き未完了。安全な拒否guardを機能完成とは扱わない。
+
+以下の「現状」「PR #75 後の照合結果」「未完了の開発候補」は旧スナップショットの記録。共通base・削除・ancestryの「未完了」は当時のmainを指し、上記候補実装の不存在を意味しない。古いテスト件数・open PR件数を現在の値として使わない。
 
 ## 現状
 

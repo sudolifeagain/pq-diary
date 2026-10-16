@@ -31,12 +31,14 @@ pub struct ParsedLink {
     pub end: usize,
 }
 
+const LINK_PATTERN: &str = r"\[\[([^\[\]]+)\]\]";
+
 /// Returns a reference to the compiled link regex, initialised at most once.
 fn link_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        // Infallible: pattern is a compile-time literal that always compiles.
-        Regex::new(r"\[\[([^\[\]]+)\]\]").unwrap_or_else(|_| unreachable!())
+        // Developer-controlled literal, validated by link_pattern_compiles.
+        Regex::new(LINK_PATTERN).expect("the hardcoded wiki-link pattern must compile")
     })
 }
 
@@ -379,6 +381,11 @@ fn bytes_to_uuid_hex(bytes: &[u8; 16]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn link_pattern_compiles() {
+        assert!(Regex::new(LINK_PATTERN).is_ok());
+    }
 
     // =========================================================================
     // TC-044-01: 単一リンクのパース

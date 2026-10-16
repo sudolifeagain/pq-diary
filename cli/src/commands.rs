@@ -4,6 +4,8 @@
 //! `main.rs`.  Handlers in this module may return `anyhow::Result` so that
 //! arbitrary error sources can be propagated through the main entry-point.
 
+#[cfg(test)]
+mod config_context_tests;
 mod import;
 mod session;
 mod templates;
@@ -1218,8 +1220,10 @@ fn render_heatmap_at(
 fn resolve_vaults_base_dir(cli: &Cli) -> anyhow::Result<PathBuf> {
     match &cli.vault {
         Some(v) => Ok(PathBuf::from(v)),
-        None => std::env::current_dir()
-            .map_err(|e| anyhow::anyhow!("Cannot determine current directory: {e}")),
+        None => std::env::current_dir().map_err(|e| {
+            let message = format!("Cannot determine current directory: {e}");
+            anyhow::Error::new(e).context(message)
+        }),
     }
 }
 
@@ -1232,13 +1236,15 @@ fn confirm_full_policy(reader: &mut impl std::io::BufRead) -> anyhow::Result<boo
     eprintln!("警告: \"full\"を設定すると日記内容がAnthropicのAPIサーバーを通過します。");
     eprintln!("      間接プロンプトインジェクション等のリスクがあります。");
     eprint!("      本当に許可しますか？ [y/N]: ");
-    std::io::stderr()
-        .flush()
-        .map_err(|e| anyhow::anyhow!("Failed to flush stderr: {e}"))?;
+    std::io::stderr().flush().map_err(|e| {
+        let message = format!("Failed to flush stderr: {e}");
+        anyhow::Error::new(e).context(message)
+    })?;
     let mut input = String::new();
-    reader
-        .read_line(&mut input)
-        .map_err(|e| anyhow::anyhow!("Failed to read input: {e}"))?;
+    reader.read_line(&mut input).map_err(|e| {
+        let message = format!("Failed to read input: {e}");
+        anyhow::Error::new(e).context(message)
+    })?;
     let trimmed = input.trim();
     Ok(trimmed == "y" || trimmed == "Y")
 }
@@ -1249,13 +1255,15 @@ fn confirm_full_policy(reader: &mut impl std::io::BufRead) -> anyhow::Result<boo
 fn confirm_vault_delete(name: &str, reader: &mut impl std::io::BufRead) -> anyhow::Result<bool> {
     use std::io::Write as _;
     eprint!("Delete vault '{name}'? [y/N]: ");
-    std::io::stderr()
-        .flush()
-        .map_err(|e| anyhow::anyhow!("Failed to flush stderr: {e}"))?;
+    std::io::stderr().flush().map_err(|e| {
+        let message = format!("Failed to flush stderr: {e}");
+        anyhow::Error::new(e).context(message)
+    })?;
     let mut input = String::new();
-    reader
-        .read_line(&mut input)
-        .map_err(|e| anyhow::anyhow!("Failed to read input: {e}"))?;
+    reader.read_line(&mut input).map_err(|e| {
+        let message = format!("Failed to read input: {e}");
+        anyhow::Error::new(e).context(message)
+    })?;
     let trimmed = input.trim();
     Ok(trimmed == "y" || trimmed == "Y")
 }
@@ -1356,13 +1364,15 @@ fn review_password_choice(
         eprintln!("Warning: weak passwords are not recommended for pq-diary vaults.");
         if confirm_weak {
             eprint!("Use this weak password anyway? [y/N]: ");
-            std::io::stderr()
-                .flush()
-                .map_err(|e| anyhow::anyhow!("Failed to flush stderr: {e}"))?;
+            std::io::stderr().flush().map_err(|e| {
+                let message = format!("Failed to flush stderr: {e}");
+                anyhow::Error::new(e).context(message)
+            })?;
             let mut input = String::new();
-            reader
-                .read_line(&mut input)
-                .map_err(|e| anyhow::anyhow!("Failed to read input: {e}"))?;
+            reader.read_line(&mut input).map_err(|e| {
+                let message = format!("Failed to read input: {e}");
+                anyhow::Error::new(e).context(message)
+            })?;
             let trimmed = input.trim();
             return Ok(trimmed == "y" || trimmed == "Y");
         }
@@ -1533,8 +1543,10 @@ fn vault_dir_from_path(vault_path: &std::path::Path) -> anyhow::Result<PathBuf> 
         .parent()
         .ok_or_else(|| anyhow::anyhow!("vault path has no parent directory"))?;
     if parent.as_os_str().is_empty() {
-        std::env::current_dir()
-            .map_err(|e| anyhow::anyhow!("Cannot determine current directory: {e}"))
+        std::env::current_dir().map_err(|e| {
+            let message = format!("Cannot determine current directory: {e}");
+            anyhow::Error::new(e).context(message)
+        })
     } else {
         Ok(parent.to_path_buf())
     }
@@ -1990,8 +2002,10 @@ pub fn cmd_init(cli: &Cli) -> anyhow::Result<()> {
         review_password_choice(password_source.secret().expose_secret(), false, &mut reader)?;
     }
 
-    std::fs::create_dir_all(&parent_dir)
-        .map_err(|e| anyhow::anyhow!("Cannot create config directory: {e}"))?;
+    std::fs::create_dir_all(&parent_dir).map_err(|e| {
+        let message = format!("Cannot create config directory: {e}");
+        anyhow::Error::new(e).context(message)
+    })?;
 
     // Reserve the config exclusively. The early existence check above is only
     // a convenience; create_new also rejects dangling symlinks and a config
@@ -2003,9 +2017,10 @@ pub fn cmd_init(cli: &Cli) -> anyhow::Result<()> {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
     }
-    let mut config_file = options
-        .open(&config_path)
-        .map_err(|e| anyhow::anyhow!("Cannot create config file: {e}"))?;
+    let mut config_file = options.open(&config_path).map_err(|e| {
+        let message = format!("Cannot create config file: {e}");
+        anyhow::Error::new(e).context(message)
+    })?;
     // Write through the reserved handle; reopening the pathname would lose
     // the exclusive-create guarantee if the path were replaced.
     let config_result = AppConfig::default().write_to(&mut config_file);
@@ -2022,7 +2037,8 @@ pub fn cmd_init(cli: &Cli) -> anyhow::Result<()> {
         Ok(m) => m,
         Err(e) => {
             let _ = std::fs::remove_file(&config_path);
-            return Err(anyhow::anyhow!("Vault creation failed: {e}"));
+            let message = format!("Vault creation failed: {e}");
+            return Err(anyhow::Error::new(e).context(message));
         }
     };
 
@@ -2034,7 +2050,8 @@ pub fn cmd_init(cli: &Cli) -> anyhow::Result<()> {
 
     if let Err(e) = create_result {
         let _ = std::fs::remove_file(&config_path);
-        return Err(anyhow::anyhow!("Vault creation failed: {e}"));
+        let message = format!("Vault creation failed: {e}");
+        return Err(anyhow::Error::new(e).context(message));
     }
 
     println!("Initialized pq-diary at {}", parent_dir.display());
@@ -2052,8 +2069,10 @@ pub fn cmd_sync(cli: &Cli) -> anyhow::Result<()> {
         );
     }
 
-    let config = AppConfig::from_file(&config_path)
-        .map_err(|e| anyhow::anyhow!("Invalid config.toml: {e}"))?;
+    let config = AppConfig::from_file(&config_path).map_err(|e| {
+        let message = format!("Invalid config.toml: {e}");
+        anyhow::Error::new(e).context(message)
+    })?;
 
     match config.app.sync_backend.as_str() {
         "git" => cmd_git_sync(cli),
@@ -2150,10 +2169,15 @@ fn resolve_default_vault_dir() -> anyhow::Result<PathBuf> {
             "pq-diary init を先に実行してください (~/.pq-diary/config.toml が見つかりません)"
         );
     }
-    let config = AppConfig::from_file(&config_path)
-        .map_err(|e| anyhow::anyhow!("Invalid config.toml: {e}"))?;
+    let config = AppConfig::from_file(&config_path).map_err(|e| {
+        let message = format!("Invalid config.toml: {e}");
+        anyhow::Error::new(e).context(message)
+    })?;
     pq_diary_core::vault::init::VaultManager::validate_vault_name(&config.app.default_vault)
-        .map_err(|e| anyhow::anyhow!("Invalid config.toml default_vault: {e}"))?;
+        .map_err(|e| {
+            let message = format!("Invalid config.toml default_vault: {e}");
+            anyhow::Error::new(e).context(message)
+        })?;
     let vaults_dir = AppConfig::default_vaults_dir().map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(vaults_dir.join(&config.app.default_vault))
 }
@@ -2176,8 +2200,10 @@ fn cmd_info_to(cli: &Cli, security: bool, out: &mut dyn std::io::Write) -> anyho
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("vault path contains non-UTF-8 characters"))?;
 
-    let vault_config = VaultConfig::from_file(&vault_toml)
-        .map_err(|e| anyhow::anyhow!("Invalid vault.toml: {e}"))?;
+    let vault_config = VaultConfig::from_file(&vault_toml).map_err(|e| {
+        let message = format!("Invalid vault.toml: {e}");
+        anyhow::Error::new(e).context(message)
+    })?;
 
     let password_source =
         get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -2194,8 +2220,10 @@ fn cmd_info_to(cli: &Cli, security: bool, out: &mut dyn std::io::Write) -> anyho
     let entry_count = entries.len();
     drop(entries);
 
-    let meta =
-        std::fs::metadata(&vault_pqd).map_err(|e| anyhow::anyhow!("Cannot stat vault.pqd: {e}"))?;
+    let meta = std::fs::metadata(&vault_pqd).map_err(|e| {
+        let message = format!("Cannot stat vault.pqd: {e}");
+        anyhow::Error::new(e).context(message)
+    })?;
     let created_str = match meta.created() {
         Ok(t) => format_system_time(t),
         Err(_) => "unknown".to_string(),

@@ -16,7 +16,8 @@ Rust製・耐量子暗号CLIジャーナルツール。詳細は `requirements.m
 - 許可するOS API: `mlock` / `munlock`、`VirtualLock` / `VirtualUnlock`、`prctl(PR_SET_DUMPABLE)`、`IsDebuggerPresent`、`GetErrorMode` / `SetErrorMode`、`GetStdHandle` / `GetConsoleMode` / `SetConsoleMode` / `ReadConsoleW`。これ以外の `unsafe` や、解放済みメモリを読むテストは禁止
 - 秘密値の所有者は `Zeroizing` / `SecretString` / `SecureBuffer` / `ZeroizeOnDrop` 実装型で保護する。借用は必要な範囲に限定し、通常の `String` / `Vec<u8>` への複製や所有権移動で保護を失わない。秘密型の `Debug` は内容を伏せる
 - 一時平文ファイルは作成時点から所有者を持たせる。cleanup失敗の警告と元のエラーの優先順位を、成功経路だけでなく失敗・早期return・unwindでもテストする
-- 外部入力・I/Oなどの失敗は `Result` で返す。`unwrap()` / `expect()` はテストのみ許可し、本番コードでは禁止する。`unwrap_or_else(|_| unreachable!())` への書換えで規約を回避しない。失敗しないgetterまで `Result` 化しない
+- 外部入力・I/Oなどの失敗は `Result` で返す。`unwrap()` はテストのみ許可。`expect()` も原則テストのみで、唯一の限定例外は開発者がソースに固定した不変の正規表現リテラルを一度だけコンパイルする初期化とする。この例外には、入力がリテラルである根拠のコメント、理由を説明する `expect` メッセージ、同じ定数をコンパイルする明示的な単体テストが必要。ユーザー入力・設定・I/O・実行時に構築したパターンには適用せず、`Result` を維持する。lintの広域無効化は禁止
+- `unwrap_or_else(|_| unreachable!())` への書換えや空の結果へのfallbackで失敗を隠さない。失敗しないgetterや固定パターン利用APIまで規約のためだけに `Result` 化しない。固定値の根拠を明記する考え方は [Rust Book](https://doc.rust-lang.org/book/ch09-03-to-panic-or-not-to-panic.html#when-you-have-more-information-than-the-compiler) に従う
 - エラーは `thiserror` で定義。`anyhow` はcli/のみ許可。失敗時に半端な状態や秘密値を残さず、検証が完了してから状態を反映する
 - プラットフォーム分岐は `#[cfg()]` で。core/ にプラットフォーム依存UIコードを入れない
 - 単体テストは各モジュールの `#[cfg(test)] mod tests`、機能の組合せはintegration testやCLI smokeで検証する

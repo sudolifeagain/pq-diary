@@ -182,7 +182,7 @@ pub fn initialize_legacy(
     config.legacy.verification_iv_b64 = Some(B64.encode(iv));
     config.legacy.verification_ct_b64 = Some(B64.encode(&ct));
 
-    write_vault_toml_atomic(&vault_toml, &config)?;
+    config.to_file(&vault_toml)?;
     Ok(())
 }
 
@@ -791,19 +791,6 @@ pub(crate) fn verify_legacy_code(
         .map_err(|e| DiaryError::Config(format!("invalid verification_ct_b64: {e}")))?;
     aead::decrypt(k_legacy, iv, &ct)
         .map_err(|_| DiaryError::Crypto("invalid legacy code".to_string()))?;
-    Ok(())
-}
-
-fn write_vault_toml_atomic(path: &Path, config: &VaultConfig) -> Result<(), DiaryError> {
-    let mut tmp_name = path
-        .file_name()
-        .ok_or_else(|| DiaryError::Config("vault.toml path has no file name".to_string()))?
-        .to_os_string();
-    tmp_name.push(".tmp");
-    let tmp_path = path.with_file_name(tmp_name);
-
-    config.to_file(&tmp_path)?;
-    std::fs::rename(&tmp_path, path).map_err(DiaryError::Io)?;
     Ok(())
 }
 

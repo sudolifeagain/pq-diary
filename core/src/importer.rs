@@ -351,37 +351,37 @@ pub fn parse_markdown(
 
     // 1. Parse YAML frontmatter
     let (frontmatter_title, frontmatter_tags, body_raw) = parse_frontmatter(&content)?;
+    let mut frontmatter_title = Zeroizing::new(frontmatter_title);
+    let mut all_tags = Zeroizing::new(frontmatter_tags);
 
     // 2. Determine title: frontmatter title takes priority over filename stem
-    let title = frontmatter_title.unwrap_or_else(|| {
+    let mut title = Zeroizing::new(frontmatter_title.take().unwrap_or_else(|| {
         Path::new(filename)
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or(filename)
             .to_string()
-    });
+    }));
 
     // 3. Convert wiki-links in body
     let (body_after_links, links_converted) = convert_wiki_links(body_raw)?;
-    // This intermediate body is replaced by tag extraction; wipe its allocation
-    // when it is discarded, including if a later rewrite fails.
-    let body_after_links = Zeroizing::new(body_after_links);
 
     // 4. Extract inline #tags from body
     let (extracted_tags, body_final, tags_converted) = extract_tags(&body_after_links)?;
+    let mut extracted_tags = Zeroizing::new(extracted_tags);
+    let mut body_final = Zeroizing::new(body_final);
 
     // 5. Merge tags: frontmatter tags first, then extracted tags (no duplicates)
-    let mut all_tags = frontmatter_tags;
-    for tag in extracted_tags {
-        if !all_tags.contains(&tag) {
-            all_tags.push(tag);
+    for tag in &mut *extracted_tags {
+        if !all_tags.contains(tag) {
+            all_tags.push(std::mem::take(tag));
         }
     }
 
     let md_file = MarkdownFile {
-        title,
-        tags: all_tags,
-        body: body_final,
+        title: std::mem::take(&mut *title),
+        tags: std::mem::take(&mut *all_tags),
+        body: std::mem::take(&mut *body_final),
         source_path: filename.to_string(),
     };
 
@@ -775,7 +775,7 @@ fn extract_frontmatter_tags(fm: &str) -> Result<Vec<String>, DiaryError> {
 /// # Errors
 ///
 /// Returns [`DiaryError::Import`] if the regex fails to compile.
-fn convert_wiki_links(body: &str) -> Result<(String, usize), DiaryError> {
+fn convert_wiki_links(body: &str) -> Result<(Zeroizing<String>, usize), DiaryError> {
     let re = WIKI_LINK_RE
         .as_ref()
         .map_err(|e| DiaryError::Import(format!("wiki-link regex: {e}")))?;
@@ -798,7 +798,7 @@ fn convert_wiki_links(body: &str) -> Result<(String, usize), DiaryError> {
         format!("[[{title}]]")
     });
 
-    Ok((result.into_owned(), count))
+    Ok((Zeroizing::new(result.into_owned()), count))
 }
 
 /// Extract inline `#tag` notation from body text.
@@ -829,7 +829,7 @@ fn extract_tags(body: &str) -> Result<(Vec<String>, String, usize), DiaryError> 
     }
 
     let mut tags: Vec<String> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut count = 0usize;
 
     let cleaned = re.replace_all(body, |caps: &regex::Captures| {
@@ -846,13 +846,14 @@ fn extract_tags(body: &str) -> Result<(Vec<String>, String, usize), DiaryError> 
         {
             return m.as_str().to_string();
         }
-        let name = caps.get(1).map_or("", |m| m.as_str());
+        // Borrow from the protected input, rather than retaining cloned tag
+        // names or allocating strings that duplicate tags would discard.
+        let name = caps.get(1).map_or("", |m| &body[m.range()]);
         if name.chars().all(char::is_numeric) {
             return m.as_str().to_string();
         }
-        let tag_name = name.to_string();
-        if seen.insert(tag_name.clone()) {
-            tags.push(tag_name);
+        if seen.insert(name) {
+            tags.push(name.to_string());
         }
         count += 1;
         String::new()
@@ -867,6 +868,21 @@ fn extract_tags(body: &str) -> Result<(Vec<String>, String, usize), DiaryError> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rewritten_body_stays_guarded_through_tag_extraction() {
+        fn assert_guard(_: &Zeroizing<String>) {}
+        let (mut body, links) = convert_wiki_links("PRIVATE [[note|alias]] #tag").unwrap();
+        assert_guard(&body);
+        assert_eq!(links, 1);
+        assert_eq!(body.as_str(), "PRIVATE [[note]] #tag");
+        let (tags, cleaned, count) = extract_tags(&body).unwrap();
+        assert_eq!(tags, vec!["tag"]);
+        assert_eq!(count, 1);
+        assert_eq!(cleaned, "PRIVATE [[note]] ");
+        body.zeroize();
+        assert!(body.is_empty());
+    }
+
     use super::*;
     use crate::{
         crypto::kdf::Argon2Params,

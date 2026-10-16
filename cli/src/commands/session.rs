@@ -104,7 +104,9 @@ mod tests {
                 assert!(matches!(typed, DiaryError::Config(_)));
                 assert_eq!(std::fs::read_to_string(&config_path).unwrap(), "[");
             } else {
-                assert!(matches!(typed, DiaryError::Io(io) if io.kind() == std::io::ErrorKind::NotFound));
+                assert!(
+                    matches!(typed, DiaryError::Io(io) if io.kind() == std::io::ErrorKind::NotFound)
+                );
                 let io = error
                     .chain()
                     .find_map(|source| source.downcast_ref::<std::io::Error>())
@@ -132,7 +134,10 @@ mod tests {
         ])
         .unwrap();
         let core = locked_core(&cli).unwrap();
-        assert!(matches!(core.list_entries(None), Err(DiaryError::NotUnlocked)));
+        assert!(matches!(
+            core.list_entries(None),
+            Err(DiaryError::NotUnlocked)
+        ));
         assert!(cli.password.is_some());
     }
 

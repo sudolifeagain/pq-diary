@@ -1122,12 +1122,18 @@ mod tests {
                 );
                 assert_eq!(std::fs::read(&vault_path).unwrap(), vault_before);
                 assert_eq!(std::fs::read(&config_path).unwrap(), config_before);
-                assert_eq!(std::fs::read(&unrelated).unwrap(), b"existing recovery data");
+                assert_eq!(
+                    std::fs::read(&unrelated).unwrap(),
+                    b"existing recovery data"
+                );
                 let metadata_after = std::fs::symlink_metadata(&collision).unwrap();
                 assert_eq!(metadata_after.file_type(), metadata_before.file_type());
                 assert_eq!(std::fs::read_link(&collision).ok(), link_before);
                 if metadata_before.is_file() {
-                    assert_eq!(std::fs::read(&collision).unwrap(), b"existing recovery data");
+                    assert_eq!(
+                        std::fs::read(&collision).unwrap(),
+                        b"existing recovery data"
+                    );
                 }
                 let mut core = DiaryCore::new(&vault_pqd_str(&vault_dir)).unwrap();
                 core.unlock(secret("master-pw")).unwrap();

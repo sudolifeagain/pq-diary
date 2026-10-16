@@ -245,7 +245,7 @@ fn cmd_new_with_attach_to(
 
         let tmpl = guard.get_template(&tmpl_name)?;
 
-        let var_refs = extract_variables(&tmpl.body);
+        let var_refs = extract_variables(&tmpl.body)?;
 
         // Populate builtin variables.
         let mut vars: HashMap<String, String> = HashMap::new();
@@ -280,7 +280,7 @@ fn cmd_new_with_attach_to(
             }
         }
 
-        let expanded = expand(&tmpl.body, &vars);
+        let expanded = expand(&tmpl.body, &vars)?;
         (expanded, title, tags)
     } else if !std::io::stdin().is_terminal() {
         // Piped stdin: read all content.
@@ -875,7 +875,7 @@ where
                 let mut vars: HashMap<String, String> = HashMap::new();
                 vars.insert(BUILTIN_DATE.to_string(), today.to_string());
                 vars.insert(BUILTIN_TITLE.to_string(), today.to_string());
-                expand(&tmpl.body, &vars)
+                expand(&tmpl.body, &vars)?
             }
             Err(pq_diary_core::DiaryError::TemplateNotFound(_)) => String::new(),
             Err(e) => {
@@ -4862,7 +4862,7 @@ mod tests {
                 let mut vars: HashMap<String, String> = HashMap::new();
                 vars.insert(BUILTIN_DATE.to_string(), today.to_string());
                 vars.insert(BUILTIN_TITLE.to_string(), today.to_string());
-                expand(&tmpl.body, &vars)
+                expand(&tmpl.body, &vars).unwrap()
             }
             Err(_) => String::new(),
         };
@@ -4936,7 +4936,7 @@ mod tests {
         let mut vars: HashMap<String, String> = HashMap::new();
         vars.insert(BUILTIN_DATE.to_string(), today.to_string());
         vars.insert(BUILTIN_TITLE.to_string(), today.to_string());
-        let expanded = expand(&tmpl.body, &vars);
+        let expanded = expand(&tmpl.body, &vars).unwrap();
         core.lock();
 
         assert_eq!(expanded, "## 2026-04-05");
@@ -4962,7 +4962,7 @@ mod tests {
                 let mut vars: HashMap<String, String> = HashMap::new();
                 vars.insert(BUILTIN_DATE.to_string(), today.to_string());
                 vars.insert(BUILTIN_TITLE.to_string(), today.to_string());
-                expand(&tmpl.body, &vars)
+                expand(&tmpl.body, &vars).unwrap()
             }
             Err(_) => String::new(),
         };

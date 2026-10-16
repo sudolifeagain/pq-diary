@@ -400,7 +400,7 @@ impl DiaryCore {
     fn current_link_index(&self) -> Result<link::LinkIndex, DiaryError> {
         let engine = self.require_engine()?;
         let entries = entry::list_entries_with_body(&self.vault_path, engine)?;
-        Ok(link::LinkIndex::build_protected(&entries))
+        link::LinkIndex::build_protected(&entries)
     }
 
     /// Resolve all `[[title]]` link references found in `body`.
@@ -416,7 +416,7 @@ impl DiaryCore {
     /// Returns an error if reading, authenticating, or decoding current entries fails.
     pub fn resolve_links(&self, body: &str) -> Result<Vec<link::ResolvedLink>, DiaryError> {
         let index = self.current_link_index()?;
-        let resolved = link::parse_links(body)
+        let resolved = link::parse_links(body)?
             .iter()
             .map(|l| index.resolve(&l.title))
             .collect();

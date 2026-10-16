@@ -4,6 +4,7 @@
 //! as `VariableKind::Builtin` (`date`, `datetime`, `title`) or
 //! `VariableKind::Custom`, and substitutes them with caller-supplied values.
 
+use crate::error::DiaryError;
 use regex::Regex;
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -37,13 +38,14 @@ pub struct VariableRef {
     pub offset: usize,
 }
 
+const VARIABLE_PATTERN: &str = r"\{\{(\w+)\}\}";
+
 /// Returns a reference to the compiled variable regex, initialised at most once.
-fn var_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        // Infallible: pattern is a compile-time literal that always compiles.
-        Regex::new(r"\{\{(\w+)\}\}").unwrap_or_else(|_| unreachable!())
-    })
+fn var_regex() -> Result<&'static Regex, DiaryError> {
+    static RE: OnceLock<Result<Regex, regex::Error>> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(VARIABLE_PATTERN))
+        .as_ref()
+        .map_err(|error| DiaryError::Template(format!("invalid variable pattern: {error}")))
 }
 
 /// Extract all `{{var_name}}` references from `body`.
@@ -57,13 +59,15 @@ fn var_regex() -> &'static Regex {
 /// ```
 /// use pq_diary_core::template_engine::{extract_variables, VariableKind};
 ///
-/// let refs = extract_variables("日付: {{date}}");
+/// let refs = extract_variables("日付: {{date}}").unwrap();
 /// assert_eq!(refs.len(), 1);
 /// assert_eq!(refs[0].name, "date");
 /// assert!(matches!(refs[0].kind, VariableKind::Builtin));
 /// ```
-pub fn extract_variables(body: &str) -> Vec<VariableRef> {
-    var_regex()
+/// # Errors
+/// Returns a template error if the cached variable pattern cannot be compiled.
+pub fn extract_variables(body: &str) -> Result<Vec<VariableRef>, DiaryError> {
+    Ok(var_regex()?
         .captures_iter(body)
         .filter_map(|cap| {
             let m = cap.get(0)?;
@@ -79,7 +83,7 @@ pub fn extract_variables(body: &str) -> Vec<VariableRef> {
                 offset: m.start(),
             })
         })
-        .collect()
+        .collect())
 }
 
 /// Expand all `{{var_name}}` occurrences in `body` using the provided map.
@@ -98,11 +102,13 @@ pub fn extract_variables(body: &str) -> Vec<VariableRef> {
 ///
 /// let mut vars = HashMap::new();
 /// vars.insert("date".to_string(), "2026-04-05".to_string());
-/// let result = expand("日付: {{date}}", &vars);
+/// let result = expand("日付: {{date}}", &vars).unwrap();
 /// assert_eq!(result, "日付: 2026-04-05");
 /// ```
-pub fn expand(body: &str, vars: &HashMap<String, String>) -> String {
-    var_regex()
+/// # Errors
+/// Returns a template error if the cached variable pattern cannot be compiled.
+pub fn expand(body: &str, vars: &HashMap<String, String>) -> Result<String, DiaryError> {
+    Ok(var_regex()?
         .replace_all(body, |caps: &regex::Captures| match caps.get(1) {
             Some(name_match) => vars.get(name_match.as_str()).cloned().unwrap_or_else(|| {
                 caps.get(0)
@@ -112,7 +118,7 @@ pub fn expand(body: &str, vars: &HashMap<String, String>) -> String {
                 .get(0)
                 .map_or_else(String::new, |m| m.as_str().to_string()),
         })
-        .into_owned()
+        .into_owned())
 }
 
 // =============================================================================
@@ -123,6 +129,11 @@ pub fn expand(body: &str, vars: &HashMap<String, String>) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn variable_pattern_compiles() {
+        assert!(Regex::new(VARIABLE_PATTERN).is_ok());
+    }
+
     // =========================================================================
     // TC-043-01: 基本変数 {{date}} の抽出
     // =========================================================================
@@ -130,7 +141,7 @@ mod tests {
     /// TC-043-01: extract_variables finds {{date}} and classifies it as Builtin.
     #[test]
     fn tc_043_01_extract_builtin_date() {
-        let refs = extract_variables("日付: {{date}}");
+        let refs = extract_variables("日付: {{date}}").unwrap();
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].name, "date");
         assert!(
@@ -146,7 +157,7 @@ mod tests {
     /// TC-043-02: extract_variables finds {{project_name}} and classifies it as Custom.
     #[test]
     fn tc_043_02_extract_custom_variable() {
-        let refs = extract_variables("PJ: {{project_name}}");
+        let refs = extract_variables("PJ: {{project_name}}").unwrap();
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].name, "project_name");
         assert!(
@@ -164,7 +175,7 @@ mod tests {
     fn tc_043_03_expand_builtin_date() {
         let mut vars = HashMap::new();
         vars.insert("date".to_string(), "2026-04-05".to_string());
-        let result = expand("日付: {{date}}", &vars);
+        let result = expand("日付: {{date}}", &vars).unwrap();
         assert_eq!(result, "日付: 2026-04-05");
     }
 
@@ -177,7 +188,7 @@ mod tests {
     fn tc_043_04_expand_repeated_variable() {
         let mut vars = HashMap::new();
         vars.insert("date".to_string(), "2026-04-05".to_string());
-        let result = expand("{{date}} メモ\n---\n{{date}} 終了", &vars);
+        let result = expand("{{date}} メモ\n---\n{{date}} 終了", &vars).unwrap();
         assert_eq!(result, "2026-04-05 メモ\n---\n2026-04-05 終了");
     }
 
@@ -188,7 +199,7 @@ mod tests {
     /// TC-043-05: extract_variables on plain text returns an empty Vec.
     #[test]
     fn tc_043_05_extract_no_variables() {
-        let refs = extract_variables("固定テキスト");
+        let refs = extract_variables("固定テキスト").unwrap();
         assert!(refs.is_empty(), "no variables expected in plain text");
     }
 
@@ -200,7 +211,7 @@ mod tests {
     /// word character.
     #[test]
     fn tc_043_06_empty_braces_ignored() {
-        let refs = extract_variables("テスト {{}}");
+        let refs = extract_variables("テスト {{}}").unwrap();
         assert!(refs.is_empty(), "{{}} must not produce a VariableRef");
     }
 
@@ -211,7 +222,7 @@ mod tests {
     /// TC-043-07: extract_variables handles a mix of Builtin and Custom variables.
     #[test]
     fn tc_043_07_mixed_variable_kinds() {
-        let refs = extract_variables("{{date}} - {{project_name}} by {{title}}");
+        let refs = extract_variables("{{date}} - {{project_name}} by {{title}}").unwrap();
         assert_eq!(refs.len(), 3);
         assert!(
             matches!(refs[0].kind, VariableKind::Builtin),
@@ -238,7 +249,7 @@ mod tests {
     #[test]
     fn expand_undefined_variable_kept() {
         let vars: HashMap<String, String> = HashMap::new();
-        let result = expand("{{unknown}} stays", &vars);
+        let result = expand("{{unknown}} stays", &vars).unwrap();
         assert_eq!(result, "{{unknown}} stays");
     }
 
@@ -249,7 +260,7 @@ mod tests {
     /// datetime and title are also recognized as Builtin.
     #[test]
     fn extract_datetime_and_title_are_builtin() {
-        let refs = extract_variables("{{datetime}} {{title}}");
+        let refs = extract_variables("{{datetime}} {{title}}").unwrap();
         assert_eq!(refs.len(), 2);
         assert!(matches!(refs[0].kind, VariableKind::Builtin));
         assert!(matches!(refs[1].kind, VariableKind::Builtin));
@@ -265,7 +276,7 @@ mod tests {
     #[test]
     fn extract_variable_offset_is_correct() {
         // "abc " is 4 bytes, so {{date}} starts at byte 4
-        let refs = extract_variables("abc {{date}}");
+        let refs = extract_variables("abc {{date}}").unwrap();
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].offset, 4);
     }

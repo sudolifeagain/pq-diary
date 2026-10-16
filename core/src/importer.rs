@@ -29,9 +29,11 @@ static WIKI_LINK_RE: LazyLock<Result<Regex, regex::Error>> =
 static TAG_RE: LazyLock<Result<Regex, regex::Error>> =
     LazyLock::new(|| Regex::new(r"#([\w/\p{S}-]+)"));
 
+const ATTACHMENT_LINK_PATTERN: &str = r"!\[\[([^\]|]+)(?:\|[^\]]+)?\]\]";
+
 /// Obsidian attachment-embed pattern: `![[filename.ext]]` (S13).
-static ATTACHMENT_LINK_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"!\[\[([^\]|]+)(?:\|[^\]]+)?\]\]").unwrap());
+static ATTACHMENT_LINK_RE: LazyLock<Result<Regex, regex::Error>> =
+    LazyLock::new(|| Regex::new(ATTACHMENT_LINK_PATTERN));
 
 /// Extract every `![[filename]]` reference from a markdown body, returning
 /// the captured filenames in document order (duplicates preserved). Used by
@@ -45,22 +47,35 @@ static ATTACHMENT_LINK_RE: LazyLock<Regex> =
 /// reports anything outside as an *unresolved* reference (audit M7 — verified
 /// by `tc_s13_110_03_import_rejects_attachment_path_escape`). Filtering here
 /// instead would silently drop such references and hide them from that report.
-pub fn parse_obsidian_attachment_links(body: &str) -> Vec<String> {
-    ATTACHMENT_LINK_RE
+/// # Errors
+/// Returns an import error if the cached attachment pattern cannot be compiled.
+pub fn parse_obsidian_attachment_links(body: &str) -> Result<Vec<String>, DiaryError> {
+    let regex = ATTACHMENT_LINK_RE
+        .as_ref()
+        .map_err(|error| DiaryError::Import(format!("invalid attachment-link pattern: {error}")))?;
+    Ok(regex
         .captures_iter(body)
         .map(|c| c[1].trim().to_string())
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]
 mod attachment_link_tests {
-    use super::parse_obsidian_attachment_links;
+    use super::{parse_obsidian_attachment_links, ATTACHMENT_LINK_PATTERN};
+
+    #[test]
+    fn attachment_link_pattern_compiles() {
+        assert!(regex::Regex::new(ATTACHMENT_LINK_PATTERN).is_ok());
+    }
 
     /// TC-S13-010-01: extracts single ![[FILE]] reference.
     #[test]
     fn tc_s13_010_01_single_link() {
         let body = "See ![[photo.png]] for details.";
-        assert_eq!(parse_obsidian_attachment_links(body), vec!["photo.png"]);
+        assert_eq!(
+            parse_obsidian_attachment_links(body).unwrap(),
+            vec!["photo.png"]
+        );
     }
 
     /// TC-S13-010-02: extracts multiple references in document order.
@@ -68,7 +83,7 @@ mod attachment_link_tests {
     fn tc_s13_010_02_multiple_links() {
         let body = "![[a.png]] and ![[b.pdf]]\n\nand ![[c.txt]]";
         assert_eq!(
-            parse_obsidian_attachment_links(body),
+            parse_obsidian_attachment_links(body).unwrap(),
             vec!["a.png", "b.pdf", "c.txt"]
         );
     }
@@ -78,7 +93,7 @@ mod attachment_link_tests {
     fn tc_s13_010_03_ignores_plain_wiki_link() {
         let body = "See [[entry]] not ![[attachment.png]]";
         assert_eq!(
-            parse_obsidian_attachment_links(body),
+            parse_obsidian_attachment_links(body).unwrap(),
             vec!["attachment.png"]
         );
     }
@@ -86,7 +101,7 @@ mod attachment_link_tests {
     /// TC-S13-010-04: empty body yields empty Vec.
     #[test]
     fn tc_s13_010_04_empty_body() {
-        assert!(parse_obsidian_attachment_links("").is_empty());
+        assert!(parse_obsidian_attachment_links("").unwrap().is_empty());
     }
 }
 

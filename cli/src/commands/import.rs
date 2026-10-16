@@ -65,6 +65,22 @@ pub(crate) fn cmd_import_to(
     args: &crate::ImportArgs,
     out: &mut dyn std::io::Write,
 ) -> anyhow::Result<()> {
+    cmd_import_with_add_to(cli, args, out, |vault, password, entry, source| {
+        pq_diary_core::attachment::add_attachment(vault, password, entry, source).map(|_| ())
+    })
+}
+
+fn cmd_import_with_add_to(
+    cli: &Cli,
+    args: &crate::ImportArgs,
+    out: &mut dyn std::io::Write,
+    mut add_attachment: impl FnMut(
+        &Path,
+        &secrecy::SecretString,
+        &str,
+        &Path,
+    ) -> Result<(), pq_diary_core::DiaryError>,
+) -> anyhow::Result<()> {
     use anyhow::Context as _;
     use secrecy::{ExposeSecret as _, SecretBox};
 
@@ -93,8 +109,7 @@ pub(crate) fn cmd_import_to(
     }
 
     // 3. Acquire password; attachments reuse it after the guarded entry import.
-    let password_source =
-        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let password_source = get_password(cli.password.as_ref())?;
 
     // 4. Open and unlock vault.
     let vault_path = resolve_vault_path(cli)?;
@@ -102,28 +117,27 @@ pub(crate) fn cmd_import_to(
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("Vault path contains non-UTF-8 characters"))?;
 
-    let mut core = DiaryCore::new(vault_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut core = DiaryCore::new(vault_str)?;
 
     let secret_password: secrecy::SecretString =
         SecretBox::new(Box::from(password_source.secret().expose_secret()));
-    core.unlock(secret_password)
-        .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+    core.unlock(secret_password).map_err(|error| {
+        let message = format!("Vault unlock failed: {error}");
+        anyhow::Error::new(error).context(message)
+    })?;
     let guard = VaultGuard::new(&mut core);
 
     // Snapshot the set of entry UUIDs that exist before the import so we can
     // identify the newly-created entries afterwards and walk their bodies for
     // `![[FILE]]` attachment references (S13).
     let pre_import_uuids: std::collections::HashSet<String> = guard
-        .list_entries(None)
-        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .list_entries(None)?
         .into_iter()
         .map(|m| m.uuid_hex)
         .collect();
 
     // 5. Run import (dry_run flag is forwarded to core).
-    let result = guard
-        .import(&args.dir, args.dry_run)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let result = guard.import(&args.dir, args.dry_run)?;
 
     // 5b. (S13) Walk every newly-imported entry, parse `![[FILE]]` references
     // from the body, and attach matching files from `<dir>/attachments/`.
@@ -137,17 +151,13 @@ pub(crate) fn cmd_import_to(
         std::collections::HashSet::new();
     if !args.dry_run {
         let attachments_dir = args.dir.join("attachments");
-        let post_metas = guard
-            .list_entries(None)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let post_metas = guard.list_entries(None)?;
         for meta in &post_metas {
             if pre_import_uuids.contains(&meta.uuid_hex) {
                 continue;
             }
             let id_prefix = &meta.uuid_hex[..meta.uuid_hex.len().min(8)];
-            let (_, plaintext) = guard
-                .get_entry(id_prefix)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let (_, plaintext) = guard.get_entry(id_prefix)?;
             let links = pq_diary_core::importer::parse_obsidian_attachment_links(&plaintext.body);
             for filename in links {
                 if let Some(src) = resolve_import_attachment_source(&attachments_dir, &filename) {
@@ -168,24 +178,27 @@ pub(crate) fn cmd_import_to(
     // 7. (S13) Apply the queued attachment adds now that the guard is gone —
     // `add_attachment` re-opens the vault with the master password.
     let mut attachment_warnings = Vec::new();
+    let mut first_attachment_error = None;
     if !pending_attachments.is_empty() {
         let vault_dir = resolve_legacy_vault_dir(cli)?;
         let master_pwd: secrecy::SecretString =
             SecretBox::new(Box::from(password_source.secret().expose_secret()));
         for (id_prefix, src) in &pending_attachments {
-            match pq_diary_core::attachment::add_attachment(&vault_dir, &master_pwd, id_prefix, src)
-            {
+            match add_attachment(&vault_dir, &master_pwd, id_prefix, src) {
                 Ok(_) => attached += 1,
                 Err(e) => {
                     let filename = src.file_name().and_then(|n| n.to_str()).unwrap_or("?");
                     attachment_warnings
                         .push(format!("  warning: failed to attach {filename}: {e}"));
+                    if first_attachment_error.is_none() {
+                        first_attachment_error = Some(e);
+                    }
                 }
             }
         }
     }
     // Finish requested mutations before a reporting error can return early.
-    (|| -> std::io::Result<()> {
+    let reporting = (|| -> std::io::Result<()> {
         if args.dry_run {
             writeln!(
                 out,
@@ -227,9 +240,20 @@ pub(crate) fn cmd_import_to(
             "Failed to report import result ({} entries imported, {attached} attachments added)",
             result.imported
         )
-    })?;
+    });
 
-    Ok(())
+    if let Some(error) = first_attachment_error {
+        let mut message = format!(
+            "Import partially committed: {} entries imported, {attached} attachments added, {} attachments failed; do not blindly repeat import",
+            result.imported,
+            attachment_warnings.len()
+        );
+        if let Err(report_error) = reporting {
+            message.push_str(&format!("; output also failed: {report_error:#}"));
+        }
+        return Err(anyhow::Error::new(error).context(message));
+    }
+    reporting
 }
 
 #[cfg(test)]
@@ -721,6 +745,123 @@ mod tests {
             );
             assert!(source.join("note.md").is_file());
         }
+    }
+
+
+    #[test]
+    fn import_attachment_failure_reports_partial_commit_and_continues() {
+        for fail_output in [false, true] {
+            for crypto_failure in [false, true] {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let vault_dir = setup_vault(&dir);
+                let source = dir.path().join("source");
+                std::fs::create_dir_all(source.join("attachments")).expect("source directory");
+                std::fs::write(
+                    source.join("note.md"),
+                    "# Note\n\n![[first.txt]]\n![[second.txt]]\n",
+                )
+                .expect("source entry");
+                for name in ["first.txt", "second.txt"] {
+                    std::fs::write(source.join("attachments").join(name), b"private payload")
+                        .expect("source attachment");
+                }
+                let cli = parse_import_cli(
+                    vault_dir.to_str().expect("vault path"),
+                    source.to_str().expect("source path"),
+                    &[],
+                );
+                let mut output = Vec::new();
+                let mut broken = FailingMutationWriter { fail_write: true };
+                let out: &mut dyn std::io::Write =
+                    if fail_output { &mut broken } else { &mut output };
+                let mut attempts = 0;
+                let error = cmd_import_with_add_to(
+                    &cli,
+                    extract_import_args(&cli),
+                    out,
+                    |vault, password, entry, path| {
+                        attempts += 1;
+                        if attempts == 1 {
+                            if crypto_failure {
+                                return Err(pq_diary_core::DiaryError::Crypto(
+                                    "injected attachment failure".into(),
+                                ));
+                            }
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::PermissionDenied,
+                                "injected attachment failure",
+                            )
+                            .into());
+                        }
+                        pq_diary_core::attachment::add_attachment(vault, password, entry, path)
+                            .map(|_| ())
+                    },
+                )
+                .expect_err("attachment failure must not return success");
+                assert_eq!(attempts, 2, "later attachment must still be attempted");
+                let cause = error
+                    .downcast_ref::<pq_diary_core::DiaryError>()
+                    .expect("typed mutation error");
+                if crypto_failure {
+                    assert!(matches!(cause, pq_diary_core::DiaryError::Crypto(_)));
+                } else {
+                    assert!(matches!(
+                        cause,
+                        pq_diary_core::DiaryError::Io(error)
+                            if error.kind() == std::io::ErrorKind::PermissionDenied
+                    ));
+                    assert!(error.chain().any(|source| source
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)));
+                }
+                let message = format!("{error:#}");
+                assert!(message.contains("Import partially committed"));
+                assert!(message.contains("1 entries imported, 1 attachments added, 1 attachments failed"));
+                assert!(message.contains("do not blindly repeat import"));
+                assert_eq!(message.contains("output also failed"), fail_output);
+                assert!(!message.contains("private payload"));
+                if !fail_output {
+                    let output = String::from_utf8(output).expect("UTF-8 output");
+                    assert!(output.contains("warning: failed to attach"));
+                    assert!(output.contains("Attachments: 1 added"));
+                }
+                let entries = read_vault_entries(&vault_dir);
+                assert_eq!(entries.len(), 1);
+                let attachments = pq_diary_core::attachment::list_attachments(
+                    &vault_dir,
+                    &secrecy::SecretBox::new(Box::from("password")),
+                    Some(&entries[0].uuid_hex),
+                )
+                .expect("reopen attachments");
+                assert_eq!(attachments.len(), 1, "successful later add remains committed");
+                for name in ["first.txt", "second.txt"] {
+                    assert_eq!(
+                        std::fs::read(source.join("attachments").join(name)).expect("source intact"),
+                        b"private payload"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn import_empty_source_retains_typed_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_vault(&dir);
+        let source = tempfile::tempdir().expect("source");
+        let cli = parse_import_cli(
+            vault_dir.to_str().expect("vault path"),
+            source.path().to_str().expect("source path"),
+            &[],
+        );
+        let error = cmd_import_to(&cli, extract_import_args(&cli), &mut Vec::new())
+            .expect_err("empty import");
+        assert!(matches!(
+            error.downcast_ref::<pq_diary_core::DiaryError>(),
+            Some(pq_diary_core::DiaryError::Import(_))
+        ));
+        assert!(error.to_string().contains("No Markdown files found"));
+        assert!(read_vault_entries(&vault_dir).is_empty());
     }
 
     // -------------------------------------------------------------------------

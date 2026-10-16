@@ -18,6 +18,7 @@ Rust製・耐量子暗号CLIジャーナルツール。詳細は `requirements.m
 - 一時平文ファイルは作成時点から所有者を持たせる。cleanup失敗の警告と元のエラーの優先順位を、成功経路だけでなく失敗・早期return・unwindでもテストする
 - 外部入力・I/Oなどの失敗は `Result` で返す。`unwrap()` / `expect()` はテストのみ許可し、本番コードでは禁止する。`unwrap_or_else(|_| unreachable!())` への書換えで規約を回避しない。失敗しないgetterまで `Result` 化しない
 - エラーは `thiserror` で定義。`anyhow` はcli/のみ許可。失敗時に半端な状態や秘密値を残さず、検証が完了してから状態を反映する
+- CLIで型付きエラーを伝播するときは `?` やsourceを保持するcontextを使い、表示文言だけへの変換で原因の型を失わない。既存の診断文言・秘密値の伏せ方・policy/confirmationの順序も回帰テストで守る
 - プラットフォーム分岐は `#[cfg()]` で。core/ にプラットフォーム依存UIコードを入れない
 - 単体テストは各モジュールの `#[cfg(test)] mod tests`、機能の組合せはintegration testやCLI smokeで検証する
 

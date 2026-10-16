@@ -71,8 +71,7 @@ where
     // Policy check before any password prompt or vault decryption.
     check_claude_policy(cli, OperationType::Write)?;
 
-    let password_source =
-        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let password_source = get_password(cli.password.as_ref())?;
 
     let mut core = session::locked_core(cli)?;
     let guard = session::unlock(&mut core, password_source.into_secret())?;
@@ -102,7 +101,7 @@ where
     }
 
     // Set up editor config.
-    let config = editor::EditorConfig::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let config = editor::EditorConfig::from_env()?;
 
     // Write a blank temp file and launch editor.
     let session = editor::EditorSession::template(&config.secure_tmpdir)
@@ -148,8 +147,7 @@ fn cmd_template_list_with_writer(
     // Policy check before any password prompt or vault decryption.
     check_claude_policy(cli, OperationType::Read)?;
 
-    let password_source =
-        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let password_source = get_password(cli.password.as_ref())?;
 
     let mut core = session::locked_core(cli)?;
     let guard = session::unlock(&mut core, password_source.into_secret())?;
@@ -192,8 +190,7 @@ fn cmd_template_show_with_writer(
     // Policy check before any password prompt or vault decryption.
     check_claude_policy(cli, OperationType::Read)?;
 
-    let password_source =
-        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let password_source = get_password(cli.password.as_ref())?;
 
     let mut core = session::locked_core(cli)?;
     let guard = session::unlock(&mut core, password_source.into_secret())?;
@@ -239,8 +236,7 @@ fn cmd_template_delete_impl(
     // Policy check before any password prompt or vault decryption.
     check_claude_policy(cli, OperationType::Write)?;
 
-    let password_source =
-        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let password_source = get_password(cli.password.as_ref())?;
 
     let mut core = session::locked_core(cli)?;
     let guard = session::unlock(&mut core, password_source.into_secret())?;
@@ -278,6 +274,42 @@ mod tests {
     use clap::Parser as _;
     use pq_diary_core::DiaryCore;
     use std::path::Path;
+
+    #[test]
+    fn command_sources_template_password_retains_type() {
+        const CHILD: &str = "PQ_DIARY_TEST_TEMPLATE_PASSWORD_SOURCE";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "commands::templates::tests::command_sources_template_password_retains_type",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env_remove("PQ_DIARY_PASSWORD")
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let cli = make_template_list_cli(dir.path().to_str().unwrap(), None);
+        let error = cmd_template_list_with_writer(&cli, &mut Vec::new()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "password error: No password provided and stdin is not a terminal"
+        );
+        assert!(matches!(
+            error.downcast_ref::<pq_diary_core::DiaryError>(),
+            Some(pq_diary_core::DiaryError::Password(_))
+        ));
+        assert!(!dir.path().join("vault.pqd").exists());
+    }
 
     // =========================================================================
     // Template command tests (TASK-0047)

@@ -2849,14 +2849,23 @@ fn argon2_params_from_vault(
 fn prompt_confirmation_mode<R: std::io::BufRead>(
     reader: &mut R,
 ) -> anyhow::Result<pq_diary_core::vault::config::ConfirmationMode> {
+    prompt_confirmation_mode_with_io(reader, &mut std::io::stdout().lock())
+}
+
+fn prompt_confirmation_mode_with_io(
+    reader: &mut dyn std::io::BufRead,
+    out: &mut dyn std::io::Write,
+) -> anyhow::Result<pq_diary_core::vault::config::ConfirmationMode> {
     use pq_diary_core::vault::config::ConfirmationMode;
-    println!("Choose confirmation mode for legacy-access:");
-    println!("  [1] timer30 (default) — 30-second timer + y/N");
-    println!("  [2] yn               — immediate y/N");
-    println!("  [3] phrase           — type 'DESTROY ALL' to confirm");
-    print!("Selection [1]: ");
-    use std::io::Write as _;
-    std::io::stdout().flush().ok();
+    writeln!(out, "Choose confirmation mode for legacy-access:")?;
+    writeln!(out, "  [1] timer30 (default) — 30-second timer + y/N")?;
+    writeln!(out, "  [2] yn               — immediate y/N")?;
+    writeln!(
+        out,
+        "  [3] phrase           — type 'DESTROY ALL' to confirm"
+    )?;
+    write!(out, "Selection [1]: ")?;
+    out.flush()?;
     let mut line = String::new();
     reader.read_line(&mut line)?;
     let choice = line.trim();
@@ -3100,8 +3109,7 @@ pub fn cmd_legacy_access(cli: &Cli) -> anyhow::Result<()> {
 
     let report = execute_legacy_access(&vault_dir, &legacy_code, &deriver, |mode| {
         run_destroy_confirmation(mode)
-    })
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    })?;
 
     println!(
         "Legacy access complete. {} entries inherited, {} entries destroyed.",
@@ -3116,54 +3124,74 @@ pub fn cmd_legacy_access(cli: &Cli) -> anyhow::Result<()> {
 fn run_destroy_confirmation(
     mode: pq_diary_core::vault::config::ConfirmationMode,
 ) -> Result<bool, pq_diary_core::error::DiaryError> {
+    run_destroy_confirmation_with_io(
+        mode,
+        &mut std::io::stdin().lock(),
+        &mut std::io::stdout().lock(),
+    )
+}
+
+fn run_destroy_confirmation_with_io(
+    mode: pq_diary_core::vault::config::ConfirmationMode,
+    reader: &mut dyn std::io::BufRead,
+    out: &mut dyn std::io::Write,
+) -> Result<bool, pq_diary_core::error::DiaryError> {
     use pq_diary_core::vault::config::ConfirmationMode;
 
-    println!();
-    println!("============================================================");
-    println!("  WARNING: THIS OPERATION IS IRREVERSIBLE");
-    println!("  - All INHERIT entries will be inherited.");
-    println!("  - All DESTROY entries (and unconfigured entries) will be");
-    println!("    PERMANENTLY ERASED with zeroize-overwrite.");
-    println!("============================================================");
+    writeln!(out)?;
+    writeln!(
+        out,
+        "============================================================"
+    )?;
+    writeln!(out, "  WARNING: THIS OPERATION IS IRREVERSIBLE")?;
+    writeln!(out, "  - All INHERIT entries will be inherited.")?;
+    writeln!(
+        out,
+        "  - All DESTROY entries (and unconfigured entries) will be"
+    )?;
+    writeln!(out, "    PERMANENTLY ERASED with zeroize-overwrite.")?;
+    writeln!(
+        out,
+        "============================================================"
+    )?;
 
     match mode {
         ConfirmationMode::Timer30 => {
             for remaining in (1..=30).rev() {
-                print!("\r  {remaining:>2} seconds remaining...");
-                use std::io::Write as _;
-                std::io::stdout().flush().ok();
+                write!(out, "\r  {remaining:>2} seconds remaining...")?;
+                out.flush()?;
                 std::thread::sleep(std::time::Duration::from_secs(1));
             }
-            println!("\r   0 seconds remaining.            ");
-            prompt_yn("Proceed? [y/N]: ")
+            writeln!(out, "\r   0 seconds remaining.            ")?;
+            prompt_yn_with_io("Proceed? [y/N]: ", reader, out)
         }
-        ConfirmationMode::Yn => prompt_yn("Proceed? [y/N]: "),
-        ConfirmationMode::Phrase => prompt_phrase("DESTROY ALL"),
+        ConfirmationMode::Yn => prompt_yn_with_io("Proceed? [y/N]: ", reader, out),
+        ConfirmationMode::Phrase => prompt_phrase_with_io("DESTROY ALL", reader, out),
     }
 }
 
-fn prompt_yn(prompt: &str) -> Result<bool, pq_diary_core::error::DiaryError> {
-    print!("{prompt}");
-    use std::io::{BufRead as _, Write as _};
-    std::io::stdout().flush().ok();
+fn prompt_yn_with_io(
+    prompt: &str,
+    reader: &mut dyn std::io::BufRead,
+    out: &mut dyn std::io::Write,
+) -> Result<bool, pq_diary_core::error::DiaryError> {
+    write!(out, "{prompt}")?;
+    out.flush()?;
     let mut line = String::new();
-    std::io::stdin()
-        .lock()
-        .read_line(&mut line)
-        .map_err(pq_diary_core::error::DiaryError::Io)?;
+    reader.read_line(&mut line)?;
     Ok(matches!(line.trim(), "y" | "Y" | "yes" | "YES"))
 }
 
-fn prompt_phrase(expected: &str) -> Result<bool, pq_diary_core::error::DiaryError> {
-    println!("Type the phrase '{expected}' to confirm:");
-    print!("> ");
-    use std::io::{BufRead as _, Write as _};
-    std::io::stdout().flush().ok();
+fn prompt_phrase_with_io(
+    expected: &str,
+    reader: &mut dyn std::io::BufRead,
+    out: &mut dyn std::io::Write,
+) -> Result<bool, pq_diary_core::error::DiaryError> {
+    writeln!(out, "Type the phrase '{expected}' to confirm:")?;
+    write!(out, "> ")?;
+    out.flush()?;
     let mut line = String::new();
-    std::io::stdin()
-        .lock()
-        .read_line(&mut line)
-        .map_err(pq_diary_core::error::DiaryError::Io)?;
+    reader.read_line(&mut line)?;
     Ok(line.trim() == expected)
 }
 
@@ -3333,21 +3361,38 @@ pub fn cmd_attachment_delete(
     filename: String,
     force: bool,
 ) -> anyhow::Result<()> {
+    cmd_attachment_delete_with_io(
+        cli,
+        entry,
+        filename,
+        force,
+        &mut std::io::stdin().lock(),
+        &mut std::io::stdout().lock(),
+    )
+}
+
+fn cmd_attachment_delete_with_io(
+    cli: &Cli,
+    entry: String,
+    filename: String,
+    force: bool,
+    reader: &mut dyn std::io::BufRead,
+    out: &mut dyn std::io::Write,
+) -> anyhow::Result<()> {
     use pq_diary_core::attachment::delete_attachment;
     use secrecy::{ExposeSecret as _, SecretBox, SecretString};
 
     if cli.claude {
         anyhow::bail!("attachment delete is not permitted with --claude");
     }
-    if !force {
-        print!("Delete attachment '{filename}' from entry {entry}? [y/N]: ");
-        use std::io::{BufRead as _, Write as _};
-        std::io::stdout().flush().ok();
-        let mut line = String::new();
-        std::io::stdin().lock().read_line(&mut line)?;
-        if !matches!(line.trim(), "y" | "Y" | "yes" | "YES") {
-            anyhow::bail!("cancelled");
-        }
+    if !force
+        && !prompt_yn_with_io(
+            &format!("Delete attachment '{filename}' from entry {entry}? [y/N]: "),
+            reader,
+            out,
+        )?
+    {
+        anyhow::bail!("cancelled");
     }
     let vault_dir = resolve_legacy_vault_dir(cli)?;
     let master_source = get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -11212,6 +11257,248 @@ mod heatmap_window_tests {
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod confirmation_output_tests {
+    use super::*;
+    use pq_diary_core::error::DiaryError;
+    use pq_diary_core::vault::config::ConfirmationMode;
+    use std::io::{self, BufRead, Read, Write};
+
+    struct UnreadableInput;
+
+    impl Read for UnreadableInput {
+        fn read(&mut self, _bytes: &mut [u8]) -> io::Result<usize> {
+            panic!("confirmation input must not be read after output failure");
+        }
+    }
+
+    impl BufRead for UnreadableInput {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            panic!("confirmation input must not be read after output failure");
+        }
+
+        fn consume(&mut self, _amount: usize) {
+            panic!("confirmation input must not be consumed after output failure");
+        }
+    }
+
+    struct ConfirmationOutput {
+        fail_write: bool,
+        bytes: Vec<u8>,
+    }
+
+    impl Write for ConfirmationOutput {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.fail_write {
+                Err(io::ErrorKind::BrokenPipe.into())
+            } else {
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+    }
+
+    fn failing_output(fail_write: bool) -> ConfirmationOutput {
+        ConfirmationOutput {
+            fail_write,
+            bytes: Vec::new(),
+        }
+    }
+
+    fn assert_broken_pipe(error: DiaryError) {
+        assert!(
+            matches!(error, DiaryError::Io(ref io) if io.kind() == io::ErrorKind::BrokenPipe),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn confirmation_write_and_flush_failures_do_not_read_input() {
+        for fail_write in [true, false] {
+            assert_broken_pipe(
+                prompt_yn_with_io(
+                    "Proceed? [y/N]: ",
+                    &mut UnreadableInput,
+                    &mut failing_output(fail_write),
+                )
+                .unwrap_err(),
+            );
+            assert_broken_pipe(
+                prompt_phrase_with_io(
+                    "DESTROY ALL",
+                    &mut UnreadableInput,
+                    &mut failing_output(fail_write),
+                )
+                .unwrap_err(),
+            );
+            let error = prompt_confirmation_mode_with_io(
+                &mut UnreadableInput,
+                &mut failing_output(fail_write),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<io::Error>().unwrap().kind(),
+                io::ErrorKind::BrokenPipe
+            );
+            for mode in [ConfirmationMode::Yn, ConfirmationMode::Phrase] {
+                assert_broken_pipe(
+                    run_destroy_confirmation_with_io(
+                        mode,
+                        &mut UnreadableInput,
+                        &mut failing_output(fail_write),
+                    )
+                    .unwrap_err(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn countdown_flush_failure_returns_before_first_sleep() {
+        let mut out = failing_output(false);
+        assert_broken_pipe(
+            run_destroy_confirmation_with_io(
+                ConfirmationMode::Timer30,
+                &mut UnreadableInput,
+                &mut out,
+            )
+            .unwrap_err(),
+        );
+        assert!(out.bytes.ends_with(b"\r  30 seconds remaining..."));
+    }
+
+    #[test]
+    fn confirmation_prompts_preserve_text_defaults_and_accepted_answers() {
+        for answer in ["y", "Y", "yes", "YES", " y \n", "", "n", "Yes", "true"] {
+            let mut reader = io::Cursor::new(answer);
+            let mut out = Vec::new();
+            let confirmed = prompt_yn_with_io("Proceed? [y/N]: ", &mut reader, &mut out).unwrap();
+            assert_eq!(
+                confirmed,
+                matches!(answer.trim(), "y" | "Y" | "yes" | "YES")
+            );
+            assert_eq!(out, b"Proceed? [y/N]: ");
+        }
+        for answer in ["DESTROY ALL", " DESTROY ALL\n", "destroy all", ""] {
+            let mut reader = io::Cursor::new(answer);
+            let mut out = Vec::new();
+            let confirmed = prompt_phrase_with_io("DESTROY ALL", &mut reader, &mut out).unwrap();
+            assert_eq!(confirmed, answer.trim() == "DESTROY ALL");
+            assert_eq!(out, b"Type the phrase 'DESTROY ALL' to confirm:\n> ");
+        }
+        for (answer, expected) in [
+            ("", ConfirmationMode::Timer30),
+            ("1", ConfirmationMode::Timer30),
+            ("timer30", ConfirmationMode::Timer30),
+            ("2", ConfirmationMode::Yn),
+            ("yn", ConfirmationMode::Yn),
+            ("3", ConfirmationMode::Phrase),
+            ("phrase", ConfirmationMode::Phrase),
+        ] {
+            let mut out = Vec::new();
+            assert_eq!(
+                prompt_confirmation_mode_with_io(&mut io::Cursor::new(answer), &mut out).unwrap(),
+                expected
+            );
+            assert_eq!(
+                String::from_utf8(out).unwrap(),
+                "Choose confirmation mode for legacy-access:\n  [1] timer30 (default) — 30-second timer + y/N\n  [2] yn               — immediate y/N\n  [3] phrase           — type 'DESTROY ALL' to confirm\nSelection [1]: "
+            );
+        }
+        assert!(
+            prompt_confirmation_mode_with_io(&mut io::Cursor::new("4"), &mut Vec::new(),)
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid selection '4'")
+        );
+    }
+
+    #[test]
+    fn confirmation_output_error_preserves_vault_config_and_attachment() {
+        use pq_diary_core::attachment::add_attachment;
+        use pq_diary_core::legacy::{
+            execute_legacy_access, initialize_legacy, Argon2LegacyDeriver,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let vault = test_support::setup_vault(&dir);
+        let password = secrecy::SecretString::new("password".into());
+        let code = secrecy::SecretString::new("synthetic legacy code".into());
+        let path = vault.join("vault.pqd");
+        let mut core = DiaryCore::new(path.to_str().unwrap()).unwrap();
+        core.unlock(secrecy::SecretString::new("password".into()))
+            .unwrap();
+        let id = core
+            .new_entry("original", "preserved body", vec![])
+            .unwrap();
+        drop(core);
+        let source = dir.path().join("fixture.txt");
+        std::fs::write(&source, b"synthetic attachment").unwrap();
+        add_attachment(&vault, &password, &id, &source).unwrap();
+        let blobs: Vec<_> = std::fs::read_dir(vault.join(".attachments"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(blobs.len(), 1);
+        let blob = &blobs[0];
+        let deriver = Argon2LegacyDeriver::new(test_support::fast_params());
+        initialize_legacy(&vault, &password, &code, ConfirmationMode::Yn, &deriver).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let config_before = std::fs::read(vault.join("vault.toml")).unwrap();
+        let blob_before = std::fs::read(blob).unwrap();
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "pq-diary",
+            "--vault",
+            vault.to_str().unwrap(),
+            "--password",
+            "password",
+            "attachment",
+            "delete",
+            &id,
+            "fixture.txt",
+        ])
+        .unwrap();
+
+        for fail_write in [true, false] {
+            let error = cmd_attachment_delete_with_io(
+                &cli,
+                id.clone(),
+                "fixture.txt".into(),
+                false,
+                &mut UnreadableInput,
+                &mut failing_output(fail_write),
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<DiaryError>(),
+                Some(DiaryError::Io(io)) if io.kind() == io::ErrorKind::BrokenPipe
+            ));
+            let result = execute_legacy_access(&vault, &code, &deriver, |mode| {
+                run_destroy_confirmation_with_io(
+                    mode,
+                    &mut UnreadableInput,
+                    &mut failing_output(fail_write),
+                )
+            });
+            assert_broken_pipe(result.unwrap_err());
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert_eq!(
+                std::fs::read(vault.join("vault.toml")).unwrap(),
+                config_before
+            );
+            assert_eq!(std::fs::read(blob).unwrap(), blob_before);
+            let mut core = DiaryCore::new(path.to_str().unwrap()).unwrap();
+            core.unlock(secrecy::SecretString::new("password".into()))
+                .unwrap();
+            assert_eq!(core.get_entry(&id).unwrap().1.body, "preserved body");
         }
     }
 }

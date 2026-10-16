@@ -10551,6 +10551,61 @@ parallelism = 1
         assert_eq!(core.get_entry(&id).unwrap().1.body, "second body");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn export_rejects_dangling_symlink_without_publishing_plaintext() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_s10_vault(&dir, "v", b"password");
+        let pqd = vault_dir.join("vault.pqd");
+        let mut core = DiaryCore::new(pqd.to_str().expect("path")).expect("core");
+        core.unlock(secrecy::SecretBox::new(Box::from("password")))
+            .expect("unlock");
+        let id = core
+            .new_entry("export fixture", "private export body", vec![])
+            .expect("entry");
+        let meta = core.list_entries(None).expect("entries").remove(0);
+        core.lock();
+
+        let original = std::fs::read(&pqd).expect("vault snapshot");
+        let config_path = vault_dir.join("vault.toml");
+        let original_config = std::fs::read(&config_path).expect("config snapshot");
+        let out = dir.path().join("out");
+        std::fs::create_dir(&out).expect("output directory");
+        let destination = out.join(build_export_filename(&meta));
+        let outside = dir.path().join("must-not-create.md");
+        symlink(&outside, &destination).expect("dangling output symlink");
+        assert!(!destination.exists(), "preflight follows the missing target");
+
+        let cli = make_cli_plain(&[
+            "--vault",
+            vault_dir.to_str().expect("vault path"),
+            "--password",
+            "password",
+            "export",
+            out.to_str().expect("output path"),
+        ]);
+        let error = cmd_export_impl(&cli, out.clone(), &mut std::io::Cursor::new(b"y\n"))
+            .expect_err("export must not follow the output symlink");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .expect("typed output error")
+                .kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert!(!outside.exists(), "plaintext must not escape the output directory");
+        assert_eq!(std::fs::read_link(&destination).expect("symlink"), outside);
+        assert_eq!(std::fs::read_dir(&out).expect("outputs").count(), 1);
+        assert_eq!(std::fs::read(&pqd).expect("vault"), original);
+        assert_eq!(std::fs::read(&config_path).expect("config"), original_config);
+        core.unlock(secrecy::SecretBox::new(Box::from("password")))
+            .expect("reopen");
+        assert_eq!(core.get_entry(&id).expect("entry").1.body, "private export body");
+        core.lock();
+    }
+
     /// TC-501-01: 3 entries export → 3 well-named files.
     #[test]
     fn tc_501_01_export_three_entries() {

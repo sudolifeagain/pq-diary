@@ -23,6 +23,14 @@ Rust製・耐量子暗号CLIジャーナルツール。詳細は `requirements.m
 
 - コマンド認証のリファクタリングではpolicy/confirmationと秘密取得の既存順序を保ち、複数回利用する認証情報（newの添付・import等）は意図を明記する
 
+## I/O変更時の契約
+
+- 一時ファイル・stagingは排他的作成に成功してから所有し、rollbackは自分が作成したものだけを対象にする。既存ファイル・symlink・他者の追加物を削除しない。`core/src/vault/atomic_file.rs` の `OwnedTemp` / `write_atomic` と `init.rs` の `InitStaging` を参照し、親ディレクトリが管理下にある前提も保つ
+- commit点を明示し、commit前の失敗では原本保全・rollbackを確認する。commit後のcleanup失敗を「保存されなかった」エラーに変えず、元の失敗とcleanup警告を区別する。atomic renameだけで物理消去やcrash耐久性まで保証したと扱わない
+- 認証したバイト列そのものをparseし、検証後に同じパスを開き直さない。read-modify-writeは `read_vault_with_attachments_authenticated` の同一snapshotからレコードと添付を引き継ぐ
+- 「存在しなければ作成」の分岐は `DiaryError::TemplateNotFound` 等の型付き不在だけに限定する。`is_err()` / `Err(_)` で破損・認証・権限・I/Oエラーまで不在扱いしない
+- CLI出力は `cmd_template_show_with_writer` のようにfallibleなwriterと明示的 `flush` で失敗を返す。`Drop` の警告は `EditorSession` のようにstderr失敗でもpanicさせず、元のエラーを隠さない
+
 ## テスト・CI方針
 
 - 個人運用のため、通常PRのCIは短いLinux検証を標準とする。fmt、build、workspace test（doctestを含む）、Clippy、既存debugバイナリを使うCLI smokeを実行する。脆弱性監査と依存ポリシー検査は維持する

@@ -577,7 +577,10 @@ fn finish_pull(
         Err(_) => {
             // Preserve the backup for manual recovery, even if restoration fails.
             if let Err(e) = std::fs::copy(bak_path, vault_path) {
-                let _ = writeln!(warnings, "Warning: failed to restore vault from backup: {e}");
+                let _ = writeln!(
+                    warnings,
+                    "Warning: failed to restore vault from backup: {e}"
+                );
             }
         }
     }
@@ -965,9 +968,11 @@ mod tests {
             Err(DiaryError::Git(message)) if message == "original merge failure"
         ));
         assert_eq!(std::fs::read(&vault).unwrap(), b"current vault");
-        assert_eq!(std::fs::read(backup.join("keep")).unwrap(), b"recovery data");
+        assert_eq!(
+            std::fs::read(backup.join("keep")).unwrap(),
+            b"recovery data"
+        );
     }
-
 
     /// TC-S8-074-01: check_git_available succeeds in a git-installed environment.
     #[test]

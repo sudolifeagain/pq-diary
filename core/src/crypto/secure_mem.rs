@@ -209,7 +209,10 @@ fn mlock_master_key_with(
         if let Err(e) = lock(buf) {
             // Secondary diagnostics must not hide the first lock error or
             // prevent the remaining fields from being attempted.
-            let _ = writeln!(warnings, "warning: failed to lock key material in memory: {e}");
+            let _ = writeln!(
+                warnings,
+                "warning: failed to lock key material in memory: {e}"
+            );
             if first_err.is_none() {
                 first_err = Some(e);
             }
@@ -386,7 +389,6 @@ mod tests {
         assert_eq!(warnings.attempts, 3);
         assert_eq!(mk.sym_key, [1; 32]);
     }
-
 
     #[test]
     fn secure_buffer_len_and_is_empty() {

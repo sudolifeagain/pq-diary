@@ -128,10 +128,7 @@ fn warn_restore_failure(
 
 /// Report prompt I/O before Windows disables console echo.
 #[cfg(any(windows, test))]
-fn write_console_prompt(
-    writer: &mut impl std::io::Write,
-    prompt: &str,
-) -> Result<(), DiaryError> {
+fn write_console_prompt(writer: &mut impl std::io::Write, prompt: &str) -> Result<(), DiaryError> {
     write!(writer, "{prompt}")
         .and_then(|()| writer.flush())
         .map_err(|e| DiaryError::Password(format!("Cannot write console prompt: {e}")))
@@ -186,11 +183,7 @@ fn read_password_tty(prompt: &str) -> Result<SecretString, DiaryError> {
                 nix::sys::termios::SetArg::TCSANOW,
                 &self.old,
             ) {
-                warn_restore_failure(
-                    &mut std::io::stderr().lock(),
-                    "terminal attributes",
-                    &e,
-                );
+                warn_restore_failure(&mut std::io::stderr().lock(), "terminal attributes", &e);
             }
         }
     }

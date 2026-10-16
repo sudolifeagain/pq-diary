@@ -372,7 +372,7 @@ fn cmd_new_with_attach_to(
                         .and_then(|n| n.to_str())
                         .unwrap_or("attachment");
                     let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-                    attached_files.push((filename.to_string(), size));
+                    attached_files.push((filename, size));
                 }
                 Err(e) => {
                     return Err(anyhow::Error::new(e).context(format!(
@@ -1364,7 +1364,7 @@ pub(crate) fn cmd_import_to(
 
     // 7. (S13) Apply the queued attachment adds now that the guard is gone —
     // `add_attachment` re-opens the vault with the master password.
-    let mut attachment_warnings = Vec::new();
+    let mut attachment_warnings = zeroize::Zeroizing::new(Vec::new());
     if !pending_attachments.is_empty() {
         let vault_dir = resolve_legacy_vault_dir(cli)?;
         let master_pwd: secrecy::SecretString =
@@ -1404,7 +1404,7 @@ pub(crate) fn cmd_import_to(
             )?;
         }
 
-        for warning in &attachment_warnings {
+        for warning in attachment_warnings.iter() {
             writeln!(out, "{warning}")?;
         }
         if attached > 0 || !skipped_links.is_empty() {

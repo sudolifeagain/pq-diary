@@ -1375,7 +1375,8 @@ pub(crate) fn cmd_import_to(
                 Ok(_) => attached += 1,
                 Err(e) => {
                     let filename = src.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-                    attachment_warnings.push(format!("  warning: failed to attach {filename}: {e}"));
+                    attachment_warnings
+                        .push(format!("  warning: failed to attach {filename}: {e}"));
                 }
             }
         }

@@ -2602,12 +2602,14 @@ fn resolve_legacy_vault_dir(cli: &Cli) -> anyhow::Result<PathBuf> {
     resolve_change_password_vault_dir(cli)
 }
 
+#[cfg(test)]
+mod legacy_attachment_sources_tests;
+
 fn argon2_params_from_vault(
     vault_dir: &std::path::Path,
 ) -> anyhow::Result<pq_diary_core::crypto::kdf::Argon2Params> {
     use pq_diary_core::vault::config::VaultConfig;
-    let config = VaultConfig::from_file(&vault_dir.join("vault.toml"))
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let config = VaultConfig::from_file(&vault_dir.join("vault.toml"))?;
     Ok(pq_diary_core::crypto::kdf::Argon2Params {
         memory_cost_kb: config.argon2.memory_cost_kb,
         time_cost: config.argon2.time_cost,
@@ -2662,15 +2664,13 @@ fn cmd_legacy_init_impl<R: std::io::BufRead>(cli: &Cli, reader: &mut R) -> anyho
     use secrecy::{ExposeSecret as _, SecretBox, SecretString};
 
     let vault_dir = resolve_legacy_vault_dir(cli)?;
-    let master_source = get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let master_source = get_password(cli.password.as_ref())?;
     let master_pwd: SecretString =
         SecretBox::new(Box::from(master_source.secret().expose_secret()));
     drop(master_source);
 
-    let legacy_code1 =
-        crate::password::prompt_password("Legacy code: ").map_err(|e| anyhow::anyhow!("{e}"))?;
-    let legacy_code2 = crate::password::prompt_password("Confirm legacy code: ")
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let legacy_code1 = crate::password::prompt_password("Legacy code: ")?;
+    let legacy_code2 = crate::password::prompt_password("Confirm legacy code: ")?;
     if legacy_code1.expose_secret() != legacy_code2.expose_secret() {
         anyhow::bail!("Legacy codes do not match");
     }
@@ -2685,8 +2685,7 @@ fn cmd_legacy_init_impl<R: std::io::BufRead>(cli: &Cli, reader: &mut R) -> anyho
     let params = argon2_params_from_vault(&vault_dir)?;
     let deriver = Argon2LegacyDeriver::new(params);
 
-    initialize_legacy(&vault_dir, &master_pwd, &legacy_code1, mode, &deriver)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    initialize_legacy(&vault_dir, &master_pwd, &legacy_code1, mode, &deriver)?;
     println!(
         "Legacy code initialized. Confirmation mode: {}",
         mode_label(mode)
@@ -2724,14 +2723,13 @@ pub fn cmd_legacy_set(
     };
 
     let vault_dir = resolve_legacy_vault_dir(cli)?;
-    let master_source = get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let master_source = get_password(cli.password.as_ref())?;
     let master_pwd: SecretString =
         SecretBox::new(Box::from(master_source.secret().expose_secret()));
     drop(master_source);
 
     let legacy_code_opt = if flag == LegacyFlag::Inherit {
-        let code = crate::password::prompt_password("Legacy code: ")
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let code = crate::password::prompt_password("Legacy code: ")?;
         Some(code)
     } else {
         None
@@ -2746,8 +2744,7 @@ pub fn cmd_legacy_set(
         &id_prefix,
         flag,
         &deriver,
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    )?;
 
     match flag {
         LegacyFlag::Inherit => println!("Entry {id_prefix} set to INHERIT"),
@@ -2770,13 +2767,12 @@ fn cmd_legacy_list_to(cli: &Cli, out: &mut dyn std::io::Write) -> anyhow::Result
     }
 
     let vault_dir = resolve_legacy_vault_dir(cli)?;
-    let master_source = get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let master_source = get_password(cli.password.as_ref())?;
     let master_pwd: SecretString =
         SecretBox::new(Box::from(master_source.secret().expose_secret()));
     drop(master_source);
 
-    let statuses =
-        list_legacy_status(&vault_dir, &master_pwd).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let statuses = list_legacy_status(&vault_dir, &master_pwd)?;
 
     let mut inherits: Vec<_> = statuses
         .iter()
@@ -2832,17 +2828,14 @@ pub fn cmd_legacy_rotate(cli: &Cli) -> anyhow::Result<()> {
     }
 
     let vault_dir = resolve_legacy_vault_dir(cli)?;
-    let master_source = get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let master_source = get_password(cli.password.as_ref())?;
     let master_pwd: SecretString =
         SecretBox::new(Box::from(master_source.secret().expose_secret()));
     drop(master_source);
 
-    let old_code = crate::password::prompt_password("Old legacy code: ")
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let new_code1 = crate::password::prompt_password("New legacy code: ")
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let new_code2 = crate::password::prompt_password("Confirm new legacy code: ")
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let old_code = crate::password::prompt_password("Old legacy code: ")?;
+    let new_code1 = crate::password::prompt_password("New legacy code: ")?;
+    let new_code2 = crate::password::prompt_password("Confirm new legacy code: ")?;
     if new_code1.expose_secret() != new_code2.expose_secret() {
         anyhow::bail!("New legacy codes do not match");
     }
@@ -2855,8 +2848,7 @@ pub fn cmd_legacy_rotate(cli: &Cli) -> anyhow::Result<()> {
 
     let params = argon2_params_from_vault(&vault_dir)?;
     let deriver = Argon2LegacyDeriver::new(params);
-    let rotated = rotate_legacy_code(&vault_dir, &master_pwd, &old_code, &new_code1, &deriver)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let rotated = rotate_legacy_code(&vault_dir, &master_pwd, &old_code, &new_code1, &deriver)?;
     println!("Legacy code rotated successfully ({rotated} INHERIT entries re-encrypted)");
     Ok(())
 }
@@ -2872,8 +2864,7 @@ pub fn cmd_legacy_access(cli: &Cli) -> anyhow::Result<()> {
 
     let vault_dir = resolve_legacy_vault_dir(cli)?;
 
-    let legacy_code =
-        crate::password::prompt_password("Legacy code: ").map_err(|e| anyhow::anyhow!("{e}"))?;
+    let legacy_code = crate::password::prompt_password("Legacy code: ")?;
 
     let params = argon2_params_from_vault(&vault_dir)?;
     let deriver = Argon2LegacyDeriver::new(params);
@@ -3012,13 +3003,12 @@ pub fn cmd_attachment_add(cli: &Cli, entry: String, path: PathBuf) -> anyhow::Re
         anyhow::bail!("attachment add is not permitted with --claude");
     }
     let vault_dir = resolve_legacy_vault_dir(cli)?;
-    let master_source = get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let master_source = get_password(cli.password.as_ref())?;
     let master_pwd: SecretString =
         SecretBox::new(Box::from(master_source.secret().expose_secret()));
     drop(master_source);
 
-    let uuid = add_attachment(&vault_dir, &master_pwd, &entry, &path)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let uuid = add_attachment(&vault_dir, &master_pwd, &entry, &path)?;
     let filename = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -3053,13 +3043,12 @@ fn cmd_attachment_list_to(
         check_claude_policy(cli, OperationType::Read)?;
     }
     let vault_dir = resolve_legacy_vault_dir(cli)?;
-    let master_source = get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let master_source = get_password(cli.password.as_ref())?;
     let master_pwd: SecretString =
         SecretBox::new(Box::from(master_source.secret().expose_secret()));
     drop(master_source);
 
-    let metas = list_attachments(&vault_dir, &master_pwd, entry.as_deref())
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let metas = list_attachments(&vault_dir, &master_pwd, entry.as_deref())?;
     if metas.is_empty() {
         writeln!(out, "No attachments.")?;
         out.flush()?;
@@ -3111,13 +3100,12 @@ pub fn cmd_attachment_extract(
         anyhow::bail!("attachment extract is not permitted with --claude");
     }
     let vault_dir = resolve_legacy_vault_dir(cli)?;
-    let master_source = get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let master_source = get_password(cli.password.as_ref())?;
     let master_pwd: SecretString =
         SecretBox::new(Box::from(master_source.secret().expose_secret()));
     drop(master_source);
 
-    extract_attachment(&vault_dir, &master_pwd, &entry, &filename, &out)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    extract_attachment(&vault_dir, &master_pwd, &entry, &filename, &out)?;
     println!(
         "Extracted: {filename} → {} (SHA-256 verified)",
         out.display()
@@ -3166,13 +3154,12 @@ fn cmd_attachment_delete_with_io(
         anyhow::bail!("cancelled");
     }
     let vault_dir = resolve_legacy_vault_dir(cli)?;
-    let master_source = get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let master_source = get_password(cli.password.as_ref())?;
     let master_pwd: SecretString =
         SecretBox::new(Box::from(master_source.secret().expose_secret()));
     drop(master_source);
 
-    delete_attachment(&vault_dir, &master_pwd, &entry, &filename)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    delete_attachment(&vault_dir, &master_pwd, &entry, &filename)?;
     println!("Deleted: {filename}");
     Ok(())
 }
@@ -3200,16 +3187,13 @@ pub fn cmd_attachment_set(
     };
 
     let vault_dir = resolve_legacy_vault_dir(cli)?;
-    let master_source = get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let master_source = get_password(cli.password.as_ref())?;
     let master_pwd: SecretString =
         SecretBox::new(Box::from(master_source.secret().expose_secret()));
     drop(master_source);
 
     let legacy_code_opt = if flag == LegacyFlag::Inherit {
-        Some(
-            crate::password::prompt_password("Legacy code: ")
-                .map_err(|e| anyhow::anyhow!("{e}"))?,
-        )
+        Some(crate::password::prompt_password("Legacy code: ")?)
     } else {
         None
     };
@@ -3223,8 +3207,7 @@ pub fn cmd_attachment_set(
         &filename,
         flag,
         &deriver,
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    )?;
     match flag {
         LegacyFlag::Inherit => println!("Attachment '{filename}' set to INHERIT"),
         LegacyFlag::Destroy => println!("Attachment '{filename}' set to DESTROY"),

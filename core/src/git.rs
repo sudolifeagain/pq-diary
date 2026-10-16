@@ -3,6 +3,9 @@
 //! Provides Git repository initialisation and related utilities for pq-diary vaults.
 //! Full push/pull/merge support is planned for later Sprint 8 tasks.
 
+/// Read-only authenticated three-way reconciliation planning.
+pub mod reconciliation;
+
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};

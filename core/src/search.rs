@@ -2,9 +2,10 @@
 //!
 //! Implements a streaming search strategy: each entry is decrypted, searched,
 //! and then its plaintext is dropped (zeroed via [`zeroize::ZeroizeOnDrop`])
-//! before moving to the next entry.  Plaintext memory is O(1 entry) — each
-//! entry is decrypted, searched, and zeroized before the next.  However, all
-//! encrypted records are loaded from one freshly authenticated vault snapshot.
+//! before moving to the next entry. Returned titles and context text remain
+//! alive until their search-result owners are dropped and zeroized. Context may
+//! contain an entire body, so plaintext memory is O(one entry + retained output).
+//! All encrypted records are loaded from one freshly authenticated vault snapshot.
 //!
 //! # Search fields
 //!
@@ -25,6 +26,7 @@ use crate::{
 };
 use regex::Regex;
 use std::path::Path;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 // =============================================================================
 // Public types
@@ -48,25 +50,62 @@ pub struct SearchQuery {
 }
 
 /// A single search match within an entry or template record.
+///
+/// Owned title and context text are zeroized on drop. Borrow fields rather than
+/// moving them out; explicitly extracted or cloned strings need their own guard.
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct SearchMatch {
     /// Entry UUID hex (32 chars, no dashes).
+    #[zeroize(skip)]
     pub uuid_hex: String,
     /// Entry title, or template name for template matches.
     pub title: String,
     /// Entry last-update timestamp (Unix seconds).
+    #[zeroize(skip)]
     pub updated_at: u64,
     /// Which field matched: `"body"`, `"title"`, `"tags"`, or `"template"`.
+    #[zeroize(skip)]
     pub matched_field: String,
     /// Context lines around each match.  Empty when `count_only` is `true`.
     pub context_blocks: Vec<ContextBlock>,
 }
 
 /// A block of lines surrounding a single match location.
+///
+/// Line contents are zeroized on drop, even when the context is the full body.
 pub struct ContextBlock {
     /// 1-based line number of the first matching line in this block.
     pub match_line_number: usize,
     /// Lines: `(line_number_1based, line_content, is_match)`.
     pub lines: Vec<(usize, String, bool)>,
+}
+
+impl Zeroize for ContextBlock {
+    fn zeroize(&mut self) {
+        for (_, content, _) in &mut self.lines {
+            content.zeroize();
+        }
+    }
+}
+
+impl Drop for ContextBlock {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for ContextBlock {}
+
+impl std::fmt::Debug for ContextBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ContextBlock([REDACTED])")
+    }
+}
+
+impl std::fmt::Debug for SearchMatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SearchMatch([REDACTED])")
+    }
 }
 
 /// Aggregated search results returned by [`search_entries`].
@@ -199,11 +238,10 @@ pub fn search_entries(
                 }
 
                 // --- tags ---
-                let matching_tags: Vec<String> = plaintext
+                let matching_tags: Vec<&String> = plaintext
                     .tags
                     .iter()
                     .filter(|t| regex.is_match(t.as_str()))
-                    .cloned()
                     .collect();
                 if !matching_tags.is_empty() {
                     matched_line_count += matching_tags.len();
@@ -215,7 +253,7 @@ pub fn search_entries(
                             lines: matching_tags
                                 .iter()
                                 .enumerate()
-                                .map(|(i, t)| (i + 1, t.clone(), true))
+                                .map(|(i, t)| (i + 1, (*t).clone(), true))
                                 .collect(),
                         }]
                     };
@@ -378,9 +416,7 @@ impl<'a> BodyMatches<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        crypto::kdf::Argon2Params, entry::EntryPlaintext, vault::init::VaultManager, DiaryCore,
-    };
+    use crate::{crypto::kdf::Argon2Params, vault::init::VaultManager, DiaryCore};
     use secrecy::SecretBox;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -771,33 +807,35 @@ mod tests {
         assert_eq!(block.lines[9].0, 10, "last line must be line 10");
     }
 
-    // -------------------------------------------------------------------------
-    // TC-B08-01: ZeroizeOnDrop and no raw body in SearchResults
-    // -------------------------------------------------------------------------
-
-    /// TC-B08-01: EntryPlaintext implements ZeroizeOnDrop; SearchMatch does not
-    /// expose a raw body field.
     #[test]
-    fn tc_b08_01_zeroize_on_drop() {
-        // Compile-time check: EntryPlaintext must implement ZeroizeOnDrop.
-        // This assertion fails to compile if the derive is missing.
-        fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
-        assert_zeroize_on_drop::<EntryPlaintext>();
-
-        // Verify that SearchMatch does not have a `body` field by confirming
-        // that only context_blocks (excerpts) are accessible — the struct
-        // layout enforces this at compile time.
-        let sm = SearchMatch {
-            uuid_hex: "abc".to_string(),
-            title: "t".to_string(),
-            updated_at: 0,
+    fn search_plaintext_owners_erase_live_buffers_and_redact_debug() {
+        fn assert_owner<T: zeroize::Zeroize + ZeroizeOnDrop>() {}
+        assert_owner::<ContextBlock>();
+        assert_owner::<SearchMatch>();
+        let sentinel = "S53_PRIVATE_SENTINEL";
+        let mut result = SearchMatch {
+            uuid_hex: "public-id".to_string(),
+            title: sentinel.to_string(),
+            updated_at: 7,
             matched_field: "body".to_string(),
-            context_blocks: Vec::new(),
+            context_blocks: vec![ContextBlock {
+                match_line_number: 1,
+                lines: vec![(1, sentinel.to_string(), true)],
+            }],
         };
-        // SearchResults only exposes title, uuid_hex, matched_field, updated_at,
-        // and context_blocks — never the full plaintext body.
-        assert_eq!(sm.matched_field, "body");
-        assert!(sm.context_blocks.is_empty());
+        assert!(!format!("{result:?}").contains(sentinel));
+        assert!(!format!("{result:#?}").contains(sentinel));
+        assert!(!format!("{:?}", result.context_blocks[0]).contains(sentinel));
+        assert!(!format!("{:#?}", result.context_blocks[0]).contains(sentinel));
+        // Exercise the exact wipe routine called by Drop while ownership is live.
+        zeroize::Zeroize::zeroize(&mut result.context_blocks[0]);
+        assert!(result.context_blocks[0].lines[0].1.is_empty());
+        assert_eq!(result.context_blocks[0].lines[0].0, 1);
+        zeroize::Zeroize::zeroize(&mut result);
+        assert!(result.title.is_empty());
+        assert!(result.context_blocks.is_empty());
+        assert_eq!(result.uuid_hex, "public-id");
+        assert_eq!(result.updated_at, 7);
     }
 
     // =========================================================================

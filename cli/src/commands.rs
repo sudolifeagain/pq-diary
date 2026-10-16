@@ -5,7 +5,12 @@
 //! arbitrary error sources can be propagated through the main entry-point.
 
 mod session;
+mod templates;
+#[cfg(test)]
+mod test_support;
+
 use session::VaultGuard;
+pub use templates::{cmd_template_add, cmd_template_delete, cmd_template_list, cmd_template_show};
 
 use crate::editor::{self, EditorConfig};
 use crate::password::{get_password, PasswordSource};
@@ -374,6 +379,16 @@ pub fn cmd_list(
     query: Option<String>,
     number: usize,
 ) -> anyhow::Result<()> {
+    cmd_list_to(cli, tag, query, number, &mut std::io::stdout())
+}
+
+fn cmd_list_to(
+    cli: &Cli,
+    tag: Option<String>,
+    query: Option<String>,
+    number: usize,
+    out: &mut dyn std::io::Write,
+) -> anyhow::Result<()> {
     use pq_diary_core::policy::OperationType;
 
     // Policy check before any password prompt or vault decryption.
@@ -395,7 +410,7 @@ pub fn cmd_list(
         let prefix = meta.id_prefix(8);
         let date = format_timestamp(meta.updated_at);
         if meta.tags.is_empty() {
-            println!("{prefix}  {date}  {}", meta.title);
+            writeln!(out, "{prefix}  {date}  {}", meta.title)?;
         } else {
             let tags_str = meta
                 .tags
@@ -403,11 +418,12 @@ pub fn cmd_list(
                 .map(|t| format!("#{t}"))
                 .collect::<Vec<_>>()
                 .join("  ");
-            println!("{prefix}  {date}  {}  {tags_str}", meta.title);
+            writeln!(out, "{prefix}  {date}  {}  {tags_str}", meta.title)?;
         }
     }
 
     // guard drops here, automatically calling lock().
+    out.flush()?;
     Ok(())
 }
 
@@ -432,6 +448,7 @@ pub fn cmd_show(cli: &Cli, id: String) -> anyhow::Result<()> {
 /// Separating the writer allows tests to capture the output without spawning a
 /// subprocess or redirecting `stdout`.
 fn cmd_show_impl(cli: &Cli, id: String, out: &mut dyn std::io::Write) -> anyhow::Result<()> {
+    use anyhow::Context as _;
     use pq_diary_core::policy::OperationType;
     use secrecy::{ExposeSecret as _, SecretBox};
 
@@ -460,12 +477,11 @@ fn cmd_show_impl(cli: &Cli, id: String, out: &mut dyn std::io::Write) -> anyhow:
     let created = format_timestamp(record.created_at);
     let updated = format_timestamp(record.updated_at);
 
-    writeln!(out, "Title:   {}", plaintext.title)
-        .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+    writeln!(out, "Title:   {}", plaintext.title).context("Failed to write entry output")?;
     writeln!(out, "Created: {created}  Updated: {updated}")
-        .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+        .context("Failed to write entry output")?;
     if plaintext.tags.is_empty() {
-        writeln!(out, "Tags:    (none)").map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+        writeln!(out, "Tags:    (none)").context("Failed to write entry output")?;
     } else {
         let tags_str = plaintext
             .tags
@@ -473,10 +489,10 @@ fn cmd_show_impl(cli: &Cli, id: String, out: &mut dyn std::io::Write) -> anyhow:
             .map(|t| format!("#{t}"))
             .collect::<Vec<_>>()
             .join("  ");
-        writeln!(out, "Tags:    {tags_str}").map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+        writeln!(out, "Tags:    {tags_str}").context("Failed to write entry output")?;
     }
-    writeln!(out).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-    write!(out, "{}", plaintext.body).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+    writeln!(out).context("Failed to write entry output")?;
+    write!(out, "{}", plaintext.body).context("Failed to write entry output")?;
 
     // Resolve [[link]] references in the body.
     let resolved = guard
@@ -484,24 +500,24 @@ fn cmd_show_impl(cli: &Cli, id: String, out: &mut dyn std::io::Write) -> anyhow:
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     if !resolved.is_empty() {
-        writeln!(out).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-        writeln!(out, "--- Links ---").map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+        writeln!(out).context("Failed to write entry output")?;
+        writeln!(out, "--- Links ---").context("Failed to write entry output")?;
         for link in &resolved {
             match link.matches.len() {
                 0 => writeln!(out, "  [[{}]] (未解決)", link.title)
-                    .map_err(|e| anyhow::anyhow!("Write error: {e}"))?,
+                    .context("Failed to write entry output")?,
                 1 => writeln!(
                     out,
                     "  [[{}]] → [{}]",
                     link.title, link.matches[0].id_prefix
                 )
-                .map_err(|e| anyhow::anyhow!("Write error: {e}"))?,
+                .context("Failed to write entry output")?,
                 _ => {
                     writeln!(out, "  [[{}]] → 複数候補:", link.title)
-                        .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+                        .context("Failed to write entry output")?;
                     for m in &link.matches {
                         writeln!(out, "    [{}]", m.id_prefix)
-                            .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+                            .context("Failed to write entry output")?;
                     }
                 }
             }
@@ -517,9 +533,9 @@ fn cmd_show_impl(cli: &Cli, id: String, out: &mut dyn std::io::Write) -> anyhow:
             SecretBox::new(Box::from(password_source.secret().expose_secret()));
         match pq_diary_core::attachment::list_attachments(&vault_dir, &listing_pwd, Some(&id)) {
             Ok(metas) if !metas.is_empty() => {
-                writeln!(out).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+                writeln!(out).context("Failed to write entry output")?;
                 writeln!(out, "--- Attachments ({}) ---", metas.len())
-                    .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+                    .context("Failed to write entry output")?;
                 for m in &metas {
                     writeln!(
                         out,
@@ -528,7 +544,7 @@ fn cmd_show_impl(cli: &Cli, id: String, out: &mut dyn std::io::Write) -> anyhow:
                         human_size(m.size_bytes),
                         m.mime_type,
                     )
-                    .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+                    .context("Failed to write entry output")?;
                 }
             }
             Ok(_) => {}
@@ -544,17 +560,18 @@ fn cmd_show_impl(cli: &Cli, id: String, out: &mut dyn std::io::Write) -> anyhow:
     if !backlinks.is_empty() {
         backlinks.sort_by_key(|b| std::cmp::Reverse(b.created_at));
 
-        writeln!(out).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-        writeln!(out, "--- Backlinks ---").map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+        writeln!(out).context("Failed to write entry output")?;
+        writeln!(out, "--- Backlinks ---").context("Failed to write entry output")?;
         for bl in &backlinks {
             let date = format_timestamp(bl.created_at);
             let prefix = backlink_uuid_prefix(&bl.source_uuid);
             writeln!(out, "  [{prefix}] {date} {}", bl.source_title)
-                .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+                .context("Failed to write entry output")?;
         }
     }
 
     // guard drops here, automatically calling lock().
+    out.flush()?;
     Ok(())
 }
 
@@ -791,270 +808,6 @@ fn cmd_delete_impl(
 }
 
 // ---------------------------------------------------------------------------
-// Template command handlers
-// ---------------------------------------------------------------------------
-
-/// Prompt the user for template deletion confirmation.
-///
-/// Prints `Delete template "{name}"? [y/N]: ` to stderr and reads a line from
-/// `reader`.  Returns `true` only when the user responds with `y` or `Y`.
-fn confirm_template_delete(name: &str, reader: &mut impl std::io::BufRead) -> anyhow::Result<bool> {
-    use std::io::Write as _;
-    eprint!("Delete template \"{name}\"? [y/N]: ");
-    std::io::stderr()
-        .flush()
-        .map_err(|e| anyhow::anyhow!("Failed to flush stderr: {e}"))?;
-    let mut input = String::new();
-    reader
-        .read_line(&mut input)
-        .map_err(|e| anyhow::anyhow!("Failed to read input: {e}"))?;
-    let trimmed = input.trim();
-    Ok(trimmed == "y" || trimmed == "Y")
-}
-
-/// Preserve the existing one-line diagnostic and the inspectable core source.
-/// Debug/CLI error-chain rendering may additionally print a `Caused by` line.
-fn template_command_error(context: &str, error: pq_diary_core::DiaryError) -> anyhow::Error {
-    let message = format!("{context}: {error}");
-    anyhow::Error::new(error).context(message)
-}
-
-/// Execute the `pq-diary template add` command.
-///
-/// Opens `$EDITOR` with a blank temporary file; on save, stores the file
-/// contents as the body of a new template named `name`.
-///
-/// If a template with the same `name` already exists, the user is prompted to
-/// confirm overwriting (unless `--claude` is set, in which case overwrite
-/// proceeds silently).
-///
-/// # Errors
-///
-/// Returns an error if password acquisition, vault unlock, editor launch,
-/// or template creation fails.
-pub fn cmd_template_add(cli: &Cli, name: String) -> anyhow::Result<()> {
-    cmd_template_add_impl(
-        cli,
-        name,
-        editor::launch_editor,
-        &mut std::io::BufReader::new(std::io::stdin()),
-    )
-}
-
-/// Internal implementation of `cmd_template_add` with injectable editor launcher and reader.
-fn cmd_template_add_impl<F>(
-    cli: &Cli,
-    name: String,
-    launch_fn: F,
-    reader: &mut impl std::io::BufRead,
-) -> anyhow::Result<()>
-where
-    F: FnOnce(&std::path::Path, &EditorConfig) -> Result<(), pq_diary_core::DiaryError>,
-{
-    use pq_diary_core::policy::OperationType;
-
-    // Policy check before any password prompt or vault decryption.
-    check_claude_policy(cli, OperationType::Write)?;
-
-    let password_source =
-        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    let mut core = session::locked_core(cli)?;
-    let guard = session::unlock(&mut core, password_source.into_secret())?;
-
-    // Check for an existing template with the same name.
-    let already_exists = match guard.get_template(&name) {
-        Ok(_) => true,
-        Err(pq_diary_core::DiaryError::TemplateNotFound(_)) => false,
-        Err(e) => return Err(template_command_error("Failed to look up template", e)),
-    };
-    if already_exists && !cli.claude {
-        use std::io::Write as _;
-        eprint!("Template \"{name}\" already exists. Overwrite? [y/N]: ");
-        std::io::stderr()
-            .flush()
-            .map_err(|e| anyhow::anyhow!("Failed to flush stderr: {e}"))?;
-        let mut input = String::new();
-        reader
-            .read_line(&mut input)
-            .map_err(|e| anyhow::anyhow!("Failed to read input: {e}"))?;
-        let trimmed = input.trim();
-        if trimmed != "y" && trimmed != "Y" {
-            println!("キャンセルしました");
-            return Ok(());
-            // guard drops here, calling lock().
-        }
-    }
-
-    // Set up editor config.
-    let config = editor::EditorConfig::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    // Write a blank temp file and launch editor.
-    let session = editor::EditorSession::template(&config.secure_tmpdir)
-        .map_err(|e| anyhow::anyhow!("Failed to write temp file: {e}"))?;
-    let body = session.finish(&config, launch_fn, editor::read_template_file)?;
-
-    // Commit an overwrite once, so a failed replacement retains the original.
-    if already_exists {
-        guard
-            .replace_template(&name, &body)
-            .map_err(|e| template_command_error("Failed to replace template", e))?;
-        println!("Template replaced: \"{name}\"");
-    } else {
-        guard
-            .new_template(&name, &body)
-            .map_err(|e| template_command_error("Failed to create template", e))?;
-        println!("Template created: \"{name}\"");
-    }
-
-    // guard drops here, automatically calling lock().
-    Ok(())
-}
-
-/// Execute the `pq-diary template list` command.
-///
-/// Lists all templates stored in the vault sorted alphabetically by name.
-/// Prints one name per line.
-///
-/// # Errors
-///
-/// Returns an error if password acquisition, vault unlock, template listing, or output fails.
-pub fn cmd_template_list(cli: &Cli) -> anyhow::Result<()> {
-    cmd_template_list_with_writer(cli, &mut std::io::stdout().lock())
-}
-
-fn cmd_template_list_with_writer(
-    cli: &Cli,
-    output: &mut impl std::io::Write,
-) -> anyhow::Result<()> {
-    use anyhow::Context as _;
-    use pq_diary_core::policy::OperationType;
-
-    // Policy check before any password prompt or vault decryption.
-    check_claude_policy(cli, OperationType::Read)?;
-
-    let password_source =
-        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    let mut core = session::locked_core(cli)?;
-    let guard = session::unlock(&mut core, password_source.into_secret())?;
-
-    let mut templates = guard
-        .list_templates()
-        .map_err(|e| template_command_error("Failed to list templates", e))?;
-    templates.sort_by(|a, b| a.name.cmp(&b.name));
-
-    for meta in &templates {
-        writeln!(output, "{}", meta.name).context("Failed to write template output")?;
-    }
-    output.flush().context("Failed to flush template output")?;
-
-    // guard drops here, automatically calling lock().
-    Ok(())
-}
-
-/// Execute the `pq-diary template show` command.
-///
-/// Displays the body text of the template identified by `name`.
-///
-/// # Errors
-///
-/// Returns an error if password acquisition, vault unlock, template lookup, or output fails.
-/// Returns `DiaryError::TemplateNotFound` (wrapped in anyhow) when no template
-/// with the given name exists.
-pub fn cmd_template_show(cli: &Cli, name: String) -> anyhow::Result<()> {
-    cmd_template_show_with_writer(cli, name, &mut std::io::stdout().lock())
-}
-
-fn cmd_template_show_with_writer(
-    cli: &Cli,
-    name: String,
-    output: &mut impl std::io::Write,
-) -> anyhow::Result<()> {
-    use anyhow::Context as _;
-    use pq_diary_core::policy::OperationType;
-
-    // Policy check before any password prompt or vault decryption.
-    check_claude_policy(cli, OperationType::Read)?;
-
-    let password_source =
-        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    let mut core = session::locked_core(cli)?;
-    let guard = session::unlock(&mut core, password_source.into_secret())?;
-
-    let plaintext = guard.get_template(&name)?;
-    output
-        .write_all(plaintext.body.as_bytes())
-        .context("Failed to write template output")?;
-    output.flush().context("Failed to flush template output")?;
-
-    // guard drops here, automatically calling lock().
-    Ok(())
-}
-
-/// Execute the `pq-diary template delete` command.
-///
-/// Looks up the template identified by `name`, then prompts for confirmation
-/// unless `force` or `--claude` is set.  Prints `Deleted template: "{name}"` on
-/// success, or `キャンセルしました` when the user declines.
-///
-/// # Errors
-///
-/// Returns an error if password acquisition, vault unlock, template lookup, or
-/// template deletion fails.
-pub fn cmd_template_delete(cli: &Cli, name: String, force: bool) -> anyhow::Result<()> {
-    cmd_template_delete_impl(
-        cli,
-        name,
-        force,
-        &mut std::io::BufReader::new(std::io::stdin()),
-    )
-}
-
-/// Internal implementation of `cmd_template_delete` with an injectable stdin reader.
-fn cmd_template_delete_impl(
-    cli: &Cli,
-    name: String,
-    force: bool,
-    reader: &mut impl std::io::BufRead,
-) -> anyhow::Result<()> {
-    use pq_diary_core::policy::OperationType;
-
-    // Policy check before any password prompt or vault decryption.
-    check_claude_policy(cli, OperationType::Write)?;
-
-    let password_source =
-        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    let mut core = session::locked_core(cli)?;
-    let guard = session::unlock(&mut core, password_source.into_secret())?;
-
-    // Verify the template exists.
-    guard.get_template(&name)?;
-
-    // Determine whether to skip confirmation.
-    let skip_confirm = force || cli.claude;
-    let do_delete = if skip_confirm {
-        true
-    } else {
-        confirm_template_delete(&name, reader)?
-    };
-
-    if do_delete {
-        guard
-            .delete_template(&name)
-            .map_err(|e| template_command_error("Failed to delete template", e))?;
-        println!("Deleted template: \"{name}\"");
-    } else {
-        println!("キャンセルしました");
-    }
-
-    // guard drops here, automatically calling lock().
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
 // Today command handler
 // ---------------------------------------------------------------------------
 
@@ -1229,6 +982,7 @@ pub(crate) fn cmd_search_to(
     }
 
     // guard drops here, automatically calling lock().
+    out.flush()?;
     Ok(())
 }
 
@@ -1349,6 +1103,7 @@ pub(crate) fn cmd_stats_to(
     }
 
     // guard drops here, automatically calling lock().
+    out.flush()?;
     Ok(())
 }
 
@@ -1360,11 +1115,18 @@ pub(crate) fn cmd_stats_to(
 /// - `▓` — 2–3 entries
 /// - `█` — 4 or more entries
 ///
-/// The grid covers the last 52 weeks (364 days) ending today.  Rows are
-/// weekdays (Mon–Sun) and columns are calendar weeks (oldest left, newest
-/// right).  A month-abbreviation header and a legend line are appended.
+/// The grid covers the current UTC calendar week and the preceding 51 weeks.
+/// Rows are weekdays (Mon–Sun), with the oldest week on the left. Future
+/// days in the current week are blank. A month header and legend are appended.
 fn render_heatmap(daily_activity: &[pq_diary_core::stats::DailyActivity]) -> String {
-    use chrono::{Datelike as _, Duration, Utc};
+    render_heatmap_at(daily_activity, chrono::Utc::now().date_naive())
+}
+
+fn render_heatmap_at(
+    daily_activity: &[pq_diary_core::stats::DailyActivity],
+    today: chrono::NaiveDate,
+) -> String {
+    use chrono::{Datelike as _, Duration};
     use std::collections::HashMap;
 
     let activity_map: HashMap<String, usize> = daily_activity
@@ -1372,25 +1134,21 @@ fn render_heatmap(daily_activity: &[pq_diary_core::stats::DailyActivity]) -> Str
         .map(|a| (a.date.clone(), a.count))
         .collect();
 
-    let today = Utc::now().date_naive();
-    let start_date = today - Duration::days(363);
-
     const WEEKS: usize = 52;
-    // grid[weekday][week]: weekday 0 = Mon … 6 = Sun
-    let mut grid = [[0usize; WEEKS]; 7];
+    // Anchor the last column to this week's Monday, rather than aligning a
+    // trailing 364-day interval that can spill into a 53rd column.
+    let current_monday = today - Duration::days(today.weekday().num_days_from_monday().into());
+    let start_date = current_monday - Duration::weeks((WEEKS - 1) as i64);
 
-    // Align grid to calendar week boundaries: Monday is always row 0.
-    let start_weekday = start_date.weekday().num_days_from_monday() as usize; // 0=Mon
-    for day_offset in 0..364i64 {
-        let date = start_date + Duration::days(day_offset);
-        let adjusted_offset = day_offset as usize + start_weekday;
-        let week = adjusted_offset / 7;
-        let weekday = adjusted_offset % 7;
-        let date_str = date.format("%Y-%m-%d").to_string();
-        let count = activity_map.get(&date_str).copied().unwrap_or(0);
-        if week < WEEKS {
-            grid[weekday][week] = count;
+    // None marks a future date, distinct from a past day with no entries.
+    let mut grid = [[None; WEEKS]; 7];
+    for day_offset in 0..(WEEKS * 7) {
+        let date = start_date + Duration::days(day_offset as i64);
+        if date > today {
+            break;
         }
+        let count = activity_map.get(&date.to_string()).copied().unwrap_or(0);
+        grid[day_offset % 7][day_offset / 7] = Some(count);
     }
 
     let count_to_char = |c: usize| -> char {
@@ -1412,8 +1170,8 @@ fn render_heatmap(daily_activity: &[pq_diary_core::stats::DailyActivity]) -> Str
     let mut header_chars: Vec<char> = std::iter::repeat_n(' ', 5 + WEEKS).collect();
     let mut last_month: u32 = 0;
     for week in 0..WEEKS {
-        // The Monday (row 0) of each grid column: offset back by start_weekday.
-        let date = start_date + Duration::days((week * 7) as i64 - start_weekday as i64);
+        // The Monday (row 0) of each grid column.
+        let date = start_date + Duration::days((week * 7) as i64);
         let month = date.month();
         if month != last_month {
             let m_str = MONTH_NAMES[(month - 1) as usize];
@@ -1433,7 +1191,7 @@ fn render_heatmap(daily_activity: &[pq_diary_core::stats::DailyActivity]) -> Str
     for (weekday, week_counts) in grid.iter().enumerate() {
         let mut row = format!("{} ", day_labels[weekday]);
         for &count in week_counts.iter() {
-            row.push(count_to_char(count));
+            row.push(count.map(count_to_char).unwrap_or(' '));
         }
         lines.push(row);
     }
@@ -1793,6 +1551,10 @@ fn review_password_choice(
 /// Returns an error if the base directory cannot be determined or vault
 /// enumeration fails.
 pub fn cmd_vault_list(cli: &Cli) -> anyhow::Result<()> {
+    cmd_vault_list_to(cli, &mut std::io::stdout())
+}
+
+fn cmd_vault_list_to(cli: &Cli, out: &mut dyn std::io::Write) -> anyhow::Result<()> {
     use pq_diary_core::vault::init::VaultManager;
 
     let base_dir = resolve_vaults_base_dir(cli)?;
@@ -1801,12 +1563,13 @@ pub fn cmd_vault_list(cli: &Cli) -> anyhow::Result<()> {
         .list_vaults_with_policy()
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    println!("{:<20} POLICY", "NAME");
-    println!("{}", "-".repeat(31));
+    writeln!(out, "{:<20} POLICY", "NAME")?;
+    writeln!(out, "{}", "-".repeat(31))?;
     for v in &vaults {
-        println!("{:<20} {}", v.name, v.policy);
+        writeln!(out, "{:<20} {}", v.name, v.policy)?;
     }
 
+    out.flush()?;
     Ok(())
 }
 
@@ -1948,26 +1711,17 @@ fn vault_dir_from_path(vault_path: &std::path::Path) -> anyhow::Result<PathBuf> 
     }
 }
 
-/// Apply conflict resolutions chosen interactively by the user.
-///
-/// For each conflict where the user chooses `r` (remote), overwrites the
-/// local provisional entry in the vault with the remote version and commits
-/// the change using the vault's privacy pipeline.
-///
-/// `reader` is injected so that tests can supply pre-programmed responses
-/// instead of reading from the real stdin.
-fn resolve_conflicts_interactive(
+/// Collect choices and apply them only to the authenticated current snapshot.
+/// Returns whether remote choices were written; local-only choices are a no-op.
+fn apply_conflict_choices(
     conflicts: &[pq_diary_core::git::MergeConflict],
-    vault_dir: &std::path::Path,
-    config: &pq_diary_core::vault::config::VaultConfig,
     vault_path: &std::path::Path,
     mac_key: &[u8; 32],
     reader: &mut impl std::io::BufRead,
-) -> anyhow::Result<()> {
-    use pq_diary_core::git::{fuzz_timestamp, get_last_commit_timestamp};
+) -> anyhow::Result<bool> {
     use pq_diary_core::vault::{
-        reader::{read_vault, verify_vault_integrity},
-        writer::write_vault_authenticated,
+        reader::read_vault_with_attachments_authenticated,
+        writer::write_vault_with_attachments_authenticated,
     };
     use std::io::Write as _;
 
@@ -1995,21 +1749,60 @@ fn resolve_conflicts_interactive(
     }
 
     if remote_uuids.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
 
-    // Apply "keep remote" choices: swap entries in vault.pqd.
-    verify_vault_integrity(vault_path, mac_key).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let (header, mut entries) = read_vault(vault_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Authenticate and parse one post-prompt snapshot, including attachments.
+    // This preserves unrelated edits made while the user was choosing. It is
+    // not a cross-process lock: another writer can still race after this read.
+    let (header, mut entries, attachments) =
+        read_vault_with_attachments_authenticated(vault_path, mac_key)?;
     for uuid in &remote_uuids {
         if let Some(conflict) = conflicts.iter().find(|c| &c.uuid == uuid) {
-            if let Some(pos) = entries.iter().position(|e| e.uuid == *uuid) {
-                entries[pos] = conflict.remote.clone();
+            let pos = entries
+                .iter()
+                .position(|e| e.uuid == *uuid)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Conflict entry disappeared while prompting; retry the merge")
+                })?;
+            if entries[pos] != conflict.local {
+                anyhow::bail!("Conflict entry changed while prompting; retry the merge");
             }
+            entries[pos] = conflict.remote.clone();
         }
     }
-    write_vault_authenticated(vault_path, header, &entries, mac_key)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // No write occurs unless every selected local version still matches.
+    write_vault_with_attachments_authenticated(
+        vault_path,
+        header,
+        &entries,
+        &attachments,
+        mac_key,
+    )?;
+    Ok(true)
+}
+
+/// Apply conflict resolutions chosen interactively by the user.
+///
+/// For each conflict where the user chooses `r` (remote), overwrites the
+/// local provisional entry in the vault with the remote version and commits
+/// the change using the vault's privacy pipeline.
+///
+/// `reader` is injected so that tests can supply pre-programmed responses
+/// instead of reading from the real stdin.
+fn resolve_conflicts_interactive(
+    conflicts: &[pq_diary_core::git::MergeConflict],
+    vault_dir: &std::path::Path,
+    config: &pq_diary_core::vault::config::VaultConfig,
+    vault_path: &std::path::Path,
+    mac_key: &[u8; 32],
+    reader: &mut impl std::io::BufRead,
+) -> anyhow::Result<()> {
+    use pq_diary_core::git::{fuzz_timestamp, get_last_commit_timestamp};
+
+    if !apply_conflict_choices(conflicts, vault_path, mac_key, reader)? {
+        return Ok(());
+    }
 
     // Commit the updated vault using the privacy pipeline.
     let prev_ts = get_last_commit_timestamp(vault_dir);
@@ -2307,6 +2100,10 @@ fn cmd_git_sync_impl(cli: &Cli, reader: &mut impl std::io::BufRead) -> anyhow::R
 /// Returns an error if `git` is not installed, the vault directory cannot be
 /// resolved, or `git status` fails.
 pub fn cmd_git_status(cli: &Cli) -> anyhow::Result<()> {
+    cmd_git_status_to(cli, &mut std::io::stdout())
+}
+
+fn cmd_git_status_to(cli: &Cli, out: &mut dyn std::io::Write) -> anyhow::Result<()> {
     use pq_diary_core::git;
 
     let vault_path = resolve_vault_path(cli)?;
@@ -2315,8 +2112,9 @@ pub fn cmd_git_status(cli: &Cli) -> anyhow::Result<()> {
     git::check_git_available().map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let status = git::git_status(&vault_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
-    print!("{status}");
+    write!(out, "{status}")?;
 
+    out.flush()?;
     Ok(())
 }
 
@@ -2538,6 +2336,10 @@ fn resolve_default_vault_dir() -> anyhow::Result<PathBuf> {
 
 /// Execute the `pq-diary info [--security]` command.
 pub fn cmd_info(cli: &Cli, security: bool) -> anyhow::Result<()> {
+    cmd_info_to(cli, security, &mut std::io::stdout())
+}
+
+fn cmd_info_to(cli: &Cli, security: bool, out: &mut dyn std::io::Write) -> anyhow::Result<()> {
     use pq_diary_core::vault::config::VaultConfig;
     use secrecy::{ExposeSecret as _, SecretBox};
 
@@ -2579,44 +2381,55 @@ pub fn cmd_info(cli: &Cli, security: bool) -> anyhow::Result<()> {
         Err(_) => "unknown".to_string(),
     };
 
-    println!("=== Vault Info ===");
-    println!("{:<16}{}", "Name:", vault_config.vault.name);
-    println!("{:<16}{}", "Policy:", vault_config.access.policy);
-    println!("{:<16}{}", "Entries:", entry_count);
-    println!("{:<16}{}", "Created:", created_str);
-    println!("{:<16}{}", "Last updated:", modified_str);
+    writeln!(out, "=== Vault Info ===")?;
+    writeln!(out, "{:<16}{}", "Name:", vault_config.vault.name)?;
+    writeln!(out, "{:<16}{}", "Policy:", vault_config.access.policy)?;
+    writeln!(out, "{:<16}{}", "Entries:", entry_count)?;
+    writeln!(out, "{:<16}{}", "Created:", created_str)?;
+    writeln!(out, "{:<16}{}", "Last updated:", modified_str)?;
 
     if security {
         let status = crate::security::HardenStatus::current();
-        println!();
-        println!("=== Security ===");
-        println!("{:<22}ML-KEM-768", "KEM algorithm:");
-        println!("{:<22}ML-DSA-65", "Signature algorithm:");
-        println!(
+        writeln!(out)?;
+        writeln!(out, "=== Security ===")?;
+        writeln!(out, "{:<22}ML-KEM-768", "KEM algorithm:")?;
+        writeln!(out, "{:<22}ML-DSA-65", "Signature algorithm:")?;
+        writeln!(
+            out,
             "{:<22}{} KB",
             "Argon2 memory:", vault_config.argon2.memory_cost_kb
-        );
-        println!(
+        )?;
+        writeln!(
+            out,
             "{:<22}{}",
             "Argon2 time cost:", vault_config.argon2.time_cost
-        );
-        println!(
+        )?;
+        writeln!(
+            out,
             "{:<22}{}",
             "Argon2 parallelism:", vault_config.argon2.parallelism
-        );
-        println!("{:<22}{}", "mlock active:", yes_no(status.mlock_active));
-        println!(
+        )?;
+        writeln!(
+            out,
+            "{:<22}{}",
+            "mlock active:",
+            yes_no(status.mlock_active)
+        )?;
+        writeln!(
+            out,
             "{:<22}{}",
             "Coredump disabled:",
             yes_no(status.coredump_disabled)
-        );
-        println!(
+        )?;
+        writeln!(
+            out,
             "{:<22}{}",
             "Debugger detected:",
             yes_no(status.debugger_detected)
-        );
+        )?;
     }
 
+    out.flush()?;
     Ok(())
 }
 
@@ -3097,6 +2910,10 @@ pub fn cmd_legacy_set(
 
 /// Execute the `pq-diary legacy list` command.
 pub fn cmd_legacy_list(cli: &Cli) -> anyhow::Result<()> {
+    cmd_legacy_list_to(cli, &mut std::io::stdout())
+}
+
+fn cmd_legacy_list_to(cli: &Cli, out: &mut dyn std::io::Write) -> anyhow::Result<()> {
     use pq_diary_core::legacy::{list_legacy_status, LegacyFlag};
     use secrecy::{ExposeSecret as _, SecretBox, SecretString};
 
@@ -3124,32 +2941,36 @@ pub fn cmd_legacy_list(cli: &Cli) -> anyhow::Result<()> {
     inherits.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
     destroys.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
 
-    println!("=== INHERIT ({} entries) ===", inherits.len());
+    writeln!(out, "=== INHERIT ({} entries) ===", inherits.len())?;
     for s in &inherits {
-        println!(
+        writeln!(
+            out,
             "{}  {}  {}",
             s.uuid_prefix,
             format_timestamp(s.updated_at),
             s.title
-        );
+        )?;
     }
-    println!();
-    println!("=== DESTROY ({} entries) ===", destroys.len());
+    writeln!(out)?;
+    writeln!(out, "=== DESTROY ({} entries) ===", destroys.len())?;
     for s in &destroys {
-        println!(
+        writeln!(
+            out,
             "{}  {}  {}",
             s.uuid_prefix,
             format_timestamp(s.updated_at),
             s.title
-        );
+        )?;
     }
-    println!();
-    println!(
+    writeln!(out)?;
+    writeln!(
+        out,
         "Summary: INHERIT {} entries / DESTROY {} entries / Total {}",
         inherits.len(),
         destroys.len(),
         statuses.len()
-    );
+    )?;
+    out.flush()?;
     Ok(())
 }
 
@@ -3347,6 +3168,14 @@ pub fn cmd_attachment_add(cli: &Cli, entry: String, path: PathBuf) -> anyhow::Re
 
 /// `pq-diary attachment list [<ENTRY_ID>]` 相当。
 pub fn cmd_attachment_list(cli: &Cli, entry: Option<String>) -> anyhow::Result<()> {
+    cmd_attachment_list_to(cli, entry, &mut std::io::stdout())
+}
+
+fn cmd_attachment_list_to(
+    cli: &Cli,
+    entry: Option<String>,
+    out: &mut dyn std::io::Write,
+) -> anyhow::Result<()> {
     use pq_diary_core::attachment::list_attachments;
     use pq_diary_core::legacy::LegacyFlag;
     use pq_diary_core::policy::OperationType;
@@ -3365,13 +3194,15 @@ pub fn cmd_attachment_list(cli: &Cli, entry: Option<String>) -> anyhow::Result<(
     let metas = list_attachments(&vault_dir, &master_pwd, entry.as_deref())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     if metas.is_empty() {
-        println!("No attachments.");
+        writeln!(out, "No attachments.")?;
+        out.flush()?;
         return Ok(());
     }
-    println!(
+    writeln!(
+        out,
         "{:<10} {:<24} {:>10}  {:<12} FLAG",
         "ENTRY", "FILE", "SIZE", "ADDED"
-    );
+    )?;
     for m in &metas {
         let entry_short: String = m
             .entry_uuid
@@ -3383,17 +3214,19 @@ pub fn cmd_attachment_list(cli: &Cli, entry: Option<String>) -> anyhow::Result<(
             LegacyFlag::Inherit => "INHERIT",
             LegacyFlag::Destroy => "DESTROY",
         };
-        println!(
+        writeln!(
+            out,
             "{:<10} {:<24} {:>10}  {:<12} {}",
             entry_short,
             truncate(&m.filename, 24),
             human_size(m.size_bytes),
             format_timestamp(m.created_at),
             flag,
-        );
+        )?;
     }
-    println!();
-    println!("Summary: {} attachment(s)", metas.len());
+    writeln!(out)?;
+    writeln!(out, "Summary: {} attachment(s)", metas.len())?;
+    out.flush()?;
     Ok(())
 }
 
@@ -3521,9 +3354,95 @@ pub fn cmd_attachment_set(
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::{
+        fast_params, seed_malformed_template, seed_templates, setup_vault, setup_vault_with_policy,
+    };
     use super::*;
     use clap::Parser as _;
     use std::path::Path;
+
+    #[test]
+    fn read_output_propagates_write_and_flush_errors() {
+        use std::io::{self, Write};
+        struct FailingWriter {
+            fail_write: bool,
+            kind: io::ErrorKind,
+        }
+        impl Write for FailingWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.fail_write {
+                    Err(io::Error::from(self.kind))
+                } else {
+                    Ok(bytes.len())
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::from(self.kind))
+            }
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault = setup_vault(&dir);
+        let ids = seed_entries(&vault, &[("private title", "private body without newline")]);
+        pq_diary_core::git::git_init(&vault, None).expect("git init");
+        let cli = make_cli(vault.to_str().expect("path"), Some("password"));
+        let base_cli = make_cli(dir.path().to_str().expect("path"), Some("password"));
+        let before = std::fs::read(vault.join("vault.pqd")).expect("snapshot");
+        let config_before = std::fs::read(vault.join("vault.toml")).expect("config");
+        for fail_write in [true, false] {
+            for kind in [io::ErrorKind::Other, io::ErrorKind::BrokenPipe] {
+                for handler in 0..12 {
+                    let mut writer = FailingWriter { fail_write, kind };
+                    let result = match handler {
+                        0 => cmd_list_to(&cli, None, None, 10, &mut writer),
+                        1 => cmd_info_to(&cli, false, &mut writer),
+                        2 => cmd_info_to(&cli, true, &mut writer),
+                        3 => cmd_attachment_list_to(&cli, None, &mut writer),
+                        4 => cmd_vault_list_to(&base_cli, &mut writer),
+                        5 => cmd_git_status_to(&cli, &mut writer),
+                        6 => cmd_legacy_list_to(&cli, &mut writer),
+                        7 => cmd_show_impl(&cli, ids[0].clone(), &mut writer),
+                        8 => cmd_search_to(
+                            &cli,
+                            &crate::SearchArgs {
+                                pattern: "private".into(),
+                                tag: None,
+                                context: 0,
+                                count: false,
+                            },
+                            &mut writer,
+                        ),
+                        n => cmd_stats_to(
+                            &cli,
+                            &crate::StatsArgs {
+                                json: n == 10,
+                                heatmap: n == 11,
+                            },
+                            &mut writer,
+                        ),
+                    };
+                    let error = result.expect_err("output failure must propagate");
+                    assert_eq!(
+                        error
+                            .downcast_ref::<io::Error>()
+                            .expect("typed I/O error")
+                            .kind(),
+                        kind,
+                        "handler {handler}"
+                    );
+                    assert!(!format!("{error:#}").contains("private"));
+                    assert_eq!(
+                        std::fs::read(vault.join("vault.pqd")).expect("vault"),
+                        before
+                    );
+                    assert_eq!(
+                        std::fs::read(vault.join("vault.toml")).expect("config"),
+                        config_before
+                    );
+                }
+            }
+        }
+        assert_eq!(read_vault_entries(&vault).len(), 1);
+    }
 
     #[test]
     fn ordinary_commands_deny_before_credentials_or_unreadable_vault() {
@@ -3565,26 +3484,6 @@ mod tests {
     // -------------------------------------------------------------------------
     // Test helpers
     // -------------------------------------------------------------------------
-
-    fn fast_params() -> pq_diary_core::crypto::kdf::Argon2Params {
-        pq_diary_core::crypto::kdf::Argon2Params {
-            memory_cost_kb: 8,
-            time_cost: 1,
-            parallelism: 1,
-        }
-    }
-
-    /// Initialise a test vault and return the vault **directory** path.
-    ///
-    /// The vault is created with the password `"password"`.
-    pub(super) fn setup_vault(dir: &tempfile::TempDir) -> PathBuf {
-        use pq_diary_core::vault::init::VaultManager;
-        let mgr = VaultManager::new(dir.path().to_path_buf())
-            .expect("VaultManager::new")
-            .with_kdf_params(fast_params());
-        mgr.init_vault("v", b"password").expect("init_vault");
-        dir.path().join("v")
-    }
 
     /// Build a `Cli` that targets `vault_dir` with an optional password flag.
     fn make_cli(vault_dir_str: &str, password: Option<&str>) -> crate::Cli {
@@ -3807,7 +3706,10 @@ mod tests {
     /// TC-0037-10: No flag uses the same configured target as info/password.
     #[test]
     fn tc_0037_10_resolve_vault_path_default() {
-        let _lock = lock_home();
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeOverride::new(dir.path());
         let root = dir.path().join(".pq-diary");
@@ -4804,432 +4706,6 @@ mod tests {
     }
 
     // =========================================================================
-    // Template command tests (TASK-0047)
-    // =========================================================================
-
-    /// Build a `Cli` targeting `vault_dir` for `template list`.
-    fn make_template_list_cli(vault_dir_str: &str, password: Option<&str>) -> crate::Cli {
-        let mut args: Vec<&str> = vec!["pq-diary", "-v", vault_dir_str];
-        if let Some(pw) = password {
-            args.extend_from_slice(&["--password", pw]);
-        }
-        args.extend_from_slice(&["template", "list"]);
-        crate::Cli::try_parse_from(&args).expect("parse test CLI")
-    }
-
-    /// Build a `Cli` targeting `vault_dir` for `template show <name>`.
-    fn make_template_show_cli(
-        vault_dir_str: &str,
-        password: Option<&str>,
-        name: &str,
-    ) -> crate::Cli {
-        let mut args: Vec<&str> = vec!["pq-diary", "-v", vault_dir_str];
-        if let Some(pw) = password {
-            args.extend_from_slice(&["--password", pw]);
-        }
-        args.extend_from_slice(&["template", "show", name]);
-        crate::Cli::try_parse_from(&args).expect("parse test CLI")
-    }
-
-    /// Build a `Cli` targeting `vault_dir` for `template delete <name>`.
-    fn make_template_delete_cli(
-        vault_dir_str: &str,
-        password: Option<&str>,
-        name: &str,
-        force: bool,
-    ) -> crate::Cli {
-        let mut args: Vec<&str> = vec!["pq-diary", "-v", vault_dir_str];
-        if let Some(pw) = password {
-            args.extend_from_slice(&["--password", pw]);
-        }
-        args.extend_from_slice(&["template", "delete", name]);
-        if force {
-            args.push("--force");
-        }
-        crate::Cli::try_parse_from(&args).expect("parse test CLI")
-    }
-
-    /// Seed the vault with templates via DiaryCore directly.
-    fn seed_templates(vault_dir: &std::path::Path, templates: &[(&str, &str)]) {
-        let vault_pqd = vault_dir.join("vault.pqd");
-        let vault_str = vault_pqd.to_str().expect("utf8");
-        let mut core = DiaryCore::new(vault_str).expect("DiaryCore::new");
-        let pw: secrecy::SecretString = secrecy::SecretBox::new(Box::from("password"));
-        core.unlock(pw).expect("unlock");
-        for (name, body) in templates {
-            core.new_template(name, body).expect("new_template");
-        }
-        core.lock();
-    }
-
-    /// Read template names from the vault, sorted alphabetically.
-    fn read_template_names_sorted(vault_dir: &std::path::Path) -> Vec<String> {
-        let vault_pqd = vault_dir.join("vault.pqd");
-        let vault_str = vault_pqd.to_str().expect("utf8");
-        let mut core = DiaryCore::new(vault_str).expect("DiaryCore::new");
-        let pw: secrecy::SecretString = secrecy::SecretBox::new(Box::from("password"));
-        core.unlock(pw).expect("unlock");
-        let mut metas = core.list_templates().expect("list_templates");
-        core.lock();
-        metas.sort_by(|a, b| a.name.cmp(&b.name));
-        metas.into_iter().map(|m| m.name).collect()
-    }
-
-    #[test]
-    fn template_output_propagates_write_and_flush_errors() {
-        use std::io::{self, Write};
-
-        struct FailingWriter {
-            fail_write: bool,
-            kind: io::ErrorKind,
-        }
-        impl Write for FailingWriter {
-            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                if self.fail_write {
-                    Err(io::Error::from(self.kind))
-                } else {
-                    Ok(bytes.len())
-                }
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Err(io::Error::from(self.kind))
-            }
-        }
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let vault_dir = setup_vault(&dir);
-        seed_templates(&vault_dir, &[("daily", "private body without newline")]);
-        let before = std::fs::read(vault_dir.join("vault.pqd")).expect("snapshot");
-        let cli = make_template_list_cli(vault_dir.to_str().expect("path"), Some("password"));
-        for fail_write in [true, false] {
-            for kind in [io::ErrorKind::Other, io::ErrorKind::BrokenPipe] {
-                for show in [false, true] {
-                    let mut writer = FailingWriter { fail_write, kind };
-                    let result = if show {
-                        cmd_template_show_with_writer(&cli, "daily".into(), &mut writer)
-                    } else {
-                        cmd_template_list_with_writer(&cli, &mut writer)
-                    };
-                    let err = result.expect_err("output failure must propagate");
-                    assert_eq!(
-                        err.downcast_ref::<io::Error>().expect("I/O source").kind(),
-                        kind
-                    );
-                    let message = format!("{err:#}");
-                    assert!(message.contains(if fail_write {
-                        "write template output"
-                    } else {
-                        "flush template output"
-                    }));
-                    assert!(!message.contains("private body"));
-                    assert_eq!(
-                        std::fs::read(vault_dir.join("vault.pqd")).expect("vault"),
-                        before
-                    );
-                }
-            }
-        }
-        assert_eq!(read_template_names_sorted(&vault_dir), vec!["daily"]);
-    }
-
-    /// TC-047-01: cmd_template_list returns Ok and templates are in alphabetical order.
-    ///
-    /// Given "weekly", "daily", "meeting" seeded (insertion order out of alpha),
-    /// the sorted result must be ["daily", "meeting", "weekly"].
-    #[test]
-    fn tc_047_01_template_list_alphabetical_order() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let vault_dir = setup_vault(&dir);
-
-        seed_templates(
-            &vault_dir,
-            &[
-                ("weekly", "week body"),
-                ("daily", "day body"),
-                ("meeting", "mtg body"),
-            ],
-        );
-
-        let vault_dir_str = vault_dir.to_str().expect("utf8");
-        let cli = make_template_list_cli(vault_dir_str, Some("password"));
-        let result = cmd_template_list(&cli);
-        assert!(
-            result.is_ok(),
-            "cmd_template_list failed: {:?}",
-            result.err()
-        );
-
-        // Verify alphabetical order via core read.
-        let sorted = read_template_names_sorted(&vault_dir);
-        assert_eq!(sorted, vec!["daily", "meeting", "weekly"]);
-    }
-
-    /// TC-047-02: cmd_template_show outputs the registered body text.
-    ///
-    /// Given template "daily" with body "## 振り返り", cmd_template_show must succeed.
-    #[test]
-    fn tc_047_02_template_show_outputs_body() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let vault_dir = setup_vault(&dir);
-
-        seed_templates(&vault_dir, &[("daily", "## 振り返り")]);
-
-        let vault_dir_str = vault_dir.to_str().expect("utf8");
-        let cli = make_template_show_cli(vault_dir_str, Some("password"), "daily");
-        let result = cmd_template_show(&cli, "daily".to_string());
-        assert!(
-            result.is_ok(),
-            "cmd_template_show failed: {:?}",
-            result.err()
-        );
-    }
-
-    /// TC-047-03: cmd_template_show returns an error for a nonexistent template.
-    ///
-    /// Given an empty vault, requesting "nonexistent" must return
-    /// DiaryError::TemplateNotFound (propagated as anyhow error).
-    #[test]
-    fn tc_047_03_template_show_nonexistent_returns_error() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let vault_dir = setup_vault(&dir);
-
-        let vault_dir_str = vault_dir.to_str().expect("utf8");
-        let cli = make_template_show_cli(vault_dir_str, Some("password"), "nonexistent");
-        let result = cmd_template_show(&cli, "nonexistent".to_string());
-        assert!(result.is_err(), "Expected error for nonexistent template");
-        let err_msg = format!("{}", result.unwrap_err());
-        assert!(
-            err_msg.contains("nonexistent"),
-            "Error message must name the missing template; got: {err_msg}"
-        );
-    }
-
-    /// TC-047-04: cmd_template_delete with --force removes the template.
-    #[test]
-    fn tc_047_04_template_delete_force_removes_template() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let vault_dir = setup_vault(&dir);
-
-        seed_templates(&vault_dir, &[("daily", "body")]);
-
-        let vault_dir_str = vault_dir.to_str().expect("utf8");
-        let cli = make_template_delete_cli(vault_dir_str, Some("password"), "daily", true);
-        let mut reader = std::io::BufReader::new("".as_bytes());
-        let result = cmd_template_delete_impl(&cli, "daily".to_string(), true, &mut reader);
-        assert!(
-            result.is_ok(),
-            "cmd_template_delete failed: {:?}",
-            result.err()
-        );
-
-        // Verify the template is gone.
-        let names = read_template_names_sorted(&vault_dir);
-        assert!(
-            names.is_empty(),
-            "Template must be deleted; names={names:?}"
-        );
-    }
-
-    /// TC-047-05: cmd_template_delete with "n" input cancels.
-    #[test]
-    fn tc_047_05_template_delete_cancel_keeps_template() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let vault_dir = setup_vault(&dir);
-
-        seed_templates(&vault_dir, &[("daily", "body")]);
-
-        let vault_dir_str = vault_dir.to_str().expect("utf8");
-        let cli = make_template_delete_cli(vault_dir_str, Some("password"), "daily", false);
-        let mut reader = std::io::BufReader::new("n\n".as_bytes());
-        let result = cmd_template_delete_impl(&cli, "daily".to_string(), false, &mut reader);
-        assert!(
-            result.is_ok(),
-            "Expected Ok on cancel; got: {:?}",
-            result.err()
-        );
-
-        // Verify the template still exists.
-        let names = read_template_names_sorted(&vault_dir);
-        assert_eq!(
-            names,
-            vec!["daily"],
-            "Template must still exist after cancel"
-        );
-    }
-
-    /// TC-047-06: cmd_template_add stores the template body written by the editor.
-    #[test]
-    fn tc_047_06_template_add_stores_body() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let vault_dir = setup_vault(&dir);
-        let vault_dir_str = vault_dir.to_str().expect("utf8");
-
-        let mut args = vec!["pq-diary", "-v", vault_dir_str, "--password", "password"];
-        args.extend_from_slice(&["template", "add", "weekly"]);
-        let cli = crate::Cli::try_parse_from(&args).expect("parse");
-
-        // Inject a fake editor that writes "## 週次レビュー" into the temp file.
-        let mock_launch = |tmpfile: &std::path::Path, _config: &EditorConfig| {
-            std::fs::write(tmpfile, "## 週次レビュー").map_err(pq_diary_core::DiaryError::Io)
-        };
-        let mut reader = std::io::BufReader::new("".as_bytes());
-        let result = cmd_template_add_impl(&cli, "weekly".to_string(), mock_launch, &mut reader);
-        assert!(
-            result.is_ok(),
-            "cmd_template_add_impl failed: {:?}",
-            result.err()
-        );
-
-        // Verify the stored body.
-        let vault_pqd = vault_dir.join("vault.pqd");
-        let vault_str = vault_pqd.to_str().expect("utf8");
-        let mut core = DiaryCore::new(vault_str).expect("DiaryCore::new");
-        let pw: secrecy::SecretString = secrecy::SecretBox::new(Box::from("password"));
-        core.unlock(pw).expect("unlock");
-        let tpl = core.get_template("weekly").expect("get_template");
-        core.lock();
-        assert_eq!(tpl.body, "## 週次レビュー");
-    }
-
-    #[test]
-    fn template_overwrite_preserves_confirmation_and_identity() {
-        use pq_diary_core::policy::AccessPolicy;
-        for (claude, answer, replace) in [
-            (false, "n\n", false),
-            (false, "y\n", true),
-            (true, "", true),
-        ] {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let vault_dir = setup_vault_with_policy(&dir, AccessPolicy::Full);
-            seed_templates(&vault_dir, &[("daily", "original")]);
-            let vault_path = vault_dir.join("vault.pqd");
-            let before = std::fs::read(&vault_path).expect("snapshot");
-            let mut core = DiaryCore::new(vault_path.to_str().expect("UTF-8")).expect("core");
-            core.unlock(secrecy::SecretBox::new(Box::from("password")))
-                .expect("unlock");
-            let original = core.list_templates().expect("template metadata");
-            core.lock();
-
-            let mut args = vec![
-                "pq-diary",
-                "--vault",
-                vault_dir.to_str().expect("UTF-8"),
-                "--password",
-                "password",
-            ];
-            if claude {
-                args.push("--claude");
-            }
-            args.extend(["template", "add", "daily"]);
-            let cli = crate::Cli::try_parse_from(args).expect("CLI");
-            let launch = |path: &Path, _: &EditorConfig| {
-                assert!(replace, "declining overwrite must not open the editor");
-                std::fs::write(path, "replacement").map_err(pq_diary_core::DiaryError::Io)
-            };
-            cmd_template_add_impl(
-                &cli,
-                "daily".into(),
-                launch,
-                &mut std::io::Cursor::new(answer),
-            )
-            .expect("template add");
-
-            core.unlock(secrecy::SecretBox::new(Box::from("password")))
-                .expect("reopen");
-            let templates = core.list_templates().expect("templates");
-            assert_eq!(templates.len(), 1);
-            assert_eq!(templates[0].uuid_hex, original[0].uuid_hex);
-            assert_eq!(templates[0].created_at, original[0].created_at);
-            assert_eq!(
-                core.get_template("daily").expect("template").body,
-                if replace { "replacement" } else { "original" }
-            );
-            if !replace {
-                assert_eq!(std::fs::read(&vault_path).expect("vault"), before);
-            }
-        }
-    }
-
-    #[test]
-    fn template_overwrite_editor_error_preserves_original() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let vault_dir = setup_vault(&dir);
-        seed_templates(&vault_dir, &[("daily", "original")]);
-        let vault_path = vault_dir.join("vault.pqd");
-        let before = std::fs::read(&vault_path).expect("snapshot");
-        let cli = crate::Cli::try_parse_from([
-            "pq-diary",
-            "--vault",
-            vault_dir.to_str().expect("UTF-8"),
-            "--password",
-            "password",
-            "template",
-            "add",
-            "daily",
-        ])
-        .expect("CLI");
-        let launch = |_: &Path, _: &EditorConfig| {
-            Err(pq_diary_core::DiaryError::Editor(
-                "synthetic failure".into(),
-            ))
-        };
-        let error = cmd_template_add_impl(
-            &cli,
-            "daily".into(),
-            launch,
-            &mut std::io::Cursor::new("y\n"),
-        )
-        .expect_err("editor failure");
-        assert!(error.to_string().contains("Editor failed"));
-        assert_eq!(std::fs::read(&vault_path).expect("vault"), before);
-    }
-
-    #[test]
-    fn template_overwrite_rejects_tampering_during_editor() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let vault_dir = setup_vault(&dir);
-        seed_templates(&vault_dir, &[("daily", "original")]);
-        let vault_path = vault_dir.join("vault.pqd");
-        let mut tampered = std::fs::read(&vault_path).expect("snapshot");
-        let padding_offset = tampered.len() - pq_diary_core::vault::format::VAULT_MAC_LEN - 1;
-        tampered[padding_offset] ^= 1;
-        let cli = crate::Cli::try_parse_from([
-            "pq-diary",
-            "--vault",
-            vault_dir.to_str().expect("UTF-8"),
-            "--password",
-            "password",
-            "template",
-            "add",
-            "daily",
-        ])
-        .expect("CLI");
-        let launch = |path: &Path, _: &EditorConfig| {
-            std::fs::write(path, "replacement")?;
-            // The vault was valid at unlock; alter authenticated padding while
-            // the editor is open, after the original lookup already succeeded.
-            std::fs::write(&vault_path, &tampered).map_err(pq_diary_core::DiaryError::Io)
-        };
-        let error = cmd_template_add_impl(
-            &cli,
-            "daily".into(),
-            launch,
-            &mut std::io::Cursor::new("y\n"),
-        )
-        .expect_err("integrity failure");
-        assert!(matches!(
-            error.downcast_ref::<pq_diary_core::DiaryError>(),
-            Some(pq_diary_core::DiaryError::Crypto(_))
-        ));
-        assert!(error.to_string().starts_with("Failed to replace template:"));
-        assert!(
-            error.to_string().contains("integrity verification failed"),
-            "{error}"
-        );
-        assert_eq!(std::fs::read(&vault_path).expect("vault"), tampered);
-    }
-
-    // =========================================================================
     // TC-048: --template flag tests (TASK-0048)
     // =========================================================================
 
@@ -5380,131 +4856,6 @@ mod tests {
         let (_, plaintext) = core.get_entry(&prefix).expect("get_entry");
         core.lock();
         Some(plaintext)
-    }
-
-    #[test]
-    fn template_context_preserves_io_source_and_diagnostic() {
-        for prefix in [
-            "Failed to look up template",
-            "Failed to list templates",
-            "Failed to create template",
-            "Failed to replace template",
-            "Failed to delete template",
-        ] {
-            let error = template_command_error(
-                prefix,
-                pq_diary_core::DiaryError::Io(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "synthetic read failure",
-                )),
-            );
-            assert_eq!(
-                error.to_string(),
-                format!("{prefix}: I/O error: synthetic read failure")
-            );
-            assert!(matches!(
-                error.downcast_ref::<pq_diary_core::DiaryError>(),
-                Some(pq_diary_core::DiaryError::Io(_))
-            ));
-            assert!(error.chain().any(|cause| cause
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)));
-        }
-    }
-
-    #[test]
-    fn template_commands_preserve_lookup_error_types() {
-        let dir = tempfile::tempdir().unwrap();
-        let vault_dir = setup_vault(&dir);
-        let cli = make_template_show_cli(vault_dir.to_str().unwrap(), Some("password"), "daily");
-        for error in [
-            cmd_template_show(&cli, "daily".into()).unwrap_err(),
-            cmd_template_delete_impl(&cli, "daily".into(), true, &mut std::io::Cursor::new(""))
-                .unwrap_err(),
-        ] {
-            assert!(matches!(
-                error.downcast_ref::<pq_diary_core::DiaryError>(),
-                Some(pq_diary_core::DiaryError::TemplateNotFound(_))
-            ));
-            assert_eq!(error.to_string(), "template not found: daily");
-        }
-        seed_malformed_template(&vault_dir);
-        let before = std::fs::read(vault_dir.join("vault.pqd")).unwrap();
-        for (error, prefix) in [
-            (
-                cmd_template_list(&cli).unwrap_err(),
-                "Failed to list templates:",
-            ),
-            (
-                cmd_template_show(&cli, "daily".into()).unwrap_err(),
-                "template error:",
-            ),
-            (
-                cmd_template_delete_impl(&cli, "daily".into(), true, &mut std::io::Cursor::new(""))
-                    .unwrap_err(),
-                "template error:",
-            ),
-            (
-                cmd_template_add_impl(
-                    &cli,
-                    "daily".into(),
-                    |_, _| panic!("must not launch editor"),
-                    &mut std::io::Cursor::new(""),
-                )
-                .unwrap_err(),
-                "Failed to look up template:",
-            ),
-        ] {
-            assert!(matches!(
-                error.downcast_ref::<pq_diary_core::DiaryError>(),
-                Some(pq_diary_core::DiaryError::Template(_))
-            ));
-            assert!(error
-                .chain()
-                .any(|cause| cause.is::<pq_diary_core::DiaryError>()));
-            assert!(error.to_string().starts_with(prefix));
-            assert!(!format!("{error:?}").contains("S47_PRIVATE_BODY"));
-            assert!(!format!("{error:?}").contains("password"));
-            assert_eq!(std::fs::read(vault_dir.join("vault.pqd")).unwrap(), before);
-        }
-    }
-
-    #[test]
-    fn template_create_preserves_invalid_name_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let vault_dir = setup_vault(&dir);
-        let before = std::fs::read(vault_dir.join("vault.pqd")).unwrap();
-        let cli = make_template_list_cli(vault_dir.to_str().unwrap(), Some("password"));
-        let error = cmd_template_add_impl(
-            &cli,
-            "bad name".into(),
-            |_, _| Ok(()),
-            &mut std::io::Cursor::new(""),
-        )
-        .unwrap_err();
-        assert!(matches!(
-            error.downcast_ref::<pq_diary_core::DiaryError>(),
-            Some(pq_diary_core::DiaryError::InvalidTemplateName(_))
-        ));
-        assert!(error.to_string().starts_with("Failed to create template:"));
-        assert_eq!(std::fs::read(vault_dir.join("vault.pqd")).unwrap(), before);
-    }
-
-    /// A valid encrypted entry payload is not a valid template payload. Re-signing
-    /// the container isolates template deserialization from unlock integrity checks.
-    fn seed_malformed_template(vault_dir: &std::path::Path) {
-        use pq_diary_core::vault::{
-            format::RECORD_TYPE_TEMPLATE, reader::read_vault, writer::write_vault_authenticated,
-        };
-        let path = vault_dir.join("vault.pqd");
-        let mut core = DiaryCore::new(path.to_str().unwrap()).unwrap();
-        core.unlock(secrecy::SecretString::new("password".into()))
-            .unwrap();
-        core.new_entry("daily", "S47_PRIVATE_BODY", vec![]).unwrap();
-        let key = core.vault_mac_key().unwrap();
-        let (header, mut records) = read_vault(&path).unwrap();
-        records[0].record_type = RECORD_TYPE_TEMPLATE;
-        write_vault_authenticated(&path, header, &records, &key).unwrap();
     }
 
     #[test]
@@ -7299,20 +6650,6 @@ mod tests {
     // TASK-0072: check_claude_policy integration tests
     // =========================================================================
 
-    /// Create a vault with a specific access policy for policy-check tests.
-    fn setup_vault_with_policy(
-        dir: &tempfile::TempDir,
-        policy: pq_diary_core::policy::AccessPolicy,
-    ) -> PathBuf {
-        use pq_diary_core::vault::init::VaultManager;
-        let mgr = VaultManager::new(dir.path().to_path_buf())
-            .expect("VaultManager::new")
-            .with_kdf_params(fast_params());
-        mgr.create_vault("v", b"password", policy)
-            .expect("create_vault");
-        dir.path().join("v")
-    }
-
     /// Build a `Cli` with `--claude` flag targeting `vault_dir`.
     fn make_cli_claude(vault_dir_str: &str, password: Option<&str>) -> crate::Cli {
         let mut args: Vec<&str> = vec!["pq-diary", "--claude", "-v", vault_dir_str];
@@ -8360,19 +7697,18 @@ parallelism = 1
 
     /// TC-S8-078-07: When `git` is not in PATH, all git subcommands fail with
     /// an appropriate error.
-    ///
-    /// **Ignored** because it modifies the process-wide PATH environment
-    /// variable and must not run concurrently with other tests.
-    /// Run with: `cargo test -- --ignored tc_s8_078_07`
+    /// Runs in an isolated subprocess so unrelated tests keep their PATH.
     #[test]
-    #[ignore = "requires environment without git in PATH; run: cargo test -- --ignored"]
     fn tc_s8_078_07_all_git_commands_fail_when_git_not_installed() {
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let vault_dir = setup_vault_for_git(&dir);
         let vault_dir_str = vault_dir.to_str().expect("utf8");
 
         // Temporarily clear PATH so git cannot be found.
-        let original_path = std::env::var_os("PATH").unwrap_or_default();
         std::env::set_var("PATH", "");
 
         let cli_init = make_git_cli(&["pq-diary", "-v", vault_dir_str, "git-init"]);
@@ -8409,8 +7745,6 @@ parallelism = 1
             cmd_git_pull(&cli_pull),
             cmd_git_sync(&cli_sync),
         ];
-
-        std::env::set_var("PATH", original_path);
 
         for (i, result) in results.iter().enumerate() {
             assert!(
@@ -9077,24 +8411,21 @@ parallelism = 1
 
     /// TC-S8-INT-E01: When `git` is absent from PATH, all git commands fail
     /// with a "not installed" or "not found" error message.
-    ///
-    /// **Ignored** — modifies the process-wide PATH variable and must not run
-    /// concurrently with other tests.
-    /// Run with: `cargo test -- --ignored tc_s8_int_e01`
+    /// Runs in an isolated subprocess so unrelated tests keep their PATH.
     #[test]
-    #[ignore = "requires environment without git in PATH; run: cargo test -- --ignored"]
     fn tc_s8_int_e01_git_not_installed_error() {
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let vault_dir = setup_vault_for_git(&dir);
         let vault_dir_str = vault_dir.to_str().expect("utf8");
 
-        let original_path = std::env::var_os("PATH").unwrap_or_default();
         std::env::set_var("PATH", "");
 
         let cli = make_git_cli(&["pq-diary", "-v", vault_dir_str, "git-init"]);
         let result = cmd_git_init(&cli, None);
-
-        std::env::set_var("PATH", original_path);
 
         assert!(
             result.is_err(),
@@ -9575,55 +8906,6 @@ parallelism = 1
         core.delete_entry(prefix).expect("delete_entry");
         let entries2 = core.list_entries(None).expect("list after delete");
         assert_eq!(entries2.len(), 0, "vault must be empty after delete");
-
-        core.lock();
-    }
-
-    // -------------------------------------------------------------------------
-    // TC-S9-E2E-02: Template lifecycle
-    // -------------------------------------------------------------------------
-
-    /// TC-S9-E2E-02: Template lifecycle — add → list → show → delete.
-    ///
-    /// Validates template CRUD operations end-to-end through DiaryCore API.
-    #[test]
-    fn tc_s9_e2e_02_template_lifecycle() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let vault_dir = setup_vault(&dir);
-        let vault_pqd = vault_dir.join("vault.pqd");
-        let vault_str = vault_pqd.to_str().expect("utf8");
-
-        let mut core = DiaryCore::new(vault_str).expect("DiaryCore::new");
-        let pw: secrecy::SecretString = secrecy::SecretBox::new(Box::from("password"));
-        core.unlock(pw).expect("unlock");
-
-        // add template
-        let _tmpl_id = core
-            .new_template("daily", "# Daily Note\n\nDate: {{date}}\n\n## Tasks\n")
-            .expect("new_template");
-
-        // list templates
-        let templates = core.list_templates().expect("list_templates");
-        assert_eq!(templates.len(), 1, "must have 1 template");
-        assert_eq!(templates[0].name, "daily");
-
-        // show template
-        let tmpl = core.get_template("daily").expect("get_template");
-        assert_eq!(tmpl.name, "daily");
-        assert!(
-            tmpl.body.contains("Daily Note"),
-            "template body must contain 'Daily Note'"
-        );
-
-        // delete template
-        core.delete_template("daily").expect("delete_template");
-
-        let templates2 = core.list_templates().expect("list_templates after delete");
-        assert_eq!(
-            templates2.len(),
-            0,
-            "template list must be empty after delete"
-        );
 
         core.lock();
     }
@@ -10289,21 +9571,13 @@ parallelism = 1
     // S10 Phase 2 tests — init / sync / info / change-password / export
     // =========================================================================
 
-    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn lock_home() -> std::sync::MutexGuard<'static, ()> {
-        match HOME_LOCK.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        }
-    }
-
     struct HomeOverride {
         previous: Option<std::ffi::OsString>,
     }
 
     impl HomeOverride {
         fn new(new_home: &std::path::Path) -> Self {
+            crate::test_environment::assert_isolated();
             let previous = std::env::var_os("PQ_DIARY_HOME");
             let root = new_home.join(".pq-diary");
             std::env::set_var("PQ_DIARY_HOME", &root);
@@ -10318,6 +9592,21 @@ parallelism = 1
                 None => std::env::remove_var("PQ_DIARY_HOME"),
             }
         }
+    }
+
+    #[test]
+    fn home_override_refuses_parallel_parent_mutation() {
+        let before = std::env::var_os("PQ_DIARY_HOME");
+        let dir = tempfile::tempdir().unwrap();
+        let result = std::panic::catch_unwind(|| HomeOverride::new(dir.path()));
+        assert!(
+            result.is_err(),
+            "override must refuse a parallel parent harness"
+        );
+        assert!(
+            std::env::var_os("PQ_DIARY_HOME") == before,
+            "override changed parent environment (values redacted)"
+        );
     }
 
     fn make_cli_plain(args: &[&str]) -> crate::Cli {
@@ -10342,9 +9631,12 @@ parallelism = 1
     /// TC-101-01: clean environment → config.toml and default vault are created.
     #[test]
     fn tc_101_01_init_creates_config_and_vault() {
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         use pq_diary_core::vault::config::AppConfig;
 
-        let _lock = lock_home();
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeOverride::new(dir.path());
 
@@ -10379,7 +9671,10 @@ parallelism = 1
     /// TC-101-E01: existing config.toml → init refuses to run.
     #[test]
     fn tc_101_e01_init_refuses_when_already_initialized() {
-        let _lock = lock_home();
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeOverride::new(dir.path());
 
@@ -10402,7 +9697,10 @@ parallelism = 1
     /// TC-101-E02: empty password → init rejected and no files created.
     #[test]
     fn tc_101_e02_init_rejects_empty_password() {
-        let _lock = lock_home();
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeOverride::new(dir.path());
 
@@ -10419,10 +9717,12 @@ parallelism = 1
     }
 
     fn assert_failed_init_preserves_existing_default(manager_config_invalid: bool) {
+        if crate::test_environment::isolated() {
+            return;
+        }
         use pq_diary_core::policy::AccessPolicy;
         use pq_diary_core::vault::init::VaultManager;
 
-        let _lock = lock_home();
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeOverride::new(dir.path());
         let pq_root = dir.path().join(".pq-diary");
@@ -10497,9 +9797,12 @@ parallelism = 1
     #[cfg(unix)]
     #[test]
     fn init_failure_preserves_dangling_default_symlink() {
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         use std::os::unix::fs::symlink;
 
-        let _lock = lock_home();
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeOverride::new(dir.path());
         let pq_root = dir.path().join(".pq-diary");
@@ -10526,9 +9829,12 @@ parallelism = 1
     #[cfg(unix)]
     #[test]
     fn init_refuses_dangling_config_symlink() {
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         use std::os::unix::fs::symlink;
 
-        let _lock = lock_home();
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeOverride::new(dir.path());
         let pq_root = dir.path().join(".pq-diary");
@@ -10555,7 +9861,10 @@ parallelism = 1
     /// TC-201-E01: unknown sync_backend → error.
     #[test]
     fn tc_201_e01_sync_unknown_backend_errors() {
-        let _lock = lock_home();
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeOverride::new(dir.path());
 
@@ -10578,7 +9887,10 @@ parallelism = 1
     /// TC-201-E02: AppConfig missing → init guidance error.
     #[test]
     fn tc_201_e02_sync_without_config_returns_init_guidance() {
-        let _lock = lock_home();
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeOverride::new(dir.path());
 
@@ -10590,7 +9902,10 @@ parallelism = 1
     /// TC-201-E03: malformed config.toml → Invalid config.toml error.
     #[test]
     fn tc_201_e03_sync_invalid_toml_errors() {
-        let _lock = lock_home();
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeOverride::new(dir.path());
 
@@ -11280,6 +10595,307 @@ parallelism = 1
                 s.chars().nth(4) == Some('-') && s.chars().nth(7) == Some('-'),
                 "expected date prefix in {s}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod conflict_snapshot_tests {
+    use super::apply_conflict_choices;
+    use pq_diary_core::{
+        git::MergeConflict,
+        vault::{
+            format::{
+                AttachmentRecord, EntryRecord, VaultHeader, RECORD_TYPE_ATTACHMENT,
+                RECORD_TYPE_ENTRY,
+            },
+            reader::read_vault_with_attachments_authenticated,
+            writer::{write_header, write_vault_with_attachments_authenticated},
+        },
+    };
+    use std::io::{self, BufRead, Read};
+
+    const KEY: [u8; 32] = [42; 32];
+
+    // Simulate another writer during the prompt without timing or real Git.
+    struct Prompt<F> {
+        input: io::Cursor<&'static str>,
+        during_prompt: Option<F>,
+    }
+    impl<F: FnOnce()> Read for Prompt<F> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.input.read(buf)
+        }
+    }
+    impl<F: FnOnce()> BufRead for Prompt<F> {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            self.input.fill_buf()
+        }
+        fn consume(&mut self, amount: usize) {
+            self.input.consume(amount);
+        }
+        fn read_line(&mut self, line: &mut String) -> io::Result<usize> {
+            if let Some(callback) = self.during_prompt.take() {
+                callback();
+            }
+            self.input.read_line(line)
+        }
+    }
+
+    fn entry(id: u8) -> EntryRecord {
+        EntryRecord {
+            record_type: RECORD_TYPE_ENTRY,
+            uuid: [id; 16],
+            created_at: 10,
+            updated_at: 20,
+            iv: [1; 12],
+            ciphertext: vec![2; 32],
+            signature: vec![3; 32],
+            content_hmac: [4; 32],
+            legacy_flag: 0,
+            legacy_key_block: vec![],
+            attachment_count: 0,
+            attachment_offset: 0,
+            padding: vec![5],
+        }
+    }
+
+    fn conflict(id: u8) -> MergeConflict {
+        let local = entry(id);
+        let mut remote = local.clone();
+        remote.content_hmac = [6; 32];
+        remote.ciphertext = vec![7; 32];
+        MergeConflict {
+            uuid: local.uuid,
+            local,
+            remote,
+        }
+    }
+
+    fn save(path: &std::path::Path, entries: &[EntryRecord], attachments: &[AttachmentRecord]) {
+        write_vault_with_attachments_authenticated(
+            path,
+            VaultHeader::new(),
+            entries,
+            attachments,
+            &KEY,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn conflict_snapshot_rejects_changed_or_missing_selected_entry_without_writes() {
+        // Changes with unchanged content HMAC and timestamp must also be caught.
+        for mutation in 0..5 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("vault.pqd");
+            let conflicts = [conflict(11), conflict(12)];
+            let original = vec![conflicts[0].local.clone(), conflicts[1].local.clone()];
+            save(&path, &original, &[]);
+            let mut current = original.clone();
+            match mutation {
+                0 => current[1].updated_at += 1,
+                1 => current[1].ciphertext[0] ^= 1,
+                2 => current[1].legacy_flag = 1,
+                3 => current[1].signature[0] ^= 1,
+                _ => {
+                    current.remove(1);
+                }
+            }
+            let mut after_prompt = Vec::new();
+            let mut prompt = Prompt {
+                input: io::Cursor::new("r\nremote\n"),
+                during_prompt: Some(|| {
+                    save(&path, &current, &[]);
+                    after_prompt = std::fs::read(&path).unwrap();
+                }),
+            };
+            let error = apply_conflict_choices(&conflicts, &path, &KEY, &mut prompt).unwrap_err();
+            assert!(
+                error.to_string().contains(if mutation == 4 {
+                    "disappeared"
+                } else {
+                    "changed"
+                }),
+                "{error}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), after_prompt);
+            let (_, records, _) = read_vault_with_attachments_authenticated(&path, &KEY).unwrap();
+            assert_eq!(records, current);
+        }
+    }
+
+    #[test]
+    fn conflict_snapshot_rejects_corrupt_metadata_without_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.pqd");
+        let conflicts = [conflict(11)];
+        save(&path, &[conflicts[0].local.clone()], &[]);
+        let (header, _, _) = read_vault_with_attachments_authenticated(&path, &KEY).unwrap();
+        let mut encoded_header = Vec::new();
+        write_header(&mut encoded_header, &header).unwrap();
+        let mut corrupted = std::fs::read(&path).unwrap();
+        // Length prefix + record type + UUID + creation timestamp.
+        corrupted[encoded_header.len() + 4 + 1 + 16 + 8] ^= 1;
+        let mut prompt = Prompt {
+            input: io::Cursor::new("r\n"),
+            during_prompt: Some(|| std::fs::write(&path, &corrupted).unwrap()),
+        };
+        let error = apply_conflict_choices(&conflicts, &path, &KEY, &mut prompt).unwrap_err();
+        assert!(
+            error.to_string().contains("integrity verification failed"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), corrupted);
+    }
+
+    #[test]
+    fn conflict_snapshot_preserves_post_prompt_unrelated_records_and_attachments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.pqd");
+        let conflicts = [conflict(11), conflict(12)];
+        save(
+            &path,
+            &[conflicts[0].local.clone(), conflicts[1].local.clone()],
+            &[],
+        );
+        let attachment = AttachmentRecord {
+            record_type: RECORD_TYPE_ATTACHMENT,
+            uuid: [13; 16],
+            iv: [14; 12],
+            ciphertext: vec![15; 32],
+            signature: vec![16; 32],
+            content_hmac: [17; 32],
+            legacy_flag: 0,
+            legacy_key_block: vec![],
+            padding: vec![18],
+        };
+        let mut unrelated = conflicts[1].local.clone();
+        unrelated.updated_at += 1;
+        let new_entry = entry(19);
+        let mut expected_attachments = Vec::new();
+        pq_diary_core::vault::writer::write_attachments(
+            &mut expected_attachments,
+            std::slice::from_ref(&attachment),
+        )
+        .unwrap();
+        let mut prompt = Prompt {
+            input: io::Cursor::new(" REMOTE \nl\n"),
+            during_prompt: Some(|| {
+                save(
+                    &path,
+                    &[
+                        conflicts[0].local.clone(),
+                        unrelated.clone(),
+                        new_entry.clone(),
+                    ],
+                    &[attachment],
+                )
+            }),
+        };
+        assert!(apply_conflict_choices(&conflicts, &path, &KEY, &mut prompt).unwrap());
+        let (_, entries, attachments) =
+            read_vault_with_attachments_authenticated(&path, &KEY).unwrap();
+        assert_eq!(
+            entries,
+            vec![conflicts[0].remote.clone(), unrelated, new_entry]
+        );
+        let mut actual_attachments = Vec::new();
+        pq_diary_core::vault::writer::write_attachments(&mut actual_attachments, &attachments)
+            .unwrap();
+        assert_eq!(actual_attachments, expected_attachments);
+    }
+
+    #[test]
+    fn conflict_snapshot_local_unknown_and_eof_choices_are_noops() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.pqd");
+        let conflicts = [conflict(11)];
+        save(&path, &[conflicts[0].local.clone()], &[]);
+        let before = std::fs::read(&path).unwrap();
+        for input in ["l\n", "local\n", "unknown\n", ""] {
+            assert!(
+                !apply_conflict_choices(&conflicts, &path, &KEY, &mut io::Cursor::new(input))
+                    .unwrap()
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
+}
+
+#[cfg(test)]
+mod heatmap_window_tests {
+    use super::render_heatmap_at;
+    use chrono::{Datelike as _, Duration, NaiveDate};
+    use pq_diary_core::stats::DailyActivity;
+
+    fn activity(date: NaiveDate, count: usize) -> DailyActivity {
+        DailyActivity {
+            date: date.to_string(),
+            count,
+        }
+    }
+
+    fn cells(output: &str) -> Vec<Vec<char>> {
+        output
+            .lines()
+            .skip(1)
+            .take(7)
+            .map(|line| {
+                let row: Vec<_> = line.chars().skip(4).collect();
+                assert_eq!(row.len(), 52);
+                row
+            })
+            .collect()
+    }
+
+    #[test]
+    fn heatmap_today_is_visible_for_every_weekday() {
+        let monday = NaiveDate::from_ymd_opt(2026, 10, 12).unwrap();
+        for offset in 0..7 {
+            let today = monday + Duration::days(offset);
+            let output = render_heatmap_at(&[activity(today, 1)], today);
+            let grid = cells(&output);
+            assert_eq!(grid[offset as usize][51], '▒', "today={today}");
+            for row in grid.iter().skip(offset as usize + 1) {
+                assert_eq!(row[51], ' ', "future cell: today={today}");
+            }
+        }
+    }
+
+    #[test]
+    fn heatmap_window_boundaries_leap_day_and_year_rollover() {
+        for (year, month, day) in [(2026, 10, 15), (2026, 10, 18), (2024, 2, 29), (2025, 1, 1)] {
+            let today = NaiveDate::from_ymd_opt(year, month, day).unwrap();
+            let weekday = today.weekday().num_days_from_monday() as usize;
+            let start = today - Duration::days(weekday as i64 + 51 * 7);
+            let activities = [
+                activity(start - Duration::days(1), 4),
+                activity(start, 2),
+                activity(today, 1),
+                activity(today + Duration::days(1), 4),
+            ];
+            let output = render_heatmap_at(&activities, today);
+            let grid = cells(&output);
+            assert_eq!(grid[0][0], '▓', "start={start}");
+            assert_eq!(grid[weekday][51], '▒', "today={today}");
+            assert_eq!(grid.iter().flatten().filter(|&&c| c == '▓').count(), 1);
+            assert_eq!(grid.iter().flatten().filter(|&&c| c == '▒').count(), 1);
+            assert!(!grid.iter().flatten().any(|&c| c == '█'));
+            for (row, counts) in grid.iter().enumerate() {
+                for (week, &cell) in counts.iter().enumerate() {
+                    if (row, week) != (0, 0) && (row, week) != (weekday, 51) {
+                        assert_eq!(
+                            cell,
+                            if week == 51 && row > weekday {
+                                ' '
+                            } else {
+                                '░'
+                            }
+                        );
+                    }
+                }
+            }
         }
     }
 }

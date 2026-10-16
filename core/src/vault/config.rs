@@ -661,29 +661,34 @@ parallelism = 1
         assert_eq!(original, restored);
     }
 
-    /// TC-S10-087-03: default_path() returns a path ending in `.pq-diary/config.toml`.
-    ///
-    /// The exact prefix depends on the user's home directory (via
-    /// `dirs::home_dir()`), so we only verify the trailing components.
+    /// TC-S10-087-03: config path honors both home fallback and an explicit root.
     #[test]
     fn tc_s10_087_03_default_path_format() {
-        let path = AppConfig::default_path().expect("default_path");
-        assert!(
-            path.ends_with(std::path::Path::new(".pq-diary").join("config.toml")),
-            "expected path ending in `.pq-diary/config.toml`, got {:?}",
-            path
-        );
+        if crate::test_environment::isolated() {
+            return;
+        }
+        assert_config_path_roots(AppConfig::default_path, "config.toml");
     }
 
-    /// TC-S10-087-04: default_vaults_dir() returns a path ending in `.pq-diary/vaults`.
+    /// TC-S10-087-04: vault directory honors both home fallback and an explicit root.
     #[test]
     fn tc_s10_087_04_default_vaults_dir_format() {
-        let path = AppConfig::default_vaults_dir().expect("default_vaults_dir");
-        assert!(
-            path.ends_with(std::path::Path::new(".pq-diary").join("vaults")),
-            "expected path ending in `.pq-diary/vaults`, got {:?}",
-            path
-        );
+        if crate::test_environment::isolated() {
+            return;
+        }
+        assert_config_path_roots(AppConfig::default_vaults_dir, "vaults");
+    }
+
+    fn assert_config_path_roots(resolve: fn() -> Result<PathBuf, DiaryError>, leaf: &str) {
+        crate::test_environment::assert_isolated();
+        std::env::remove_var("PQ_DIARY_HOME");
+        let home = dirs::home_dir().expect("isolated home");
+        assert_eq!(resolve().unwrap(), home.join(".pq-diary").join(leaf));
+
+        let dir = tempfile::tempdir().expect("override root");
+        let root = dir.path().join("custom root 日本語");
+        std::env::set_var("PQ_DIARY_HOME", &root);
+        assert_eq!(resolve().unwrap(), root.join(leaf));
     }
 
     /// TC-S10-087-05: from_file with invalid TOML content returns DiaryError::Config.

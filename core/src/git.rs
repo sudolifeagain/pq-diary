@@ -198,32 +198,9 @@ pub fn git_init(vault_dir: &Path, remote: Option<&str>) -> Result<(), DiaryError
             .map_err(|e| DiaryError::Git(format!("failed to parse vault.toml: {e}")))?;
         config.git.author_name = "pq-diary".to_string();
         config.git.author_email = author_email;
-        let new_content = toml::to_string_pretty(&config)
-            .map_err(|e| DiaryError::Git(format!("failed to serialize vault.toml: {e}")))?;
-        // Atomic write: .toml.tmp → rename to vault.toml (mirrors set_policy pattern).
-        let tmp_path = toml_path.with_extension("toml.tmp");
-        {
-            use std::io::Write;
-            let mut file = std::fs::File::create(&tmp_path)
-                .map_err(|e| DiaryError::Git(format!("failed to create temp file: {e}")))?;
-            file.write_all(new_content.as_bytes())
-                .map_err(|e| DiaryError::Git(format!("failed to write temp file: {e}")))?;
-            file.sync_all()
-                .map_err(|e| DiaryError::Git(format!("failed to sync temp file: {e}")))?;
-        }
-        // Owner-only on Unix so the rename does not re-expose vault.toml at 0644
-        // (audit M1; mirrors VaultConfig::to_file and set_policy).
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600)).map_err(
-                |e| DiaryError::Git(format!("failed to set vault.toml permissions: {e}")),
-            )?;
-        }
-        if let Err(e) = std::fs::rename(&tmp_path, &toml_path) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(DiaryError::Io(e));
-        }
+        config
+            .to_file(&toml_path)
+            .map_err(|e| DiaryError::Git(format!("failed to write vault.toml: {e}")))?;
     }
 
     // Step 7: Add remote if provided (REQ-005).
@@ -1038,6 +1015,78 @@ mod tests {
             "hex part must be lowercase hex: {}",
             email
         );
+    }
+
+    #[test]
+    fn git_init_preserves_unowned_config_staging_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.toml");
+        let staging = dir.path().join("vault.toml.tmp");
+        let mut config = VaultConfig::default();
+        config.vault.name = "preserved vault".into();
+        config.git.commit_message = "preserved message".into();
+        config.to_file(&path).unwrap();
+        std::fs::write(&staging, b"unrelated staging data").unwrap();
+
+        git_init(dir.path(), None).unwrap();
+
+        assert_eq!(std::fs::read(&staging).unwrap(), b"unrelated staging data");
+        assert_git_init_config(dir.path(), config);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_init_preserves_unowned_config_staging_symlinks() {
+        for dangling in [false, true] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("vault.toml");
+            let staging = dir.path().join("vault.toml.tmp");
+            let target = dir.path().join("unrelated");
+            let config = VaultConfig::default();
+            config.to_file(&path).unwrap();
+            if !dangling {
+                std::fs::write(&target, b"unrelated target data").unwrap();
+            }
+            std::os::unix::fs::symlink(&target, &staging).unwrap();
+
+            git_init(dir.path(), None).unwrap();
+
+            assert_eq!(std::fs::read_link(&staging).unwrap(), target);
+            if dangling {
+                assert!(!target.exists());
+            } else {
+                assert_eq!(std::fs::read(&target).unwrap(), b"unrelated target data");
+            }
+            assert_git_init_config(dir.path(), config);
+        }
+    }
+
+    fn assert_git_init_config(vault_dir: &Path, mut expected: VaultConfig) {
+        let path = vault_dir.join("vault.toml");
+        let updated = VaultConfig::from_file(&path).unwrap();
+        let name = git_stdout(vault_dir, &["config", "user.name"]).unwrap();
+        let email = git_stdout(vault_dir, &["config", "user.email"]).unwrap();
+        assert_eq!(std::str::from_utf8(&name).unwrap().trim(), "pq-diary");
+        assert_eq!(
+            std::str::from_utf8(&email).unwrap().trim(),
+            updated.git.author_email
+        );
+        expected.git.author_name = "pq-diary".into();
+        expected.git.author_email = updated.git.author_email.clone();
+        assert_eq!(updated, expected);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert!(std::fs::read_dir(vault_dir).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("vault.toml.tmp.")));
     }
 
     /// TC-S8-074-07: git_init with remote adds origin.

@@ -10576,7 +10576,10 @@ parallelism = 1
         let destination = out.join(build_export_filename(&meta));
         let outside = dir.path().join("must-not-create.md");
         symlink(&outside, &destination).expect("dangling output symlink");
-        assert!(!destination.exists(), "preflight follows the missing target");
+        assert!(
+            !destination.exists(),
+            "preflight follows the missing target"
+        );
 
         let cli = make_cli_plain(&[
             "--vault",
@@ -10602,7 +10605,10 @@ parallelism = 1
         assert_eq!(std::fs::read_link(&destination).expect("symlink"), outside);
         assert_eq!(std::fs::read_dir(&out).expect("outputs").count(), 1);
         assert_eq!(std::fs::read(&pqd).expect("vault"), original);
-        assert_eq!(std::fs::read(&config_path).expect("config"), original_config);
+        assert_eq!(
+            std::fs::read(&config_path).expect("config"),
+            original_config
+        );
         core.unlock(secrecy::SecretBox::new(Box::from("password")))
             .expect("reopen");
         assert_eq!(

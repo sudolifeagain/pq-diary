@@ -92,6 +92,27 @@ pub fn get_password(flag_value: Option<&SecretString>) -> Result<PasswordSource,
     ))
 }
 
+/// Confirm a newly chosen interactive password before creating any state.
+/// Explicit flag/environment values keep their non-interactive behavior.
+pub fn confirm_new_password(source: &PasswordSource) -> Result<(), DiaryError> {
+    confirm_new_password_with(source, prompt_password)
+}
+
+fn confirm_new_password_with(
+    source: &PasswordSource,
+    prompt: impl FnOnce(&str) -> Result<SecretString, DiaryError>,
+) -> Result<(), DiaryError> {
+    use secrecy::ExposeSecret as _;
+
+    if let PasswordSource::Tty(password) = source {
+        let confirmation = prompt("Confirm new password: ")?;
+        if password.expose_secret() != confirmation.expose_secret() {
+            return Err(DiaryError::Password("Passwords do not match".to_string()));
+        }
+    }
+    Ok(())
+}
+
 /// Read a password from the controlling TTY with echo disabled, using a
 /// caller-supplied prompt.
 ///
@@ -354,6 +375,44 @@ fn read_password_tty(_prompt: &str) -> Result<SecretString, DiaryError> {
 mod tests {
     use super::*;
     use secrecy::ExposeSecret;
+
+    #[test]
+    fn new_interactive_password_requires_matching_confirmation() {
+        let source = PasswordSource::Tty(SecretString::from("original"));
+        confirm_new_password_with(&source, |prompt| {
+            assert_eq!(prompt, "Confirm new password: ");
+            Ok(SecretString::from("original"))
+        })
+        .unwrap();
+        for value in ["different", ""] {
+            let error =
+                confirm_new_password_with(&source, |_| Ok(SecretString::from(value))).unwrap_err();
+            assert!(matches!(error, DiaryError::Password(_)));
+            let message = error.to_string();
+            assert!(message.contains("Passwords do not match"));
+            assert!(!message.contains("original") && !message.contains("different"));
+        }
+    }
+
+    #[test]
+    fn new_password_confirmation_propagates_prompt_failure() {
+        let source = PasswordSource::Tty(SecretString::from("original"));
+        let error = confirm_new_password_with(&source, |_| {
+            Err(DiaryError::Password("test input failure".to_string()))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("test input failure"));
+    }
+
+    #[test]
+    fn explicit_new_password_sources_do_not_prompt() {
+        for source in [
+            PasswordSource::Flag(SecretString::from("original")),
+            PasswordSource::Env(SecretString::from("original")),
+        ] {
+            confirm_new_password_with(&source, |_| panic!("must not prompt")).unwrap();
+        }
+    }
 
     struct FailedOutput {
         fail_flush: bool,

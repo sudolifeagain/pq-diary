@@ -111,7 +111,17 @@ cargo build --workspace --locked
 cargo test --workspace --locked
 cargo clippy --workspace --locked --all-targets -- -D warnings
 bash ci/smoke-test.sh ./target/debug/pq-diary
+python3 ci/install-smoke.py
 ```
+
+`install-smoke.py` はLinuxのPython 3標準ライブラリを使い、上記debugビルドの
+キャッシュを再利用して `cargo install --debug --locked --offline --root <tempdir>` を検証する。
+導入・再導入・削除・再導入後の読取り、日記/設定のバイト一致、同名ファイルの衝突、
+無関係なファイルの保持を確認する。アプリの保存先も `PQ_DIARY_HOME` で隔離する。
+PTYを使った実CLIの `init` / `vault create` では確認不一致による未作成・原本保全と、
+一致後の解錠を確認する。実行は一時ディレクトリを所有し、終了時に片付ける。
+文書化したrelease導入経路は、必要に応じ `cargo build --release --locked` の後に
+`python3 ci/install-smoke.py --profile release` で確認できる。
 
 `cargo test --workspace` にはintegration testとdoctestも含まれる。
 別jobで同じテストを重ねない。脆弱性を確認する `cargo audit` と、

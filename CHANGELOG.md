@@ -10,6 +10,11 @@ the **History** table at the bottom for git-tag pointers.
 
 ## [Unreleased]
 
+### Installation and first use
+
+- Require matching confirmation for interactive new passwords in `init` and `vault create` before creating state; retain flag/environment automation and existing policy/weak-password confirmation order.
+- Add isolated Linux Cargo lifecycle and real-terminal setup checks to the default CI, reusing debug build artifacts.
+
 ### Current implementation status (2026-10-16)
 
 - Current writer schema is **0x06**; readers accept v0x04–v0x06. S16 v0x07 integration/migration is unfinished. MDK/keyslot primitives are present but are not yet the normal vault create/unlock/data path.

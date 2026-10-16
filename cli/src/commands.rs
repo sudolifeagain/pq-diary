@@ -10595,14 +10595,20 @@ parallelism = 1
                 .kind(),
             std::io::ErrorKind::AlreadyExists
         );
-        assert!(!outside.exists(), "plaintext must not escape the output directory");
+        assert!(
+            !outside.exists(),
+            "plaintext must not escape the output directory"
+        );
         assert_eq!(std::fs::read_link(&destination).expect("symlink"), outside);
         assert_eq!(std::fs::read_dir(&out).expect("outputs").count(), 1);
         assert_eq!(std::fs::read(&pqd).expect("vault"), original);
         assert_eq!(std::fs::read(&config_path).expect("config"), original_config);
         core.unlock(secrecy::SecretBox::new(Box::from("password")))
             .expect("reopen");
-        assert_eq!(core.get_entry(&id).expect("entry").1.body, "private export body");
+        assert_eq!(
+            core.get_entry(&id).expect("entry").1.body,
+            "private export body"
+        );
         core.lock();
     }
 

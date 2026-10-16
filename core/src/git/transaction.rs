@@ -1,6 +1,8 @@
 //! Git's ref update is the commit point. Never restore the vault after HEAD moves.
 //! The real index lock excludes ordinary Git index writers, not alternate-index
 //! commits, direct ref mutation, or non-Git vault writers during this short phase.
+//! Hooks run normally, but arbitrary replacement of owned backup/staging paths
+//! is outside the ownership guarantee; their side effects cannot be rolled back.
 use super::*;
 use reconciliation::{git_stdout, pin_commit};
 use std::process::Command;
@@ -339,7 +341,20 @@ pub(super) fn apply(
         );
     }
     staging.armed = true;
-    backup.armed = true;
+    // Do not remove an obviously replaced recovery path. This is a conservative
+    // content/type check, not protection against hostile concurrent replacement.
+    let backup_unchanged = std::fs::symlink_metadata(&backup.path)
+        .is_ok_and(|metadata| metadata.file_type().is_file())
+        && std::fs::read(&backup.path).is_ok_and(|bytes| bytes == c.original);
+    if backup_unchanged {
+        backup.armed = true;
+    } else {
+        let _ = writeln!(
+            std::io::stderr(),
+            "warning: recovery backup changed; retained {}",
+            backup.path.display()
+        );
+    }
     Ok(())
 }
 fn restore(path: &Path, bytes: &[u8]) -> Result<(), DiaryError> {

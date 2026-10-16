@@ -638,23 +638,33 @@ fn hook_modified_commit_is_not_reported_as_rolled_back() {
 #[test]
 #[cfg(unix)]
 fn postcommit_backup_cleanup_failure_remains_success() {
-    let f = Fixture::new(&[record(1, 1)]);
-    f.publish(&[record(1, 1), record(2, 1)]);
-    install_hook(
-        &f,
-        "post-commit",
-        "mv vault.pqd.bak saved-backup\nmkdir vault.pqd.bak\nprintf retained > vault.pqd.bak/keep",
-    );
-    f.pull().unwrap();
-    assert_eq!(
-        git(&f.local, &["show", "HEAD:vault.pqd"]),
-        std::fs::read(f.local.join("vault.pqd")).unwrap()
-    );
-    assert_eq!(
-        std::fs::read(f.local.join("vault.pqd.bak/keep")).unwrap(),
-        b"retained"
-    );
-    assert!(!f.local.join(".git/index.lock").exists());
+    for replacement in [
+        "mkdir vault.pqd.bak; printf retained > vault.pqd.bak/keep",
+        "printf retained > vault.pqd.bak",
+    ] {
+        let f = Fixture::new(&[record(1, 1)]);
+        f.publish(&[record(1, 1), record(2, 1)]);
+        install_hook(
+            &f,
+            "post-commit",
+            &format!("mv vault.pqd.bak saved-backup\n{replacement}"),
+        );
+        f.pull().unwrap();
+        assert_eq!(
+            git(&f.local, &["show", "HEAD:vault.pqd"]),
+            std::fs::read(f.local.join("vault.pqd")).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(if f.local.join("vault.pqd.bak").is_dir() {
+                f.local.join("vault.pqd.bak/keep")
+            } else {
+                f.local.join("vault.pqd.bak")
+            })
+            .unwrap(),
+            b"retained"
+        );
+        assert!(!f.local.join(".git/index.lock").exists());
+    }
 }
 
 #[test]

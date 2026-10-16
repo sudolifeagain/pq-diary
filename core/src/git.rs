@@ -465,8 +465,8 @@ pub fn git_push(
 /// require an explicit interactive choice. Otherwise unresolved conflicts are
 /// returned without changing the vault, index or HEAD.
 ///
-/// Legacy/unverified common bases fail closed. This does not record remote Git
-/// ancestry yet; a later push can still be rejected as non-fast-forward.
+/// Legacy/unverified common bases fail closed. Successful reconciliation records
+/// pinned remote ancestry while preserving unrelated staging in the real index.
 pub fn git_pull_merge(
     vault_dir: &Path,
     config: &VaultConfig,

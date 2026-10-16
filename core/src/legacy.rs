@@ -2204,13 +2204,8 @@ mod tests {
         let (vault_dir, ids) = vault_with_one_entry(&dir, 1);
         let source = dir.path().join("keep.txt");
         std::fs::write(&source, b"recoverable attachment").unwrap();
-        crate::attachment::add_attachment(
-            &vault_dir,
-            &secret("master-pw"),
-            &ids[0],
-            &source,
-        )
-        .unwrap();
+        crate::attachment::add_attachment(&vault_dir, &secret("master-pw"), &ids[0], &source)
+            .unwrap();
         set_entry_flag(
             &vault_dir,
             &secret("master-pw"),
@@ -2231,12 +2226,9 @@ mod tests {
         )
         .unwrap();
 
-        let metas = crate::attachment::list_attachments(
-            &vault_dir,
-            &secret("master-pw"),
-            Some(&ids[0]),
-        )
-        .unwrap();
+        let metas =
+            crate::attachment::list_attachments(&vault_dir, &secret("master-pw"), Some(&ids[0]))
+                .unwrap();
         let blob_path = crate::attachment::blob_path(&vault_dir, &metas[0].blob_uuid);
         let vault_path = vault_dir.join("vault.pqd");
         let config_path = vault_dir.join("vault.toml");
@@ -2294,7 +2286,11 @@ mod tests {
         );
         assert_eq!(error.to_string(), expected_error.to_string(), "{case}");
         assert_eq!(std::fs::read(&vault_path).unwrap(), vault_before, "{case}");
-        assert_eq!(std::fs::read(&config_path).unwrap(), config_before, "{case}");
+        assert_eq!(
+            std::fs::read(&config_path).unwrap(),
+            config_before,
+            "{case}"
+        );
         assert_eq!(std::fs::read(&blob_path).unwrap(), blob_before, "{case}");
         crate::vault::reader::verify_vault_integrity(&vault_path, &mac_key).unwrap();
         for sidecar in [

@@ -191,7 +191,7 @@ fn cmd_import_with_add_to(
                     attachment_warnings
                         .push(format!("  warning: failed to attach {filename}: {e}"));
                     if first_attachment_error.is_none() {
-                        first_attachment_error = Some(e);
+                        first_attachment_error = Some((filename.to_owned(), e));
                     }
                 }
             }
@@ -242,9 +242,9 @@ fn cmd_import_with_add_to(
         )
     });
 
-    if let Some(error) = first_attachment_error {
+    if let Some((filename, error)) = first_attachment_error {
         let mut message = format!(
-            "Import partially committed: {} entries imported, {attached} attachments added, {} attachments failed; do not blindly repeat import",
+            "Import partially committed: {} entries imported, {attached} attachments added, {} attachments failed (first failure: {filename}); do not blindly repeat import",
             result.imported,
             attachment_warnings.len()
         );
@@ -747,7 +747,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn import_attachment_failure_reports_partial_commit_and_continues() {
         for fail_output in [false, true] {
@@ -772,8 +771,11 @@ mod tests {
                 );
                 let mut output = Vec::new();
                 let mut broken = FailingMutationWriter { fail_write: true };
-                let out: &mut dyn std::io::Write =
-                    if fail_output { &mut broken } else { &mut output };
+                let out: &mut dyn std::io::Write = if fail_output {
+                    &mut broken
+                } else {
+                    &mut output
+                };
                 let mut attempts = 0;
                 let error = cmd_import_with_add_to(
                     &cli,
@@ -810,14 +812,20 @@ mod tests {
                         pq_diary_core::DiaryError::Io(error)
                             if error.kind() == std::io::ErrorKind::PermissionDenied
                     ));
-                    assert!(error.chain().any(|source| source
-                        .downcast_ref::<std::io::Error>()
-                        .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)));
+                    assert!(error.chain().any(|source| {
+                        source
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|error| {
+                                error.kind() == std::io::ErrorKind::PermissionDenied
+                            })
+                    }));
                 }
                 let message = format!("{error:#}");
                 assert!(message.contains("Import partially committed"));
-                assert!(message.contains("1 entries imported, 1 attachments added, 1 attachments failed"));
+                assert!(message
+                    .contains("1 entries imported, 1 attachments added, 1 attachments failed"));
                 assert!(message.contains("do not blindly repeat import"));
+                assert!(message.contains("first failure:"));
                 assert_eq!(message.contains("output also failed"), fail_output);
                 assert!(!message.contains("private payload"));
                 if !fail_output {
@@ -833,10 +841,15 @@ mod tests {
                     Some(&entries[0].uuid_hex),
                 )
                 .expect("reopen attachments");
-                assert_eq!(attachments.len(), 1, "successful later add remains committed");
+                assert_eq!(
+                    attachments.len(),
+                    1,
+                    "successful later add remains committed"
+                );
                 for name in ["first.txt", "second.txt"] {
                     assert_eq!(
-                        std::fs::read(source.join("attachments").join(name)).expect("source intact"),
+                        std::fs::read(source.join("attachments").join(name))
+                            .expect("source intact"),
                         b"private payload"
                     );
                 }

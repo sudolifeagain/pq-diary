@@ -29,9 +29,14 @@ static WIKI_LINK_RE: LazyLock<Result<Regex, regex::Error>> =
 static TAG_RE: LazyLock<Result<Regex, regex::Error>> =
     LazyLock::new(|| Regex::new(r"#([\w/\p{S}-]+)"));
 
+const ATTACHMENT_LINK_PATTERN: &str = r"!\[\[([^\]|]+)(?:\|[^\]]+)?\]\]";
+
 /// Obsidian attachment-embed pattern: `![[filename.ext]]` (S13).
-static ATTACHMENT_LINK_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"!\[\[([^\]|]+)(?:\|[^\]]+)?\]\]").unwrap());
+static ATTACHMENT_LINK_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // Developer-controlled literal, validated by attachment_link_pattern_compiles.
+    Regex::new(ATTACHMENT_LINK_PATTERN)
+        .expect("the hardcoded Obsidian attachment-link pattern must compile")
+});
 
 /// Extract every `![[filename]]` reference from a markdown body, returning
 /// the captured filenames in document order (duplicates preserved). Used by
@@ -54,7 +59,12 @@ pub fn parse_obsidian_attachment_links(body: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod attachment_link_tests {
-    use super::parse_obsidian_attachment_links;
+    use super::{parse_obsidian_attachment_links, ATTACHMENT_LINK_PATTERN};
+
+    #[test]
+    fn attachment_link_pattern_compiles() {
+        assert!(regex::Regex::new(ATTACHMENT_LINK_PATTERN).is_ok());
+    }
 
     /// TC-S13-010-01: extracts single ![[FILE]] reference.
     #[test]

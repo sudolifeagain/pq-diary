@@ -1,6 +1,8 @@
 //! Markdown import command, attachment resolution, and output adapters.
 
-use super::{check_claude_policy, resolve_legacy_vault_dir, resolve_vault_path, session::VaultGuard};
+use super::{
+    check_claude_policy, resolve_legacy_vault_dir, resolve_vault_path, session::VaultGuard,
+};
 use crate::password::get_password;
 use crate::Cli;
 use pq_diary_core::DiaryCore;

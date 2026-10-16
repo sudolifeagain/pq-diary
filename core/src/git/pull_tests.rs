@@ -226,16 +226,41 @@ fn delete_edit_choices_are_explicit_on_both_sides() {
 }
 #[test]
 fn resolver_failure_and_changed_inputs_never_apply_the_merge() {
-    for change in ["error", "vault", "config", "head", "tracking", "attachment"] {
+    for change in [
+        "error",
+        "vault",
+        "metadata",
+        "invalid_mac",
+        "config",
+        "head",
+        "tracking",
+        "attachment",
+    ] {
         let f = Fixture::new(&[record(1, 1)]);
-        f.local(&[]);
-        f.publish(&[record(1, 2)]);
+        if matches!(change, "metadata" | "invalid_mac") {
+            f.local(&[record(1, 2)]);
+            f.publish(&[]);
+        } else {
+            f.local(&[]);
+            f.publish(&[record(1, 2)]);
+        }
         let before = state(&f);
         let mut after = None;
         let result = resolve(&f, &mut |_| {
             match change {
                 "error" => return Err(DiaryError::Git("prompt failed".into())),
                 "vault" => f.local(&[record(2, 1)]),
+                "metadata" => {
+                    let mut changed = record(1, 2);
+                    changed.legacy_flag = 1;
+                    f.local(&[changed]);
+                }
+                "invalid_mac" => {
+                    let path = f.local.join("vault.pqd");
+                    let mut bytes = std::fs::read(&path).unwrap();
+                    bytes[16] ^= 1;
+                    std::fs::write(path, bytes).unwrap();
+                }
                 "config" => {
                     let mut bytes = before.config.clone();
                     bytes.extend_from_slice(b"\n# changed");
@@ -311,6 +336,23 @@ fn resolved_commit_preserves_staging_and_rolls_back_on_hook_failure() {
             );
         } else {
             result.unwrap();
+            assert_eq!(git(&f.local, &["show", ":sentinel"]), b"staged");
+            assert_eq!(std::fs::read(f.local.join("sentinel")).unwrap(), b"staged");
+            assert_eq!(
+                git(&f.local, &["show", "HEAD:vault.pqd"]),
+                std::fs::read(f.local.join("vault.pqd")).unwrap()
+            );
+            assert_eq!(git(&f.local, &["log", "-1", "--format=%an"]), b"test\n");
+            assert_eq!(
+                git(&f.local, &["log", "-1", "--format=%ae"]),
+                b"test@localhost\n"
+            );
+            assert_eq!(
+                String::from_utf8(git(&f.local, &["log", "-1", "--format=%B"]))
+                    .unwrap()
+                    .trim(),
+                f.config.git.commit_message
+            );
             assert_eq!(
                 git(&f.local, &["diff", "--cached", "--name-only"]),
                 b"sentinel\n"

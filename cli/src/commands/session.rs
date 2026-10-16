@@ -11,7 +11,7 @@ pub(super) fn locked_core(cli: &Cli) -> anyhow::Result<DiaryCore> {
     let vault_str = vault_path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("Vault path contains non-UTF-8 characters"))?;
-    DiaryCore::new(vault_str).map_err(|e| anyhow::anyhow!("{e}"))
+    DiaryCore::new(vault_str).map_err(anyhow::Error::new)
 }
 
 /// Keep the CLI diagnostic prefix while retaining the typed underlying error.
@@ -74,6 +74,68 @@ impl std::ops::Deref for VaultGuard<'_> {
 mod tests {
     use super::super::test_support::setup_vault;
     use super::*;
+    use clap::Parser as _;
+
+    #[test]
+    fn locked_core_preserves_constructor_error_type_display_and_io_source() {
+        const PASSWORD: &str = "synthetic password must stay protected";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.pqd");
+        let config_path = dir.path().join("vault.toml");
+        let cli = Cli::try_parse_from([
+            "pq-diary",
+            "--vault",
+            path.to_str().unwrap(),
+            "--password",
+            PASSWORD,
+            "list",
+        ])
+        .unwrap();
+
+        for invalid_config in [false, true] {
+            if invalid_config {
+                std::fs::write(&config_path, "[").unwrap();
+            }
+            let expected = DiaryCore::new(path.to_str().unwrap()).err().unwrap();
+            let error = locked_core(&cli).err().unwrap();
+            let typed = error.downcast_ref::<DiaryError>().expect("typed source");
+            assert_eq!(error.to_string(), expected.to_string());
+            if invalid_config {
+                assert!(matches!(typed, DiaryError::Config(_)));
+                assert_eq!(std::fs::read_to_string(&config_path).unwrap(), "[");
+            } else {
+                assert!(matches!(typed, DiaryError::Io(io) if io.kind() == std::io::ErrorKind::NotFound));
+                let io = error
+                    .chain()
+                    .find_map(|source| source.downcast_ref::<std::io::Error>())
+                    .expect("original I/O cause");
+                assert_eq!(io.kind(), std::io::ErrorKind::NotFound);
+                assert!(!config_path.exists());
+            }
+            assert!(!error.to_string().contains(PASSWORD));
+            assert!(!format!("{error:?}").contains(PASSWORD));
+            assert!(!path.exists());
+        }
+    }
+
+    #[test]
+    fn locked_core_does_not_consume_password_or_unlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = setup_vault(&dir);
+        let cli = Cli::try_parse_from([
+            "pq-diary",
+            "--vault",
+            vault.to_str().unwrap(),
+            "--password",
+            "synthetic wrong password",
+            "list",
+        ])
+        .unwrap();
+        let core = locked_core(&cli).unwrap();
+        assert!(matches!(core.list_entries(None), Err(DiaryError::NotUnlocked)));
+        assert!(cli.password.is_some());
+    }
+
     // =========================================================================
     // TC-A13: VaultGuard drop guard tests (TASK-0056)
     // =========================================================================

@@ -378,8 +378,7 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             );
             assert!(
-                String::from_utf8_lossy(&output.stdout)
-                    .contains("1 passed; 0 failed; 0 ignored"),
+                String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed; 0 ignored"),
                 "child must execute the regression test"
             );
             assert_eq!(std::fs::read(&path).unwrap(), before);

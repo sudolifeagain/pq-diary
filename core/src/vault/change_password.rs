@@ -287,8 +287,7 @@ mod tests {
         let staging = vault_dir.join("vault.pqd.tmp.new");
         std::fs::write(&staging, b"unowned staging data").unwrap();
 
-        re_encrypt_vault(&vault_dir, &make_secret("Old123!"), &make_secret("New456!"))
-            .unwrap();
+        re_encrypt_vault(&vault_dir, &make_secret("Old123!"), &make_secret("New456!")).unwrap();
 
         assert_eq!(std::fs::read(&staging).unwrap(), b"unowned staging data");
         let path = vault_dir.join("vault.pqd");
@@ -309,8 +308,7 @@ mod tests {
             }
             std::os::unix::fs::symlink(&target, &staging).unwrap();
 
-            re_encrypt_vault(&vault_dir, &make_secret("Old123!"), &make_secret("New456!"))
-                .unwrap();
+            re_encrypt_vault(&vault_dir, &make_secret("Old123!"), &make_secret("New456!")).unwrap();
 
             assert_eq!(std::fs::read_link(&staging).unwrap(), target);
             if dangling {
@@ -379,6 +377,11 @@ mod tests {
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .contains("1 passed; 0 failed; 0 ignored"),
+                "child must execute the regression test"
+            );
             assert_eq!(std::fs::read(&path).unwrap(), before);
             assert_eq!(
                 std::fs::read(vault_dir.join("vault.toml")).unwrap(),
@@ -391,16 +394,14 @@ mod tests {
             }
             assert!(std::fs::read_dir(&vault_dir).unwrap().all(|entry| {
                 let name = entry.unwrap().file_name();
-                !name.to_string_lossy().starts_with("vault.pqd.tmp.")
-                    || name == "vault.pqd.tmp.new"
+                !name.to_string_lossy().starts_with("vault.pqd.tmp.") || name == "vault.pqd.tmp.new"
             }));
             let mut core = DiaryCore::new(path.to_str().unwrap()).unwrap();
             core.unlock(make_secret("Old123!")).unwrap();
             assert_eq!(core.get_entry(&id).unwrap().1.body, body);
             drop(core);
 
-            re_encrypt_vault(&vault_dir, &make_secret("Old123!"), &make_secret("New456!"))
-                .unwrap();
+            re_encrypt_vault(&vault_dir, &make_secret("Old123!"), &make_secret("New456!")).unwrap();
             let mut core = DiaryCore::new(path.to_str().unwrap()).unwrap();
             core.unlock(make_secret("New456!")).unwrap();
             assert_eq!(core.get_entry(&id).unwrap().1.body, body);

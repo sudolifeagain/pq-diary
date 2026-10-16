@@ -6,10 +6,10 @@
 //! password-dependent material (KDF salt, verification token, encrypted
 //! key blobs) and all entry payloads are re-encrypted with the new key.
 //!
-//! Failure handling is atomic: the new vault is written to `vault.pqd.tmp`
-//! first and renamed only on success. On any error the temporary file is
-//! best-effort overwritten with zeros and removed, leaving the original
-//! `vault.pqd` untouched.
+//! The authenticated writer owns a uniquely created sibling and atomically
+//! replaces `vault.pqd` only after writing and syncing succeed. Pre-commit
+//! failures preserve the original and clean up only that owned sibling.
+//! This does not guarantee physical erasure or crash durability.
 
 use std::path::Path;
 
@@ -143,33 +143,16 @@ pub fn re_encrypt_vault(
         &dsa_seed,
     )?;
 
-    // Step 9: write the new vault to vault.pqd.tmp.path() then atomically rename
-    // it on top of the original. write_vault already performs the .tmp+rename
-    // dance internally, so we redirect it at a side-by-side path and then move
-    // it into place. This guarantees that the original vault remains intact
-    // until the very last fs::rename, and the temporary file is cleaned up on
-    // failure.
-    let final_tmp = vault_dir.join("vault.pqd.tmp.new");
+    // Step 9: the authenticated writer owns staging and the atomic commit.
+    // All records are prepared above; no outer temporary path is needed.
     let mac_key = crate::crypto::derive_vault_mac_key(new_key.as_ref())?;
-    let write_result = crate::vault::writer::write_vault_with_attachments_authenticated(
-        &final_tmp,
+    crate::vault::writer::write_vault_with_attachments_authenticated(
+        &vault_pqd,
         new_header,
         &new_entries,
         &new_attachments,
         &mac_key,
-    );
-    if let Err(e) = write_result {
-        cleanup_tmp(&final_tmp);
-        return Err(e);
-    }
-
-    // Atomic swap: replace vault.pqd with the new file.
-    if let Err(e) = std::fs::rename(&final_tmp, &vault_pqd) {
-        cleanup_tmp(&final_tmp);
-        return Err(DiaryError::Io(e));
-    }
-
-    Ok(())
+    )
 }
 
 /// Decrypt an `IV || ciphertext` blob using the symmetric key.
@@ -266,38 +249,6 @@ fn re_encrypt_entry(
     })
 }
 
-/// Best-effort cleanup of a temporary vault file. Errors are ignored except
-/// for `NotFound` because the file may already have been moved or never
-/// created.
-fn cleanup_tmp(path: &Path) {
-    // First, zeroize the contents by overwriting with random bytes (best effort).
-    if let Ok(meta) = std::fs::metadata(path) {
-        let size = meta.len() as usize;
-        if size > 0 {
-            let mut buf = Zeroizing::new(vec![0u8; size]);
-            OsRng.fill_bytes(&mut buf);
-            if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(path) {
-                use std::io::Write as _;
-                let _ = f.write_all(&buf);
-                let _ = f.sync_all();
-            }
-        }
-    }
-    if let Err(e) = std::fs::remove_file(path) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            eprintln!("Warning: failed to remove temporary vault file: {e}");
-        }
-    }
-    // Also remove the standard ".tmp" file that write_vault might have left.
-    let std_tmp = path.with_extension("new.tmp");
-    if let Err(e) = std::fs::remove_file(&std_tmp) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            // Silently ignore; non-existence is the expected state.
-            let _ = e;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,6 +278,133 @@ mod tests {
             .with_kdf_params(fast_params());
         mgr.init_vault("v", password).expect("init_vault");
         dir.path().join("v")
+    }
+
+    #[test]
+    fn password_rotation_preserves_unowned_staging_file() {
+        let dir = tempdir().unwrap();
+        let vault_dir = setup_vault(&dir, b"Old123!");
+        let staging = vault_dir.join("vault.pqd.tmp.new");
+        std::fs::write(&staging, b"unowned staging data").unwrap();
+
+        re_encrypt_vault(&vault_dir, &make_secret("Old123!"), &make_secret("New456!"))
+            .unwrap();
+
+        assert_eq!(std::fs::read(&staging).unwrap(), b"unowned staging data");
+        let path = vault_dir.join("vault.pqd");
+        let mut core = DiaryCore::new(path.to_str().unwrap()).unwrap();
+        core.unlock(make_secret("New456!")).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn password_rotation_preserves_unowned_staging_symlinks() {
+        for dangling in [false, true] {
+            let dir = tempdir().unwrap();
+            let vault_dir = setup_vault(&dir, b"Old123!");
+            let staging = vault_dir.join("vault.pqd.tmp.new");
+            let target = dir.path().join("unrelated");
+            if !dangling {
+                std::fs::write(&target, b"unrelated data").unwrap();
+            }
+            std::os::unix::fs::symlink(&target, &staging).unwrap();
+
+            re_encrypt_vault(&vault_dir, &make_secret("Old123!"), &make_secret("New456!"))
+                .unwrap();
+
+            assert_eq!(std::fs::read_link(&staging).unwrap(), target);
+            if dangling {
+                assert!(!target.exists());
+            } else {
+                assert_eq!(std::fs::read(&target).unwrap(), b"unrelated data");
+            }
+            let path = vault_dir.join("vault.pqd");
+            let mut core = DiaryCore::new(path.to_str().unwrap()).unwrap();
+            core.unlock(make_secret("New456!")).unwrap();
+        }
+    }
+
+    // Inject a real partial-write failure only in a subprocess, without unsafe
+    // calls or changing the parent harness's environment or resource limits.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn password_rotation_write_failure_preserves_original_and_unowned_staging() {
+        const CHILD_PATH: &str = "PQ_DIARY_ROTATION_FAILURE_TEST_PATH";
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            let vault_dir = std::path::PathBuf::from(path);
+            let result =
+                re_encrypt_vault(&vault_dir, &make_secret("Old123!"), &make_secret("New456!"));
+            assert!(matches!(result, Err(DiaryError::Io(_))), "{result:?}");
+            return;
+        }
+
+        for symlink in [false, true] {
+            let dir = tempdir().unwrap();
+            let vault_dir = setup_vault(&dir, b"Old123!");
+            let path = vault_dir.join("vault.pqd");
+            let mut core = DiaryCore::new(path.to_str().unwrap()).unwrap();
+            core.unlock(make_secret("Old123!")).unwrap();
+            let body = "synthetic body".repeat(1024);
+            let id = core.new_entry("original", &body, vec![]).unwrap();
+            drop(core);
+            let before = std::fs::read(&path).unwrap();
+            let config_before = std::fs::read(vault_dir.join("vault.toml")).unwrap();
+            let staging = vault_dir.join("vault.pqd.tmp.new");
+            let target = dir.path().join("unrelated");
+            std::fs::write(&target, b"unowned staging data").unwrap();
+            if symlink {
+                std::os::unix::fs::symlink(&target, &staging).unwrap();
+            } else {
+                std::fs::write(&staging, b"unowned staging data").unwrap();
+            }
+
+            let output = std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    "ulimit -f 1; trap '' XFSZ; exec \"$@\"",
+                    "rotation-test",
+                ])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "vault::change_password::tests::password_rotation_write_failure_preserves_original_and_unowned_staging",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env(CHILD_PATH, &vault_dir)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child failed: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert_eq!(
+                std::fs::read(vault_dir.join("vault.toml")).unwrap(),
+                config_before
+            );
+            assert_eq!(std::fs::read(&staging).unwrap(), b"unowned staging data");
+            assert_eq!(std::fs::read(&target).unwrap(), b"unowned staging data");
+            if symlink {
+                assert_eq!(std::fs::read_link(&staging).unwrap(), target);
+            }
+            assert!(std::fs::read_dir(&vault_dir).unwrap().all(|entry| {
+                let name = entry.unwrap().file_name();
+                !name.to_string_lossy().starts_with("vault.pqd.tmp.")
+                    || name == "vault.pqd.tmp.new"
+            }));
+            let mut core = DiaryCore::new(path.to_str().unwrap()).unwrap();
+            core.unlock(make_secret("Old123!")).unwrap();
+            assert_eq!(core.get_entry(&id).unwrap().1.body, body);
+            drop(core);
+
+            re_encrypt_vault(&vault_dir, &make_secret("Old123!"), &make_secret("New456!"))
+                .unwrap();
+            let mut core = DiaryCore::new(path.to_str().unwrap()).unwrap();
+            core.unlock(make_secret("New456!")).unwrap();
+            assert_eq!(core.get_entry(&id).unwrap().1.body, body);
+        }
     }
 
     #[test]

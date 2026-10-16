@@ -19,7 +19,7 @@ use crate::password::{get_password, PasswordSource};
 use crate::Cli;
 use chrono::{DateTime, Local, Utc};
 use pq_diary_core::{DiaryCore, EntryMeta, EntryPlaintext, Tag};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
 // Private helpers
@@ -344,7 +344,7 @@ fn cmd_new_with_attach_to(
                         .and_then(|n| n.to_str())
                         .unwrap_or("attachment");
                     let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-                    attached_files.push((filename.to_string(), size));
+                    attached_files.push((filename, size));
                 }
                 Err(e) => {
                     return Err(anyhow::Error::new(e).context(format!(
@@ -1629,28 +1629,20 @@ fn resolve_conflicts_interactive(
 ) -> anyhow::Result<()> {
     use pq_diary_core::git::{fuzz_timestamp, get_last_commit_timestamp};
 
+    // Validate timestamp arithmetic before prompting or writing conflict choices.
+    let prev_ts = get_last_commit_timestamp(vault_dir);
+    let fuzz_hours = config.git.privacy.timestamp_fuzz_hours;
+    let fuzzed_ts = fuzz_timestamp(prev_ts, fuzz_hours)?;
+    let ts_str = fuzzed_ts.to_rfc3339();
+
     if !apply_conflict_choices(conflicts, vault_path, mac_key, reader)? {
         return Ok(());
     }
 
     // Commit the updated vault using the privacy pipeline.
-    let prev_ts = get_last_commit_timestamp(vault_dir);
-    let fuzz_hours = config.git.privacy.timestamp_fuzz_hours;
-    let fuzzed_ts = fuzz_timestamp(prev_ts, fuzz_hours);
-    let ts_str = fuzzed_ts.to_rfc3339();
 
-    let add_out = std::process::Command::new("git")
-        .current_dir(vault_dir)
-        .args(["add", "vault.pqd"])
-        .output()
-        .map_err(|e| anyhow::anyhow!("git add failed: {e}"))?;
-    if !add_out.status.success() {
-        return Err(anyhow::anyhow!(
-            "git add failed: {}",
-            String::from_utf8_lossy(&add_out.stderr)
-        ));
-    }
-
+    // Commit only the resolved vault; preserve unrelated staging on success
+    // and leave the original index intact if a commit hook rejects it.
     let commit_out = std::process::Command::new("git")
         .current_dir(vault_dir)
         .arg("-c")
@@ -1659,10 +1651,13 @@ fn resolve_conflicts_interactive(
         .arg(format!("user.email={}", config.git.author_email))
         .args([
             "commit",
+            "--only",
             "--date",
             &ts_str,
             "-m",
             &config.git.commit_message,
+            "--",
+            "vault.pqd",
         ])
         .env("GIT_AUTHOR_DATE", &ts_str)
         .env("GIT_COMMITTER_DATE", &ts_str)
@@ -2446,8 +2441,7 @@ fn cmd_export_impl(
         }
 
         let content = build_export_content(meta, &body);
-        std::fs::write(path, content)
-            .map_err(|e| anyhow::anyhow!("Failed to write {}: {e}", path.display()))?;
+        write_export_markdown(path, &content)?;
     }
 
     if attachment_count > 0 {
@@ -2461,6 +2455,22 @@ fn cmd_export_impl(
         println!("Exported {} entries to {}", count, dir.display());
     }
     Ok(())
+}
+
+/// Claim only a new export destination and write through that same handle.
+/// The earlier existence check is advisory: another writer or a dangling
+/// symlink may occupy the path by the time plaintext is ready to publish.
+fn write_export_markdown(path: &Path, content: &str) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use std::io::Write as _;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("Failed to create export file {}", path.display()))?;
+    file.write_all(content.as_bytes())
+        .with_context(|| format!("Failed to write {}", path.display()))
 }
 
 fn build_export_filename(meta: &pq_diary_core::EntryMeta) -> String {
@@ -2610,14 +2620,23 @@ fn argon2_params_from_vault(
 fn prompt_confirmation_mode<R: std::io::BufRead>(
     reader: &mut R,
 ) -> anyhow::Result<pq_diary_core::vault::config::ConfirmationMode> {
+    prompt_confirmation_mode_with_io(reader, &mut std::io::stdout().lock())
+}
+
+fn prompt_confirmation_mode_with_io(
+    reader: &mut dyn std::io::BufRead,
+    out: &mut dyn std::io::Write,
+) -> anyhow::Result<pq_diary_core::vault::config::ConfirmationMode> {
     use pq_diary_core::vault::config::ConfirmationMode;
-    println!("Choose confirmation mode for legacy-access:");
-    println!("  [1] timer30 (default) — 30-second timer + y/N");
-    println!("  [2] yn               — immediate y/N");
-    println!("  [3] phrase           — type 'DESTROY ALL' to confirm");
-    print!("Selection [1]: ");
-    use std::io::Write as _;
-    std::io::stdout().flush().ok();
+    writeln!(out, "Choose confirmation mode for legacy-access:")?;
+    writeln!(out, "  [1] timer30 (default) — 30-second timer + y/N")?;
+    writeln!(out, "  [2] yn               — immediate y/N")?;
+    writeln!(
+        out,
+        "  [3] phrase           — type 'DESTROY ALL' to confirm"
+    )?;
+    write!(out, "Selection [1]: ")?;
+    out.flush()?;
     let mut line = String::new();
     reader.read_line(&mut line)?;
     let choice = line.trim();
@@ -2861,8 +2880,7 @@ pub fn cmd_legacy_access(cli: &Cli) -> anyhow::Result<()> {
 
     let report = execute_legacy_access(&vault_dir, &legacy_code, &deriver, |mode| {
         run_destroy_confirmation(mode)
-    })
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    })?;
 
     println!(
         "Legacy access complete. {} entries inherited, {} entries destroyed.",
@@ -2877,54 +2895,74 @@ pub fn cmd_legacy_access(cli: &Cli) -> anyhow::Result<()> {
 fn run_destroy_confirmation(
     mode: pq_diary_core::vault::config::ConfirmationMode,
 ) -> Result<bool, pq_diary_core::error::DiaryError> {
+    run_destroy_confirmation_with_io(
+        mode,
+        &mut std::io::stdin().lock(),
+        &mut std::io::stdout().lock(),
+    )
+}
+
+fn run_destroy_confirmation_with_io(
+    mode: pq_diary_core::vault::config::ConfirmationMode,
+    reader: &mut dyn std::io::BufRead,
+    out: &mut dyn std::io::Write,
+) -> Result<bool, pq_diary_core::error::DiaryError> {
     use pq_diary_core::vault::config::ConfirmationMode;
 
-    println!();
-    println!("============================================================");
-    println!("  WARNING: THIS OPERATION IS IRREVERSIBLE");
-    println!("  - All INHERIT entries will be inherited.");
-    println!("  - All DESTROY entries (and unconfigured entries) will be");
-    println!("    PERMANENTLY ERASED with zeroize-overwrite.");
-    println!("============================================================");
+    writeln!(out)?;
+    writeln!(
+        out,
+        "============================================================"
+    )?;
+    writeln!(out, "  WARNING: THIS OPERATION IS IRREVERSIBLE")?;
+    writeln!(out, "  - All INHERIT entries will be inherited.")?;
+    writeln!(
+        out,
+        "  - All DESTROY entries (and unconfigured entries) will be"
+    )?;
+    writeln!(out, "    PERMANENTLY ERASED with zeroize-overwrite.")?;
+    writeln!(
+        out,
+        "============================================================"
+    )?;
 
     match mode {
         ConfirmationMode::Timer30 => {
             for remaining in (1..=30).rev() {
-                print!("\r  {remaining:>2} seconds remaining...");
-                use std::io::Write as _;
-                std::io::stdout().flush().ok();
+                write!(out, "\r  {remaining:>2} seconds remaining...")?;
+                out.flush()?;
                 std::thread::sleep(std::time::Duration::from_secs(1));
             }
-            println!("\r   0 seconds remaining.            ");
-            prompt_yn("Proceed? [y/N]: ")
+            writeln!(out, "\r   0 seconds remaining.            ")?;
+            prompt_yn_with_io("Proceed? [y/N]: ", reader, out)
         }
-        ConfirmationMode::Yn => prompt_yn("Proceed? [y/N]: "),
-        ConfirmationMode::Phrase => prompt_phrase("DESTROY ALL"),
+        ConfirmationMode::Yn => prompt_yn_with_io("Proceed? [y/N]: ", reader, out),
+        ConfirmationMode::Phrase => prompt_phrase_with_io("DESTROY ALL", reader, out),
     }
 }
 
-fn prompt_yn(prompt: &str) -> Result<bool, pq_diary_core::error::DiaryError> {
-    print!("{prompt}");
-    use std::io::{BufRead as _, Write as _};
-    std::io::stdout().flush().ok();
+fn prompt_yn_with_io(
+    prompt: &str,
+    reader: &mut dyn std::io::BufRead,
+    out: &mut dyn std::io::Write,
+) -> Result<bool, pq_diary_core::error::DiaryError> {
+    write!(out, "{prompt}")?;
+    out.flush()?;
     let mut line = String::new();
-    std::io::stdin()
-        .lock()
-        .read_line(&mut line)
-        .map_err(pq_diary_core::error::DiaryError::Io)?;
+    reader.read_line(&mut line)?;
     Ok(matches!(line.trim(), "y" | "Y" | "yes" | "YES"))
 }
 
-fn prompt_phrase(expected: &str) -> Result<bool, pq_diary_core::error::DiaryError> {
-    println!("Type the phrase '{expected}' to confirm:");
-    print!("> ");
-    use std::io::{BufRead as _, Write as _};
-    std::io::stdout().flush().ok();
+fn prompt_phrase_with_io(
+    expected: &str,
+    reader: &mut dyn std::io::BufRead,
+    out: &mut dyn std::io::Write,
+) -> Result<bool, pq_diary_core::error::DiaryError> {
+    writeln!(out, "Type the phrase '{expected}' to confirm:")?;
+    write!(out, "> ")?;
+    out.flush()?;
     let mut line = String::new();
-    std::io::stdin()
-        .lock()
-        .read_line(&mut line)
-        .map_err(pq_diary_core::error::DiaryError::Io)?;
+    reader.read_line(&mut line)?;
     Ok(line.trim() == expected)
 }
 
@@ -3094,21 +3132,38 @@ pub fn cmd_attachment_delete(
     filename: String,
     force: bool,
 ) -> anyhow::Result<()> {
+    cmd_attachment_delete_with_io(
+        cli,
+        entry,
+        filename,
+        force,
+        &mut std::io::stdin().lock(),
+        &mut std::io::stdout().lock(),
+    )
+}
+
+fn cmd_attachment_delete_with_io(
+    cli: &Cli,
+    entry: String,
+    filename: String,
+    force: bool,
+    reader: &mut dyn std::io::BufRead,
+    out: &mut dyn std::io::Write,
+) -> anyhow::Result<()> {
     use pq_diary_core::attachment::delete_attachment;
     use secrecy::{ExposeSecret as _, SecretBox, SecretString};
 
     if cli.claude {
         anyhow::bail!("attachment delete is not permitted with --claude");
     }
-    if !force {
-        print!("Delete attachment '{filename}' from entry {entry}? [y/N]: ");
-        use std::io::{BufRead as _, Write as _};
-        std::io::stdout().flush().ok();
-        let mut line = String::new();
-        std::io::stdin().lock().read_line(&mut line)?;
-        if !matches!(line.trim(), "y" | "Y" | "yes" | "YES") {
-            anyhow::bail!("cancelled");
-        }
+    if !force
+        && !prompt_yn_with_io(
+            &format!("Delete attachment '{filename}' from entry {entry}? [y/N]: "),
+            reader,
+            out,
+        )?
+    {
+        anyhow::bail!("cancelled");
     }
     let vault_dir = resolve_legacy_vault_dir(cli)?;
     let master_source = get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -9952,6 +10007,96 @@ parallelism = 1
         assert_eq!(core.get_entry(&id).unwrap().1.body, "second body");
     }
 
+    #[test]
+    fn export_preserves_destination_created_after_preflight() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("export.md");
+        assert!(!path.exists(), "export preflight sees an available path");
+        // A competing writer claims the destination after our preflight.
+        std::fs::write(&path, b"other writer's contents").expect("competing file");
+
+        let error = write_export_markdown(&path, "private export body")
+            .expect_err("exclusive creation must reject the competing file");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .expect("typed output error")
+                .kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("competing file"),
+            b"other writer's contents"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_rejects_dangling_symlink_without_publishing_plaintext() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_s10_vault(&dir, "v", b"password");
+        let pqd = vault_dir.join("vault.pqd");
+        let mut core = DiaryCore::new(pqd.to_str().expect("path")).expect("core");
+        core.unlock(secrecy::SecretBox::new(Box::from("password")))
+            .expect("unlock");
+        let id = core
+            .new_entry("export fixture", "private export body", vec![])
+            .expect("entry");
+        let meta = core.list_entries(None).expect("entries").remove(0);
+        core.lock();
+
+        let original = std::fs::read(&pqd).expect("vault snapshot");
+        let config_path = vault_dir.join("vault.toml");
+        let original_config = std::fs::read(&config_path).expect("config snapshot");
+        let out = dir.path().join("out");
+        std::fs::create_dir(&out).expect("output directory");
+        let destination = out.join(build_export_filename(&meta));
+        let outside = dir.path().join("must-not-create.md");
+        symlink(&outside, &destination).expect("dangling output symlink");
+        assert!(
+            !destination.exists(),
+            "preflight follows the missing target"
+        );
+
+        let cli = make_cli_plain(&[
+            "--vault",
+            vault_dir.to_str().expect("vault path"),
+            "--password",
+            "password",
+            "export",
+            out.to_str().expect("output path"),
+        ]);
+        let error = cmd_export_impl(&cli, out.clone(), &mut std::io::Cursor::new(b"y\n"))
+            .expect_err("export must not follow the output symlink");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .expect("typed output error")
+                .kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert!(
+            !outside.exists(),
+            "plaintext must not escape the output directory"
+        );
+        assert_eq!(std::fs::read_link(&destination).expect("symlink"), outside);
+        assert_eq!(std::fs::read_dir(&out).expect("outputs").count(), 1);
+        assert_eq!(std::fs::read(&pqd).expect("vault"), original);
+        assert_eq!(
+            std::fs::read(&config_path).expect("config"),
+            original_config
+        );
+        core.unlock(secrecy::SecretBox::new(Box::from("password")))
+            .expect("reopen");
+        assert_eq!(
+            core.get_entry(&id).expect("entry").1.body,
+            "private export body"
+        );
+        core.lock();
+    }
+
     /// TC-501-01: 3 entries export → 3 well-named files.
     #[test]
     fn tc_501_01_export_three_entries() {
@@ -10002,7 +10147,7 @@ parallelism = 1
 
 #[cfg(test)]
 mod conflict_snapshot_tests {
-    use super::apply_conflict_choices;
+    use super::{apply_conflict_choices, resolve_conflicts_interactive};
     use pq_diary_core::{
         git::MergeConflict,
         vault::{
@@ -10017,6 +10162,28 @@ mod conflict_snapshot_tests {
     use std::io::{self, BufRead, Read};
 
     const KEY: [u8; 32] = [42; 32];
+
+    #[test]
+    fn invalid_fuzz_config_preserves_conflicts_without_prompting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.pqd");
+        let conflicts = [conflict(11)];
+        save(&path, &[conflicts[0].local.clone()], &[]);
+        let before = std::fs::read(&path).unwrap();
+        let mut config = pq_diary_core::vault::config::VaultConfig::default();
+        config.git.privacy.timestamp_fuzz_hours = u64::MAX;
+        let mut input = io::Cursor::new("r\n");
+        let error =
+            resolve_conflicts_interactive(&conflicts, dir.path(), &config, &path, &KEY, &mut input)
+                .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<pq_diary_core::error::DiaryError>(),
+            Some(pq_diary_core::error::DiaryError::Config(_))
+        ));
+        assert_eq!(input.position(), 0);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 
     // Simulate another writer during the prompt without timing or real Git.
     struct Prompt<F> {
@@ -10084,6 +10251,119 @@ mod conflict_snapshot_tests {
         .unwrap();
     }
 
+    fn checked_git(dir: &std::path::Path, args: &[&str]) -> Vec<u8> {
+        let output = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    fn resolution_fixture() -> (
+        tempfile::TempDir,
+        pq_diary_core::vault::config::VaultConfig,
+        MergeConflict,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        checked_git(dir.path(), &["init"]);
+        checked_git(dir.path(), &["config", "user.name", "fixture"]);
+        checked_git(dir.path(), &["config", "user.email", "fixture@localhost"]);
+        checked_git(dir.path(), &["config", "commit.gpgsign", "false"]);
+        let conflict = conflict(11);
+        save(
+            &dir.path().join("vault.pqd"),
+            std::slice::from_ref(&conflict.local),
+            &[],
+        );
+        checked_git(dir.path(), &["add", "vault.pqd"]);
+        checked_git(dir.path(), &["commit", "-m", "initial"]);
+        std::fs::write(dir.path().join("sentinel.txt"), b"unrelated staged data").unwrap();
+        checked_git(dir.path(), &["add", "sentinel.txt"]);
+        let mut config = pq_diary_core::vault::config::VaultConfig::default();
+        config.git.author_name = "pq-diary".into();
+        config.git.author_email = "resolution@localhost".into();
+        config.git.commit_message = "Update vault".into();
+        config.git.privacy.timestamp_fuzz_hours = 0;
+        (dir, config, conflict)
+    }
+
+    #[test]
+    fn conflict_resolution_commits_only_vault_and_preserves_staged_sentinel() {
+        let (dir, config, conflict) = resolution_fixture();
+        let path = dir.path().join("vault.pqd");
+        super::resolve_conflicts_interactive(
+            std::slice::from_ref(&conflict),
+            dir.path(),
+            &config,
+            &path,
+            &KEY,
+            &mut io::Cursor::new("r\n"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            checked_git(dir.path(), &["diff", "--cached", "--name-only"]),
+            b"sentinel.txt\n"
+        );
+        assert_eq!(
+            checked_git(dir.path(), &["ls-tree", "--name-only", "HEAD"]),
+            b"vault.pqd\n"
+        );
+        assert_eq!(
+            checked_git(dir.path(), &["show", ":sentinel.txt"]),
+            b"unrelated staged data"
+        );
+        assert_eq!(
+            checked_git(dir.path(), &["log", "-1", "--format=%an <%ae>%n%s"]),
+            b"pq-diary <resolution@localhost>\nUpdate vault\n"
+        );
+        let (_, records, _) = read_vault_with_attachments_authenticated(&path, &KEY).unwrap();
+        assert_eq!(records, vec![conflict.remote]);
+        assert_eq!(
+            checked_git(dir.path(), &["show", "HEAD:vault.pqd"]),
+            std::fs::read(&path).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conflict_resolution_rejected_commit_preserves_head_and_index() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (dir, config, conflict) = resolution_fixture();
+        let path = dir.path().join("vault.pqd");
+        let hook = dir.path().join(".git/hooks/pre-commit");
+        std::fs::write(&hook, b"#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let head = checked_git(dir.path(), &["rev-parse", "HEAD"]);
+        let index = std::fs::read(dir.path().join(".git/index")).unwrap();
+
+        assert!(super::resolve_conflicts_interactive(
+            std::slice::from_ref(&conflict),
+            dir.path(),
+            &config,
+            &path,
+            &KEY,
+            &mut io::Cursor::new("r\n"),
+        )
+        .is_err());
+        assert_eq!(checked_git(dir.path(), &["rev-parse", "HEAD"]), head);
+        assert_eq!(std::fs::read(dir.path().join(".git/index")).unwrap(), index);
+        assert_eq!(
+            checked_git(dir.path(), &["diff", "--cached", "--name-only"]),
+            b"sentinel.txt\n"
+        );
+        // The existing resolver writes the chosen vault before committing.
+        // A rejected commit leaves that authenticated choice available to retry.
+        let (_, records, _) = read_vault_with_attachments_authenticated(&path, &KEY).unwrap();
+        assert_eq!(records, vec![conflict.remote]);
+    }
     #[test]
     fn conflict_snapshot_rejects_changed_or_missing_selected_entry_without_writes() {
         // Changes with unchanged content HMAC and timestamp must also be caught.
@@ -10297,6 +10577,248 @@ mod heatmap_window_tests {
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod confirmation_output_tests {
+    use super::*;
+    use pq_diary_core::error::DiaryError;
+    use pq_diary_core::vault::config::ConfirmationMode;
+    use std::io::{self, BufRead, Read, Write};
+
+    struct UnreadableInput;
+
+    impl Read for UnreadableInput {
+        fn read(&mut self, _bytes: &mut [u8]) -> io::Result<usize> {
+            panic!("confirmation input must not be read after output failure");
+        }
+    }
+
+    impl BufRead for UnreadableInput {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            panic!("confirmation input must not be read after output failure");
+        }
+
+        fn consume(&mut self, _amount: usize) {
+            panic!("confirmation input must not be consumed after output failure");
+        }
+    }
+
+    struct ConfirmationOutput {
+        fail_write: bool,
+        bytes: Vec<u8>,
+    }
+
+    impl Write for ConfirmationOutput {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.fail_write {
+                Err(io::ErrorKind::BrokenPipe.into())
+            } else {
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+    }
+
+    fn failing_output(fail_write: bool) -> ConfirmationOutput {
+        ConfirmationOutput {
+            fail_write,
+            bytes: Vec::new(),
+        }
+    }
+
+    fn assert_broken_pipe(error: DiaryError) {
+        assert!(
+            matches!(error, DiaryError::Io(ref io) if io.kind() == io::ErrorKind::BrokenPipe),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn confirmation_write_and_flush_failures_do_not_read_input() {
+        for fail_write in [true, false] {
+            assert_broken_pipe(
+                prompt_yn_with_io(
+                    "Proceed? [y/N]: ",
+                    &mut UnreadableInput,
+                    &mut failing_output(fail_write),
+                )
+                .unwrap_err(),
+            );
+            assert_broken_pipe(
+                prompt_phrase_with_io(
+                    "DESTROY ALL",
+                    &mut UnreadableInput,
+                    &mut failing_output(fail_write),
+                )
+                .unwrap_err(),
+            );
+            let error = prompt_confirmation_mode_with_io(
+                &mut UnreadableInput,
+                &mut failing_output(fail_write),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<io::Error>().unwrap().kind(),
+                io::ErrorKind::BrokenPipe
+            );
+            for mode in [ConfirmationMode::Yn, ConfirmationMode::Phrase] {
+                assert_broken_pipe(
+                    run_destroy_confirmation_with_io(
+                        mode,
+                        &mut UnreadableInput,
+                        &mut failing_output(fail_write),
+                    )
+                    .unwrap_err(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn countdown_flush_failure_returns_before_first_sleep() {
+        let mut out = failing_output(false);
+        assert_broken_pipe(
+            run_destroy_confirmation_with_io(
+                ConfirmationMode::Timer30,
+                &mut UnreadableInput,
+                &mut out,
+            )
+            .unwrap_err(),
+        );
+        assert!(out.bytes.ends_with(b"\r  30 seconds remaining..."));
+    }
+
+    #[test]
+    fn confirmation_prompts_preserve_text_defaults_and_accepted_answers() {
+        for answer in ["y", "Y", "yes", "YES", " y \n", "", "n", "Yes", "true"] {
+            let mut reader = io::Cursor::new(answer);
+            let mut out = Vec::new();
+            let confirmed = prompt_yn_with_io("Proceed? [y/N]: ", &mut reader, &mut out).unwrap();
+            assert_eq!(
+                confirmed,
+                matches!(answer.trim(), "y" | "Y" | "yes" | "YES")
+            );
+            assert_eq!(out, b"Proceed? [y/N]: ");
+        }
+        for answer in ["DESTROY ALL", " DESTROY ALL\n", "destroy all", ""] {
+            let mut reader = io::Cursor::new(answer);
+            let mut out = Vec::new();
+            let confirmed = prompt_phrase_with_io("DESTROY ALL", &mut reader, &mut out).unwrap();
+            assert_eq!(confirmed, answer.trim() == "DESTROY ALL");
+            assert_eq!(out, b"Type the phrase 'DESTROY ALL' to confirm:\n> ");
+        }
+        for (answer, expected) in [
+            ("", ConfirmationMode::Timer30),
+            ("1", ConfirmationMode::Timer30),
+            ("timer30", ConfirmationMode::Timer30),
+            ("2", ConfirmationMode::Yn),
+            ("yn", ConfirmationMode::Yn),
+            ("3", ConfirmationMode::Phrase),
+            ("phrase", ConfirmationMode::Phrase),
+        ] {
+            let mut out = Vec::new();
+            assert_eq!(
+                prompt_confirmation_mode_with_io(&mut io::Cursor::new(answer), &mut out).unwrap(),
+                expected
+            );
+            assert_eq!(
+                String::from_utf8(out).unwrap(),
+                "Choose confirmation mode for legacy-access:\n  [1] timer30 (default) — 30-second timer + y/N\n  [2] yn               — immediate y/N\n  [3] phrase           — type 'DESTROY ALL' to confirm\nSelection [1]: "
+            );
+        }
+        assert!(
+            prompt_confirmation_mode_with_io(&mut io::Cursor::new("4"), &mut Vec::new(),)
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid selection '4'")
+        );
+    }
+
+    #[test]
+    fn confirmation_output_error_preserves_vault_config_and_attachment() {
+        use pq_diary_core::attachment::add_attachment;
+        use pq_diary_core::legacy::{
+            execute_legacy_access, initialize_legacy, Argon2LegacyDeriver,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let vault = test_support::setup_vault(&dir);
+        let password = secrecy::SecretString::new("password".into());
+        let code = secrecy::SecretString::new("synthetic legacy code".into());
+        let path = vault.join("vault.pqd");
+        let mut core = DiaryCore::new(path.to_str().unwrap()).unwrap();
+        core.unlock(secrecy::SecretString::new("password".into()))
+            .unwrap();
+        let id = core
+            .new_entry("original", "preserved body", vec![])
+            .unwrap();
+        drop(core);
+        let source = dir.path().join("fixture.txt");
+        std::fs::write(&source, b"synthetic attachment").unwrap();
+        add_attachment(&vault, &password, &id, &source).unwrap();
+        let blobs: Vec<_> = std::fs::read_dir(vault.join(".attachments"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(blobs.len(), 1);
+        let blob = &blobs[0];
+        let deriver = Argon2LegacyDeriver::new(test_support::fast_params());
+        initialize_legacy(&vault, &password, &code, ConfirmationMode::Yn, &deriver).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let config_before = std::fs::read(vault.join("vault.toml")).unwrap();
+        let blob_before = std::fs::read(blob).unwrap();
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "pq-diary",
+            "--vault",
+            vault.to_str().unwrap(),
+            "--password",
+            "password",
+            "attachment",
+            "delete",
+            &id,
+            "fixture.txt",
+        ])
+        .unwrap();
+
+        for fail_write in [true, false] {
+            let error = cmd_attachment_delete_with_io(
+                &cli,
+                id.clone(),
+                "fixture.txt".into(),
+                false,
+                &mut UnreadableInput,
+                &mut failing_output(fail_write),
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<DiaryError>(),
+                Some(DiaryError::Io(io)) if io.kind() == io::ErrorKind::BrokenPipe
+            ));
+            let result = execute_legacy_access(&vault, &code, &deriver, |mode| {
+                run_destroy_confirmation_with_io(
+                    mode,
+                    &mut UnreadableInput,
+                    &mut failing_output(fail_write),
+                )
+            });
+            assert_broken_pipe(result.unwrap_err());
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert_eq!(
+                std::fs::read(vault.join("vault.toml")).unwrap(),
+                config_before
+            );
+            assert_eq!(std::fs::read(blob).unwrap(), blob_before);
+            let mut core = DiaryCore::new(path.to_str().unwrap()).unwrap();
+            core.unlock(secrecy::SecretString::new("password".into()))
+                .unwrap();
+            assert_eq!(core.get_entry(&id).unwrap().1.body, "preserved body");
         }
     }
 }

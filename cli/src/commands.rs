@@ -374,6 +374,16 @@ pub fn cmd_list(
     query: Option<String>,
     number: usize,
 ) -> anyhow::Result<()> {
+    cmd_list_to(cli, tag, query, number, &mut std::io::stdout())
+}
+
+fn cmd_list_to(
+    cli: &Cli,
+    tag: Option<String>,
+    query: Option<String>,
+    number: usize,
+    out: &mut dyn std::io::Write,
+) -> anyhow::Result<()> {
     use pq_diary_core::policy::OperationType;
 
     // Policy check before any password prompt or vault decryption.
@@ -395,7 +405,7 @@ pub fn cmd_list(
         let prefix = meta.id_prefix(8);
         let date = format_timestamp(meta.updated_at);
         if meta.tags.is_empty() {
-            println!("{prefix}  {date}  {}", meta.title);
+            writeln!(out, "{prefix}  {date}  {}", meta.title)?;
         } else {
             let tags_str = meta
                 .tags
@@ -403,11 +413,12 @@ pub fn cmd_list(
                 .map(|t| format!("#{t}"))
                 .collect::<Vec<_>>()
                 .join("  ");
-            println!("{prefix}  {date}  {}  {tags_str}", meta.title);
+            writeln!(out, "{prefix}  {date}  {}  {tags_str}", meta.title)?;
         }
     }
 
     // guard drops here, automatically calling lock().
+    out.flush()?;
     Ok(())
 }
 
@@ -432,6 +443,7 @@ pub fn cmd_show(cli: &Cli, id: String) -> anyhow::Result<()> {
 /// Separating the writer allows tests to capture the output without spawning a
 /// subprocess or redirecting `stdout`.
 fn cmd_show_impl(cli: &Cli, id: String, out: &mut dyn std::io::Write) -> anyhow::Result<()> {
+    use anyhow::Context as _;
     use pq_diary_core::policy::OperationType;
     use secrecy::{ExposeSecret as _, SecretBox};
 
@@ -460,12 +472,11 @@ fn cmd_show_impl(cli: &Cli, id: String, out: &mut dyn std::io::Write) -> anyhow:
     let created = format_timestamp(record.created_at);
     let updated = format_timestamp(record.updated_at);
 
-    writeln!(out, "Title:   {}", plaintext.title)
-        .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+    writeln!(out, "Title:   {}", plaintext.title).context("Failed to write entry output")?;
     writeln!(out, "Created: {created}  Updated: {updated}")
-        .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+        .context("Failed to write entry output")?;
     if plaintext.tags.is_empty() {
-        writeln!(out, "Tags:    (none)").map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+        writeln!(out, "Tags:    (none)").context("Failed to write entry output")?;
     } else {
         let tags_str = plaintext
             .tags
@@ -473,10 +484,10 @@ fn cmd_show_impl(cli: &Cli, id: String, out: &mut dyn std::io::Write) -> anyhow:
             .map(|t| format!("#{t}"))
             .collect::<Vec<_>>()
             .join("  ");
-        writeln!(out, "Tags:    {tags_str}").map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+        writeln!(out, "Tags:    {tags_str}").context("Failed to write entry output")?;
     }
-    writeln!(out).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-    write!(out, "{}", plaintext.body).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+    writeln!(out).context("Failed to write entry output")?;
+    write!(out, "{}", plaintext.body).context("Failed to write entry output")?;
 
     // Resolve [[link]] references in the body.
     let resolved = guard
@@ -484,24 +495,24 @@ fn cmd_show_impl(cli: &Cli, id: String, out: &mut dyn std::io::Write) -> anyhow:
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     if !resolved.is_empty() {
-        writeln!(out).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-        writeln!(out, "--- Links ---").map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+        writeln!(out).context("Failed to write entry output")?;
+        writeln!(out, "--- Links ---").context("Failed to write entry output")?;
         for link in &resolved {
             match link.matches.len() {
                 0 => writeln!(out, "  [[{}]] (未解決)", link.title)
-                    .map_err(|e| anyhow::anyhow!("Write error: {e}"))?,
+                    .context("Failed to write entry output")?,
                 1 => writeln!(
                     out,
                     "  [[{}]] → [{}]",
                     link.title, link.matches[0].id_prefix
                 )
-                .map_err(|e| anyhow::anyhow!("Write error: {e}"))?,
+                .context("Failed to write entry output")?,
                 _ => {
                     writeln!(out, "  [[{}]] → 複数候補:", link.title)
-                        .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+                        .context("Failed to write entry output")?;
                     for m in &link.matches {
                         writeln!(out, "    [{}]", m.id_prefix)
-                            .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+                            .context("Failed to write entry output")?;
                     }
                 }
             }
@@ -517,9 +528,9 @@ fn cmd_show_impl(cli: &Cli, id: String, out: &mut dyn std::io::Write) -> anyhow:
             SecretBox::new(Box::from(password_source.secret().expose_secret()));
         match pq_diary_core::attachment::list_attachments(&vault_dir, &listing_pwd, Some(&id)) {
             Ok(metas) if !metas.is_empty() => {
-                writeln!(out).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+                writeln!(out).context("Failed to write entry output")?;
                 writeln!(out, "--- Attachments ({}) ---", metas.len())
-                    .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+                    .context("Failed to write entry output")?;
                 for m in &metas {
                     writeln!(
                         out,
@@ -528,7 +539,7 @@ fn cmd_show_impl(cli: &Cli, id: String, out: &mut dyn std::io::Write) -> anyhow:
                         human_size(m.size_bytes),
                         m.mime_type,
                     )
-                    .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+                    .context("Failed to write entry output")?;
                 }
             }
             Ok(_) => {}
@@ -544,17 +555,18 @@ fn cmd_show_impl(cli: &Cli, id: String, out: &mut dyn std::io::Write) -> anyhow:
     if !backlinks.is_empty() {
         backlinks.sort_by_key(|b| std::cmp::Reverse(b.created_at));
 
-        writeln!(out).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-        writeln!(out, "--- Backlinks ---").map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+        writeln!(out).context("Failed to write entry output")?;
+        writeln!(out, "--- Backlinks ---").context("Failed to write entry output")?;
         for bl in &backlinks {
             let date = format_timestamp(bl.created_at);
             let prefix = backlink_uuid_prefix(&bl.source_uuid);
             writeln!(out, "  [{prefix}] {date} {}", bl.source_title)
-                .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+                .context("Failed to write entry output")?;
         }
     }
 
     // guard drops here, automatically calling lock().
+    out.flush()?;
     Ok(())
 }
 
@@ -1229,6 +1241,7 @@ pub(crate) fn cmd_search_to(
     }
 
     // guard drops here, automatically calling lock().
+    out.flush()?;
     Ok(())
 }
 
@@ -1349,6 +1362,7 @@ pub(crate) fn cmd_stats_to(
     }
 
     // guard drops here, automatically calling lock().
+    out.flush()?;
     Ok(())
 }
 
@@ -1796,6 +1810,10 @@ fn review_password_choice(
 /// Returns an error if the base directory cannot be determined or vault
 /// enumeration fails.
 pub fn cmd_vault_list(cli: &Cli) -> anyhow::Result<()> {
+    cmd_vault_list_to(cli, &mut std::io::stdout())
+}
+
+fn cmd_vault_list_to(cli: &Cli, out: &mut dyn std::io::Write) -> anyhow::Result<()> {
     use pq_diary_core::vault::init::VaultManager;
 
     let base_dir = resolve_vaults_base_dir(cli)?;
@@ -1804,12 +1822,13 @@ pub fn cmd_vault_list(cli: &Cli) -> anyhow::Result<()> {
         .list_vaults_with_policy()
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    println!("{:<20} POLICY", "NAME");
-    println!("{}", "-".repeat(31));
+    writeln!(out, "{:<20} POLICY", "NAME")?;
+    writeln!(out, "{}", "-".repeat(31))?;
     for v in &vaults {
-        println!("{:<20} {}", v.name, v.policy);
+        writeln!(out, "{:<20} {}", v.name, v.policy)?;
     }
 
+    out.flush()?;
     Ok(())
 }
 
@@ -2340,6 +2359,10 @@ fn cmd_git_sync_impl(cli: &Cli, reader: &mut impl std::io::BufRead) -> anyhow::R
 /// Returns an error if `git` is not installed, the vault directory cannot be
 /// resolved, or `git status` fails.
 pub fn cmd_git_status(cli: &Cli) -> anyhow::Result<()> {
+    cmd_git_status_to(cli, &mut std::io::stdout())
+}
+
+fn cmd_git_status_to(cli: &Cli, out: &mut dyn std::io::Write) -> anyhow::Result<()> {
     use pq_diary_core::git;
 
     let vault_path = resolve_vault_path(cli)?;
@@ -2348,8 +2371,9 @@ pub fn cmd_git_status(cli: &Cli) -> anyhow::Result<()> {
     git::check_git_available().map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let status = git::git_status(&vault_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
-    print!("{status}");
+    write!(out, "{status}")?;
 
+    out.flush()?;
     Ok(())
 }
 
@@ -2571,6 +2595,10 @@ fn resolve_default_vault_dir() -> anyhow::Result<PathBuf> {
 
 /// Execute the `pq-diary info [--security]` command.
 pub fn cmd_info(cli: &Cli, security: bool) -> anyhow::Result<()> {
+    cmd_info_to(cli, security, &mut std::io::stdout())
+}
+
+fn cmd_info_to(cli: &Cli, security: bool, out: &mut dyn std::io::Write) -> anyhow::Result<()> {
     use pq_diary_core::vault::config::VaultConfig;
     use secrecy::{ExposeSecret as _, SecretBox};
 
@@ -2612,44 +2640,55 @@ pub fn cmd_info(cli: &Cli, security: bool) -> anyhow::Result<()> {
         Err(_) => "unknown".to_string(),
     };
 
-    println!("=== Vault Info ===");
-    println!("{:<16}{}", "Name:", vault_config.vault.name);
-    println!("{:<16}{}", "Policy:", vault_config.access.policy);
-    println!("{:<16}{}", "Entries:", entry_count);
-    println!("{:<16}{}", "Created:", created_str);
-    println!("{:<16}{}", "Last updated:", modified_str);
+    writeln!(out, "=== Vault Info ===")?;
+    writeln!(out, "{:<16}{}", "Name:", vault_config.vault.name)?;
+    writeln!(out, "{:<16}{}", "Policy:", vault_config.access.policy)?;
+    writeln!(out, "{:<16}{}", "Entries:", entry_count)?;
+    writeln!(out, "{:<16}{}", "Created:", created_str)?;
+    writeln!(out, "{:<16}{}", "Last updated:", modified_str)?;
 
     if security {
         let status = crate::security::HardenStatus::current();
-        println!();
-        println!("=== Security ===");
-        println!("{:<22}ML-KEM-768", "KEM algorithm:");
-        println!("{:<22}ML-DSA-65", "Signature algorithm:");
-        println!(
+        writeln!(out)?;
+        writeln!(out, "=== Security ===")?;
+        writeln!(out, "{:<22}ML-KEM-768", "KEM algorithm:")?;
+        writeln!(out, "{:<22}ML-DSA-65", "Signature algorithm:")?;
+        writeln!(
+            out,
             "{:<22}{} KB",
             "Argon2 memory:", vault_config.argon2.memory_cost_kb
-        );
-        println!(
+        )?;
+        writeln!(
+            out,
             "{:<22}{}",
             "Argon2 time cost:", vault_config.argon2.time_cost
-        );
-        println!(
+        )?;
+        writeln!(
+            out,
             "{:<22}{}",
             "Argon2 parallelism:", vault_config.argon2.parallelism
-        );
-        println!("{:<22}{}", "mlock active:", yes_no(status.mlock_active));
-        println!(
+        )?;
+        writeln!(
+            out,
+            "{:<22}{}",
+            "mlock active:",
+            yes_no(status.mlock_active)
+        )?;
+        writeln!(
+            out,
             "{:<22}{}",
             "Coredump disabled:",
             yes_no(status.coredump_disabled)
-        );
-        println!(
+        )?;
+        writeln!(
+            out,
             "{:<22}{}",
             "Debugger detected:",
             yes_no(status.debugger_detected)
-        );
+        )?;
     }
 
+    out.flush()?;
     Ok(())
 }
 
@@ -3130,6 +3169,10 @@ pub fn cmd_legacy_set(
 
 /// Execute the `pq-diary legacy list` command.
 pub fn cmd_legacy_list(cli: &Cli) -> anyhow::Result<()> {
+    cmd_legacy_list_to(cli, &mut std::io::stdout())
+}
+
+fn cmd_legacy_list_to(cli: &Cli, out: &mut dyn std::io::Write) -> anyhow::Result<()> {
     use pq_diary_core::legacy::{list_legacy_status, LegacyFlag};
     use secrecy::{ExposeSecret as _, SecretBox, SecretString};
 
@@ -3157,32 +3200,36 @@ pub fn cmd_legacy_list(cli: &Cli) -> anyhow::Result<()> {
     inherits.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
     destroys.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
 
-    println!("=== INHERIT ({} entries) ===", inherits.len());
+    writeln!(out, "=== INHERIT ({} entries) ===", inherits.len())?;
     for s in &inherits {
-        println!(
+        writeln!(
+            out,
             "{}  {}  {}",
             s.uuid_prefix,
             format_timestamp(s.updated_at),
             s.title
-        );
+        )?;
     }
-    println!();
-    println!("=== DESTROY ({} entries) ===", destroys.len());
+    writeln!(out)?;
+    writeln!(out, "=== DESTROY ({} entries) ===", destroys.len())?;
     for s in &destroys {
-        println!(
+        writeln!(
+            out,
             "{}  {}  {}",
             s.uuid_prefix,
             format_timestamp(s.updated_at),
             s.title
-        );
+        )?;
     }
-    println!();
-    println!(
+    writeln!(out)?;
+    writeln!(
+        out,
         "Summary: INHERIT {} entries / DESTROY {} entries / Total {}",
         inherits.len(),
         destroys.len(),
         statuses.len()
-    );
+    )?;
+    out.flush()?;
     Ok(())
 }
 
@@ -3380,6 +3427,14 @@ pub fn cmd_attachment_add(cli: &Cli, entry: String, path: PathBuf) -> anyhow::Re
 
 /// `pq-diary attachment list [<ENTRY_ID>]` 相当。
 pub fn cmd_attachment_list(cli: &Cli, entry: Option<String>) -> anyhow::Result<()> {
+    cmd_attachment_list_to(cli, entry, &mut std::io::stdout())
+}
+
+fn cmd_attachment_list_to(
+    cli: &Cli,
+    entry: Option<String>,
+    out: &mut dyn std::io::Write,
+) -> anyhow::Result<()> {
     use pq_diary_core::attachment::list_attachments;
     use pq_diary_core::legacy::LegacyFlag;
     use pq_diary_core::policy::OperationType;
@@ -3398,13 +3453,15 @@ pub fn cmd_attachment_list(cli: &Cli, entry: Option<String>) -> anyhow::Result<(
     let metas = list_attachments(&vault_dir, &master_pwd, entry.as_deref())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     if metas.is_empty() {
-        println!("No attachments.");
+        writeln!(out, "No attachments.")?;
+        out.flush()?;
         return Ok(());
     }
-    println!(
+    writeln!(
+        out,
         "{:<10} {:<24} {:>10}  {:<12} FLAG",
         "ENTRY", "FILE", "SIZE", "ADDED"
-    );
+    )?;
     for m in &metas {
         let entry_short: String = m
             .entry_uuid
@@ -3416,17 +3473,19 @@ pub fn cmd_attachment_list(cli: &Cli, entry: Option<String>) -> anyhow::Result<(
             LegacyFlag::Inherit => "INHERIT",
             LegacyFlag::Destroy => "DESTROY",
         };
-        println!(
+        writeln!(
+            out,
             "{:<10} {:<24} {:>10}  {:<12} {}",
             entry_short,
             truncate(&m.filename, 24),
             human_size(m.size_bytes),
             format_timestamp(m.created_at),
             flag,
-        );
+        )?;
     }
-    println!();
-    println!("Summary: {} attachment(s)", metas.len());
+    writeln!(out)?;
+    writeln!(out, "Summary: {} attachment(s)", metas.len())?;
+    out.flush()?;
     Ok(())
 }
 
@@ -3557,6 +3616,89 @@ mod tests {
     use super::*;
     use clap::Parser as _;
     use std::path::Path;
+
+    #[test]
+    fn read_output_propagates_write_and_flush_errors() {
+        use std::io::{self, Write};
+        struct FailingWriter {
+            fail_write: bool,
+            kind: io::ErrorKind,
+        }
+        impl Write for FailingWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.fail_write {
+                    Err(io::Error::from(self.kind))
+                } else {
+                    Ok(bytes.len())
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::from(self.kind))
+            }
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault = setup_vault(&dir);
+        let ids = seed_entries(&vault, &[("private title", "private body without newline")]);
+        pq_diary_core::git::git_init(&vault, None).expect("git init");
+        let cli = make_cli(vault.to_str().expect("path"), Some("password"));
+        let base_cli = make_cli(dir.path().to_str().expect("path"), Some("password"));
+        let before = std::fs::read(vault.join("vault.pqd")).expect("snapshot");
+        let config_before = std::fs::read(vault.join("vault.toml")).expect("config");
+        for fail_write in [true, false] {
+            for kind in [io::ErrorKind::Other, io::ErrorKind::BrokenPipe] {
+                for handler in 0..12 {
+                    let mut writer = FailingWriter { fail_write, kind };
+                    let result = match handler {
+                        0 => cmd_list_to(&cli, None, None, 10, &mut writer),
+                        1 => cmd_info_to(&cli, false, &mut writer),
+                        2 => cmd_info_to(&cli, true, &mut writer),
+                        3 => cmd_attachment_list_to(&cli, None, &mut writer),
+                        4 => cmd_vault_list_to(&base_cli, &mut writer),
+                        5 => cmd_git_status_to(&cli, &mut writer),
+                        6 => cmd_legacy_list_to(&cli, &mut writer),
+                        7 => cmd_show_impl(&cli, ids[0].clone(), &mut writer),
+                        8 => cmd_search_to(
+                            &cli,
+                            &crate::SearchArgs {
+                                pattern: "private".into(),
+                                tag: None,
+                                context: 0,
+                                count: false,
+                            },
+                            &mut writer,
+                        ),
+                        n => cmd_stats_to(
+                            &cli,
+                            &crate::StatsArgs {
+                                json: n == 10,
+                                heatmap: n == 11,
+                            },
+                            &mut writer,
+                        ),
+                    };
+                    let error = result.expect_err("output failure must propagate");
+                    assert_eq!(
+                        error
+                            .downcast_ref::<io::Error>()
+                            .expect("typed I/O error")
+                            .kind(),
+                        kind,
+                        "handler {handler}"
+                    );
+                    assert!(!format!("{error:#}").contains("private"));
+                    assert_eq!(
+                        std::fs::read(vault.join("vault.pqd")).expect("vault"),
+                        before
+                    );
+                    assert_eq!(
+                        std::fs::read(vault.join("vault.toml")).expect("config"),
+                        config_before
+                    );
+                }
+            }
+        }
+        assert_eq!(read_vault_entries(&vault).len(), 1);
+    }
 
     #[test]
     fn ordinary_commands_deny_before_credentials_or_unreadable_vault() {

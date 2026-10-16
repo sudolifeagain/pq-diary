@@ -1,6 +1,7 @@
 # 開発棚卸し（2026-10-16 JST）
 
-対象: `main` の `0e085c06869223d8979ece642f073d0c2bcfe306`。
+更新時点: `main` の [`ed77e6cfeafaeaba2ff5f02b65714b18880d6da9`](https://github.com/sudolifeagain/pq-diary/commit/ed77e6cfeafaeaba2ff5f02b65714b18880d6da9)（PR #75 マージ後）。
+以下のベースライン・第1修正単位の実行結果は、旧棚卸し対象 `0e085c06869223d8979ece642f073d0c2bcfe306` からの履歴であり、現在のmainで再実行した件数ではない。今回の更新はソースと既存回帰テストの静的照合のみ。
 この記録は実装の棚卸しであり、完全なセキュリティ監査ではない。
 
 ## 現状
@@ -9,10 +10,10 @@
 - 日記CRUD、日次ノート、テンプレート、検索、インポート・エクスポート、添付、パスワード変更、遺言アクセス、Git同期の実装あり。存在することと全組合せの正しさは別。
 - 現行 writer は schema **0x06**。v4/v5 を読む互換経路あり。
 - S16 は HKDF、MDK、各種キースロット、鍵ファイルの基礎実装までマージ済み。実際の作成・解錠・保存・CLIへの接続、v0x07移行は未完了。耐量子鍵カプセル化が通常のデータ保護経路に組み込まれたとは扱わない。
-- 本PR作成前の2026-10-16棚卸し時点で open PR は0件。open issue は #15–20 と #23 の7件（S16 epicと6サブタスク）。リモートへの変更は実施していない。
+- 今回の文書更新前の確認では open PR は0件、open issue は #15–20 と #23 の7件（S16 epicと6サブタスク）。これは確認時点の件数。
 - `requirements.md` の未実装表記、現行v5表記、暗号機能の説明と、現行コードには差異がある。S16の将来仕様を現在の保証として読まない。
 
-## ベースライン
+## 初回棚卸しのベースライン（履歴）
 
 Linuxの新しい作業ディレクトリで Rust 1.95.0、固定 Cargo.lock の依存を使い、
 `cargo test --workspace --locked` を実行した。
@@ -26,28 +27,35 @@ Linuxの新しい作業ディレクトリで Rust 1.95.0、固定 Cargo.lock の
 これは修正前の基準値。ignoredケース、Windows/macOS/ARM、性能目標の再検証を
 含まない。既存テスト成功だけでは以下の未カバー障害を除外できなかった。
 
-## S17: 既存データの保全を先に修正
+## S17 第1修正単位で扱った不具合（履歴）
 
 1. **遺言アクセスの置換失敗時に原本を損なう問題**
-   - `core/src/legacy.rs` は新ファイルへの置換前に原本の非継承レコードを上書きする。
+   - `core/src/legacy.rs` は修正前、新ファイルへの置換前に原本の非継承レコードを上書きしていた。
    - vault または設定ファイルのバックアップ名をディレクトリで塞ぐ2ケースで、エラー後に原本バイトが変わることを再現した。
    - 両ファイルの置換成功まで原本を保持し、成功後に旧バックアップを消去する順序へ修正した。
 2. **テンプレートを含むvaultでパスワード変更が失敗する問題**
-   - `core/src/vault/change_password.rs` がテンプレートも `EntryPlaintext` として読むため、`missing field title` で失敗する。
-   - 日記とテンプレートが混在する回帰テストで再現済み。レコード種別に対応する型で検証し、共通の再暗号化処理を維持する。
+   - `core/src/vault/change_password.rs` が修正前はテンプレートも `EntryPlaintext` として読んでいたため、`missing field title` で失敗していた。
+   - 日記とテンプレートが混在する回帰テストで再現済み。レコード種別に対応する型で検証し、共通の再暗号化処理を維持するよう修正した。
 
-## 次の調査・修正候補（未修正、静的確認）
+## PR #75 後の照合結果（静的確認）
 
-- Git pull後のcommitがリモート履歴を親に持たず、次のpushがnon-fast-forwardとなる可能性。ローカルbare remoteと2クローンで再現する。
-- Git pushが添付blobをstageせず、pullがリモート添付レコードを採用しない。blobとメタデータの両方を扱う往復テストが必要。
-- 現行Gitの「3-way」処理にmerge-base参照がなく、削除を復活させる可能性。HMACだけの比較では遺言フラグ変更も失われ得る。
-- INHERIT設定後の編集で主本文だけ更新され、継承用コピーは古いまま。継承コードの再入力など更新手順を設計する必要があり、無断でDESTROYに戻さない。
-- 添付・遺言の一部マスターパスワードAPIはvault全体のMAC検証を経由しない。破損fixtureで読み書き前の拒否を確認する。master keyを持たないlegacy-accessは別の設計課題。
-- 長寿命のDiaryCoreでCRUD後のリンク索引が更新されない。unlock途中の索引検証失敗後にengineが残る可能性も別途確認する。
+- 遺言アクセスのbackup失敗時保全、日記・テンプレート混在vaultのパスワード変更は修正済み。回帰テストは `core/src/legacy.rs` の `tc_s12_007_08_vault_backup_failure_keeps_original` / `tc_s12_007_09_toml_backup_failure_keeps_original`、`core/src/vault/change_password.rs` の `password_rotation_preserves_templates_and_entries`。
+- 添付・master-password遺言APIの整合性検証は実装済み。両モジュールに `*_apis_reject_tampered_mac_without_side_effects` / `*_apis_reject_tampered_timestamp_without_side_effects` がある。master keyを持たないlegacy-accessの認証設計とは区別する。
+- リンク照会は現在のsnapshotから索引を作り直す。unlock失敗後もlockedを保つ。`core/src/lib.rs` の `link_queries_follow_create_update_delete_without_reunlock` / `failed_unlock_does_not_publish_partial_state` / `failed_reunlock_clears_previous_session` で回帰を扱う。
+- INHERIT編集は古い継承用コピーを残さないよう拒否する安全策が実装済み（`core/src/entry.rs::update_entry`）。継承コードを再取得し両コピーを更新する編集機能は未実装。現在は別エントリに改訂を作成する。
+- Git pullは取得したsnapshotを検証してから更新し、添付付きvault、異なる鍵/header、異なる設定値を拒否する。guardによる拒否を同期機能の完成とは扱わない。
+- 通常CIはLinuxのbuild/test/Clippy/fmt/debug smokeとaudit/deny。全OS/ARM・release smokeは手動 `full_matrix=true`。現在の設定は [ci.yml](../.github/workflows/ci.yml)、検証方針は [workflow.md](workflow.md) を参照。
 
-新しいS16機能の一括実装より、上記の再現・データ保全・互換性を優先する。
+## 未完了の開発候補
 
-## S17 第1修正単位の検証
+1. Gitの共通baseに基づく削除・同一HMACのメタデータ変更の照合と、完全に検証したmerge後のremote ancestry記録。`core/src/git.rs::git_pull_merge_inner` は現在UUID unionとローカルcommitのため、削除復活やpull後pushのnon-fast-forwardが残る。force-pushで回避しない。
+2. Gitの添付メタデータ・暗号化blobの一体同期、および端末間のheader/key/config変更の移行設計。現行の拒否guardは実装完了まで維持する。
+3. S16のv0x07 reader/writer、作成・解錠・保存・非破壊移行への統合。その後に鍵ファイル・recipient・recoveryの利用導線、MDKローテーション、メタデータ機密化、CLIを完成させる。[Epic #20](https://github.com/sudolifeagain/pq-diary/issues/20) と #15–19 / #23 は未完了。既存のMDK/keyslot単体APIを未着手とは扱わない。
+4. Phase 2の残候補。`list` はtagとtitle queryの併用・固定降順・件数制限まで実装済みだが、選択可能なsort・list JSON・複数条件の拡張は未実装（`stats --json` は既存）。daemonはhidden stub。Web Clipper、固定ブロック、XOR分散は別の未完了項目。
+
+小さいPRごとに回帰・失敗時保全・互換性を確認し、古いテスト件数やチェック済み表記だけで完了判定しない。
+
+## S17 第1修正単位の検証（履歴）
 
 - 上記2件を修正。テンプレート1件、バックアップ失敗2件を修正前に失敗確認。
 - 修正後 `cargo test --workspace --locked`: 787 passed / 15 ignored / 0 failed。

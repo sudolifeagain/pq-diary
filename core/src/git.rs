@@ -826,7 +826,6 @@ fn git_pull_merge_inner(
 
     // Commit only the vault. Git's temporary index preserves unrelated staging
     // and leaves the original index intact if the commit is rejected.
-
     let commit_out = std::process::Command::new("git")
         .current_dir(vault_dir)
         .arg("-c")
@@ -991,14 +990,8 @@ mod tests {
             fuzz_timestamp_at(None, window, 0, now).unwrap(),
             now - Duration::seconds(window - 1)
         );
-        assert_eq!(
-            fuzz_timestamp_at(None, window, window, now).unwrap(),
-            now
-        );
-        assert_eq!(
-            fuzz_timestamp_at(Some(now), window, 0, now).unwrap(),
-            now
-        );
+        assert_eq!(fuzz_timestamp_at(None, window, window, now).unwrap(), now);
+        assert_eq!(fuzz_timestamp_at(Some(now), window, 0, now).unwrap(), now);
     }
 
     #[test]

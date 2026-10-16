@@ -177,7 +177,7 @@ fn cmd_import_with_add_to(
 
     // 7. (S13) Apply the queued attachment adds now that the guard is gone —
     // `add_attachment` re-opens the vault with the master password.
-    let mut attachment_warnings = Vec::new();
+    let mut attachment_warnings = zeroize::Zeroizing::new(Vec::new());
     let mut first_attachment_error = None;
     if !pending_attachments.is_empty() {
         let vault_dir = resolve_legacy_vault_dir(cli)?;
@@ -191,7 +191,7 @@ fn cmd_import_with_add_to(
                     attachment_warnings
                         .push(format!("  warning: failed to attach {filename}: {e}"));
                     if first_attachment_error.is_none() {
-                        first_attachment_error = Some((filename.to_owned(), e));
+                        first_attachment_error = Some((filename, e));
                     }
                 }
             }
@@ -220,7 +220,7 @@ fn cmd_import_with_add_to(
             )?;
         }
 
-        for warning in &attachment_warnings {
+        for warning in attachment_warnings.iter() {
             writeln!(out, "{warning}")?;
         }
         if attached > 0 || !skipped_links.is_empty() {

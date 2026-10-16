@@ -10629,15 +10629,9 @@ mod conflict_snapshot_tests {
         let mut config = pq_diary_core::vault::config::VaultConfig::default();
         config.git.privacy.timestamp_fuzz_hours = u64::MAX;
         let mut input = io::Cursor::new("r\n");
-        let error = resolve_conflicts_interactive(
-            &conflicts,
-            dir.path(),
-            &config,
-            &path,
-            &KEY,
-            &mut input,
-        )
-        .unwrap_err();
+        let error =
+            resolve_conflicts_interactive(&conflicts, dir.path(), &config, &path, &KEY, &mut input)
+                .unwrap_err();
         assert!(matches!(
             error.downcast_ref::<pq_diary_core::error::DiaryError>(),
             Some(pq_diary_core::error::DiaryError::Config(_))

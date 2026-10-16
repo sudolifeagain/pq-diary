@@ -3810,7 +3810,10 @@ mod tests {
     /// TC-0037-10: No flag uses the same configured target as info/password.
     #[test]
     fn tc_0037_10_resolve_vault_path_default() {
-        let _lock = lock_home();
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeOverride::new(dir.path());
         let root = dir.path().join(".pq-diary");
@@ -8363,19 +8366,18 @@ parallelism = 1
 
     /// TC-S8-078-07: When `git` is not in PATH, all git subcommands fail with
     /// an appropriate error.
-    ///
-    /// **Ignored** because it modifies the process-wide PATH environment
-    /// variable and must not run concurrently with other tests.
-    /// Run with: `cargo test -- --ignored tc_s8_078_07`
+    /// Runs in an isolated subprocess so unrelated tests keep their PATH.
     #[test]
-    #[ignore = "requires environment without git in PATH; run: cargo test -- --ignored"]
     fn tc_s8_078_07_all_git_commands_fail_when_git_not_installed() {
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let vault_dir = setup_vault_for_git(&dir);
         let vault_dir_str = vault_dir.to_str().expect("utf8");
 
         // Temporarily clear PATH so git cannot be found.
-        let original_path = std::env::var_os("PATH").unwrap_or_default();
         std::env::set_var("PATH", "");
 
         let cli_init = make_git_cli(&["pq-diary", "-v", vault_dir_str, "git-init"]);
@@ -8412,8 +8414,6 @@ parallelism = 1
             cmd_git_pull(&cli_pull),
             cmd_git_sync(&cli_sync),
         ];
-
-        std::env::set_var("PATH", original_path);
 
         for (i, result) in results.iter().enumerate() {
             assert!(
@@ -9080,24 +9080,21 @@ parallelism = 1
 
     /// TC-S8-INT-E01: When `git` is absent from PATH, all git commands fail
     /// with a "not installed" or "not found" error message.
-    ///
-    /// **Ignored** — modifies the process-wide PATH variable and must not run
-    /// concurrently with other tests.
-    /// Run with: `cargo test -- --ignored tc_s8_int_e01`
+    /// Runs in an isolated subprocess so unrelated tests keep their PATH.
     #[test]
-    #[ignore = "requires environment without git in PATH; run: cargo test -- --ignored"]
     fn tc_s8_int_e01_git_not_installed_error() {
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let vault_dir = setup_vault_for_git(&dir);
         let vault_dir_str = vault_dir.to_str().expect("utf8");
 
-        let original_path = std::env::var_os("PATH").unwrap_or_default();
         std::env::set_var("PATH", "");
 
         let cli = make_git_cli(&["pq-diary", "-v", vault_dir_str, "git-init"]);
         let result = cmd_git_init(&cli, None);
-
-        std::env::set_var("PATH", original_path);
 
         assert!(
             result.is_err(),
@@ -10292,21 +10289,13 @@ parallelism = 1
     // S10 Phase 2 tests — init / sync / info / change-password / export
     // =========================================================================
 
-    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn lock_home() -> std::sync::MutexGuard<'static, ()> {
-        match HOME_LOCK.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        }
-    }
-
     struct HomeOverride {
         previous: Option<std::ffi::OsString>,
     }
 
     impl HomeOverride {
         fn new(new_home: &std::path::Path) -> Self {
+            crate::test_environment::assert_isolated();
             let previous = std::env::var_os("PQ_DIARY_HOME");
             let root = new_home.join(".pq-diary");
             std::env::set_var("PQ_DIARY_HOME", &root);
@@ -10321,6 +10310,21 @@ parallelism = 1
                 None => std::env::remove_var("PQ_DIARY_HOME"),
             }
         }
+    }
+
+    #[test]
+    fn home_override_refuses_parallel_parent_mutation() {
+        let before = std::env::var_os("PQ_DIARY_HOME");
+        let dir = tempfile::tempdir().unwrap();
+        let result = std::panic::catch_unwind(|| HomeOverride::new(dir.path()));
+        assert!(
+            result.is_err(),
+            "override must refuse a parallel parent harness"
+        );
+        assert!(
+            std::env::var_os("PQ_DIARY_HOME") == before,
+            "override changed parent environment (values redacted)"
+        );
     }
 
     fn make_cli_plain(args: &[&str]) -> crate::Cli {
@@ -10345,9 +10349,12 @@ parallelism = 1
     /// TC-101-01: clean environment → config.toml and default vault are created.
     #[test]
     fn tc_101_01_init_creates_config_and_vault() {
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         use pq_diary_core::vault::config::AppConfig;
 
-        let _lock = lock_home();
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeOverride::new(dir.path());
 
@@ -10382,7 +10389,10 @@ parallelism = 1
     /// TC-101-E01: existing config.toml → init refuses to run.
     #[test]
     fn tc_101_e01_init_refuses_when_already_initialized() {
-        let _lock = lock_home();
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeOverride::new(dir.path());
 
@@ -10405,7 +10415,10 @@ parallelism = 1
     /// TC-101-E02: empty password → init rejected and no files created.
     #[test]
     fn tc_101_e02_init_rejects_empty_password() {
-        let _lock = lock_home();
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeOverride::new(dir.path());
 
@@ -10422,10 +10435,12 @@ parallelism = 1
     }
 
     fn assert_failed_init_preserves_existing_default(manager_config_invalid: bool) {
+        if crate::test_environment::isolated() {
+            return;
+        }
         use pq_diary_core::policy::AccessPolicy;
         use pq_diary_core::vault::init::VaultManager;
 
-        let _lock = lock_home();
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeOverride::new(dir.path());
         let pq_root = dir.path().join(".pq-diary");
@@ -10500,9 +10515,12 @@ parallelism = 1
     #[cfg(unix)]
     #[test]
     fn init_failure_preserves_dangling_default_symlink() {
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         use std::os::unix::fs::symlink;
 
-        let _lock = lock_home();
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeOverride::new(dir.path());
         let pq_root = dir.path().join(".pq-diary");
@@ -10529,9 +10547,12 @@ parallelism = 1
     #[cfg(unix)]
     #[test]
     fn init_refuses_dangling_config_symlink() {
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         use std::os::unix::fs::symlink;
 
-        let _lock = lock_home();
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeOverride::new(dir.path());
         let pq_root = dir.path().join(".pq-diary");
@@ -10558,7 +10579,10 @@ parallelism = 1
     /// TC-201-E01: unknown sync_backend → error.
     #[test]
     fn tc_201_e01_sync_unknown_backend_errors() {
-        let _lock = lock_home();
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeOverride::new(dir.path());
 
@@ -10581,7 +10605,10 @@ parallelism = 1
     /// TC-201-E02: AppConfig missing → init guidance error.
     #[test]
     fn tc_201_e02_sync_without_config_returns_init_guidance() {
-        let _lock = lock_home();
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeOverride::new(dir.path());
 
@@ -10593,7 +10620,10 @@ parallelism = 1
     /// TC-201-E03: malformed config.toml → Invalid config.toml error.
     #[test]
     fn tc_201_e03_sync_invalid_toml_errors() {
-        let _lock = lock_home();
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeOverride::new(dir.path());
 

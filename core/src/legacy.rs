@@ -124,8 +124,9 @@ pub struct LegacyAccessReport {
     pub destroyed: usize,
     /// Attachments carried into the heir's vault (S13).
     pub inherited_attachments: usize,
-    /// Attachments destroyed during legacy-access (S13). Blob files are
-    /// only zeroize-deleted once their reference count drops to zero.
+    /// Attachment records omitted from the committed heir vault (S13).
+    /// Unreferenced blob cleanup follows the commit and can fail separately
+    /// with `DiaryError::LegacyCleanupIncomplete`.
     pub destroyed_attachments: usize,
 }
 
@@ -447,6 +448,10 @@ pub fn rotate_legacy_code(
 ///
 /// `confirm_callback` lets the CLI layer render the timer30 / yn / phrase
 /// UX without coupling the core to a TTY.
+///
+/// `LegacyCleanupIncomplete` means the heir vault and configuration have already
+/// been committed, but attachment cleanup failed. Its report describes that
+/// committed recovery; callers must not retry legacy access as though it rolled back.
 pub fn execute_legacy_access<F>(
     vault_dir: &Path,
     legacy_code: &SecretString,
@@ -635,39 +640,83 @@ where
     // ones not in `surviving_blobs`. This zeroizes-and-deletes orphaned
     // bodies regardless of whether they were originally INHERIT (parent
     // entry destroyed) or DESTROY records — matching REQ-302 and REQ-503.
-    let attachments_dir = crate::attachment::attachments_dir(vault_dir);
-    if attachments_dir.is_dir() {
-        if let Ok(read_dir) = std::fs::read_dir(&attachments_dir) {
-            for entry in read_dir.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|s| s.to_str()) != Some("bin") {
-                    continue;
-                }
-                let stem = match path.file_stem().and_then(|s| s.to_str()) {
-                    Some(s) => s,
-                    None => continue,
-                };
-                let uuid_bytes = match parse_hex_uuid(stem) {
-                    Some(u) => u,
-                    None => continue,
-                };
-                if !surviving_blobs.contains(&uuid_bytes) {
-                    let _ = crate::attachment::zeroize_and_delete(&path);
-                }
-            }
-        }
-    }
-
-    Ok(LegacyAccessReport {
+    let report = LegacyAccessReport {
         inherited,
         destroyed,
         inherited_attachments,
         destroyed_attachments,
-    })
+    };
+    cleanup_legacy_blobs(vault_dir, &surviving_blobs, report)?;
+    Ok(report)
+}
+
+fn cleanup_legacy_blobs(
+    vault_dir: &Path,
+    surviving_blobs: &std::collections::HashSet<[u8; 16]>,
+    report: LegacyAccessReport,
+) -> Result<(), DiaryError> {
+    let attachments_dir = crate::attachment::attachments_dir(vault_dir);
+    let incomplete = |path: PathBuf, source: DiaryError| DiaryError::LegacyCleanupIncomplete {
+        report,
+        path,
+        source: Box::new(source),
+    };
+    match std::fs::symlink_metadata(&attachments_dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(incomplete(attachments_dir, error.into())),
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(incomplete(
+                attachments_dir,
+                std::io::Error::other("attachment directory is not a directory or is a symlink")
+                    .into(),
+            ));
+        }
+        Ok(_) => {}
+    }
+    let entries = std::fs::read_dir(&attachments_dir)
+        .map_err(|error| incomplete(attachments_dir.clone(), error.into()))?;
+    cleanup_legacy_blob_entries(
+        entries.map(|entry| entry.map(|entry| entry.path())),
+        &attachments_dir,
+        surviving_blobs,
+        report,
+    )
+}
+
+fn cleanup_legacy_blob_entries(
+    entries: impl Iterator<Item = std::io::Result<PathBuf>>,
+    attachments_dir: &Path,
+    surviving_blobs: &std::collections::HashSet<[u8; 16]>,
+    report: LegacyAccessReport,
+) -> Result<(), DiaryError> {
+    let incomplete = |path: PathBuf, source: DiaryError| DiaryError::LegacyCleanupIncomplete {
+        report,
+        path,
+        source: Box::new(source),
+    };
+    for entry in entries {
+        let path =
+            entry.map_err(|error| incomplete(attachments_dir.to_path_buf(), error.into()))?;
+        if path.extension().and_then(|s| s.to_str()) != Some("bin") {
+            continue;
+        }
+        let Some(uuid_bytes) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(parse_hex_uuid)
+        else {
+            continue;
+        };
+        if !surviving_blobs.contains(&uuid_bytes) {
+            crate::attachment::zeroize_and_delete(&path)
+                .map_err(|source| incomplete(path, source))?;
+        }
+    }
+    Ok(())
 }
 
 fn parse_hex_uuid(s: &str) -> Option<[u8; 16]> {
-    if s.len() != 32 {
+    if s.len() != 32 || !s.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }
     let mut out = [0u8; 16];
@@ -1022,6 +1071,172 @@ mod tests {
     use crate::DiaryCore;
     use secrecy::SecretBox;
     use tempfile::tempdir;
+
+    #[test]
+    fn attachment_uuid_parser_accepts_only_ascii_hex() {
+        assert_eq!(
+            parse_hex_uuid("00112233445566778899aAbBcCdDeEfF"),
+            Some([
+                0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff,
+            ])
+        );
+        for invalid in [
+            format!("€{}", "a".repeat(29)),
+            "é".repeat(16),
+            "a".repeat(31),
+            "g".repeat(32),
+            format!("+1{}", "a".repeat(30)),
+        ] {
+            assert_eq!(parse_hex_uuid(&invalid), None);
+        }
+    }
+
+    #[test]
+    fn legacy_access_preserves_unrelated_unicode_attachment_filename() {
+        let dir = tempdir().unwrap();
+        let (vault_dir, _) = vault_with_one_entry(&dir, 1);
+        let attachments = crate::attachment::attachments_dir(&vault_dir);
+        std::fs::create_dir_all(&attachments).unwrap();
+        let unrelated = attachments.join(format!("€{}.bin", "a".repeat(29)));
+        std::fs::write(&unrelated, b"unrelated synthetic data").unwrap();
+        execute_legacy_access(
+            &vault_dir,
+            &secret("legacy-code"),
+            &fast_deriver(),
+            always_confirm,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(unrelated).unwrap(),
+            b"unrelated synthetic data"
+        );
+        let mut heir = DiaryCore::new(&vault_pqd_str(&vault_dir)).unwrap();
+        heir.unlock(secret("legacy-code")).unwrap();
+    }
+
+    fn assert_cleanup_failure_commits_reopenable_vault(prepare: impl FnOnce(&Path) -> PathBuf) {
+        use std::error::Error;
+        let dir = tempdir().unwrap();
+        let (vault_dir, ids) = vault_with_one_entry(&dir, 1);
+        set_entry_flag(
+            &vault_dir,
+            &secret("master-pw"),
+            Some(&secret("legacy-code")),
+            &ids[0],
+            LegacyFlag::Inherit,
+            &fast_deriver(),
+        )
+        .unwrap();
+        let obstacle = prepare(&vault_dir);
+        let error = execute_legacy_access(
+            &vault_dir,
+            &secret("legacy-code"),
+            &fast_deriver(),
+            always_confirm,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("recovery committed"));
+        assert!(error.source().is_some());
+        match error {
+            DiaryError::LegacyCleanupIncomplete {
+                report,
+                path,
+                source,
+            } => {
+                assert_eq!(report.inherited, 1);
+                assert_eq!(report.destroyed, 0);
+                assert_eq!(path, obstacle);
+                assert!(matches!(*source, DiaryError::Io(_)));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        assert!(std::fs::symlink_metadata(&obstacle).is_ok());
+        if obstacle.is_dir() && !obstacle.is_symlink() {
+            assert_eq!(
+                std::fs::read(obstacle.join("unrelated")).unwrap(),
+                b"keep me"
+            );
+        } else if !obstacle.is_symlink() {
+            assert_eq!(std::fs::read(&obstacle).unwrap(), b"keep me");
+        }
+        let config = VaultConfig::from_file(&vault_dir.join("vault.toml")).unwrap();
+        assert!(!config.legacy.initialized);
+        let mut heir = DiaryCore::new(&vault_pqd_str(&vault_dir)).unwrap();
+        heir.unlock(secret("legacy-code")).unwrap();
+        assert_eq!(heir.list_entries(None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn legacy_cleanup_failure_reports_committed_recovery() {
+        assert_cleanup_failure_commits_reopenable_vault(|vault_dir| {
+            let obstacle = crate::attachment::attachments_dir(vault_dir)
+                .join(format!("{}.bin", "a".repeat(32)));
+            std::fs::create_dir_all(&obstacle).unwrap();
+            std::fs::write(obstacle.join("unrelated"), b"keep me").unwrap();
+            obstacle
+        });
+    }
+
+    #[test]
+    fn legacy_cleanup_reports_invalid_attachment_directory() {
+        assert_cleanup_failure_commits_reopenable_vault(|vault_dir| {
+            let obstacle = crate::attachment::attachments_dir(vault_dir);
+            std::fs::write(&obstacle, b"keep me").unwrap();
+            obstacle
+        });
+    }
+
+    #[test]
+    fn legacy_cleanup_reports_directory_iteration_error() {
+        use std::error::Error;
+        let path = Path::new("synthetic-attachments");
+        let error = cleanup_legacy_blob_entries(
+            std::iter::once(Err(std::io::Error::other("synthetic iteration failure"))),
+            path,
+            &Default::default(),
+            LegacyAccessReport {
+                inherited: 7,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.source().is_some());
+        match error {
+            DiaryError::LegacyCleanupIncomplete {
+                report,
+                path: context,
+                ..
+            } => {
+                assert_eq!(report.inherited, 7);
+                assert_eq!(context, path);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_cleanup_preserves_symlink_and_external_target() {
+        for link_directory in [false, true] {
+            let outside = tempdir().unwrap();
+            let target = outside.path().join(format!("{}.bin", "b".repeat(32)));
+            std::fs::write(&target, b"outside synthetic data").unwrap();
+            assert_cleanup_failure_commits_reopenable_vault(|vault_dir| {
+                let attachments = crate::attachment::attachments_dir(vault_dir);
+                if link_directory {
+                    std::os::unix::fs::symlink(outside.path(), &attachments).unwrap();
+                    attachments
+                } else {
+                    std::fs::create_dir_all(&attachments).unwrap();
+                    let link = attachments.join(target.file_name().unwrap());
+                    std::os::unix::fs::symlink(&target, &link).unwrap();
+                    link
+                }
+            });
+            assert_eq!(std::fs::read(&target).unwrap(), b"outside synthetic data");
+        }
+    }
 
     fn fast_params() -> Argon2Params {
         Argon2Params {

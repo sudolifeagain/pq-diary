@@ -36,6 +36,8 @@ caller mutations. The same rule applies to manually constructing detached lines.
 The importer also protects the owned intermediate link-rewritten body until tag
 extraction finishes, including error exits. This does not change its public API,
 frontmatter parsing, or Markdown rewriting behavior.
+Import also guards metadata through rewrites and tag merging, wipes discarded
+duplicate tags, and borrows tag-deduplication keys from the protected input.
 
 These are ownership-lifetime guarantees for these explicit buffers, not a claim
 that compiler, allocator, regex engine or terminal/output copies can all be

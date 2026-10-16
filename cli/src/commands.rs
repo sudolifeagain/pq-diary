@@ -3403,7 +3403,10 @@ mod tests {
             )
             .expect_err("output failure must propagate");
             assert_eq!(
-                error.downcast_ref::<std::io::Error>().expect("I/O source").kind(),
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .expect("I/O source")
+                    .kind(),
                 std::io::ErrorKind::BrokenPipe
             );
             let entries = read_vault_entries(&vault_dir);
@@ -3414,7 +3417,11 @@ mod tests {
                 Some(&entries[0].uuid_hex),
             )
             .expect("reopen attachments");
-            assert_eq!(attachments.len(), 1, "reporting must not skip attachment work");
+            assert_eq!(
+                attachments.len(),
+                1,
+                "reporting must not skip attachment work"
+            );
             assert_eq!(attachments[0].filename, "photo.txt");
             assert_eq!(
                 std::fs::read(vault_dir.join("vault.toml")).expect("config"),

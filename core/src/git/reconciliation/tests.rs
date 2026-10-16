@@ -402,6 +402,51 @@ fn rejects_unauthenticated_or_bad_mac_common_base_and_tracked_blobs() {
 }
 
 #[test]
+fn pinned_reads_ignore_legacy_graft_ancestry_overrides() {
+    if crate::test_environment::isolated() {
+        return;
+    }
+    for inherited_override in [false, true] {
+        for unrelated in [true, false] {
+            std::env::remove_var("GIT_GRAFT_FILE");
+            let repo = Repo::new();
+            let base = repo.commit(&[record(1, 1)], &[], "base");
+            let parents = if unrelated {
+                vec![]
+            } else {
+                vec![base.as_str()]
+            };
+            let tip = repo.commit(&[], &parents, "tip");
+            std::fs::create_dir_all(repo.dir.path().join(".git/info")).unwrap();
+            let grafts = if inherited_override {
+                repo.dir.path().join("custom-grafts")
+            } else {
+                repo.dir.path().join(".git/info/grafts")
+            };
+            let override_data = if unrelated {
+                format!("{tip} {base}\n")
+            } else {
+                format!("{tip}\n")
+            };
+            std::fs::write(&grafts, &override_data).unwrap();
+            if inherited_override {
+                std::env::set_var("GIT_GRAFT_FILE", &grafts);
+            }
+            let inputs = read_committed_inputs(repo.dir.path(), &base, &tip, &KEY);
+            if unrelated {
+                assert!(
+                    inputs.is_err(),
+                    "a graft must not invent authenticated ancestry"
+                );
+            } else {
+                assert_eq!(inputs.unwrap().base_commit, base);
+            }
+            assert_eq!(std::fs::read_to_string(grafts).unwrap(), override_data);
+        }
+    }
+}
+
+#[test]
 fn pinned_reads_ignore_replace_refs_and_reject_missing_vaults() {
     let repo = Repo::new();
     let base = repo.commit(&[record(1, 1)], &[], "base");

@@ -11,12 +11,36 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use super::{git_stdout, parse_sync_config, reject_attachment_records, run_git_command};
+use super::{parse_sync_config, reject_attachment_records};
 use crate::error::DiaryError;
 use crate::vault::format::{
     EntryRecord, VaultHeader, FLAG_INTEGRITY, RECORD_TYPE_ENTRY, RECORD_TYPE_TEMPLATE,
 };
 use crate::vault::reader::{read_vault_with_attachments_from_bytes, verify_vault_integrity_bytes};
+
+// Legacy graft files rewrite ancestry independently of replacement objects.
+// An empty graft path disables both the default file and an inherited override.
+// Keep these environment overrides on Command, never in the parent process.
+fn run_git_command(repository: &Path, args: &[&str]) -> Result<std::process::Output, DiaryError> {
+    std::process::Command::new("git")
+        .current_dir(repository)
+        .env("GIT_GRAFT_FILE", "")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .args(args)
+        .output()
+        .map_err(|error| DiaryError::Git(format!("failed to read Git snapshot: {error}")))
+}
+
+fn git_stdout(repository: &Path, args: &[&str]) -> Result<Vec<u8>, DiaryError> {
+    let output = run_git_command(repository, args)?;
+    if !output.status.success() {
+        return Err(DiaryError::Git(format!(
+            "failed to read Git snapshot: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(output.stdout)
+}
 
 /// An authenticated, attachment-free snapshot. Construction requires a whole-vault
 /// MAC: legacy files accepted by the general reader cannot prove record absence.

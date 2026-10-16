@@ -1800,15 +1800,17 @@ fn resolve_conflicts_interactive(
 ) -> anyhow::Result<()> {
     use pq_diary_core::git::{fuzz_timestamp, get_last_commit_timestamp};
 
+    // Validate timestamp arithmetic before prompting or writing conflict choices.
+    let prev_ts = get_last_commit_timestamp(vault_dir);
+    let fuzz_hours = config.git.privacy.timestamp_fuzz_hours;
+    let fuzzed_ts = fuzz_timestamp(prev_ts, fuzz_hours)?;
+    let ts_str = fuzzed_ts.to_rfc3339();
+
     if !apply_conflict_choices(conflicts, vault_path, mac_key, reader)? {
         return Ok(());
     }
 
     // Commit the updated vault using the privacy pipeline.
-    let prev_ts = get_last_commit_timestamp(vault_dir);
-    let fuzz_hours = config.git.privacy.timestamp_fuzz_hours;
-    let fuzzed_ts = fuzz_timestamp(prev_ts, fuzz_hours);
-    let ts_str = fuzzed_ts.to_rfc3339();
 
     let add_out = std::process::Command::new("git")
         .current_dir(vault_dir)
@@ -10706,7 +10708,7 @@ parallelism = 1
 
 #[cfg(test)]
 mod conflict_snapshot_tests {
-    use super::apply_conflict_choices;
+    use super::{apply_conflict_choices, resolve_conflicts_interactive};
     use pq_diary_core::{
         git::MergeConflict,
         vault::{
@@ -10721,6 +10723,28 @@ mod conflict_snapshot_tests {
     use std::io::{self, BufRead, Read};
 
     const KEY: [u8; 32] = [42; 32];
+
+    #[test]
+    fn invalid_fuzz_config_preserves_conflicts_without_prompting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.pqd");
+        let conflicts = [conflict(11)];
+        save(&path, &[conflicts[0].local.clone()], &[]);
+        let before = std::fs::read(&path).unwrap();
+        let mut config = pq_diary_core::vault::config::VaultConfig::default();
+        config.git.privacy.timestamp_fuzz_hours = u64::MAX;
+        let mut input = io::Cursor::new("r\n");
+        let error =
+            resolve_conflicts_interactive(&conflicts, dir.path(), &config, &path, &KEY, &mut input)
+                .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<pq_diary_core::error::DiaryError>(),
+            Some(pq_diary_core::error::DiaryError::Config(_))
+        ));
+        assert_eq!(input.position(), 0);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 
     // Simulate another writer during the prompt without timing or real Git.
     struct Prompt<F> {

@@ -2617,8 +2617,7 @@ fn cmd_export_impl(
         }
 
         let content = build_export_content(meta, &body);
-        std::fs::write(path, content)
-            .map_err(|e| anyhow::anyhow!("Failed to write {}: {e}", path.display()))?;
+        write_export_markdown(path, &content)?;
     }
 
     if attachment_count > 0 {
@@ -2632,6 +2631,22 @@ fn cmd_export_impl(
         println!("Exported {} entries to {}", count, dir.display());
     }
     Ok(())
+}
+
+/// Claim only a new export destination and write through that same handle.
+/// The earlier existence check is advisory: another writer or a dangling
+/// symlink may occupy the path by the time plaintext is ready to publish.
+fn write_export_markdown(path: &Path, content: &str) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use std::io::Write as _;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("Failed to create export file {}", path.display()))?;
+    file.write_all(content.as_bytes())
+        .with_context(|| format!("Failed to write {}", path.display()))
 }
 
 fn build_export_filename(meta: &pq_diary_core::EntryMeta) -> String {
@@ -10549,6 +10564,32 @@ parallelism = 1
         core.unlock(password).expect("unlock after export");
         assert_eq!(core.list_entries(None).unwrap().len(), 2);
         assert_eq!(core.get_entry(&id).unwrap().1.body, "second body");
+    }
+
+    #[test]
+    fn export_preserves_destination_created_after_preflight() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("export.md");
+        assert!(
+            !path.exists(),
+            "export preflight sees an available path"
+        );
+        // A competing writer claims the destination after our preflight.
+        std::fs::write(&path, b"other writer's contents").expect("competing file");
+
+        let error = write_export_markdown(&path, "private export body")
+            .expect_err("exclusive creation must reject the competing file");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .expect("typed output error")
+                .kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("competing file"),
+            b"other writer's contents"
+        );
     }
 
     #[cfg(unix)]

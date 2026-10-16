@@ -463,7 +463,12 @@ fn unsupported_remote_paths_and_existing_operation_state_are_preserved() {
         let f = Fixture::new(&[record(1, 1)]);
         f.publish(&[record(1, 1), record(2, 1)]);
         if obstacle == "remote-file" {
-            std::fs::write(f.remote.join("other\nfile"), b"remote data").unwrap();
+            let remote_path = if cfg!(windows) {
+                "other file"
+            } else {
+                "other\nfile"
+            };
+            std::fs::write(f.remote.join(remote_path), b"remote data").unwrap();
             git(&f.remote, &["add", "."]);
             git(&f.remote, &["commit", "-m", "unsupported"]);
             git(&f.remote, &["push"]);

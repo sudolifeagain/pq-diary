@@ -1072,11 +1072,13 @@ mod tests {
     use secrecy::SecretBox;
     use tempfile::tempdir;
 
-    fn assert_legacy_sidecar_collisions_preserved(
-        create_collision: impl Fn(&Path, &Path),
-    ) {
+    fn assert_legacy_sidecar_collisions_preserved(create_collision: impl Fn(&Path, &Path)) {
         for operation in ["rotate", "access"] {
-            let suffix = if operation == "rotate" { "rotate" } else { "legacy" };
+            let suffix = if operation == "rotate" {
+                "rotate"
+            } else {
+                "legacy"
+            };
             for name in [
                 format!("vault.pqd.tmp.{suffix}"),
                 format!("vault.toml.tmp.{suffix}"),

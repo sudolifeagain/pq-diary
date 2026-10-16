@@ -2,6 +2,7 @@ use super::*;
 use clap::Parser as _;
 use pq_diary_core::{vault::config::AppConfig, DiaryError};
 use std::io::{self, BufRead, Read};
+use std::path::Path;
 
 fn cli_at(path: &Path, command: &str) -> Cli {
     Cli::try_parse_from([

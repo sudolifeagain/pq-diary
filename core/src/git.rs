@@ -150,7 +150,8 @@ pub fn generate_gitignore() -> String {
 /// # Errors
 ///
 /// Returns [`DiaryError::Git`] if `.git` already exists, any Git command fails,
-/// or `vault.toml` cannot be read/written.
+/// or `vault.toml` cannot be read/parsed. Returns [`DiaryError::Config`] on
+/// config serialization failure and [`DiaryError::Io`] on config write failure.
 pub fn git_init(vault_dir: &Path, remote: Option<&str>) -> Result<(), DiaryError> {
     // Step 1: Check if already initialised (EDGE-006).
     if vault_dir.join(".git").exists() {
@@ -198,9 +199,7 @@ pub fn git_init(vault_dir: &Path, remote: Option<&str>) -> Result<(), DiaryError
             .map_err(|e| DiaryError::Git(format!("failed to parse vault.toml: {e}")))?;
         config.git.author_name = "pq-diary".to_string();
         config.git.author_email = author_email;
-        config
-            .to_file(&toml_path)
-            .map_err(|e| DiaryError::Git(format!("failed to write vault.toml: {e}")))?;
+        config.to_file(&toml_path)?;
     }
 
     // Step 7: Add remote if provided (REQ-005).

@@ -158,7 +158,7 @@ fn cmd_import_with_add_to(
             }
             let id_prefix = &meta.uuid_hex[..meta.uuid_hex.len().min(8)];
             let (_, plaintext) = guard.get_entry(id_prefix)?;
-            let links = pq_diary_core::importer::parse_obsidian_attachment_links(&plaintext.body);
+            let links = pq_diary_core::importer::parse_obsidian_attachment_links(&plaintext.body)?;
             for filename in links {
                 if let Some(src) = resolve_import_attachment_source(&attachments_dir, &filename) {
                     let id_prefix = id_prefix.to_string();

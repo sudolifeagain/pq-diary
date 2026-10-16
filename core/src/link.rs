@@ -12,6 +12,7 @@ use std::sync::OnceLock;
 use zeroize::Zeroize;
 
 use crate::entry::EntryMeta;
+use crate::error::DiaryError;
 
 // =============================================================================
 // ParsedLink / parse_links
@@ -34,12 +35,11 @@ pub struct ParsedLink {
 const LINK_PATTERN: &str = r"\[\[([^\[\]]+)\]\]";
 
 /// Returns a reference to the compiled link regex, initialised at most once.
-fn link_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        // Developer-controlled literal, validated by link_pattern_compiles.
-        Regex::new(LINK_PATTERN).expect("the hardcoded wiki-link pattern must compile")
-    })
+fn link_regex() -> Result<&'static Regex, DiaryError> {
+    static RE: OnceLock<Result<Regex, regex::Error>> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(LINK_PATTERN))
+        .as_ref()
+        .map_err(|error| DiaryError::Entry(format!("invalid wiki-link pattern: {error}")))
 }
 
 /// Extract all `[[title]]` link references from `body`.
@@ -57,12 +57,14 @@ fn link_regex() -> &'static Regex {
 /// ```
 /// use pq_diary_core::link::parse_links;
 ///
-/// let links = parse_links("参照: [[プロジェクトA]]");
+/// let links = parse_links("参照: [[プロジェクトA]]").unwrap();
 /// assert_eq!(links.len(), 1);
 /// assert_eq!(links[0].title, "プロジェクトA");
 /// ```
-pub fn parse_links(body: &str) -> Vec<ParsedLink> {
-    link_regex()
+/// # Errors
+/// Returns an entry error if the cached parser pattern cannot be compiled.
+pub fn parse_links(body: &str) -> Result<Vec<ParsedLink>, DiaryError> {
+    Ok(link_regex()?
         .captures_iter(body)
         .filter_map(|cap| {
             let m = cap.get(0)?;
@@ -73,7 +75,7 @@ pub fn parse_links(body: &str) -> Vec<ParsedLink> {
                 end: m.end(),
             })
         })
-        .collect()
+        .collect())
 }
 
 // =============================================================================
@@ -158,18 +160,22 @@ impl LinkIndex {
     ///
     /// Entries whose `uuid_hex` cannot be parsed as 32 lowercase hex characters
     /// are silently skipped.
-    pub fn build(entries: &[(EntryMeta, String)]) -> Self {
+    /// # Errors
+    /// Returns an entry error if the link parser cannot be initialized.
+    pub fn build(entries: &[(EntryMeta, String)]) -> Result<Self, DiaryError> {
         Self::build_from_entries(entries.iter().map(|(meta, body)| (meta, body.as_str())))
     }
 
     /// Build directly from protected bodies without allocating unprotected copies.
-    pub(crate) fn build_protected(entries: &[(EntryMeta, zeroize::Zeroizing<String>)]) -> Self {
+    pub(crate) fn build_protected(
+        entries: &[(EntryMeta, zeroize::Zeroizing<String>)],
+    ) -> Result<Self, DiaryError> {
         Self::build_from_entries(entries.iter().map(|(meta, body)| (meta, body.as_str())))
     }
 
     fn build_from_entries<'a>(
         entries: impl Iterator<Item = (&'a EntryMeta, &'a str)> + Clone,
-    ) -> Self {
+    ) -> Result<Self, DiaryError> {
         let mut index = LinkIndex {
             title_to_uuids: HashMap::new(),
             uuid_to_backlinks: HashMap::new(),
@@ -196,7 +202,7 @@ impl LinkIndex {
             let Ok(source_uuid) = uuid_hex_to_bytes(&meta.uuid_hex) else {
                 continue;
             };
-            for link in parse_links(body) {
+            for link in parse_links(body)? {
                 let Some(target_uuids) = index.title_to_uuids.get(&link.title) else {
                     continue;
                 };
@@ -216,7 +222,7 @@ impl LinkIndex {
             }
         }
 
-        index
+        Ok(index)
     }
 
     /// Resolve a `[[title]]` reference to matching entries.
@@ -396,7 +402,7 @@ mod tests {
     #[test]
     fn tc_044_01_single_link_parse() {
         let body = "今日は [[プロジェクトA]] について";
-        let links = parse_links(body);
+        let links = parse_links(body).unwrap();
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].title, "プロジェクトA");
         // start..end must reconstruct the full [[...]] text
@@ -411,7 +417,7 @@ mod tests {
     #[test]
     fn tc_044_02_multiple_links_parse() {
         let body = "[[A]] と [[B]] を参照";
-        let links = parse_links(body);
+        let links = parse_links(body).unwrap();
         assert_eq!(links.len(), 2);
         assert_eq!(links[0].title, "A");
         assert_eq!(links[1].title, "B");
@@ -427,7 +433,7 @@ mod tests {
     /// character.
     #[test]
     fn tc_044_03_empty_link_skipped() {
-        let links = parse_links("テスト [[]] 空");
+        let links = parse_links("テスト [[]] 空").unwrap();
         assert!(links.is_empty(), "[[]] must produce no ParsedLink");
     }
 
@@ -438,7 +444,7 @@ mod tests {
     /// TC-044-04: Plain text with no [[...]] patterns yields an empty Vec.
     #[test]
     fn tc_044_04_no_links() {
-        let links = parse_links("リンクなしテキスト");
+        let links = parse_links("リンクなしテキスト").unwrap();
         assert!(links.is_empty(), "no links expected in plain text");
     }
 
@@ -450,7 +456,7 @@ mod tests {
     #[test]
     fn tc_044_05_japanese_title_link() {
         let body = "[[日本語のタイトル]]";
-        let links = parse_links(body);
+        let links = parse_links(body).unwrap();
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].title, "日本語のタイトル");
         assert_eq!(&body[links[0].start..links[0].end], "[[日本語のタイトル]]");
@@ -464,7 +470,7 @@ mod tests {
     #[test]
     fn tc_044_06_special_chars_in_title() {
         let body = "[[2026-04-05 ミーティング #議事録]]";
-        let links = parse_links(body);
+        let links = parse_links(body).unwrap();
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].title, "2026-04-05 ミーティング #議事録");
         assert_eq!(
@@ -481,7 +487,7 @@ mod tests {
     #[test]
     fn nested_brackets_innermost_match() {
         let body = "[[a[[b]]]]";
-        let links = parse_links(body);
+        let links = parse_links(body).unwrap();
         // [^\[\]]+ forbids brackets inside, so only [[b]] matches
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].title, "b");
@@ -494,7 +500,7 @@ mod tests {
     /// Empty string input yields an empty Vec.
     #[test]
     fn empty_body_yields_no_links() {
-        let links = parse_links("");
+        let links = parse_links("").unwrap();
         assert!(links.is_empty());
     }
 
@@ -506,7 +512,7 @@ mod tests {
     #[test]
     fn links_returned_in_order() {
         let body = "[[第一]] 本文 [[第二]] 続き [[第三]]";
-        let links = parse_links(body);
+        let links = parse_links(body).unwrap();
         assert_eq!(links.len(), 3);
         assert_eq!(links[0].title, "第一");
         assert_eq!(links[1].title, "第二");
@@ -545,7 +551,7 @@ mod tests {
             (make_meta(UUID_A, "A", 100), "[[B]]".to_string()),
             (make_meta(UUID_B, "B", 200), String::new()),
         ];
-        let index = LinkIndex::build(&entries);
+        let index = LinkIndex::build(&entries).unwrap();
 
         // resolve("B") → 1 match: entry B
         let resolved = index.resolve("B");
@@ -572,7 +578,7 @@ mod tests {
             (make_meta(UUID_B, "メモ", 200), String::new()),
             (make_meta(UUID_C, "C", 300), "[[メモ]]".to_string()),
         ];
-        let index = LinkIndex::build(&entries);
+        let index = LinkIndex::build(&entries).unwrap();
 
         let resolved = index.resolve("メモ");
         assert_eq!(resolved.matches.len(), 2, "both メモ entries must match");
@@ -593,7 +599,7 @@ mod tests {
     #[test]
     fn tc_045_03_unresolved_link() {
         let entries = vec![(make_meta(UUID_A, "A", 100), "[[存在しない]]".to_string())];
-        let index = LinkIndex::build(&entries);
+        let index = LinkIndex::build(&entries).unwrap();
 
         let resolved = index.resolve("存在しない");
         assert!(
@@ -613,7 +619,7 @@ mod tests {
             (make_meta(UUID_A, "A", 100), "[[B]]".to_string()),
             (make_meta(UUID_B, "B", 200), "[[A]]".to_string()),
         ];
-        let index = LinkIndex::build(&entries);
+        let index = LinkIndex::build(&entries).unwrap();
 
         let bl_a = index.backlinks_for("A");
         assert_eq!(bl_a.len(), 1);
@@ -636,7 +642,7 @@ mod tests {
             (make_meta(UUID_B, "B", 200), String::new()),
             (make_meta(UUID_C, "C", 300), String::new()),
         ];
-        let index = LinkIndex::build(&entries);
+        let index = LinkIndex::build(&entries).unwrap();
 
         let mut titles = index.all_titles();
         titles.sort();
@@ -650,7 +656,7 @@ mod tests {
     /// TC-045-06: An index built from an empty slice returns empty results.
     #[test]
     fn tc_045_06_empty_index() {
-        let index = LinkIndex::build(&[]);
+        let index = LinkIndex::build(&[]).unwrap();
         assert!(
             index.resolve("anything").matches.is_empty(),
             "empty index resolve must be empty"
@@ -676,7 +682,7 @@ mod tests {
             (make_meta(UUID_A, "A", 100), "[[B]]".to_string()),
             (make_meta(UUID_B, "B", 200), String::new()),
         ];
-        let mut index = LinkIndex::build(&entries);
+        let mut index = LinkIndex::build(&entries).unwrap();
         index.zeroize();
 
         assert!(

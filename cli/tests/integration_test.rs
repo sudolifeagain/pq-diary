@@ -563,7 +563,7 @@ fn tc_s5_03_today_with_daily_template() {
     let mut vars = std::collections::HashMap::new();
     vars.insert(BUILTIN_DATE.to_string(), today.to_string());
     vars.insert(BUILTIN_TITLE.to_string(), today.to_string());
-    let initial_body = expand(&tpl.body, &vars);
+    let initial_body = expand(&tpl.body, &vars).unwrap();
 
     // Verify expansion result before creating entry.
     assert_eq!(initial_body, "## 2026-04-05 の記録");
@@ -680,7 +680,7 @@ fn tc_s5_06_template_variable_expansion() {
     let body = "## {{date}} - {{project_name}}";
 
     // Step 1: extract variables
-    let refs = extract_variables(body);
+    let refs = extract_variables(body).unwrap();
     assert_eq!(refs.len(), 2, "must find exactly 2 variable references");
     assert_eq!(refs[0].name, "date");
     assert!(
@@ -697,7 +697,7 @@ fn tc_s5_06_template_variable_expansion() {
     let mut vars = std::collections::HashMap::new();
     vars.insert("date".to_string(), "2026-04-05".to_string());
     vars.insert("project_name".to_string(), "Alpha".to_string());
-    let result = expand(body, &vars);
+    let result = expand(body, &vars).unwrap();
 
     // Step 3: verify result
     assert_eq!(result, "## 2026-04-05 - Alpha");

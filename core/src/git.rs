@@ -6,7 +6,7 @@
 /// Read-only authenticated three-way reconciliation planning.
 pub mod reconciliation;
 
-use std::collections::{HashMap, HashSet};
+mod pull;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -50,35 +50,22 @@ impl GitOperations {
 
 /// Result returned by [`git_pull_merge`].
 ///
-/// Summarises how many entries were added, updated, or left unchanged, and
-/// lists any unresolved conflicts (same UUID, same `updated_at`, different
-/// `content_hmac`) that the caller must resolve.
+/// Summarises the applied changes. A nonempty conflict list means the entire
+/// merge was deferred without writes; resolve it through the callback API.
 #[derive(Debug, Clone)]
 pub struct MergeResult {
     /// Number of entries present in the remote but not in the local vault (added).
     pub added: usize,
     /// Number of entries updated via last-write-wins (`updated_at` comparison).
     pub updated: usize,
-    /// Number of entries deleted (reserved; always 0 in Phase 1).
+    /// Number of local entries removed by the merge.
     pub deleted: usize,
-    /// Unresolved conflicts: same UUID, same `updated_at`, different `content_hmac`.
+    /// Unresolved three-way choices; when nonempty, no merge was applied.
     pub conflicts: Vec<MergeConflict>,
 }
 
-/// A merge conflict: same UUID appeared in both local and remote with different
-/// `content_hmac` values and identical `updated_at` timestamps.
-///
-/// The caller (CLI layer) must choose [`ConflictResolution::KeepLocal`] or
-/// [`ConflictResolution::KeepRemote`] for each conflict before re-writing the vault.
-#[derive(Debug, Clone)]
-pub struct MergeConflict {
-    /// UUID of the conflicting entry (16-byte raw bytes).
-    pub uuid: [u8; 16],
-    /// Local version of the entry.
-    pub local: EntryRecord,
-    /// Remote version of the entry.
-    pub remote: EntryRecord,
-}
+/// A three-way conflict. Either side can be absent (delete/edit).
+pub use reconciliation::RecordConflict as MergeConflict;
 
 /// Strategy for resolving a [`MergeConflict`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -470,37 +457,15 @@ pub fn git_push(
     Ok(())
 }
 
-/// Fetch from origin and merge compatible, attachment-free vault entries.
+/// Fetch and merge authenticated, attachment-free snapshots using their common base.
 ///
-/// # Algorithm
+/// Divergent present records retain last-write-wins when timestamps differ.
+/// In Claude mode equal-timestamp present records keep local; delete/edit conflicts
+/// require an explicit interactive choice. Otherwise unresolved conflicts are
+/// returned without changing the vault, index or HEAD.
 ///
-/// 1. Verify local data and reject unsupported attachment sync.
-/// 2. Fetch origin and resolve the remote commit; no new commits means a no-op.
-/// 3. Read the remote vault with `git show`, without changing the working tree
-///    or index. Verify its integrity and reject attachments, header/key changes,
-///    or a different `vault.toml` before creating a backup.
-/// 4. Create `vault_path.bak` without replacing an existing recovery backup.
-/// 5. Merge by UUID:
-///    - Local-only UUID → keep.
-///    - Remote-only UUID → add (`MergeResult.added++`).
-///    - Both sides, same `content_hmac` → keep local unchanged.
-///    - Both sides, different `content_hmac`, different `updated_at`
-///      → adopt the record with the larger (newer) `updated_at`
-///      (`MergeResult.updated++`).
-///    - Both sides, different `content_hmac`, same `updated_at`
-///      → true conflict. When `claude_mode` is `true`, local wins silently.
-///      Otherwise the conflict is recorded in `MergeResult.conflicts` and
-///      local is used as the provisional resolution.
-/// 6. Write merged records atomically with an authenticated vault MAC.
-/// 7. Commit only `vault.pqd` with the privacy pipeline from `config.git`.
-/// 8. Delete the new backup on success; restore it on error.
-///
-/// This remains an entry-level merge: it does not reconcile deletions or record
-/// remote Git ancestry. A later push may still be rejected as non-fast-forward.
-///
-/// # Errors
-///
-/// Returns [`DiaryError::Git`] on any Git command failure or I/O problem.
+/// Legacy/unverified common bases fail closed. This does not record remote Git
+/// ancestry yet; a later push can still be rejected as non-fast-forward.
 pub fn git_pull_merge(
     vault_dir: &Path,
     config: &VaultConfig,
@@ -508,70 +473,36 @@ pub fn git_pull_merge(
     mac_key: &[u8; 32],
     claude_mode: bool,
 ) -> Result<MergeResult, DiaryError> {
-    timestamp_fuzz_seconds(config.git.privacy.timestamp_fuzz_hours)?;
+    git_pull_merge_with_resolver(vault_dir, config, vault_path, mac_key, &mut |conflict| {
+        if claude_mode {
+            if conflict.local.is_none() || conflict.remote.is_none() {
+                return Err(DiaryError::Git(
+                    "delete/edit conflict requires an explicit choice; retry git-pull interactively".into(),
+                ));
+            }
+            Ok(Some(ConflictResolution::KeepLocal))
+        } else {
+            Ok(None)
+        }
+    })
+}
 
-    if !vault_dir.join(".git").exists() {
-        return Err(DiaryError::Git(
-            "git repository is not initialized: .git directory not found".to_string(),
-        ));
-    }
-    if !vault_path.exists() {
-        return Err(DiaryError::Git("vault.pqd does not exist".to_string()));
-    }
-    let Some(input) = prepare_pull(vault_dir, vault_path, mac_key)? else {
-        return Ok(MergeResult {
-            added: 0,
-            updated: 0,
-            deleted: 0,
-            conflicts: Vec::new(),
-        });
-    };
-
-    // Date-range failures must also precede backup creation and vault mutation.
-    let prev_ts = get_last_commit_timestamp(vault_dir);
-    let ts_str = fuzz_timestamp(prev_ts, config.git.privacy.timestamp_fuzz_hours)?.to_rfc3339();
-
-    // Create a new backup only after preflight. Never replace recovery data
-    // left by an earlier failed merge.
-    let bak_name = format!(
-        "{}.bak",
-        vault_path.file_name().unwrap_or_default().to_string_lossy()
-    );
-    let bak_path = vault_path.with_file_name(bak_name);
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut backup = options.open(&bak_path).map_err(|e| {
-        DiaryError::Git(format!(
-            "cannot create new vault backup; preserve any existing backup before retrying: {e}"
-        ))
-    })?;
-    let copy_result = (|| {
-        let mut source = std::fs::File::open(vault_path)?;
-        std::io::copy(&mut source, &mut backup)?;
-        backup.sync_all()
-    })();
-    drop(backup);
-    if let Err(error) = copy_result {
-        let _ = std::fs::remove_file(&bak_path);
-        return Err(DiaryError::Io(error));
-    }
-
-    let result = git_pull_merge_inner(
-        vault_dir,
-        config,
-        vault_path,
-        mac_key,
-        claude_mode,
-        input,
-        &ts_str,
-    );
-
-    finish_pull(result, &bak_path, vault_path, &mut std::io::stderr().lock())
+/// Collect all conflict choices before writing, then revalidate the original
+/// HEAD, tracking ref, working vault/config bytes and absence of attachments.
+/// Returning None defers the entire merge without any vault/index/HEAD mutation.
+/// Callback errors also abort before backup creation. The callback must not mutate
+/// merge state; changes are detected rather than overwritten.
+///
+/// Validation is not a cross-process lock: callers must exclude concurrent writers
+/// during the short apply/commit phase. Fetch updates remote refs before prompting.
+pub fn git_pull_merge_with_resolver(
+    vault_dir: &Path,
+    config: &VaultConfig,
+    vault_path: &Path,
+    mac_key: &[u8; 32],
+    resolver: &mut impl FnMut(&MergeConflict) -> Result<Option<ConflictResolution>, DiaryError>,
+) -> Result<MergeResult, DiaryError> {
+    pull::merge(vault_dir, config, vault_path, mac_key, resolver)
 }
 
 /// Cleanup diagnostics never replace the primary merge result.
@@ -603,12 +534,6 @@ fn finish_pull(
 // =============================================================================
 // Private helpers
 // =============================================================================
-
-struct PullInput {
-    local_header: VaultHeader,
-    local_entries: Vec<EntryRecord>,
-    remote_entries: Vec<EntryRecord>,
-}
 
 fn reject_attachment_records(
     entries: &[EntryRecord],
@@ -652,86 +577,6 @@ fn read_authenticated_snapshot(
     read_vault_with_attachments_from_bytes(&bytes)
 }
 
-/// Fetch and validate remote data without modifying the working tree or index.
-fn prepare_pull(
-    vault_dir: &Path,
-    vault_path: &Path,
-    mac_key: &[u8; 32],
-) -> Result<Option<PullInput>, DiaryError> {
-    let (local_header, local_entries, attachments) =
-        read_authenticated_snapshot(vault_path, mac_key)?;
-    reject_attachment_records(&local_entries, &attachments)?;
-    reject_local_attachment_blobs(vault_dir)?;
-
-    git_stdout(vault_dir, &["fetch", "origin"])?;
-    let tracking_ref = get_tracking_ref(vault_dir)?;
-    let resolved = git_stdout(
-        vault_dir,
-        &[
-            "rev-parse",
-            "--verify",
-            &format!("{tracking_ref}^{{commit}}"),
-        ],
-    )?;
-    let remote_commit = std::str::from_utf8(&resolved)
-        .map_err(|_| DiaryError::Git("invalid remote commit ID".into()))?
-        .trim();
-    let count = git_stdout(
-        vault_dir,
-        &["rev-list", &format!("HEAD..{remote_commit}"), "--count"],
-    )?;
-    let count: u64 = std::str::from_utf8(&count)
-        .ok()
-        .and_then(|value| value.trim().parse().ok())
-        .ok_or_else(|| DiaryError::Git("invalid remote commit count".into()))?;
-    if count == 0 {
-        return Ok(None);
-    }
-
-    let remote_bytes = git_stdout(vault_dir, &["show", &format!("{remote_commit}:vault.pqd")])?;
-    verify_vault_integrity_bytes(&remote_bytes, mac_key)
-        .map_err(|e| DiaryError::Git(format!("remote vault.pqd failed integrity check: {e}")))?;
-    let (remote_header, remote_entries, attachments) =
-        read_vault_with_attachments_from_bytes(&remote_bytes)?;
-    reject_attachment_records(&remote_entries, &attachments)?;
-    if !git_stdout(vault_dir, &["ls-tree", remote_commit, "--", ".attachments"])?.is_empty() {
-        return Err(DiaryError::Git(
-            "remote attachment blob sync is not supported; local data was left unchanged".into(),
-        ));
-    }
-
-    // Payload length changes normally. Every other header field describes the
-    // encryption context or format, which this entry-only merge cannot migrate.
-    if local_header.schema_version != remote_header.schema_version
-        || local_header.flags != remote_header.flags
-        || local_header.kdf_salt != remote_header.kdf_salt
-        || local_header.legacy_salt != remote_header.legacy_salt
-        || local_header.verification_iv != remote_header.verification_iv
-        || local_header.verification_ct != remote_header.verification_ct
-        || local_header.kem_pk_offset != remote_header.kem_pk_offset
-        || local_header.dsa_pk_hash != remote_header.dsa_pk_hash
-        || local_header.kem_encrypted_sk != remote_header.kem_encrypted_sk
-        || local_header.dsa_encrypted_sk != remote_header.dsa_encrypted_sk
-    {
-        return Err(DiaryError::Git("vault header/key changes cannot be merged automatically; local data was left unchanged".into()));
-    }
-    let remote_config = git_stdout(vault_dir, &["show", &format!("{remote_commit}:vault.toml")])?;
-    if parse_sync_config(&remote_config)?
-        != parse_sync_config(&std::fs::read(vault_dir.join("vault.toml"))?)?
-    {
-        return Err(DiaryError::Git(
-            "vault.toml changes cannot be merged automatically; local data was left unchanged"
-                .into(),
-        ));
-    }
-
-    Ok(Some(PullInput {
-        local_header,
-        local_entries,
-        remote_entries,
-    }))
-}
-
 /// Compare all TOML keys/values, including unknown future fields, while
 /// allowing comments, whitespace, and table/key ordering to differ.
 fn parse_sync_config(bytes: &[u8]) -> Result<toml::Value, DiaryError> {
@@ -739,118 +584,6 @@ fn parse_sync_config(bytes: &[u8]) -> Result<toml::Value, DiaryError> {
         .map_err(|_| DiaryError::Git("vault.toml is not valid UTF-8".into()))?;
     toml::from_str(text)
         .map_err(|_| DiaryError::Git("vault.toml cannot be parsed for safe sync".into()))
-}
-
-/// Merge validated snapshots. The caller handles backup cleanup/restore.
-fn git_pull_merge_inner(
-    vault_dir: &Path,
-    config: &VaultConfig,
-    vault_path: &Path,
-    mac_key: &[u8; 32],
-    claude_mode: bool,
-    input: PullInput,
-    ts_str: &str,
-) -> Result<MergeResult, DiaryError> {
-    let PullInput {
-        local_header,
-        local_entries,
-        remote_entries,
-    } = input;
-    // Build UUID → EntryRecord maps for the entry-level merge.
-    let local_map: HashMap<[u8; 16], EntryRecord> =
-        local_entries.into_iter().map(|e| (e.uuid, e)).collect();
-    let remote_map: HashMap<[u8; 16], EntryRecord> =
-        remote_entries.into_iter().map(|e| (e.uuid, e)).collect();
-
-    let all_uuids: HashSet<[u8; 16]> = local_map.keys().chain(remote_map.keys()).cloned().collect();
-
-    let mut merged: Vec<EntryRecord> = Vec::with_capacity(all_uuids.len());
-    let mut added = 0usize;
-    let mut updated = 0usize;
-    let mut conflicts: Vec<MergeConflict> = Vec::new();
-
-    for uuid in all_uuids {
-        match (local_map.get(&uuid), remote_map.get(&uuid)) {
-            (Some(local), None) => {
-                // Local-only: keep as-is.
-                merged.push(local.clone());
-            }
-            (None, Some(remote)) => {
-                // Remote-only: adopt.
-                merged.push(remote.clone());
-                added += 1;
-            }
-            (Some(local), Some(remote)) => {
-                if local.content_hmac == remote.content_hmac {
-                    // Identical content: keep local (no change).
-                    merged.push(local.clone());
-                } else if local.updated_at > remote.updated_at {
-                    // Local is newer: last-write-wins → keep local.
-                    merged.push(local.clone());
-                    updated += 1;
-                } else if remote.updated_at > local.updated_at {
-                    // Remote is newer: last-write-wins → adopt remote.
-                    merged.push(remote.clone());
-                    updated += 1;
-                } else {
-                    // True conflict: same updated_at, different content_hmac.
-                    if claude_mode {
-                        // Auto-resolve: local wins silently (REQ-026).
-                        merged.push(local.clone());
-                    } else {
-                        // Record conflict; use local as provisional fallback.
-                        conflicts.push(MergeConflict {
-                            uuid,
-                            local: local.clone(),
-                            remote: remote.clone(),
-                        });
-                        merged.push(local.clone());
-                    }
-                }
-            }
-            (None, None) => unreachable!("UUID must appear in at least one map"),
-        }
-    }
-
-    // Atomically write merged entries with a vault-level MAC (REQ-028).
-    write_vault_with_attachments_authenticated(vault_path, local_header, &merged, &[], mac_key)?;
-
-    // Commit only the vault. Git's temporary index preserves unrelated staging
-    // and leaves the original index intact if the commit is rejected.
-    let commit_out = std::process::Command::new("git")
-        .current_dir(vault_dir)
-        .arg("-c")
-        .arg(format!("user.name={}", config.git.author_name))
-        .arg("-c")
-        .arg(format!("user.email={}", config.git.author_email))
-        .args([
-            "commit",
-            "--only",
-            "--date",
-            ts_str,
-            "-m",
-            &config.git.commit_message,
-            "--",
-            "vault.pqd",
-        ])
-        .env("GIT_AUTHOR_DATE", ts_str)
-        .env("GIT_COMMITTER_DATE", ts_str)
-        .output()
-        .map_err(|e| DiaryError::Git(format!("failed to spawn git commit: {e}")))?;
-
-    if !commit_out.status.success() {
-        return Err(DiaryError::Git(format!(
-            "git commit failed after merge: {}",
-            String::from_utf8_lossy(&commit_out.stderr)
-        )));
-    }
-
-    Ok(MergeResult {
-        added,
-        updated,
-        deleted: 0,
-        conflicts,
-    })
 }
 
 /// Return the output of `git status` in `vault_dir` as a UTF-8 string.
@@ -1510,7 +1243,9 @@ mod tests {
         config: &crate::vault::config::VaultConfig,
     ) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
         use crate::vault::format::VaultHeader;
-        use crate::vault::writer::write_vault as wv;
+        let wv = |path: &Path, header, entries: &[EntryRecord]| {
+            write_vault_authenticated(path, header, entries, &TEST_MAC_KEY)
+        };
 
         let tmp = tempdir().expect("tempdir");
         let bare_dir = tmp.path().join("bare.git");
@@ -1941,7 +1676,9 @@ mod tests {
         crate::vault::config::VaultConfig,
     ) {
         use crate::vault::format::VaultHeader;
-        use crate::vault::writer::write_vault as wv;
+        let wv = |path: &Path, header, entries: &[EntryRecord]| {
+            write_vault_authenticated(path, header, entries, &TEST_MAC_KEY)
+        };
 
         let config = make_git_push_config(
             "pq-diary",
@@ -2173,7 +1910,7 @@ mod tests {
             let expected_error = match change {
                 "malformed" => {
                     std::fs::write(&remote_path, b"invalid remote vault").unwrap();
-                    "integrity"
+                    "invalid magic"
                 }
                 "mac" => {
                     write_vault_authenticated(&remote_path, header, &entries, &TEST_MAC_KEY)
@@ -2189,7 +1926,8 @@ mod tests {
                     } else {
                         header.kem_encrypted_sk.push(0xAB);
                     }
-                    crate::vault::writer::write_vault(&remote_path, header, &entries).unwrap();
+                    write_vault_authenticated(&remote_path, header, &entries, &TEST_MAC_KEY)
+                        .unwrap();
                     "header"
                 }
                 "config" => {
@@ -2258,7 +1996,8 @@ mod tests {
                 "entry_count" => {
                     let (header, mut entries) = read_vault(&vault_path).unwrap();
                     entries[0].attachment_count = 1;
-                    crate::vault::writer::write_vault(&vault_path, header, &entries).unwrap();
+                    write_vault_authenticated(&vault_path, header, &entries, &TEST_MAC_KEY)
+                        .unwrap();
                 }
                 "blob" => {
                     std::fs::create_dir(vault_dir.join(".attachments")).unwrap();
@@ -2305,7 +2044,7 @@ mod tests {
 
     #[test]
     fn pull_preserves_existing_recovery_backup() {
-        let (_tmp, vault_dir, vault_path, config) = setup_pull_test(&[], &[]);
+        let (_tmp, vault_dir, vault_path, config) = setup_pull_test(&[make_entry(1, 1, 20)], &[]);
         let original = local_git_state(&vault_dir);
         let backup_path = vault_dir.join("vault.pqd.bak");
         std::fs::write(&backup_path, b"previous recovery backup").unwrap();
@@ -2339,7 +2078,7 @@ mod tests {
     fn pull_failed_commit_preserves_vault_head_and_index() {
         use std::os::unix::fs::PermissionsExt;
 
-        let (_tmp, vault_dir, vault_path, config) = setup_pull_test(&[], &[]);
+        let (_tmp, vault_dir, vault_path, config) = setup_pull_test(&[make_entry(1, 1, 20)], &[]);
         std::fs::write(vault_dir.join("unrelated.txt"), b"staged user change").unwrap();
         assert!(run_git_command(&vault_dir, &["add", "unrelated.txt"])
             .unwrap()
@@ -2694,3 +2433,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod pull_tests;

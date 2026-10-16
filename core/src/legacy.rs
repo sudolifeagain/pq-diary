@@ -400,36 +400,25 @@ pub fn rotate_legacy_code(
     config.legacy.verification_iv_b64 = Some(B64.encode(iv));
     config.legacy.verification_ct_b64 = Some(B64.encode(&ct));
 
-    let vault_tmp = sidecar_path(&vault_pqd, ".tmp.rotate")?;
-    let toml_tmp = sidecar_path(&vault_toml, ".tmp.rotate")?;
-    cleanup_sensitive_file(&vault_tmp);
-    cleanup_sensitive_file(&writer_tmp_path(&vault_tmp));
-    cleanup_sensitive_file(&toml_tmp);
+    let vault_tmp = OwnedLegacyFile::create(sidecar_path(&vault_pqd, ".tmp.rotate")?)?;
+    let toml_tmp = OwnedLegacyFile::create(sidecar_path(&vault_toml, ".tmp.rotate")?)?;
 
     // Master ciphertext is unchanged (only legacy_key_blocks rotate), so the
     // integrity MAC keys on the existing master key.
     let mac_key = crate::crypto::derive_vault_mac_key(&_k_master)?;
-    if let Err(e) = crate::vault::writer::write_vault_with_attachments_authenticated(
-        &vault_tmp,
+    crate::vault::writer::write_vault_with_attachments_authenticated(
+        &vault_tmp.path,
         header,
         &entries,
         &attachments,
         &mac_key,
-    ) {
-        cleanup_sensitive_file(&vault_tmp);
-        cleanup_sensitive_file(&writer_tmp_path(&vault_tmp));
-        return Err(e);
-    }
-    if let Err(e) = write_vault_toml_sidecar(&toml_tmp, &config) {
-        cleanup_sensitive_file(&vault_tmp);
-        cleanup_sensitive_file(&toml_tmp);
-        return Err(e);
-    }
+    )?;
+    write_vault_toml_sidecar(&toml_tmp.path, &config)?;
     replace_vault_and_toml(
         &vault_pqd,
-        &vault_tmp,
+        &vault_tmp.path,
         &vault_toml,
-        &toml_tmp,
+        &toml_tmp.path,
         ".bak.rotate",
     )?;
 
@@ -597,31 +586,20 @@ where
     config.legacy.verification_iv_b64 = None;
     config.legacy.verification_ct_b64 = None;
 
-    let vault_tmp = sidecar_path(&vault_pqd, ".tmp.legacy")?;
-    let toml_tmp = sidecar_path(&vault_toml, ".tmp.legacy")?;
-    cleanup_sensitive_file(&vault_tmp);
-    cleanup_sensitive_file(&writer_tmp_path(&vault_tmp));
-    cleanup_sensitive_file(&toml_tmp);
+    let vault_tmp = OwnedLegacyFile::create(sidecar_path(&vault_pqd, ".tmp.legacy")?)?;
+    let toml_tmp = OwnedLegacyFile::create(sidecar_path(&vault_toml, ".tmp.legacy")?)?;
 
     // The heir's vault is encrypted under K_legacy (now its master key), so the
     // integrity MAC must key on K_legacy for a later `unlock(legacy_code)` to verify.
     let mac_key = crate::crypto::derive_vault_mac_key(&k_legacy)?;
-    if let Err(e) = crate::vault::writer::write_vault_with_attachments_authenticated(
-        &vault_tmp,
+    crate::vault::writer::write_vault_with_attachments_authenticated(
+        &vault_tmp.path,
         new_header,
         &new_entries,
         &new_attachments,
         &mac_key,
-    ) {
-        cleanup_sensitive_file(&vault_tmp);
-        cleanup_sensitive_file(&writer_tmp_path(&vault_tmp));
-        return Err(e);
-    }
-    if let Err(e) = write_vault_toml_sidecar(&toml_tmp, &config) {
-        cleanup_sensitive_file(&vault_tmp);
-        cleanup_sensitive_file(&toml_tmp);
-        return Err(e);
-    }
+    )?;
+    write_vault_toml_sidecar(&toml_tmp.path, &config)?;
 
     // Keep the original vault intact until both replacements succeed. The
     // transaction helper then wipes the entire old vault through its renamed
@@ -629,9 +607,9 @@ where
     // the original that rollback must restore if a later rename fails.
     replace_vault_and_toml(
         &vault_pqd,
-        &vault_tmp,
+        &vault_tmp.path,
         &vault_toml,
-        &toml_tmp,
+        &toml_tmp.path,
         ".bak.legacy",
     )?;
 
@@ -821,13 +799,37 @@ fn sidecar_path(path: &Path, suffix: &str) -> Result<PathBuf, DiaryError> {
     Ok(path.with_file_name(name))
 }
 
-fn writer_tmp_path(path: &Path) -> PathBuf {
-    let mut name = path
-        .file_name()
-        .map(|n| n.to_os_string())
-        .unwrap_or_default();
-    name.push(".tmp");
-    path.with_file_name(name)
+/// Owns a sidecar only after exclusive creation. The parent directory must
+/// remain under the caller's control, as for the shared atomic writer.
+struct OwnedLegacyFile {
+    path: PathBuf,
+    cleanup_on_drop: bool,
+}
+
+impl OwnedLegacyFile {
+    fn create(path: PathBuf) -> Result<Self, DiaryError> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        // Close the reservation before replacement, including on Windows.
+        drop(options.open(&path)?);
+        Ok(Self {
+            path,
+            cleanup_on_drop: true,
+        })
+    }
+}
+
+impl Drop for OwnedLegacyFile {
+    fn drop(&mut self) {
+        if self.cleanup_on_drop {
+            cleanup_sensitive_file(&self.path);
+        }
+    }
 }
 
 fn replace_vault_and_toml(
@@ -837,67 +839,96 @@ fn replace_vault_and_toml(
     toml_tmp: &Path,
     backup_suffix: &str,
 ) -> Result<(), DiaryError> {
-    let vault_bak = sidecar_path(vault_path, backup_suffix)?;
-    let toml_bak = sidecar_path(toml_path, backup_suffix)?;
-    cleanup_sensitive_file(&vault_bak);
-    cleanup_sensitive_file(&toml_bak);
+    replace_vault_and_toml_with(
+        vault_path,
+        vault_tmp,
+        toml_path,
+        toml_tmp,
+        backup_suffix,
+        |from, to| std::fs::rename(from, to),
+    )
+}
 
+fn replace_vault_and_toml_with(
+    vault_path: &Path,
+    vault_tmp: &Path,
+    toml_path: &Path,
+    toml_tmp: &Path,
+    backup_suffix: &str,
+    mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> Result<(), DiaryError> {
+    // Claim both destinations before moving either original. Existing recovery
+    // data (including symlinks) is never overwritten or cleaned up.
+    let mut vault_bak = OwnedLegacyFile::create(sidecar_path(vault_path, backup_suffix)?)?;
+    let mut toml_bak = OwnedLegacyFile::create(sidecar_path(toml_path, backup_suffix)?)?;
     let mut vault_backed_up = false;
     let mut toml_backed_up = false;
-    let mut vault_replaced = false;
 
     let result = (|| -> Result<(), DiaryError> {
-        std::fs::rename(vault_path, &vault_bak).map_err(DiaryError::Io)?;
+        rename(vault_path, &vault_bak.path)?;
+        // From this point the backup owns the original: preserve it on error
+        // or unwind until recovery or the complete two-file commit succeeds.
+        vault_bak.cleanup_on_drop = false;
         vault_backed_up = true;
-        std::fs::rename(toml_path, &toml_bak).map_err(DiaryError::Io)?;
+        rename(toml_path, &toml_bak.path)?;
+        toml_bak.cleanup_on_drop = false;
         toml_backed_up = true;
-        std::fs::rename(vault_tmp, vault_path).map_err(DiaryError::Io)?;
-        vault_replaced = true;
-        std::fs::rename(toml_tmp, toml_path).map_err(DiaryError::Io)?;
+        rename(vault_tmp, vault_path)?;
+        rename(toml_tmp, toml_path)?;
         Ok(())
     })();
 
-    if let Err(e) = result {
-        if vault_replaced {
-            cleanup_sensitive_file(vault_path);
-        }
+    if let Err(error) = result {
+        let mut recovery_errors = Vec::new();
         if toml_backed_up {
-            restore_backup(&toml_bak, toml_path);
+            if let Err(recovery) = rename(&toml_bak.path, toml_path) {
+                recovery_errors.push(format!("{:?}: {recovery}", toml_bak.path));
+            }
         }
         if vault_backed_up {
-            restore_backup(&vault_bak, vault_path);
+            if let Err(recovery) = rename(&vault_bak.path, vault_path) {
+                recovery_errors.push(format!("{:?}: {recovery}", vault_bak.path));
+            }
         }
-        cleanup_sensitive_file(vault_tmp);
-        cleanup_sensitive_file(toml_tmp);
-        return Err(e);
+        if !recovery_errors.is_empty() {
+            return Err(DiaryError::Vault(format!(
+                "legacy transaction failed: {error}; rollback incomplete; preserve recovery backups and inspect before retrying: {}",
+                recovery_errors.join("; ")
+            )));
+        }
+        return Err(error);
     }
 
-    // Only destroy the old files once both replacements have committed. These
-    // are renamed originals, not copies, so overwriting also clears hard links
-    // to the previous vault while leaving the new vault intact.
-    cleanup_sensitive_file(&vault_bak);
-    cleanup_sensitive_file(&toml_bak);
+    // Both replacements committed. Only now may Drop wipe our renamed
+    // originals, including their hard links; cleanup cannot turn success into Err.
+    vault_bak.cleanup_on_drop = true;
+    toml_bak.cleanup_on_drop = true;
     Ok(())
 }
 
-fn restore_backup(backup: &Path, target: &Path) {
-    if let Err(e) = std::fs::rename(backup, target) {
-        eprintln!("Warning: failed to restore backup {backup:?} to {target:?}: {e}");
-    }
+fn cleanup_sensitive_file(path: &Path) {
+    cleanup_sensitive_file_with_writer(path, &mut std::io::stderr().lock());
 }
 
-fn cleanup_sensitive_file(path: &Path) {
+fn cleanup_sensitive_file_with_writer(path: &Path, warnings: &mut impl std::io::Write) {
     if path.is_dir() {
         return;
     }
     if path.is_file() {
-        if let Err(e) = zeroize_file(path) {
-            eprintln!("Warning: failed to zeroize temporary file {path:?}: {e}");
+        if let Err(error) = zeroize_file(path) {
+            // Secondary diagnostics must not panic or hide the primary error.
+            let _ = writeln!(
+                warnings,
+                "Warning: failed to zeroize temporary file {path:?}: {error}"
+            );
         }
     }
-    if let Err(e) = std::fs::remove_file(path) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            eprintln!("Warning: failed to remove temporary file {path:?}: {e}");
+    if let Err(error) = std::fs::remove_file(path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            let _ = writeln!(
+                warnings,
+                "Warning: failed to remove temporary file {path:?}: {error}"
+            );
         }
     }
 }
@@ -1097,6 +1128,7 @@ mod tests {
                 create_collision(&collision, &unrelated);
                 let metadata_before = std::fs::symlink_metadata(&collision).unwrap();
                 let link_before = std::fs::read_link(&collision).ok();
+                let dangling_target = unrelated.with_extension("absent");
 
                 let result = if operation == "rotate" {
                     rotate_legacy_code(
@@ -1129,6 +1161,13 @@ mod tests {
                 let metadata_after = std::fs::symlink_metadata(&collision).unwrap();
                 assert_eq!(metadata_after.file_type(), metadata_before.file_type());
                 assert_eq!(std::fs::read_link(&collision).ok(), link_before);
+                assert!(!dangling_target.exists());
+                if metadata_before.is_dir() {
+                    assert_eq!(
+                        std::fs::read(collision.join("sentinel")).unwrap(),
+                        b"directory contents"
+                    );
+                }
                 if metadata_before.is_file() {
                     assert_eq!(
                         std::fs::read(&collision).unwrap(),
@@ -1153,6 +1192,7 @@ mod tests {
     fn legacy_transactions_preserve_existing_sidecar_directories() {
         assert_legacy_sidecar_collisions_preserved(|path, _| {
             std::fs::create_dir(path).unwrap();
+            std::fs::write(path.join("sentinel"), b"directory contents").unwrap();
         });
     }
 
@@ -1165,6 +1205,189 @@ mod tests {
         assert_legacy_sidecar_collisions_preserved(|path, target| {
             std::os::unix::fs::symlink(target.with_extension("absent"), path).unwrap();
         });
+    }
+
+    fn transaction_fixture(dir: &Path) -> [PathBuf; 4] {
+        let paths = [
+            dir.join("vault.pqd"),
+            dir.join("vault.pqd.tmp"),
+            dir.join("vault.toml"),
+            dir.join("vault.toml.tmp"),
+        ];
+        for (path, bytes) in paths.iter().zip([
+            &b"original vault"[..],
+            &b"new vault"[..],
+            &b"original config"[..],
+            &b"new config"[..],
+        ]) {
+            std::fs::write(path, bytes).unwrap();
+        }
+        paths
+    }
+
+    #[test]
+    fn legacy_transaction_restores_both_originals_after_each_rename_failure() {
+        for fail_at in 1..=4 {
+            let dir = tempdir().unwrap();
+            let [vault, vault_tmp, config, config_tmp] = transaction_fixture(dir.path());
+            let mut calls = 0;
+            let result = replace_vault_and_toml_with(
+                &vault,
+                &vault_tmp,
+                &config,
+                &config_tmp,
+                ".bak",
+                |from, to| {
+                    calls += 1;
+                    if calls == fail_at {
+                        return Err(std::io::Error::other("injected forward rename failure"));
+                    }
+                    std::fs::rename(from, to)
+                },
+            );
+            assert!(
+                matches!(result, Err(DiaryError::Io(ref e))
+                    if e.to_string() == "injected forward rename failure"),
+                "rename {fail_at}: {result:?}"
+            );
+            assert_eq!(std::fs::read(&vault).unwrap(), b"original vault");
+            assert_eq!(std::fs::read(&config).unwrap(), b"original config");
+            assert!(!sidecar_path(&vault, ".bak").unwrap().exists());
+            assert!(!sidecar_path(&config, ".bak").unwrap().exists());
+        }
+    }
+
+    #[test]
+    fn legacy_transaction_retains_backups_and_attempts_both_failed_restores() {
+        for failures in [vec![5], vec![6], vec![5, 6]] {
+            let dir = tempdir().unwrap();
+            let [vault, vault_tmp, config, config_tmp] = transaction_fixture(dir.path());
+            let vault_bak = sidecar_path(&vault, ".bak").unwrap();
+            let config_bak = sidecar_path(&config, ".bak").unwrap();
+            let mut calls = 0;
+            let result = replace_vault_and_toml_with(
+                &vault,
+                &vault_tmp,
+                &config,
+                &config_tmp,
+                ".bak",
+                |from, to| {
+                    calls += 1;
+                    if calls == 4 {
+                        return Err(std::io::Error::other("injected commit failure"));
+                    }
+                    if failures.contains(&calls) {
+                        return Err(std::io::Error::other("injected recovery failure"));
+                    }
+                    std::fs::rename(from, to)
+                },
+            );
+            assert_eq!(calls, 6, "must attempt both restores");
+            let error = result.expect_err("failed recovery must be reported");
+            let message = error.to_string();
+            assert!(matches!(error, DiaryError::Vault(_)));
+            assert!(message.contains("injected commit failure"));
+            assert!(message.contains("injected recovery failure"));
+            assert!(message.contains("rollback incomplete"));
+            for (call, backup, original, bytes) in [
+                (5, &config_bak, &config, &b"original config"[..]),
+                (6, &vault_bak, &vault, &b"original vault"[..]),
+            ] {
+                if failures.contains(&call) {
+                    assert_eq!(std::fs::read(backup).unwrap(), bytes);
+                    assert!(message.contains(&format!("{backup:?}")));
+                } else {
+                    assert_eq!(std::fs::read(original).unwrap(), bytes);
+                    assert!(!backup.exists());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_transaction_replaces_closed_reservations_and_cleans_backups() {
+        let dir = tempdir().unwrap();
+        let [vault, vault_tmp, config, config_tmp] = transaction_fixture(dir.path());
+        replace_vault_and_toml(&vault, &vault_tmp, &config, &config_tmp, ".bak").unwrap();
+        assert_eq!(std::fs::read(&vault).unwrap(), b"new vault");
+        assert_eq!(std::fs::read(&config).unwrap(), b"new config");
+        assert!(!sidecar_path(&vault, ".bak").unwrap().exists());
+        assert!(!sidecar_path(&config, ".bak").unwrap().exists());
+    }
+
+    #[test]
+    fn legacy_transaction_retains_original_backups_on_unwind() {
+        let dir = tempdir().unwrap();
+        let [vault, vault_tmp, config, config_tmp] = transaction_fixture(dir.path());
+        let result = std::panic::catch_unwind(|| {
+            let mut calls = 0;
+            let _ = replace_vault_and_toml_with(
+                &vault,
+                &vault_tmp,
+                &config,
+                &config_tmp,
+                ".bak",
+                |from, to| {
+                    calls += 1;
+                    assert_ne!(calls, 4, "injected unwind before second replacement");
+                    std::fs::rename(from, to)
+                },
+            );
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read(sidecar_path(&vault, ".bak").unwrap()).unwrap(),
+            b"original vault"
+        );
+        assert_eq!(
+            std::fs::read(sidecar_path(&config, ".bak").unwrap()).unwrap(),
+            b"original config"
+        );
+    }
+
+    #[test]
+    fn owned_legacy_sidecar_is_private_and_cleaned_on_unwind() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("owned.tmp");
+        let result = std::panic::catch_unwind(|| {
+            let owned = OwnedLegacyFile::create(path.clone()).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_eq!(
+                    std::fs::metadata(&owned.path).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+            std::fs::write(&owned.path, b"owned temporary bytes").unwrap();
+            panic!("injected unwind");
+        });
+        assert!(result.is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn legacy_cleanup_warning_write_failure_does_not_panic() {
+        struct BrokenWarnings {
+            attempts: usize,
+        }
+        impl std::io::Write for BrokenWarnings {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                self.attempts += 1;
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        let dir = tempdir().unwrap();
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"unrelated data").unwrap();
+        let mut warnings = BrokenWarnings { attempts: 0 };
+        cleanup_sensitive_file_with_writer(&blocker.join("child"), &mut warnings);
+        assert!(warnings.attempts > 0);
+        assert_eq!(std::fs::read(blocker).unwrap(), b"unrelated data");
     }
 
     #[test]

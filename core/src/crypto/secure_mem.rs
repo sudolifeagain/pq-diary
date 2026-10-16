@@ -12,6 +12,7 @@
 
 use crate::error::DiaryError;
 use secrecy::SecretBox;
+use std::io::Write;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// A byte buffer that is automatically zeroed on drop.
@@ -193,12 +194,22 @@ pub fn munlock_buffer(buf: &[u8]) -> Result<(), DiaryError> {
 ///
 /// Returns the first error encountered, or `Ok(())` if all locks succeed.
 pub fn mlock_master_key(mk: &MasterKey) -> Result<(), DiaryError> {
+    mlock_master_key_with(mk, mlock_buffer, &mut std::io::stderr().lock())
+}
+
+fn mlock_master_key_with(
+    mk: &MasterKey,
+    mut lock: impl FnMut(&[u8]) -> Result<(), DiaryError>,
+    warnings: &mut impl Write,
+) -> Result<(), DiaryError> {
     let mut first_err: Option<DiaryError> = None;
 
     let fields: [&[u8]; 3] = [&mk.sym_key, mk.dsa_sk.as_ref(), mk.kem_sk.as_ref()];
     for buf in fields {
-        if let Err(e) = mlock_buffer(buf) {
-            eprintln!("warning: failed to lock key material in memory: {e}");
+        if let Err(e) = lock(buf) {
+            // Secondary diagnostics must not hide the first lock error or
+            // prevent the remaining fields from being attempted.
+            let _ = writeln!(warnings, "warning: failed to lock key material in memory: {e}");
             if first_err.is_none() {
                 first_err = Some(e);
             }
@@ -214,19 +225,28 @@ pub fn mlock_master_key(mk: &MasterKey) -> Result<(), DiaryError> {
 /// Unlock all key-material fields of `mk` from physical memory.
 ///
 /// Calls [`munlock_buffer`] on each field of [`MasterKey`].
-/// Errors are silently ignored because the memory will be zeroed and freed
-/// immediately after this call.
+/// Errors are reported best-effort because the memory will be zeroed and freed
+/// immediately after this call. A broken warning stream must not interrupt cleanup.
 ///
 /// Always returns `Ok(())`.
 pub fn munlock_master_key(mk: &MasterKey) -> Result<(), DiaryError> {
-    if let Err(e) = munlock_buffer(&mk.sym_key) {
-        eprintln!("warning: munlock sym_key failed: {e}");
-    }
-    if let Err(e) = munlock_buffer(mk.dsa_sk.as_ref()) {
-        eprintln!("warning: munlock dsa_sk failed: {e}");
-    }
-    if let Err(e) = munlock_buffer(mk.kem_sk.as_ref()) {
-        eprintln!("warning: munlock kem_sk failed: {e}");
+    munlock_master_key_with(mk, munlock_buffer, &mut std::io::stderr().lock())
+}
+
+fn munlock_master_key_with(
+    mk: &MasterKey,
+    mut unlock: impl FnMut(&[u8]) -> Result<(), DiaryError>,
+    warnings: &mut impl Write,
+) -> Result<(), DiaryError> {
+    let fields: [(&str, &[u8]); 3] = [
+        ("sym_key", &mk.sym_key),
+        ("dsa_sk", mk.dsa_sk.as_ref()),
+        ("kem_sk", mk.kem_sk.as_ref()),
+    ];
+    for (name, buf) in fields {
+        if let Err(e) = unlock(buf) {
+            let _ = writeln!(warnings, "warning: munlock {name} failed: {e}");
+        }
     }
     Ok(())
 }
@@ -314,6 +334,59 @@ fn munlock_buffer_platform(_buf: &[u8]) -> Result<(), DiaryError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct BrokenWarnings {
+        attempts: usize,
+    }
+
+    impl Write for BrokenWarnings {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            self.attempts += 1;
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+    }
+
+    #[test]
+    fn broken_warnings_preserve_first_lock_error_and_attempt_every_field() {
+        let mk = MasterKey {
+            sym_key: [1; 32],
+            dsa_sk: vec![2; 16].into_boxed_slice(),
+            kem_sk: vec![3; 8].into_boxed_slice(),
+        };
+        let mut warnings = BrokenWarnings { attempts: 0 };
+        let mut seen = Vec::new();
+        let result = mlock_master_key_with(
+            &mk,
+            |buf| {
+                seen.push(buf.len());
+                Err(DiaryError::Crypto(format!("lock failure {}", seen.len())))
+            },
+            &mut warnings,
+        );
+        assert!(matches!(result, Err(DiaryError::Crypto(message)) if message == "lock failure 1"));
+        assert_eq!(seen, [32, 16, 8]);
+        assert_eq!(warnings.attempts, 3);
+
+        seen.clear();
+        warnings.attempts = 0;
+        munlock_master_key_with(
+            &mk,
+            |buf| {
+                seen.push(buf.len());
+                Err(DiaryError::Crypto("unlock failure".into()))
+            },
+            &mut warnings,
+        )
+        .unwrap();
+        assert_eq!(seen, [32, 16, 8]);
+        assert_eq!(warnings.attempts, 3);
+        assert_eq!(mk.sym_key, [1; 32]);
+    }
+
 
     #[test]
     fn secure_buffer_len_and_is_empty() {

@@ -1800,15 +1800,17 @@ fn resolve_conflicts_interactive(
 ) -> anyhow::Result<()> {
     use pq_diary_core::git::{fuzz_timestamp, get_last_commit_timestamp};
 
+    // Validate timestamp arithmetic before prompting or writing conflict choices.
+    let prev_ts = get_last_commit_timestamp(vault_dir);
+    let fuzz_hours = config.git.privacy.timestamp_fuzz_hours;
+    let fuzzed_ts = fuzz_timestamp(prev_ts, fuzz_hours)?;
+    let ts_str = fuzzed_ts.to_rfc3339();
+
     if !apply_conflict_choices(conflicts, vault_path, mac_key, reader)? {
         return Ok(());
     }
 
     // Commit the updated vault using the privacy pipeline.
-    let prev_ts = get_last_commit_timestamp(vault_dir);
-    let fuzz_hours = config.git.privacy.timestamp_fuzz_hours;
-    let fuzzed_ts = fuzz_timestamp(prev_ts, fuzz_hours);
-    let ts_str = fuzzed_ts.to_rfc3339();
 
     let add_out = std::process::Command::new("git")
         .current_dir(vault_dir)

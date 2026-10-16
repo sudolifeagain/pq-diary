@@ -1810,18 +1810,8 @@ fn resolve_conflicts_interactive(
     let fuzzed_ts = fuzz_timestamp(prev_ts, fuzz_hours);
     let ts_str = fuzzed_ts.to_rfc3339();
 
-    let add_out = std::process::Command::new("git")
-        .current_dir(vault_dir)
-        .args(["add", "vault.pqd"])
-        .output()
-        .map_err(|e| anyhow::anyhow!("git add failed: {e}"))?;
-    if !add_out.status.success() {
-        return Err(anyhow::anyhow!(
-            "git add failed: {}",
-            String::from_utf8_lossy(&add_out.stderr)
-        ));
-    }
-
+    // Commit only the resolved vault; preserve unrelated staging on success
+    // and leave the original index intact if a commit hook rejects it.
     let commit_out = std::process::Command::new("git")
         .current_dir(vault_dir)
         .arg("-c")
@@ -1830,10 +1820,13 @@ fn resolve_conflicts_interactive(
         .arg(format!("user.email={}", config.git.author_email))
         .args([
             "commit",
+            "--only",
             "--date",
             &ts_str,
             "-m",
             &config.git.commit_message,
+            "--",
+            "vault.pqd",
         ])
         .env("GIT_AUTHOR_DATE", &ts_str)
         .env("GIT_COMMITTER_DATE", &ts_str)
@@ -10683,6 +10676,119 @@ mod conflict_snapshot_tests {
         .unwrap();
     }
 
+    fn checked_git(dir: &std::path::Path, args: &[&str]) -> Vec<u8> {
+        let output = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    fn resolution_fixture() -> (
+        tempfile::TempDir,
+        pq_diary_core::vault::config::VaultConfig,
+        MergeConflict,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        checked_git(dir.path(), &["init"]);
+        checked_git(dir.path(), &["config", "user.name", "fixture"]);
+        checked_git(dir.path(), &["config", "user.email", "fixture@localhost"]);
+        checked_git(dir.path(), &["config", "commit.gpgsign", "false"]);
+        let conflict = conflict(11);
+        save(
+            &dir.path().join("vault.pqd"),
+            std::slice::from_ref(&conflict.local),
+            &[],
+        );
+        checked_git(dir.path(), &["add", "vault.pqd"]);
+        checked_git(dir.path(), &["commit", "-m", "initial"]);
+        std::fs::write(dir.path().join("sentinel.txt"), b"unrelated staged data").unwrap();
+        checked_git(dir.path(), &["add", "sentinel.txt"]);
+        let mut config = pq_diary_core::vault::config::VaultConfig::default();
+        config.git.author_name = "pq-diary".into();
+        config.git.author_email = "resolution@localhost".into();
+        config.git.commit_message = "Update vault".into();
+        config.git.privacy.timestamp_fuzz_hours = 0;
+        (dir, config, conflict)
+    }
+
+    #[test]
+    fn conflict_resolution_commits_only_vault_and_preserves_staged_sentinel() {
+        let (dir, config, conflict) = resolution_fixture();
+        let path = dir.path().join("vault.pqd");
+        super::resolve_conflicts_interactive(
+            std::slice::from_ref(&conflict),
+            dir.path(),
+            &config,
+            &path,
+            &KEY,
+            &mut io::Cursor::new("r\n"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            checked_git(dir.path(), &["diff", "--cached", "--name-only"]),
+            b"sentinel.txt\n"
+        );
+        assert_eq!(
+            checked_git(dir.path(), &["ls-tree", "--name-only", "HEAD"]),
+            b"vault.pqd\n"
+        );
+        assert_eq!(
+            checked_git(dir.path(), &["show", ":sentinel.txt"]),
+            b"unrelated staged data"
+        );
+        assert_eq!(
+            checked_git(dir.path(), &["log", "-1", "--format=%an <%ae>%n%s"]),
+            b"pq-diary <resolution@localhost>\nUpdate vault\n"
+        );
+        let (_, records, _) = read_vault_with_attachments_authenticated(&path, &KEY).unwrap();
+        assert_eq!(records, vec![conflict.remote]);
+        assert_eq!(
+            checked_git(dir.path(), &["show", "HEAD:vault.pqd"]),
+            std::fs::read(&path).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conflict_resolution_rejected_commit_preserves_head_and_index() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (dir, config, conflict) = resolution_fixture();
+        let path = dir.path().join("vault.pqd");
+        let hook = dir.path().join(".git/hooks/pre-commit");
+        std::fs::write(&hook, b"#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let head = checked_git(dir.path(), &["rev-parse", "HEAD"]);
+        let index = std::fs::read(dir.path().join(".git/index")).unwrap();
+
+        assert!(super::resolve_conflicts_interactive(
+            std::slice::from_ref(&conflict),
+            dir.path(),
+            &config,
+            &path,
+            &KEY,
+            &mut io::Cursor::new("r\n"),
+        )
+        .is_err());
+        assert_eq!(checked_git(dir.path(), &["rev-parse", "HEAD"]), head);
+        assert_eq!(std::fs::read(dir.path().join(".git/index")).unwrap(), index);
+        assert_eq!(
+            checked_git(dir.path(), &["diff", "--cached", "--name-only"]),
+            b"sentinel.txt\n"
+        );
+        // The existing resolver writes the chosen vault before committing.
+        // A rejected commit leaves that authenticated choice available to retry.
+        let (_, records, _) = read_vault_with_attachments_authenticated(&path, &KEY).unwrap();
+        assert_eq!(records, vec![conflict.remote]);
+    }
     #[test]
     fn conflict_snapshot_rejects_changed_or_missing_selected_entry_without_writes() {
         // Changes with unchanged content HMAC and timestamp must also be caught.

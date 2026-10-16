@@ -379,6 +379,16 @@ pub fn cmd_list(
     query: Option<String>,
     number: usize,
 ) -> anyhow::Result<()> {
+    cmd_list_to(cli, tag, query, number, &mut std::io::stdout())
+}
+
+fn cmd_list_to(
+    cli: &Cli,
+    tag: Option<String>,
+    query: Option<String>,
+    number: usize,
+    out: &mut dyn std::io::Write,
+) -> anyhow::Result<()> {
     use pq_diary_core::policy::OperationType;
 
     // Policy check before any password prompt or vault decryption.
@@ -400,7 +410,7 @@ pub fn cmd_list(
         let prefix = meta.id_prefix(8);
         let date = format_timestamp(meta.updated_at);
         if meta.tags.is_empty() {
-            println!("{prefix}  {date}  {}", meta.title);
+            writeln!(out, "{prefix}  {date}  {}", meta.title)?;
         } else {
             let tags_str = meta
                 .tags
@@ -408,11 +418,12 @@ pub fn cmd_list(
                 .map(|t| format!("#{t}"))
                 .collect::<Vec<_>>()
                 .join("  ");
-            println!("{prefix}  {date}  {}  {tags_str}", meta.title);
+            writeln!(out, "{prefix}  {date}  {}  {tags_str}", meta.title)?;
         }
     }
 
     // guard drops here, automatically calling lock().
+    out.flush()?;
     Ok(())
 }
 
@@ -437,6 +448,7 @@ pub fn cmd_show(cli: &Cli, id: String) -> anyhow::Result<()> {
 /// Separating the writer allows tests to capture the output without spawning a
 /// subprocess or redirecting `stdout`.
 fn cmd_show_impl(cli: &Cli, id: String, out: &mut dyn std::io::Write) -> anyhow::Result<()> {
+    use anyhow::Context as _;
     use pq_diary_core::policy::OperationType;
     use secrecy::{ExposeSecret as _, SecretBox};
 
@@ -465,12 +477,11 @@ fn cmd_show_impl(cli: &Cli, id: String, out: &mut dyn std::io::Write) -> anyhow:
     let created = format_timestamp(record.created_at);
     let updated = format_timestamp(record.updated_at);
 
-    writeln!(out, "Title:   {}", plaintext.title)
-        .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+    writeln!(out, "Title:   {}", plaintext.title).context("Failed to write entry output")?;
     writeln!(out, "Created: {created}  Updated: {updated}")
-        .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+        .context("Failed to write entry output")?;
     if plaintext.tags.is_empty() {
-        writeln!(out, "Tags:    (none)").map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+        writeln!(out, "Tags:    (none)").context("Failed to write entry output")?;
     } else {
         let tags_str = plaintext
             .tags
@@ -478,10 +489,10 @@ fn cmd_show_impl(cli: &Cli, id: String, out: &mut dyn std::io::Write) -> anyhow:
             .map(|t| format!("#{t}"))
             .collect::<Vec<_>>()
             .join("  ");
-        writeln!(out, "Tags:    {tags_str}").map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+        writeln!(out, "Tags:    {tags_str}").context("Failed to write entry output")?;
     }
-    writeln!(out).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-    write!(out, "{}", plaintext.body).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+    writeln!(out).context("Failed to write entry output")?;
+    write!(out, "{}", plaintext.body).context("Failed to write entry output")?;
 
     // Resolve [[link]] references in the body.
     let resolved = guard
@@ -489,24 +500,24 @@ fn cmd_show_impl(cli: &Cli, id: String, out: &mut dyn std::io::Write) -> anyhow:
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     if !resolved.is_empty() {
-        writeln!(out).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-        writeln!(out, "--- Links ---").map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+        writeln!(out).context("Failed to write entry output")?;
+        writeln!(out, "--- Links ---").context("Failed to write entry output")?;
         for link in &resolved {
             match link.matches.len() {
                 0 => writeln!(out, "  [[{}]] (未解決)", link.title)
-                    .map_err(|e| anyhow::anyhow!("Write error: {e}"))?,
+                    .context("Failed to write entry output")?,
                 1 => writeln!(
                     out,
                     "  [[{}]] → [{}]",
                     link.title, link.matches[0].id_prefix
                 )
-                .map_err(|e| anyhow::anyhow!("Write error: {e}"))?,
+                .context("Failed to write entry output")?,
                 _ => {
                     writeln!(out, "  [[{}]] → 複数候補:", link.title)
-                        .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+                        .context("Failed to write entry output")?;
                     for m in &link.matches {
                         writeln!(out, "    [{}]", m.id_prefix)
-                            .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+                            .context("Failed to write entry output")?;
                     }
                 }
             }
@@ -522,9 +533,9 @@ fn cmd_show_impl(cli: &Cli, id: String, out: &mut dyn std::io::Write) -> anyhow:
             SecretBox::new(Box::from(password_source.secret().expose_secret()));
         match pq_diary_core::attachment::list_attachments(&vault_dir, &listing_pwd, Some(&id)) {
             Ok(metas) if !metas.is_empty() => {
-                writeln!(out).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+                writeln!(out).context("Failed to write entry output")?;
                 writeln!(out, "--- Attachments ({}) ---", metas.len())
-                    .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+                    .context("Failed to write entry output")?;
                 for m in &metas {
                     writeln!(
                         out,
@@ -533,7 +544,7 @@ fn cmd_show_impl(cli: &Cli, id: String, out: &mut dyn std::io::Write) -> anyhow:
                         human_size(m.size_bytes),
                         m.mime_type,
                     )
-                    .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+                    .context("Failed to write entry output")?;
                 }
             }
             Ok(_) => {}
@@ -549,17 +560,18 @@ fn cmd_show_impl(cli: &Cli, id: String, out: &mut dyn std::io::Write) -> anyhow:
     if !backlinks.is_empty() {
         backlinks.sort_by_key(|b| std::cmp::Reverse(b.created_at));
 
-        writeln!(out).map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
-        writeln!(out, "--- Backlinks ---").map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+        writeln!(out).context("Failed to write entry output")?;
+        writeln!(out, "--- Backlinks ---").context("Failed to write entry output")?;
         for bl in &backlinks {
             let date = format_timestamp(bl.created_at);
             let prefix = backlink_uuid_prefix(&bl.source_uuid);
             writeln!(out, "  [{prefix}] {date} {}", bl.source_title)
-                .map_err(|e| anyhow::anyhow!("Write error: {e}"))?;
+                .context("Failed to write entry output")?;
         }
     }
 
     // guard drops here, automatically calling lock().
+    out.flush()?;
     Ok(())
 }
 
@@ -970,6 +982,7 @@ pub(crate) fn cmd_search_to(
     }
 
     // guard drops here, automatically calling lock().
+    out.flush()?;
     Ok(())
 }
 
@@ -1090,6 +1103,7 @@ pub(crate) fn cmd_stats_to(
     }
 
     // guard drops here, automatically calling lock().
+    out.flush()?;
     Ok(())
 }
 
@@ -1101,11 +1115,18 @@ pub(crate) fn cmd_stats_to(
 /// - `▓` — 2–3 entries
 /// - `█` — 4 or more entries
 ///
-/// The grid covers the last 52 weeks (364 days) ending today.  Rows are
-/// weekdays (Mon–Sun) and columns are calendar weeks (oldest left, newest
-/// right).  A month-abbreviation header and a legend line are appended.
+/// The grid covers the current UTC calendar week and the preceding 51 weeks.
+/// Rows are weekdays (Mon–Sun), with the oldest week on the left. Future
+/// days in the current week are blank. A month header and legend are appended.
 fn render_heatmap(daily_activity: &[pq_diary_core::stats::DailyActivity]) -> String {
-    use chrono::{Datelike as _, Duration, Utc};
+    render_heatmap_at(daily_activity, chrono::Utc::now().date_naive())
+}
+
+fn render_heatmap_at(
+    daily_activity: &[pq_diary_core::stats::DailyActivity],
+    today: chrono::NaiveDate,
+) -> String {
+    use chrono::{Datelike as _, Duration};
     use std::collections::HashMap;
 
     let activity_map: HashMap<String, usize> = daily_activity
@@ -1113,25 +1134,21 @@ fn render_heatmap(daily_activity: &[pq_diary_core::stats::DailyActivity]) -> Str
         .map(|a| (a.date.clone(), a.count))
         .collect();
 
-    let today = Utc::now().date_naive();
-    let start_date = today - Duration::days(363);
-
     const WEEKS: usize = 52;
-    // grid[weekday][week]: weekday 0 = Mon … 6 = Sun
-    let mut grid = [[0usize; WEEKS]; 7];
+    // Anchor the last column to this week's Monday, rather than aligning a
+    // trailing 364-day interval that can spill into a 53rd column.
+    let current_monday = today - Duration::days(today.weekday().num_days_from_monday().into());
+    let start_date = current_monday - Duration::weeks((WEEKS - 1) as i64);
 
-    // Align grid to calendar week boundaries: Monday is always row 0.
-    let start_weekday = start_date.weekday().num_days_from_monday() as usize; // 0=Mon
-    for day_offset in 0..364i64 {
-        let date = start_date + Duration::days(day_offset);
-        let adjusted_offset = day_offset as usize + start_weekday;
-        let week = adjusted_offset / 7;
-        let weekday = adjusted_offset % 7;
-        let date_str = date.format("%Y-%m-%d").to_string();
-        let count = activity_map.get(&date_str).copied().unwrap_or(0);
-        if week < WEEKS {
-            grid[weekday][week] = count;
+    // None marks a future date, distinct from a past day with no entries.
+    let mut grid = [[None; WEEKS]; 7];
+    for day_offset in 0..(WEEKS * 7) {
+        let date = start_date + Duration::days(day_offset as i64);
+        if date > today {
+            break;
         }
+        let count = activity_map.get(&date.to_string()).copied().unwrap_or(0);
+        grid[day_offset % 7][day_offset / 7] = Some(count);
     }
 
     let count_to_char = |c: usize| -> char {
@@ -1153,8 +1170,8 @@ fn render_heatmap(daily_activity: &[pq_diary_core::stats::DailyActivity]) -> Str
     let mut header_chars: Vec<char> = std::iter::repeat_n(' ', 5 + WEEKS).collect();
     let mut last_month: u32 = 0;
     for week in 0..WEEKS {
-        // The Monday (row 0) of each grid column: offset back by start_weekday.
-        let date = start_date + Duration::days((week * 7) as i64 - start_weekday as i64);
+        // The Monday (row 0) of each grid column.
+        let date = start_date + Duration::days((week * 7) as i64);
         let month = date.month();
         if month != last_month {
             let m_str = MONTH_NAMES[(month - 1) as usize];
@@ -1174,7 +1191,7 @@ fn render_heatmap(daily_activity: &[pq_diary_core::stats::DailyActivity]) -> Str
     for (weekday, week_counts) in grid.iter().enumerate() {
         let mut row = format!("{} ", day_labels[weekday]);
         for &count in week_counts.iter() {
-            row.push(count_to_char(count));
+            row.push(count.map(count_to_char).unwrap_or(' '));
         }
         lines.push(row);
     }
@@ -1534,6 +1551,10 @@ fn review_password_choice(
 /// Returns an error if the base directory cannot be determined or vault
 /// enumeration fails.
 pub fn cmd_vault_list(cli: &Cli) -> anyhow::Result<()> {
+    cmd_vault_list_to(cli, &mut std::io::stdout())
+}
+
+fn cmd_vault_list_to(cli: &Cli, out: &mut dyn std::io::Write) -> anyhow::Result<()> {
     use pq_diary_core::vault::init::VaultManager;
 
     let base_dir = resolve_vaults_base_dir(cli)?;
@@ -1542,12 +1563,13 @@ pub fn cmd_vault_list(cli: &Cli) -> anyhow::Result<()> {
         .list_vaults_with_policy()
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    println!("{:<20} POLICY", "NAME");
-    println!("{}", "-".repeat(31));
+    writeln!(out, "{:<20} POLICY", "NAME")?;
+    writeln!(out, "{}", "-".repeat(31))?;
     for v in &vaults {
-        println!("{:<20} {}", v.name, v.policy);
+        writeln!(out, "{:<20} {}", v.name, v.policy)?;
     }
 
+    out.flush()?;
     Ok(())
 }
 
@@ -1689,26 +1711,17 @@ fn vault_dir_from_path(vault_path: &std::path::Path) -> anyhow::Result<PathBuf> 
     }
 }
 
-/// Apply conflict resolutions chosen interactively by the user.
-///
-/// For each conflict where the user chooses `r` (remote), overwrites the
-/// local provisional entry in the vault with the remote version and commits
-/// the change using the vault's privacy pipeline.
-///
-/// `reader` is injected so that tests can supply pre-programmed responses
-/// instead of reading from the real stdin.
-fn resolve_conflicts_interactive(
+/// Collect choices and apply them only to the authenticated current snapshot.
+/// Returns whether remote choices were written; local-only choices are a no-op.
+fn apply_conflict_choices(
     conflicts: &[pq_diary_core::git::MergeConflict],
-    vault_dir: &std::path::Path,
-    config: &pq_diary_core::vault::config::VaultConfig,
     vault_path: &std::path::Path,
     mac_key: &[u8; 32],
     reader: &mut impl std::io::BufRead,
-) -> anyhow::Result<()> {
-    use pq_diary_core::git::{fuzz_timestamp, get_last_commit_timestamp};
+) -> anyhow::Result<bool> {
     use pq_diary_core::vault::{
-        reader::{read_vault, verify_vault_integrity},
-        writer::write_vault_authenticated,
+        reader::read_vault_with_attachments_authenticated,
+        writer::write_vault_with_attachments_authenticated,
     };
     use std::io::Write as _;
 
@@ -1736,21 +1749,60 @@ fn resolve_conflicts_interactive(
     }
 
     if remote_uuids.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
 
-    // Apply "keep remote" choices: swap entries in vault.pqd.
-    verify_vault_integrity(vault_path, mac_key).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let (header, mut entries) = read_vault(vault_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Authenticate and parse one post-prompt snapshot, including attachments.
+    // This preserves unrelated edits made while the user was choosing. It is
+    // not a cross-process lock: another writer can still race after this read.
+    let (header, mut entries, attachments) =
+        read_vault_with_attachments_authenticated(vault_path, mac_key)?;
     for uuid in &remote_uuids {
         if let Some(conflict) = conflicts.iter().find(|c| &c.uuid == uuid) {
-            if let Some(pos) = entries.iter().position(|e| e.uuid == *uuid) {
-                entries[pos] = conflict.remote.clone();
+            let pos = entries
+                .iter()
+                .position(|e| e.uuid == *uuid)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Conflict entry disappeared while prompting; retry the merge")
+                })?;
+            if entries[pos] != conflict.local {
+                anyhow::bail!("Conflict entry changed while prompting; retry the merge");
             }
+            entries[pos] = conflict.remote.clone();
         }
     }
-    write_vault_authenticated(vault_path, header, &entries, mac_key)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // No write occurs unless every selected local version still matches.
+    write_vault_with_attachments_authenticated(
+        vault_path,
+        header,
+        &entries,
+        &attachments,
+        mac_key,
+    )?;
+    Ok(true)
+}
+
+/// Apply conflict resolutions chosen interactively by the user.
+///
+/// For each conflict where the user chooses `r` (remote), overwrites the
+/// local provisional entry in the vault with the remote version and commits
+/// the change using the vault's privacy pipeline.
+///
+/// `reader` is injected so that tests can supply pre-programmed responses
+/// instead of reading from the real stdin.
+fn resolve_conflicts_interactive(
+    conflicts: &[pq_diary_core::git::MergeConflict],
+    vault_dir: &std::path::Path,
+    config: &pq_diary_core::vault::config::VaultConfig,
+    vault_path: &std::path::Path,
+    mac_key: &[u8; 32],
+    reader: &mut impl std::io::BufRead,
+) -> anyhow::Result<()> {
+    use pq_diary_core::git::{fuzz_timestamp, get_last_commit_timestamp};
+
+    if !apply_conflict_choices(conflicts, vault_path, mac_key, reader)? {
+        return Ok(());
+    }
 
     // Commit the updated vault using the privacy pipeline.
     let prev_ts = get_last_commit_timestamp(vault_dir);
@@ -2048,6 +2100,10 @@ fn cmd_git_sync_impl(cli: &Cli, reader: &mut impl std::io::BufRead) -> anyhow::R
 /// Returns an error if `git` is not installed, the vault directory cannot be
 /// resolved, or `git status` fails.
 pub fn cmd_git_status(cli: &Cli) -> anyhow::Result<()> {
+    cmd_git_status_to(cli, &mut std::io::stdout())
+}
+
+fn cmd_git_status_to(cli: &Cli, out: &mut dyn std::io::Write) -> anyhow::Result<()> {
     use pq_diary_core::git;
 
     let vault_path = resolve_vault_path(cli)?;
@@ -2056,8 +2112,9 @@ pub fn cmd_git_status(cli: &Cli) -> anyhow::Result<()> {
     git::check_git_available().map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let status = git::git_status(&vault_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
-    print!("{status}");
+    write!(out, "{status}")?;
 
+    out.flush()?;
     Ok(())
 }
 
@@ -2279,6 +2336,10 @@ fn resolve_default_vault_dir() -> anyhow::Result<PathBuf> {
 
 /// Execute the `pq-diary info [--security]` command.
 pub fn cmd_info(cli: &Cli, security: bool) -> anyhow::Result<()> {
+    cmd_info_to(cli, security, &mut std::io::stdout())
+}
+
+fn cmd_info_to(cli: &Cli, security: bool, out: &mut dyn std::io::Write) -> anyhow::Result<()> {
     use pq_diary_core::vault::config::VaultConfig;
     use secrecy::{ExposeSecret as _, SecretBox};
 
@@ -2320,44 +2381,55 @@ pub fn cmd_info(cli: &Cli, security: bool) -> anyhow::Result<()> {
         Err(_) => "unknown".to_string(),
     };
 
-    println!("=== Vault Info ===");
-    println!("{:<16}{}", "Name:", vault_config.vault.name);
-    println!("{:<16}{}", "Policy:", vault_config.access.policy);
-    println!("{:<16}{}", "Entries:", entry_count);
-    println!("{:<16}{}", "Created:", created_str);
-    println!("{:<16}{}", "Last updated:", modified_str);
+    writeln!(out, "=== Vault Info ===")?;
+    writeln!(out, "{:<16}{}", "Name:", vault_config.vault.name)?;
+    writeln!(out, "{:<16}{}", "Policy:", vault_config.access.policy)?;
+    writeln!(out, "{:<16}{}", "Entries:", entry_count)?;
+    writeln!(out, "{:<16}{}", "Created:", created_str)?;
+    writeln!(out, "{:<16}{}", "Last updated:", modified_str)?;
 
     if security {
         let status = crate::security::HardenStatus::current();
-        println!();
-        println!("=== Security ===");
-        println!("{:<22}ML-KEM-768", "KEM algorithm:");
-        println!("{:<22}ML-DSA-65", "Signature algorithm:");
-        println!(
+        writeln!(out)?;
+        writeln!(out, "=== Security ===")?;
+        writeln!(out, "{:<22}ML-KEM-768", "KEM algorithm:")?;
+        writeln!(out, "{:<22}ML-DSA-65", "Signature algorithm:")?;
+        writeln!(
+            out,
             "{:<22}{} KB",
             "Argon2 memory:", vault_config.argon2.memory_cost_kb
-        );
-        println!(
+        )?;
+        writeln!(
+            out,
             "{:<22}{}",
             "Argon2 time cost:", vault_config.argon2.time_cost
-        );
-        println!(
+        )?;
+        writeln!(
+            out,
             "{:<22}{}",
             "Argon2 parallelism:", vault_config.argon2.parallelism
-        );
-        println!("{:<22}{}", "mlock active:", yes_no(status.mlock_active));
-        println!(
+        )?;
+        writeln!(
+            out,
+            "{:<22}{}",
+            "mlock active:",
+            yes_no(status.mlock_active)
+        )?;
+        writeln!(
+            out,
             "{:<22}{}",
             "Coredump disabled:",
             yes_no(status.coredump_disabled)
-        );
-        println!(
+        )?;
+        writeln!(
+            out,
             "{:<22}{}",
             "Debugger detected:",
             yes_no(status.debugger_detected)
-        );
+        )?;
     }
 
+    out.flush()?;
     Ok(())
 }
 
@@ -2838,6 +2910,10 @@ pub fn cmd_legacy_set(
 
 /// Execute the `pq-diary legacy list` command.
 pub fn cmd_legacy_list(cli: &Cli) -> anyhow::Result<()> {
+    cmd_legacy_list_to(cli, &mut std::io::stdout())
+}
+
+fn cmd_legacy_list_to(cli: &Cli, out: &mut dyn std::io::Write) -> anyhow::Result<()> {
     use pq_diary_core::legacy::{list_legacy_status, LegacyFlag};
     use secrecy::{ExposeSecret as _, SecretBox, SecretString};
 
@@ -2865,32 +2941,36 @@ pub fn cmd_legacy_list(cli: &Cli) -> anyhow::Result<()> {
     inherits.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
     destroys.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
 
-    println!("=== INHERIT ({} entries) ===", inherits.len());
+    writeln!(out, "=== INHERIT ({} entries) ===", inherits.len())?;
     for s in &inherits {
-        println!(
+        writeln!(
+            out,
             "{}  {}  {}",
             s.uuid_prefix,
             format_timestamp(s.updated_at),
             s.title
-        );
+        )?;
     }
-    println!();
-    println!("=== DESTROY ({} entries) ===", destroys.len());
+    writeln!(out)?;
+    writeln!(out, "=== DESTROY ({} entries) ===", destroys.len())?;
     for s in &destroys {
-        println!(
+        writeln!(
+            out,
             "{}  {}  {}",
             s.uuid_prefix,
             format_timestamp(s.updated_at),
             s.title
-        );
+        )?;
     }
-    println!();
-    println!(
+    writeln!(out)?;
+    writeln!(
+        out,
         "Summary: INHERIT {} entries / DESTROY {} entries / Total {}",
         inherits.len(),
         destroys.len(),
         statuses.len()
-    );
+    )?;
+    out.flush()?;
     Ok(())
 }
 
@@ -3088,6 +3168,14 @@ pub fn cmd_attachment_add(cli: &Cli, entry: String, path: PathBuf) -> anyhow::Re
 
 /// `pq-diary attachment list [<ENTRY_ID>]` 相当。
 pub fn cmd_attachment_list(cli: &Cli, entry: Option<String>) -> anyhow::Result<()> {
+    cmd_attachment_list_to(cli, entry, &mut std::io::stdout())
+}
+
+fn cmd_attachment_list_to(
+    cli: &Cli,
+    entry: Option<String>,
+    out: &mut dyn std::io::Write,
+) -> anyhow::Result<()> {
     use pq_diary_core::attachment::list_attachments;
     use pq_diary_core::legacy::LegacyFlag;
     use pq_diary_core::policy::OperationType;
@@ -3106,13 +3194,15 @@ pub fn cmd_attachment_list(cli: &Cli, entry: Option<String>) -> anyhow::Result<(
     let metas = list_attachments(&vault_dir, &master_pwd, entry.as_deref())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     if metas.is_empty() {
-        println!("No attachments.");
+        writeln!(out, "No attachments.")?;
+        out.flush()?;
         return Ok(());
     }
-    println!(
+    writeln!(
+        out,
         "{:<10} {:<24} {:>10}  {:<12} FLAG",
         "ENTRY", "FILE", "SIZE", "ADDED"
-    );
+    )?;
     for m in &metas {
         let entry_short: String = m
             .entry_uuid
@@ -3124,17 +3214,19 @@ pub fn cmd_attachment_list(cli: &Cli, entry: Option<String>) -> anyhow::Result<(
             LegacyFlag::Inherit => "INHERIT",
             LegacyFlag::Destroy => "DESTROY",
         };
-        println!(
+        writeln!(
+            out,
             "{:<10} {:<24} {:>10}  {:<12} {}",
             entry_short,
             truncate(&m.filename, 24),
             human_size(m.size_bytes),
             format_timestamp(m.created_at),
             flag,
-        );
+        )?;
     }
-    println!();
-    println!("Summary: {} attachment(s)", metas.len());
+    writeln!(out)?;
+    writeln!(out, "Summary: {} attachment(s)", metas.len())?;
+    out.flush()?;
     Ok(())
 }
 
@@ -3268,6 +3360,89 @@ mod tests {
     use super::*;
     use clap::Parser as _;
     use std::path::Path;
+
+    #[test]
+    fn read_output_propagates_write_and_flush_errors() {
+        use std::io::{self, Write};
+        struct FailingWriter {
+            fail_write: bool,
+            kind: io::ErrorKind,
+        }
+        impl Write for FailingWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.fail_write {
+                    Err(io::Error::from(self.kind))
+                } else {
+                    Ok(bytes.len())
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::from(self.kind))
+            }
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault = setup_vault(&dir);
+        let ids = seed_entries(&vault, &[("private title", "private body without newline")]);
+        pq_diary_core::git::git_init(&vault, None).expect("git init");
+        let cli = make_cli(vault.to_str().expect("path"), Some("password"));
+        let base_cli = make_cli(dir.path().to_str().expect("path"), Some("password"));
+        let before = std::fs::read(vault.join("vault.pqd")).expect("snapshot");
+        let config_before = std::fs::read(vault.join("vault.toml")).expect("config");
+        for fail_write in [true, false] {
+            for kind in [io::ErrorKind::Other, io::ErrorKind::BrokenPipe] {
+                for handler in 0..12 {
+                    let mut writer = FailingWriter { fail_write, kind };
+                    let result = match handler {
+                        0 => cmd_list_to(&cli, None, None, 10, &mut writer),
+                        1 => cmd_info_to(&cli, false, &mut writer),
+                        2 => cmd_info_to(&cli, true, &mut writer),
+                        3 => cmd_attachment_list_to(&cli, None, &mut writer),
+                        4 => cmd_vault_list_to(&base_cli, &mut writer),
+                        5 => cmd_git_status_to(&cli, &mut writer),
+                        6 => cmd_legacy_list_to(&cli, &mut writer),
+                        7 => cmd_show_impl(&cli, ids[0].clone(), &mut writer),
+                        8 => cmd_search_to(
+                            &cli,
+                            &crate::SearchArgs {
+                                pattern: "private".into(),
+                                tag: None,
+                                context: 0,
+                                count: false,
+                            },
+                            &mut writer,
+                        ),
+                        n => cmd_stats_to(
+                            &cli,
+                            &crate::StatsArgs {
+                                json: n == 10,
+                                heatmap: n == 11,
+                            },
+                            &mut writer,
+                        ),
+                    };
+                    let error = result.expect_err("output failure must propagate");
+                    assert_eq!(
+                        error
+                            .downcast_ref::<io::Error>()
+                            .expect("typed I/O error")
+                            .kind(),
+                        kind,
+                        "handler {handler}"
+                    );
+                    assert!(!format!("{error:#}").contains("private"));
+                    assert_eq!(
+                        std::fs::read(vault.join("vault.pqd")).expect("vault"),
+                        before
+                    );
+                    assert_eq!(
+                        std::fs::read(vault.join("vault.toml")).expect("config"),
+                        config_before
+                    );
+                }
+            }
+        }
+        assert_eq!(read_vault_entries(&vault).len(), 1);
+    }
 
     #[test]
     fn ordinary_commands_deny_before_credentials_or_unreadable_vault() {
@@ -3531,7 +3706,10 @@ mod tests {
     /// TC-0037-10: No flag uses the same configured target as info/password.
     #[test]
     fn tc_0037_10_resolve_vault_path_default() {
-        let _lock = lock_home();
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeOverride::new(dir.path());
         let root = dir.path().join(".pq-diary");
@@ -7519,19 +7697,18 @@ parallelism = 1
 
     /// TC-S8-078-07: When `git` is not in PATH, all git subcommands fail with
     /// an appropriate error.
-    ///
-    /// **Ignored** because it modifies the process-wide PATH environment
-    /// variable and must not run concurrently with other tests.
-    /// Run with: `cargo test -- --ignored tc_s8_078_07`
+    /// Runs in an isolated subprocess so unrelated tests keep their PATH.
     #[test]
-    #[ignore = "requires environment without git in PATH; run: cargo test -- --ignored"]
     fn tc_s8_078_07_all_git_commands_fail_when_git_not_installed() {
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let vault_dir = setup_vault_for_git(&dir);
         let vault_dir_str = vault_dir.to_str().expect("utf8");
 
         // Temporarily clear PATH so git cannot be found.
-        let original_path = std::env::var_os("PATH").unwrap_or_default();
         std::env::set_var("PATH", "");
 
         let cli_init = make_git_cli(&["pq-diary", "-v", vault_dir_str, "git-init"]);
@@ -7568,8 +7745,6 @@ parallelism = 1
             cmd_git_pull(&cli_pull),
             cmd_git_sync(&cli_sync),
         ];
-
-        std::env::set_var("PATH", original_path);
 
         for (i, result) in results.iter().enumerate() {
             assert!(
@@ -8236,24 +8411,21 @@ parallelism = 1
 
     /// TC-S8-INT-E01: When `git` is absent from PATH, all git commands fail
     /// with a "not installed" or "not found" error message.
-    ///
-    /// **Ignored** — modifies the process-wide PATH variable and must not run
-    /// concurrently with other tests.
-    /// Run with: `cargo test -- --ignored tc_s8_int_e01`
+    /// Runs in an isolated subprocess so unrelated tests keep their PATH.
     #[test]
-    #[ignore = "requires environment without git in PATH; run: cargo test -- --ignored"]
     fn tc_s8_int_e01_git_not_installed_error() {
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let vault_dir = setup_vault_for_git(&dir);
         let vault_dir_str = vault_dir.to_str().expect("utf8");
 
-        let original_path = std::env::var_os("PATH").unwrap_or_default();
         std::env::set_var("PATH", "");
 
         let cli = make_git_cli(&["pq-diary", "-v", vault_dir_str, "git-init"]);
         let result = cmd_git_init(&cli, None);
-
-        std::env::set_var("PATH", original_path);
 
         assert!(
             result.is_err(),
@@ -9399,21 +9571,13 @@ parallelism = 1
     // S10 Phase 2 tests — init / sync / info / change-password / export
     // =========================================================================
 
-    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn lock_home() -> std::sync::MutexGuard<'static, ()> {
-        match HOME_LOCK.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        }
-    }
-
     struct HomeOverride {
         previous: Option<std::ffi::OsString>,
     }
 
     impl HomeOverride {
         fn new(new_home: &std::path::Path) -> Self {
+            crate::test_environment::assert_isolated();
             let previous = std::env::var_os("PQ_DIARY_HOME");
             let root = new_home.join(".pq-diary");
             std::env::set_var("PQ_DIARY_HOME", &root);
@@ -9428,6 +9592,21 @@ parallelism = 1
                 None => std::env::remove_var("PQ_DIARY_HOME"),
             }
         }
+    }
+
+    #[test]
+    fn home_override_refuses_parallel_parent_mutation() {
+        let before = std::env::var_os("PQ_DIARY_HOME");
+        let dir = tempfile::tempdir().unwrap();
+        let result = std::panic::catch_unwind(|| HomeOverride::new(dir.path()));
+        assert!(
+            result.is_err(),
+            "override must refuse a parallel parent harness"
+        );
+        assert!(
+            std::env::var_os("PQ_DIARY_HOME") == before,
+            "override changed parent environment (values redacted)"
+        );
     }
 
     fn make_cli_plain(args: &[&str]) -> crate::Cli {
@@ -9452,9 +9631,12 @@ parallelism = 1
     /// TC-101-01: clean environment → config.toml and default vault are created.
     #[test]
     fn tc_101_01_init_creates_config_and_vault() {
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         use pq_diary_core::vault::config::AppConfig;
 
-        let _lock = lock_home();
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeOverride::new(dir.path());
 
@@ -9489,7 +9671,10 @@ parallelism = 1
     /// TC-101-E01: existing config.toml → init refuses to run.
     #[test]
     fn tc_101_e01_init_refuses_when_already_initialized() {
-        let _lock = lock_home();
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeOverride::new(dir.path());
 
@@ -9512,7 +9697,10 @@ parallelism = 1
     /// TC-101-E02: empty password → init rejected and no files created.
     #[test]
     fn tc_101_e02_init_rejects_empty_password() {
-        let _lock = lock_home();
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeOverride::new(dir.path());
 
@@ -9529,10 +9717,12 @@ parallelism = 1
     }
 
     fn assert_failed_init_preserves_existing_default(manager_config_invalid: bool) {
+        if crate::test_environment::isolated() {
+            return;
+        }
         use pq_diary_core::policy::AccessPolicy;
         use pq_diary_core::vault::init::VaultManager;
 
-        let _lock = lock_home();
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeOverride::new(dir.path());
         let pq_root = dir.path().join(".pq-diary");
@@ -9607,9 +9797,12 @@ parallelism = 1
     #[cfg(unix)]
     #[test]
     fn init_failure_preserves_dangling_default_symlink() {
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         use std::os::unix::fs::symlink;
 
-        let _lock = lock_home();
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeOverride::new(dir.path());
         let pq_root = dir.path().join(".pq-diary");
@@ -9636,9 +9829,12 @@ parallelism = 1
     #[cfg(unix)]
     #[test]
     fn init_refuses_dangling_config_symlink() {
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         use std::os::unix::fs::symlink;
 
-        let _lock = lock_home();
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeOverride::new(dir.path());
         let pq_root = dir.path().join(".pq-diary");
@@ -9665,7 +9861,10 @@ parallelism = 1
     /// TC-201-E01: unknown sync_backend → error.
     #[test]
     fn tc_201_e01_sync_unknown_backend_errors() {
-        let _lock = lock_home();
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeOverride::new(dir.path());
 
@@ -9688,7 +9887,10 @@ parallelism = 1
     /// TC-201-E02: AppConfig missing → init guidance error.
     #[test]
     fn tc_201_e02_sync_without_config_returns_init_guidance() {
-        let _lock = lock_home();
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeOverride::new(dir.path());
 
@@ -9700,7 +9902,10 @@ parallelism = 1
     /// TC-201-E03: malformed config.toml → Invalid config.toml error.
     #[test]
     fn tc_201_e03_sync_invalid_toml_errors() {
-        let _lock = lock_home();
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = HomeOverride::new(dir.path());
 
@@ -10390,6 +10595,307 @@ parallelism = 1
                 s.chars().nth(4) == Some('-') && s.chars().nth(7) == Some('-'),
                 "expected date prefix in {s}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod conflict_snapshot_tests {
+    use super::apply_conflict_choices;
+    use pq_diary_core::{
+        git::MergeConflict,
+        vault::{
+            format::{
+                AttachmentRecord, EntryRecord, VaultHeader, RECORD_TYPE_ATTACHMENT,
+                RECORD_TYPE_ENTRY,
+            },
+            reader::read_vault_with_attachments_authenticated,
+            writer::{write_header, write_vault_with_attachments_authenticated},
+        },
+    };
+    use std::io::{self, BufRead, Read};
+
+    const KEY: [u8; 32] = [42; 32];
+
+    // Simulate another writer during the prompt without timing or real Git.
+    struct Prompt<F> {
+        input: io::Cursor<&'static str>,
+        during_prompt: Option<F>,
+    }
+    impl<F: FnOnce()> Read for Prompt<F> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.input.read(buf)
+        }
+    }
+    impl<F: FnOnce()> BufRead for Prompt<F> {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            self.input.fill_buf()
+        }
+        fn consume(&mut self, amount: usize) {
+            self.input.consume(amount);
+        }
+        fn read_line(&mut self, line: &mut String) -> io::Result<usize> {
+            if let Some(callback) = self.during_prompt.take() {
+                callback();
+            }
+            self.input.read_line(line)
+        }
+    }
+
+    fn entry(id: u8) -> EntryRecord {
+        EntryRecord {
+            record_type: RECORD_TYPE_ENTRY,
+            uuid: [id; 16],
+            created_at: 10,
+            updated_at: 20,
+            iv: [1; 12],
+            ciphertext: vec![2; 32],
+            signature: vec![3; 32],
+            content_hmac: [4; 32],
+            legacy_flag: 0,
+            legacy_key_block: vec![],
+            attachment_count: 0,
+            attachment_offset: 0,
+            padding: vec![5],
+        }
+    }
+
+    fn conflict(id: u8) -> MergeConflict {
+        let local = entry(id);
+        let mut remote = local.clone();
+        remote.content_hmac = [6; 32];
+        remote.ciphertext = vec![7; 32];
+        MergeConflict {
+            uuid: local.uuid,
+            local,
+            remote,
+        }
+    }
+
+    fn save(path: &std::path::Path, entries: &[EntryRecord], attachments: &[AttachmentRecord]) {
+        write_vault_with_attachments_authenticated(
+            path,
+            VaultHeader::new(),
+            entries,
+            attachments,
+            &KEY,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn conflict_snapshot_rejects_changed_or_missing_selected_entry_without_writes() {
+        // Changes with unchanged content HMAC and timestamp must also be caught.
+        for mutation in 0..5 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("vault.pqd");
+            let conflicts = [conflict(11), conflict(12)];
+            let original = vec![conflicts[0].local.clone(), conflicts[1].local.clone()];
+            save(&path, &original, &[]);
+            let mut current = original.clone();
+            match mutation {
+                0 => current[1].updated_at += 1,
+                1 => current[1].ciphertext[0] ^= 1,
+                2 => current[1].legacy_flag = 1,
+                3 => current[1].signature[0] ^= 1,
+                _ => {
+                    current.remove(1);
+                }
+            }
+            let mut after_prompt = Vec::new();
+            let mut prompt = Prompt {
+                input: io::Cursor::new("r\nremote\n"),
+                during_prompt: Some(|| {
+                    save(&path, &current, &[]);
+                    after_prompt = std::fs::read(&path).unwrap();
+                }),
+            };
+            let error = apply_conflict_choices(&conflicts, &path, &KEY, &mut prompt).unwrap_err();
+            assert!(
+                error.to_string().contains(if mutation == 4 {
+                    "disappeared"
+                } else {
+                    "changed"
+                }),
+                "{error}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), after_prompt);
+            let (_, records, _) = read_vault_with_attachments_authenticated(&path, &KEY).unwrap();
+            assert_eq!(records, current);
+        }
+    }
+
+    #[test]
+    fn conflict_snapshot_rejects_corrupt_metadata_without_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.pqd");
+        let conflicts = [conflict(11)];
+        save(&path, &[conflicts[0].local.clone()], &[]);
+        let (header, _, _) = read_vault_with_attachments_authenticated(&path, &KEY).unwrap();
+        let mut encoded_header = Vec::new();
+        write_header(&mut encoded_header, &header).unwrap();
+        let mut corrupted = std::fs::read(&path).unwrap();
+        // Length prefix + record type + UUID + creation timestamp.
+        corrupted[encoded_header.len() + 4 + 1 + 16 + 8] ^= 1;
+        let mut prompt = Prompt {
+            input: io::Cursor::new("r\n"),
+            during_prompt: Some(|| std::fs::write(&path, &corrupted).unwrap()),
+        };
+        let error = apply_conflict_choices(&conflicts, &path, &KEY, &mut prompt).unwrap_err();
+        assert!(
+            error.to_string().contains("integrity verification failed"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), corrupted);
+    }
+
+    #[test]
+    fn conflict_snapshot_preserves_post_prompt_unrelated_records_and_attachments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.pqd");
+        let conflicts = [conflict(11), conflict(12)];
+        save(
+            &path,
+            &[conflicts[0].local.clone(), conflicts[1].local.clone()],
+            &[],
+        );
+        let attachment = AttachmentRecord {
+            record_type: RECORD_TYPE_ATTACHMENT,
+            uuid: [13; 16],
+            iv: [14; 12],
+            ciphertext: vec![15; 32],
+            signature: vec![16; 32],
+            content_hmac: [17; 32],
+            legacy_flag: 0,
+            legacy_key_block: vec![],
+            padding: vec![18],
+        };
+        let mut unrelated = conflicts[1].local.clone();
+        unrelated.updated_at += 1;
+        let new_entry = entry(19);
+        let mut expected_attachments = Vec::new();
+        pq_diary_core::vault::writer::write_attachments(
+            &mut expected_attachments,
+            std::slice::from_ref(&attachment),
+        )
+        .unwrap();
+        let mut prompt = Prompt {
+            input: io::Cursor::new(" REMOTE \nl\n"),
+            during_prompt: Some(|| {
+                save(
+                    &path,
+                    &[
+                        conflicts[0].local.clone(),
+                        unrelated.clone(),
+                        new_entry.clone(),
+                    ],
+                    &[attachment],
+                )
+            }),
+        };
+        assert!(apply_conflict_choices(&conflicts, &path, &KEY, &mut prompt).unwrap());
+        let (_, entries, attachments) =
+            read_vault_with_attachments_authenticated(&path, &KEY).unwrap();
+        assert_eq!(
+            entries,
+            vec![conflicts[0].remote.clone(), unrelated, new_entry]
+        );
+        let mut actual_attachments = Vec::new();
+        pq_diary_core::vault::writer::write_attachments(&mut actual_attachments, &attachments)
+            .unwrap();
+        assert_eq!(actual_attachments, expected_attachments);
+    }
+
+    #[test]
+    fn conflict_snapshot_local_unknown_and_eof_choices_are_noops() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.pqd");
+        let conflicts = [conflict(11)];
+        save(&path, &[conflicts[0].local.clone()], &[]);
+        let before = std::fs::read(&path).unwrap();
+        for input in ["l\n", "local\n", "unknown\n", ""] {
+            assert!(
+                !apply_conflict_choices(&conflicts, &path, &KEY, &mut io::Cursor::new(input))
+                    .unwrap()
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
+}
+
+#[cfg(test)]
+mod heatmap_window_tests {
+    use super::render_heatmap_at;
+    use chrono::{Datelike as _, Duration, NaiveDate};
+    use pq_diary_core::stats::DailyActivity;
+
+    fn activity(date: NaiveDate, count: usize) -> DailyActivity {
+        DailyActivity {
+            date: date.to_string(),
+            count,
+        }
+    }
+
+    fn cells(output: &str) -> Vec<Vec<char>> {
+        output
+            .lines()
+            .skip(1)
+            .take(7)
+            .map(|line| {
+                let row: Vec<_> = line.chars().skip(4).collect();
+                assert_eq!(row.len(), 52);
+                row
+            })
+            .collect()
+    }
+
+    #[test]
+    fn heatmap_today_is_visible_for_every_weekday() {
+        let monday = NaiveDate::from_ymd_opt(2026, 10, 12).unwrap();
+        for offset in 0..7 {
+            let today = monday + Duration::days(offset);
+            let output = render_heatmap_at(&[activity(today, 1)], today);
+            let grid = cells(&output);
+            assert_eq!(grid[offset as usize][51], '▒', "today={today}");
+            for row in grid.iter().skip(offset as usize + 1) {
+                assert_eq!(row[51], ' ', "future cell: today={today}");
+            }
+        }
+    }
+
+    #[test]
+    fn heatmap_window_boundaries_leap_day_and_year_rollover() {
+        for (year, month, day) in [(2026, 10, 15), (2026, 10, 18), (2024, 2, 29), (2025, 1, 1)] {
+            let today = NaiveDate::from_ymd_opt(year, month, day).unwrap();
+            let weekday = today.weekday().num_days_from_monday() as usize;
+            let start = today - Duration::days(weekday as i64 + 51 * 7);
+            let activities = [
+                activity(start - Duration::days(1), 4),
+                activity(start, 2),
+                activity(today, 1),
+                activity(today + Duration::days(1), 4),
+            ];
+            let output = render_heatmap_at(&activities, today);
+            let grid = cells(&output);
+            assert_eq!(grid[0][0], '▓', "start={start}");
+            assert_eq!(grid[weekday][51], '▒', "today={today}");
+            assert_eq!(grid.iter().flatten().filter(|&&c| c == '▓').count(), 1);
+            assert_eq!(grid.iter().flatten().filter(|&&c| c == '▒').count(), 1);
+            assert!(!grid.iter().flatten().any(|&c| c == '█'));
+            for (row, counts) in grid.iter().enumerate() {
+                for (week, &cell) in counts.iter().enumerate() {
+                    if (row, week) != (0, 0) && (row, week) != (weekday, 51) {
+                        assert_eq!(
+                            cell,
+                            if week == 51 && row > weekday {
+                                ' '
+                            } else {
+                                '░'
+                            }
+                        );
+                    }
+                }
+            }
         }
     }
 }

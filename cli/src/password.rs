@@ -345,11 +345,6 @@ mod tests {
         }
     }
 
-    /// Mutex to serialize tests that read/write the `PQ_DIARY_PASSWORD`
-    /// environment variable.  Env vars are process-global state, so concurrent
-    /// access from parallel tests causes flaky failures.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// Helper: construct a `SecretString` from a literal for use in tests.
     fn make_secret(s: &str) -> SecretString {
         SecretString::from(s.to_string())
@@ -362,7 +357,10 @@ mod tests {
     /// TC-S9-081-03: `get_password(Some(&SecretString))` からパスワード文字列を正しく取得する。
     #[test]
     fn tc_s9_081_03_get_password_with_secret_string() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         std::env::remove_var("PQ_DIARY_PASSWORD");
 
         let secret = make_secret("my_pass");
@@ -383,7 +381,9 @@ mod tests {
     /// インタラクティブフォールバック検証である。
     #[test]
     fn tc_s9_081_04_get_password_none_falls_back_to_interactive() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        if crate::test_environment::isolated() {
+            return;
+        }
 
         use std::io::IsTerminal as _;
         if std::io::stdin().is_terminal() {
@@ -407,7 +407,10 @@ mod tests {
     /// correct secret value.
     #[test]
     fn tc_0034_01_flag_returns_flag_source() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         std::env::remove_var("PQ_DIARY_PASSWORD");
 
         let secret = make_secret("flag_test_password");
@@ -425,7 +428,9 @@ mod tests {
     /// `PasswordSource::Env` with the correct secret value.
     #[test]
     fn tc_0034_02_env_var_returns_env_source() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        if crate::test_environment::isolated() {
+            return;
+        }
 
         let test_val = "env_tc0034_02_unique";
         std::env::set_var("PQ_DIARY_PASSWORD", test_val);
@@ -444,7 +449,9 @@ mod tests {
     /// TC-0034-03: `--password` flag takes priority over the env var.
     #[test]
     fn tc_0034_03_flag_priority_over_env() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        if crate::test_environment::isolated() {
+            return;
+        }
 
         std::env::set_var("PQ_DIARY_PASSWORD", "env_pass_03");
         let secret = make_secret("flag_pass_03");
@@ -466,7 +473,9 @@ mod tests {
     /// `get_password(None)` with no env var must return an error.
     #[test]
     fn tc_0034_04_no_tty_no_credentials_returns_error() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        if crate::test_environment::isolated() {
+            return;
+        }
 
         use std::io::IsTerminal as _;
         if std::io::stdin().is_terminal() {
@@ -486,7 +495,10 @@ mod tests {
     /// representation does not reveal the secret value.
     #[test]
     fn tc_0034_05_secret_string_redacts_debug_output() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         std::env::remove_var("PQ_DIARY_PASSWORD");
 
         let secret = make_secret("super_secret_value");
@@ -504,7 +516,10 @@ mod tests {
     /// of the caller.
     #[test]
     fn tc_0034_06_empty_password_flag_accepted() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        if crate::test_environment::isolated() {
+            return;
+        }
+
         std::env::remove_var("PQ_DIARY_PASSWORD");
 
         let secret = make_secret("");
@@ -519,7 +534,9 @@ mod tests {
     /// panicking.
     #[test]
     fn tc_0034_07_empty_password_env_accepted() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        if crate::test_environment::isolated() {
+            return;
+        }
 
         std::env::set_var("PQ_DIARY_PASSWORD", "");
         let result = get_password(None);
@@ -536,7 +553,9 @@ mod tests {
     /// after `get_password` reads it, so child processes cannot inherit it.
     #[test]
     fn tc_a07_01_env_var_removed_after_read() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        if crate::test_environment::isolated() {
+            return;
+        }
 
         std::env::set_var("PQ_DIARY_PASSWORD", "secret_a07_01");
         let result = get_password(None);

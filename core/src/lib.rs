@@ -1382,3 +1382,7 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), tampered);
     }
 }
+
+#[cfg(test)]
+#[path = "../../test-support/environment.rs"]
+mod test_environment;

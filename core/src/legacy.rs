@@ -558,14 +558,9 @@ where
             destroyed_attachments += 1;
             continue;
         }
-        let lpt = match crate::attachment::decrypt_attachment_legacy_block(record, &k_legacy) {
-            Ok(v) => v,
-            Err(_) => {
-                // Corrupted legacy block on an INHERIT record — treat as destroy.
-                destroyed_attachments += 1;
-                continue;
-            }
-        };
+        // Corruption is not a DESTROY decision: abort before replacing the
+        // vault or sweeping blobs still recoverable with the master password.
+        let lpt = crate::attachment::decrypt_attachment_legacy_block(record, &k_legacy)?;
         if !inherited_entry_uuids.contains(&lpt.entry_uuid) {
             // REQ-504: parent entry is DESTROY → cascade to attachment.
             destroyed_attachments += 1;
@@ -2253,8 +2248,7 @@ mod tests {
         }
         let expected_error =
             crate::attachment::decrypt_attachment_legacy_block(&attachments[0], &legacy_key)
-                .err()
-                .expect("fixture must fail attachment legacy-block validation");
+                .expect_err("fixture must fail attachment legacy-block validation");
         let master_key = kdf::derive_key(b"master-pw", &header.kdf_salt, &fast_params()).unwrap();
         let mac_key = crate::crypto::derive_vault_mac_key(master_key.as_ref()).unwrap();
         // Keep the whole-vault MAC valid: only legacy access to this attachment

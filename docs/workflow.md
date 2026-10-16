@@ -122,6 +122,7 @@ PTYを使った実CLIの `init` / `vault create` では確認不一致による�
 一致後の解錠を確認する。実行は一時ディレクトリを所有し、終了時に片付ける。
 文書化したrelease導入経路は、必要に応じ `cargo build --release --locked` の後に
 `python3 ci/install-smoke.py --profile release` で確認できる。
+利用者向けの手順は [ユーザーマニュアル](user-guide.md) を参照する。
 
 `cargo test --workspace` にはintegration testとdoctestも含まれる。
 別jobで同じテストを重ねない。脆弱性を確認する `cargo audit` と、

@@ -2617,8 +2617,7 @@ fn cmd_export_impl(
         }
 
         let content = build_export_content(meta, &body);
-        std::fs::write(path, content)
-            .map_err(|e| anyhow::anyhow!("Failed to write {}: {e}", path.display()))?;
+        write_export_markdown(path, &content)?;
     }
 
     if attachment_count > 0 {
@@ -2632,6 +2631,22 @@ fn cmd_export_impl(
         println!("Exported {} entries to {}", count, dir.display());
     }
     Ok(())
+}
+
+/// Claim only a new export destination and write through that same handle.
+/// The earlier existence check is advisory: another writer or a dangling
+/// symlink may occupy the path by the time plaintext is ready to publish.
+fn write_export_markdown(path: &Path, content: &str) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use std::io::Write as _;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("Failed to create export file {}", path.display()))?;
+    file.write_all(content.as_bytes())
+        .with_context(|| format!("Failed to write {}", path.display()))
 }
 
 fn build_export_filename(meta: &pq_diary_core::EntryMeta) -> String {
@@ -10549,6 +10564,96 @@ parallelism = 1
         core.unlock(password).expect("unlock after export");
         assert_eq!(core.list_entries(None).unwrap().len(), 2);
         assert_eq!(core.get_entry(&id).unwrap().1.body, "second body");
+    }
+
+    #[test]
+    fn export_preserves_destination_created_after_preflight() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("export.md");
+        assert!(!path.exists(), "export preflight sees an available path");
+        // A competing writer claims the destination after our preflight.
+        std::fs::write(&path, b"other writer's contents").expect("competing file");
+
+        let error = write_export_markdown(&path, "private export body")
+            .expect_err("exclusive creation must reject the competing file");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .expect("typed output error")
+                .kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("competing file"),
+            b"other writer's contents"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_rejects_dangling_symlink_without_publishing_plaintext() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = setup_s10_vault(&dir, "v", b"password");
+        let pqd = vault_dir.join("vault.pqd");
+        let mut core = DiaryCore::new(pqd.to_str().expect("path")).expect("core");
+        core.unlock(secrecy::SecretBox::new(Box::from("password")))
+            .expect("unlock");
+        let id = core
+            .new_entry("export fixture", "private export body", vec![])
+            .expect("entry");
+        let meta = core.list_entries(None).expect("entries").remove(0);
+        core.lock();
+
+        let original = std::fs::read(&pqd).expect("vault snapshot");
+        let config_path = vault_dir.join("vault.toml");
+        let original_config = std::fs::read(&config_path).expect("config snapshot");
+        let out = dir.path().join("out");
+        std::fs::create_dir(&out).expect("output directory");
+        let destination = out.join(build_export_filename(&meta));
+        let outside = dir.path().join("must-not-create.md");
+        symlink(&outside, &destination).expect("dangling output symlink");
+        assert!(
+            !destination.exists(),
+            "preflight follows the missing target"
+        );
+
+        let cli = make_cli_plain(&[
+            "--vault",
+            vault_dir.to_str().expect("vault path"),
+            "--password",
+            "password",
+            "export",
+            out.to_str().expect("output path"),
+        ]);
+        let error = cmd_export_impl(&cli, out.clone(), &mut std::io::Cursor::new(b"y\n"))
+            .expect_err("export must not follow the output symlink");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .expect("typed output error")
+                .kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert!(
+            !outside.exists(),
+            "plaintext must not escape the output directory"
+        );
+        assert_eq!(std::fs::read_link(&destination).expect("symlink"), outside);
+        assert_eq!(std::fs::read_dir(&out).expect("outputs").count(), 1);
+        assert_eq!(std::fs::read(&pqd).expect("vault"), original);
+        assert_eq!(
+            std::fs::read(&config_path).expect("config"),
+            original_config
+        );
+        core.unlock(secrecy::SecretBox::new(Box::from("password")))
+            .expect("reopen");
+        assert_eq!(
+            core.get_entry(&id).expect("entry").1.body,
+            "private export body"
+        );
+        core.lock();
     }
 
     /// TC-501-01: 3 entries export → 3 well-named files.

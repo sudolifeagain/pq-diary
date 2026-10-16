@@ -11,7 +11,7 @@ use rand::rngs::OsRng;
 use rand::{Rng, RngCore};
 
 use crate::error::DiaryError;
-use crate::vault::config::VaultConfig;
+use crate::vault::config::{timestamp_fuzz_seconds, VaultConfig};
 use crate::vault::format::{AttachmentRecord, EntryRecord, VaultHeader};
 use crate::vault::reader::{read_vault_with_attachments_from_bytes, verify_vault_integrity_bytes};
 use crate::vault::writer::{
@@ -273,24 +273,44 @@ pub fn make_author(config: &VaultConfig) -> String {
 ///    `prev` when `Some`, or `Utc::now() - fuzz_hours hours` when `None`.
 /// 4. Return `min(candidate, Utc::now())` to prevent future-dated timestamps.
 ///
-/// The `+ 1` guarantees strict `prev < result` on every call (REQ-015).
-pub fn fuzz_timestamp(prev: Option<DateTime<Utc>>, fuzz_hours: u64) -> DateTime<Utc> {
+/// The result is capped at now, including when the previous date is in the future.
+///
+/// # Errors
+///
+/// Returns a configuration error for an unrepresentable duration, or a Git error
+/// when the timestamp arithmetic exceeds chrono's date range.
+pub fn fuzz_timestamp(
+    prev: Option<DateTime<Utc>>,
+    fuzz_hours: u64,
+) -> Result<DateTime<Utc>, DiaryError> {
+    let max_offset_secs = timestamp_fuzz_seconds(fuzz_hours)?;
+    let now = Utc::now();
     if fuzz_hours == 0 {
-        return Utc::now();
+        return Ok(now);
     }
+    let offset_secs = OsRng.gen_range(0..=max_offset_secs);
+    fuzz_timestamp_at(prev, max_offset_secs, offset_secs, now)
+}
 
-    let max_offset_secs = fuzz_hours * 3600;
-    let offset_secs = OsRng.gen_range(0u64..=max_offset_secs);
-
+/// Deterministic arithmetic shared by the random sampler and boundary tests.
+fn fuzz_timestamp_at(
+    prev: Option<DateTime<Utc>>,
+    max_offset_secs: i64,
+    offset_secs: i64,
+    now: DateTime<Utc>,
+) -> Result<DateTime<Utc>, DiaryError> {
+    let range_error = || DiaryError::Git("timestamp fuzzing exceeds supported date range".into());
+    let window = Duration::try_seconds(max_offset_secs).ok_or_else(range_error)?;
     let base = match prev {
         Some(p) => p,
-        None => Utc::now() - Duration::hours(fuzz_hours as i64),
+        None => now.checked_sub_signed(window).ok_or_else(range_error)?,
     };
-
-    let candidate = base + Duration::seconds(offset_secs as i64 + 1);
-    let now = Utc::now();
-
-    candidate.min(now)
+    let step = offset_secs
+        .checked_add(1)
+        .and_then(Duration::try_seconds)
+        .ok_or_else(range_error)?;
+    let candidate = base.checked_add_signed(step).ok_or_else(range_error)?;
+    Ok(candidate.min(now))
 }
 
 /// Retrieve the author date of the most-recent commit in the repository.
@@ -364,6 +384,8 @@ pub fn git_push(
     vault_path: &Path,
     mac_key: &[u8; 32],
 ) -> Result<(), DiaryError> {
+    timestamp_fuzz_seconds(config.git.privacy.timestamp_fuzz_hours)?;
+
     // Step 1: .git directory must exist (EDGE-003).
     if !vault_dir.join(".git").exists() {
         return Err(DiaryError::Git(
@@ -383,6 +405,10 @@ pub fn git_push(
         ));
     }
 
+    // Validate all timestamp arithmetic before rewriting the vault or index.
+    let prev_ts = get_last_commit_timestamp(vault_dir);
+    let ts_str = fuzz_timestamp(prev_ts, config.git.privacy.timestamp_fuzz_hours)?.to_rfc3339();
+
     // Step 3: Verify then re-write vault.pqd with authenticated random padding
     // (REQ-013, REQ-016). Decryption is not required — EntryRecords are passed
     // through unchanged.
@@ -400,12 +426,6 @@ pub fn git_push(
             &extra,
         )?;
     }
-
-    // Step 4: Compute fuzzed author/committer timestamp (REQ-014).
-    let prev_ts = get_last_commit_timestamp(vault_dir);
-    let fuzz_hours = config.git.privacy.timestamp_fuzz_hours;
-    let fuzzed_ts = fuzz_timestamp(prev_ts, fuzz_hours);
-    let ts_str = fuzzed_ts.to_rfc3339();
 
     // Step 5: Stage only the three allowed files (REQ-010).
     let add_out = run_git_command(vault_dir, &["add", "vault.pqd", "vault.toml", ".gitignore"])?;
@@ -508,6 +528,8 @@ pub fn git_pull_merge(
     mac_key: &[u8; 32],
     claude_mode: bool,
 ) -> Result<MergeResult, DiaryError> {
+    timestamp_fuzz_seconds(config.git.privacy.timestamp_fuzz_hours)?;
+
     if !vault_dir.join(".git").exists() {
         return Err(DiaryError::Git(
             "git repository is not initialized: .git directory not found".to_string(),
@@ -524,6 +546,10 @@ pub fn git_pull_merge(
             conflicts: Vec::new(),
         });
     };
+
+    // Date-range failures must also precede backup creation and vault mutation.
+    let prev_ts = get_last_commit_timestamp(vault_dir);
+    let ts_str = fuzz_timestamp(prev_ts, config.git.privacy.timestamp_fuzz_hours)?.to_rfc3339();
 
     // Create a new backup only after preflight. Never replace recovery data
     // left by an earlier failed merge.
@@ -555,7 +581,15 @@ pub fn git_pull_merge(
         return Err(DiaryError::Io(error));
     }
 
-    let result = git_pull_merge_inner(vault_dir, config, vault_path, mac_key, claude_mode, input);
+    let result = git_pull_merge_inner(
+        vault_dir,
+        config,
+        vault_path,
+        mac_key,
+        claude_mode,
+        input,
+        &ts_str,
+    );
 
     match &result {
         Ok(_) => {
@@ -724,6 +758,7 @@ fn git_pull_merge_inner(
     mac_key: &[u8; 32],
     claude_mode: bool,
     input: PullInput,
+    ts_str: &str,
 ) -> Result<MergeResult, DiaryError> {
     let PullInput {
         local_header,
@@ -791,10 +826,6 @@ fn git_pull_merge_inner(
 
     // Commit only the vault. Git's temporary index preserves unrelated staging
     // and leaves the original index intact if the commit is rejected.
-    let prev_ts = get_last_commit_timestamp(vault_dir);
-    let fuzz_hours = config.git.privacy.timestamp_fuzz_hours;
-    let fuzzed_ts = fuzz_timestamp(prev_ts, fuzz_hours);
-    let ts_str = fuzzed_ts.to_rfc3339();
 
     let commit_out = std::process::Command::new("git")
         .current_dir(vault_dir)
@@ -806,14 +837,14 @@ fn git_pull_merge_inner(
             "commit",
             "--only",
             "--date",
-            &ts_str,
+            ts_str,
             "-m",
             &config.git.commit_message,
             "--",
             "vault.pqd",
         ])
-        .env("GIT_AUTHOR_DATE", &ts_str)
-        .env("GIT_COMMITTER_DATE", &ts_str)
+        .env("GIT_AUTHOR_DATE", ts_str)
+        .env("GIT_COMMITTER_DATE", ts_str)
         .output()
         .map_err(|e| DiaryError::Git(format!("failed to spawn git commit: {e}")))?;
 
@@ -927,6 +958,67 @@ mod tests {
     use tempfile::tempdir;
 
     const TEST_MAC_KEY: [u8; 32] = [0x42; 32];
+
+    #[test]
+    fn timestamp_fuzz_rejects_unrepresentable_inputs() {
+        use crate::vault::config::MAX_TIMESTAMP_FUZZ_HOURS;
+
+        for hours in [MAX_TIMESTAMP_FUZZ_HOURS + 1, i64::MAX as u64, u64::MAX] {
+            assert!(matches!(
+                fuzz_timestamp(None, hours),
+                Err(DiaryError::Config(_))
+            ));
+        }
+        let now = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let max_seconds = timestamp_fuzz_seconds(MAX_TIMESTAMP_FUZZ_HOURS).unwrap();
+        assert!(fuzz_timestamp_at(None, max_seconds, 0, now).is_err());
+        assert!(fuzz_timestamp_at(Some(DateTime::<Utc>::MAX_UTC), 3600, 0, now).is_err());
+        assert!(fuzz_timestamp_at(None, 3600, 0, DateTime::<Utc>::MIN_UTC).is_err());
+    }
+
+    #[test]
+    fn timestamp_fuzz_fixed_clock_covers_both_offset_endpoints() {
+        let now = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let window = 6 * 3600;
+        let prev = now - Duration::hours(12);
+        for offset in [0, window] {
+            assert_eq!(
+                fuzz_timestamp_at(Some(prev), window, offset, now).unwrap(),
+                prev + Duration::seconds(offset + 1)
+            );
+        }
+        assert_eq!(
+            fuzz_timestamp_at(None, window, 0, now).unwrap(),
+            now - Duration::seconds(window - 1)
+        );
+        assert_eq!(
+            fuzz_timestamp_at(None, window, window, now).unwrap(),
+            now
+        );
+        assert_eq!(
+            fuzz_timestamp_at(Some(now), window, 0, now).unwrap(),
+            now
+        );
+    }
+
+    #[test]
+    fn invalid_timestamp_config_fails_before_git_or_vault_mutation() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.pqd");
+        std::fs::write(&path, b"unchanged vault").unwrap();
+        let mut config = VaultConfig::default();
+        config.git.privacy.timestamp_fuzz_hours = u64::MAX;
+        assert!(matches!(
+            git_push(dir.path(), &config, &path, &TEST_MAC_KEY),
+            Err(DiaryError::Config(_))
+        ));
+        assert!(matches!(
+            git_pull_merge(dir.path(), &config, &path, &TEST_MAC_KEY, false),
+            Err(DiaryError::Config(_))
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), b"unchanged vault");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 
     /// TC-S8-074-01: check_git_available succeeds in a git-installed environment.
     #[test]
@@ -1148,7 +1240,7 @@ mod tests {
         use chrono::{Duration, Utc};
 
         let before = Utc::now();
-        let result = fuzz_timestamp(None, 0);
+        let result = fuzz_timestamp(None, 0).unwrap();
         let after = Utc::now();
 
         let diff = (result - before).num_milliseconds().abs();
@@ -1172,7 +1264,7 @@ mod tests {
         let mut results = Vec::new();
 
         for _ in 0..5 {
-            let result = fuzz_timestamp(Some(prev), 6);
+            let result = fuzz_timestamp(Some(prev), 6).unwrap();
             let now = Utc::now();
             assert!(
                 result > prev,
@@ -1201,7 +1293,7 @@ mod tests {
         let prev = Utc::now() - Duration::hours(1);
 
         for i in 0..10 {
-            let result = fuzz_timestamp(Some(prev), 6);
+            let result = fuzz_timestamp(Some(prev), 6).unwrap();
             assert!(
                 result > prev,
                 "iteration {i}: prev < result must hold. prev={prev}, result={result}"
@@ -1527,7 +1619,7 @@ mod tests {
             .output()
             .expect("git log --format=%aI");
         let ts_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        let commit_ts = chrono::DateTime::parse_from_rfc3339(&ts_str)
+        let commit_ts = chrono::DateTime::parse_from_rfc3339(ts_str)
             .expect("parse commit author date")
             .with_timezone(&Utc);
 
@@ -1559,7 +1651,7 @@ mod tests {
             .output()
             .expect("git log --format=%aI");
         let ts_str2 = String::from_utf8_lossy(&out2.stdout).trim().to_string();
-        let commit_ts2 = chrono::DateTime::parse_from_rfc3339(&ts_str2)
+        let commit_ts2 = chrono::DateTime::parse_from_rfc3339(ts_str2)
             .expect("parse commit author date (fuzz=0)")
             .with_timezone(&Utc);
 

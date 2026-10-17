@@ -111,8 +111,14 @@ impl EditorSession {
         let edit_result = launch(path, config);
         let read_result = read(path);
         self.cleanup();
-        edit_result.map_err(|e| anyhow::anyhow!("Editor failed: {e}"))?;
-        read_result.map_err(|e| anyhow::anyhow!("Failed to read temp file: {e}"))
+        edit_result.map_err(|e| {
+            let message = format!("Editor failed: {e}");
+            anyhow::Error::new(e).context(message)
+        })?;
+        read_result.map_err(|e| {
+            let message = format!("Failed to read temp file: {e}");
+            anyhow::Error::new(e).context(message)
+        })
     }
 
     fn cleanup(&mut self) {

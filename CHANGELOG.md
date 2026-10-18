@@ -12,6 +12,7 @@ the **History** table at the bottom for git-tag pointers.
 
 ### Installation and first use
 
+- Add a Japanese user manual covering Cargo installation/uninstallation, setup, daily operations, backups and updates, linked from the new README.
 - Require matching confirmation for interactive new passwords in `init` and `vault create` before creating state; retain flag/environment automation and existing policy/weak-password confirmation order.
 - Add isolated Linux Cargo lifecycle and real-terminal setup checks to the default CI, reusing debug build artifacts.
 

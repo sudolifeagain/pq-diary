@@ -1,12 +1,8 @@
-//! Read-only planning for a future three-way pull. The existing pull remains unchanged.
+//! Authenticated, read-only three-way planning used by Git pull.
 //!
-//! This is an entry/template-only planner, not an apply transaction. A subsequent
-//! pull integration must authenticate the working snapshot, reject local attachment
-//! blobs, collect explicit choices (including an absent side), revalidate tips and
-//! local bytes after prompting, then apply with isolated index/ancestry handling.
-//! Divergent edits/additions remain explicit conflicts here; adopting any automatic
-//! winner policy is a separate caller decision. Encrypted template names cannot be
-//! compared across different UUIDs with only a MAC key.
+//! The planner has no apply transaction or winner policy. Git pull supplies its
+//! documented LWW policy for divergent present records and explicit absence choices.
+//! Encrypted template names cannot be compared across different UUIDs with only a MAC key.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -31,7 +27,7 @@ fn run_git_command(repository: &Path, args: &[&str]) -> Result<std::process::Out
         .map_err(|error| DiaryError::Git(format!("failed to read Git snapshot: {error}")))
 }
 
-fn git_stdout(repository: &Path, args: &[&str]) -> Result<Vec<u8>, DiaryError> {
+pub(super) fn git_stdout(repository: &Path, args: &[&str]) -> Result<Vec<u8>, DiaryError> {
     let output = run_git_command(repository, args)?;
     if !output.status.success() {
         return Err(DiaryError::Git(format!(
@@ -47,9 +43,9 @@ fn git_stdout(repository: &Path, args: &[&str]) -> Result<Vec<u8>, DiaryError> {
 /// Config is compared semantically, including unknown TOML fields.
 #[derive(Debug)]
 pub struct AuthenticatedSnapshot {
-    header: VaultHeader,
-    entries: Vec<EntryRecord>,
-    config: toml::Value,
+    pub(super) header: VaultHeader,
+    pub(super) entries: Vec<EntryRecord>,
+    pub(super) config: toml::Value,
 }
 
 impl AuthenticatedSnapshot {
@@ -152,7 +148,7 @@ fn valid_object_id(id: &str) -> bool {
     matches!(id.len(), 40 | 64) && id.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-fn pin_commit(repository: &Path, reference: &str) -> Result<String, DiaryError> {
+pub(super) fn pin_commit(repository: &Path, reference: &str) -> Result<String, DiaryError> {
     let bytes = git_stdout(
         repository,
         &[
@@ -275,7 +271,7 @@ fn same_header_context(left: &VaultHeader, right: &VaultHeader) -> bool {
 }
 
 /// A conflict preserves absence as a possible choice (including delete/edit).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RecordConflict {
     pub uuid: [u8; 16],
     pub base: Option<EntryRecord>,
@@ -309,7 +305,7 @@ fn index_records(entries: &[EntryRecord]) -> Result<BTreeMap<[u8; 16], &EntryRec
     Ok(records)
 }
 
-fn same_record(left: &EntryRecord, right: &EntryRecord) -> bool {
+pub(super) fn same_record(left: &EntryRecord, right: &EntryRecord) -> bool {
     // Ignore only random padding. Metadata and ciphertext changes are real changes
     // even with equal HMACs/timestamps; never use timestamps to infer ancestry.
     let EntryRecord {

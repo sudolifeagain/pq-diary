@@ -1836,6 +1836,9 @@ fn cmd_git_status_to(cli: &Cli, out: &mut dyn std::io::Write) -> anyhow::Result<
 // S10 Phase 2: init / sync / info / change-password / export
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
+mod config_auth_sources_tests;
+
 /// Execute the `pq-diary init` command.
 ///
 /// Initialises `~/.pq-diary/config.toml` plus a default vault at
@@ -1854,7 +1857,7 @@ pub fn cmd_init(cli: &Cli) -> anyhow::Result<()> {
     use pq_diary_core::vault::init::VaultManager;
     use secrecy::ExposeSecret as _;
 
-    let config_path = AppConfig::default_path().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let config_path = AppConfig::default_path()?;
     let parent_dir = config_path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("config path has no parent directory"))?
@@ -1864,8 +1867,7 @@ pub fn cmd_init(cli: &Cli) -> anyhow::Result<()> {
         anyhow::bail!("Already initialized at {}", parent_dir.display());
     }
 
-    let password_source =
-        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let password_source = get_password(cli.password.as_ref())?;
     if password_source.secret().expose_secret().is_empty() {
         anyhow::bail!("New password must not be empty");
     }
@@ -1902,7 +1904,7 @@ pub fn cmd_init(cli: &Cli) -> anyhow::Result<()> {
     drop(config_file);
     if let Err(e) = config_result {
         let _ = std::fs::remove_file(&config_path);
-        return Err(anyhow::anyhow!("{e}"));
+        return Err(e.into());
     }
 
     let vaults_dir = parent_dir.join("vaults");
@@ -1935,7 +1937,7 @@ pub fn cmd_init(cli: &Cli) -> anyhow::Result<()> {
 pub fn cmd_sync(cli: &Cli) -> anyhow::Result<()> {
     use pq_diary_core::vault::config::AppConfig;
 
-    let config_path = AppConfig::default_path().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let config_path = AppConfig::default_path()?;
     if !config_path.exists() {
         anyhow::bail!(
             "pq-diary init を先に実行してください (~/.pq-diary/config.toml が見つかりません)"
@@ -1961,14 +1963,12 @@ pub fn cmd_change_password(cli: &Cli) -> anyhow::Result<()> {
 
     resolve_change_password_vault_dir(cli)?;
 
-    let old_source = get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let old_source = get_password(cli.password.as_ref())?;
     let old_pwd: SecretString = SecretBox::new(Box::from(old_source.secret().expose_secret()));
     drop(old_source);
 
-    let new_pwd1 =
-        crate::password::prompt_password("New password: ").map_err(|e| anyhow::anyhow!("{e}"))?;
-    let new_pwd2 = crate::password::prompt_password("Confirm new password: ")
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let new_pwd1 = crate::password::prompt_password("New password: ")?;
+    let new_pwd2 = crate::password::prompt_password("Confirm new password: ")?;
 
     cmd_change_password_impl(
         cli,
@@ -2014,14 +2014,14 @@ fn cmd_change_password_impl(
         let vault_pqd_str = vault_pqd
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("vault path contains non-UTF-8 characters"))?;
-        let mut core = DiaryCore::new(vault_pqd_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut core = DiaryCore::new(vault_pqd_str)?;
         let attempt: secrecy::SecretString =
             secrecy::SecretBox::new(Box::from(old_pwd.expose_secret()));
         core.unlock(attempt)
             .map_err(|_| anyhow::anyhow!("Old password is incorrect"))?;
     }
 
-    re_encrypt_vault(&vault_dir, &old_pwd, &new_pwd1).map_err(|e| anyhow::anyhow!("{e}"))?;
+    re_encrypt_vault(&vault_dir, &old_pwd, &new_pwd1)?;
 
     println!("Password changed successfully");
     Ok(())
@@ -2034,7 +2034,7 @@ fn resolve_change_password_vault_dir(cli: &Cli) -> anyhow::Result<PathBuf> {
 
 fn resolve_default_vault_dir() -> anyhow::Result<PathBuf> {
     use pq_diary_core::vault::config::AppConfig;
-    let config_path = AppConfig::default_path().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let config_path = AppConfig::default_path()?;
     if !config_path.exists() {
         anyhow::bail!(
             "pq-diary init を先に実行してください (~/.pq-diary/config.toml が見つかりません)"
@@ -2044,7 +2044,7 @@ fn resolve_default_vault_dir() -> anyhow::Result<PathBuf> {
         .map_err(|e| anyhow::anyhow!("Invalid config.toml: {e}"))?;
     pq_diary_core::vault::init::VaultManager::validate_vault_name(&config.app.default_vault)
         .map_err(|e| anyhow::anyhow!("Invalid config.toml default_vault: {e}"))?;
-    let vaults_dir = AppConfig::default_vaults_dir().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let vaults_dir = AppConfig::default_vaults_dir()?;
     Ok(vaults_dir.join(&config.app.default_vault))
 }
 
@@ -2069,18 +2069,15 @@ fn cmd_info_to(cli: &Cli, security: bool, out: &mut dyn std::io::Write) -> anyho
     let vault_config = VaultConfig::from_file(&vault_toml)
         .map_err(|e| anyhow::anyhow!("Invalid vault.toml: {e}"))?;
 
-    let password_source =
-        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut core = DiaryCore::new(vault_pqd_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let password_source = get_password(cli.password.as_ref())?;
+    let mut core = DiaryCore::new(vault_pqd_str)?;
     let secret_password: secrecy::SecretString =
         SecretBox::new(Box::from(password_source.secret().expose_secret()));
     core.unlock(secret_password)
         .map_err(|_| anyhow::anyhow!("Vault unlock failed"))?;
     let guard = VaultGuard::new(&mut core);
 
-    let entries = guard
-        .list_entries(None)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let entries = guard.list_entries(None)?;
     let entry_count = entries.len();
     drop(entries);
 

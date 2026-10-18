@@ -1,8 +1,30 @@
-# 開発棚卸し（2026-10-16 JST）
+# 開発棚卸し（2026-10-16の履歴・2026-10-18追記）
 
-更新時点: `main` の [`ed77e6cfeafaeaba2ff5f02b65714b18880d6da9`](https://github.com/sudolifeagain/pq-diary/commit/ed77e6cfeafaeaba2ff5f02b65714b18880d6da9)（PR #75 マージ後）。
+旧スナップショットの更新時点: `main` の [`ed77e6cfeafaeaba2ff5f02b65714b18880d6da9`](https://github.com/sudolifeagain/pq-diary/commit/ed77e6cfeafaeaba2ff5f02b65714b18880d6da9)（PR #75 マージ後）。
 以下のベースライン・第1修正単位の実行結果は、旧棚卸し対象 `0e085c06869223d8979ece642f073d0c2bcfe306` からの履歴であり、現在のmainで再実行した件数ではない。今回の更新はソースと既存回帰テストの静的照合のみ。
 この記録は実装の棚卸しであり、完全なセキュリティ監査ではない。
+
+## mainへの統合確認（2026-10-18）
+
+確認したmainは [`8aa5f2b`](https://github.com/sudolifeagain/pq-diary/commit/8aa5f2b3351efe55143563ee9510b788656409ef)。PR #93–100 はレビュー・通常CI確認後にマージ済み。
+共通base・削除・メタデータ照合（#94）、remoteを第2親に記録するcommitと無関係なstagingの保全（#95）が利用可能になった。
+#95ではWindowsの拡張長パスをGitへ渡す不具合を修正（`344ca01`）。native WindowsのGitテストは修正前17失敗、修正後74成功。
+[修正headのCI](https://github.com/sudolifeagain/pq-diary/actions/runs/39107519832) でLinuxのcheck・audit・denyも成功した。
+全OS/releaseの最終統合検証はこの記録時点では未実施。以前のmainの全OS結果を今回の変更の結果として扱わない。
+
+対応条件は認証した共通履歴・互換ヘッダ/config・添付なし。Git添付同期、鍵/config移行、S16のvault・CLI統合とv0x07移行は未完了。
+export分離と対象CLI経路のsource保全（#93・#96–100）も統合済みだが、全機能や全エラー経路の完了を意味しない。
+
+## 提出済み実装とmainの区別（履歴: 2026-10-16 03:30 UTC確認）
+
+当時確認したmainは [`6eb1b5c`](https://github.com/sudolifeagain/pq-diary/commit/6eb1b5c09763974da9c283ad2681de55d8b46429)。以下は提出時点のdraft PRの履歴であり、現在の提供状況は上の統合確認を参照する。
+
+- [PR #94](https://github.com/sudolifeagain/pq-diary/pull/94) は認証した共通baseによる削除・同一HMACのメタデータ変更の照合と、prepare → 選択 → 再検証 → applyを実装済み、未マージ。
+- [PR #95](https://github.com/sudolifeagain/pq-diary/pull/95) は #94 の上に、remoteを第2親に記録するcommitと無関係なstagingを保つindex transactionを実装済み、未マージ。確認headは `5fba931`。#94のマージ後にbaseをmainへ変更して通常CIを確認する必要があり、新transactionのnative Windows検証も未完了。既存mainの全OS成功はこの変更の検証を代替しない。
+- [PR #93](https://github.com/sudolifeagain/pq-diary/pull/93) はexportコマンドのモジュール分離、[PR #96](https://github.com/sudolifeagain/pq-diary/pull/96)・[PR #97](https://github.com/sudolifeagain/pq-diary/pull/97)・[PR #98](https://github.com/sudolifeagain/pq-diary/pull/98)・[PR #99](https://github.com/sudolifeagain/pq-diary/pull/99)・[PR #100](https://github.com/sudolifeagain/pq-diary/pull/100) は対象CLI経路の型付きエラーsource保全を提出済み。いずれも未マージ。#98は#95、#99は#93に積まれている。全経路の負債解消を意味しない。
+- Git添付メタデータ/blob一体同期、header/key/config移行、S16のvault・CLI統合とv0x07移行は引き続き未完了。安全な拒否guardを機能完成とは扱わない。
+
+以下の「現状」「PR #75 後の照合結果」「未完了の開発候補」は旧スナップショットの記録。共通base・削除・ancestryの「未完了」は当時のmainを指し、上記候補実装の不存在を意味しない。古いテスト件数・open PR件数を現在の値として使わない。
 
 ## 現状
 

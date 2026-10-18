@@ -172,12 +172,17 @@
 
 ### Git sync correctness debt
 
-- [ ] Record remote ancestry after a complete, validated merge. The current
-  entry-level merge makes a local-only commit, so pull followed by push after a
-  remote advance is rejected as non-fast-forward. Never work around this with
-  force-push
-- [ ] Reconcile deletions against a common base, plus same-HMAC record metadata
-  changes; the current UUID union and content-only comparison are insufficient
+2026-10-18確認のmainは `8aa5f2b`。共通base・削除・同一HMACのメタデータ照合は
+[PR #94](https://github.com/sudolifeagain/pq-diary/pull/94)、remote ancestryと無関係なstagingの保全は
+[PR #95](https://github.com/sudolifeagain/pq-diary/pull/95) でマージ済み。
+#95のWindowsパス不具合を修正後、native WindowsのGitテスト74件と更新headの通常CIを確認した。
+認証した共通履歴・互換ヘッダ/config・添付なしが対応条件。添付同期と鍵/config移行は引き続き未完了。
+検証範囲と過去の提出状況は [開発棚卸し](development-inventory.md) を参照。
+
+- [x] Record pinned remote ancestry after a complete, validated merge, preserving
+  unrelated staging. Supported pulls can be followed by ordinary push; no force-push
+- [x] Reconcile deletions against an authenticated common base, including same-HMAC
+  record metadata changes. Delete/edit conflicts require an explicit choice
 - [ ] Sync attachment metadata and encrypted `.attachments` blobs together.
   Until then, push/pull explicitly reject attachment-bearing vaults
 - [ ] Define header/key and configuration migration across devices. Until then,

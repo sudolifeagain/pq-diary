@@ -7,6 +7,7 @@
 pub mod reconciliation;
 
 mod pull;
+mod transaction;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -464,8 +465,8 @@ pub fn git_push(
 /// require an explicit interactive choice. Otherwise unresolved conflicts are
 /// returned without changing the vault, index or HEAD.
 ///
-/// Legacy/unverified common bases fail closed. This does not record remote Git
-/// ancestry yet; a later push can still be rejected as non-fast-forward.
+/// Legacy/unverified common bases fail closed. Successful reconciliation records
+/// pinned remote ancestry while preserving unrelated staging in the real index.
 pub fn git_pull_merge(
     vault_dir: &Path,
     config: &VaultConfig,
@@ -503,32 +504,6 @@ pub fn git_pull_merge_with_resolver(
     resolver: &mut impl FnMut(&MergeConflict) -> Result<Option<ConflictResolution>, DiaryError>,
 ) -> Result<MergeResult, DiaryError> {
     pull::merge(vault_dir, config, vault_path, mac_key, resolver)
-}
-
-/// Cleanup diagnostics never replace the primary merge result.
-fn finish_pull(
-    result: Result<MergeResult, DiaryError>,
-    bak_path: &Path,
-    vault_path: &Path,
-    warnings: &mut impl Write,
-) -> Result<MergeResult, DiaryError> {
-    match &result {
-        Ok(_) => {
-            if let Err(e) = std::fs::remove_file(bak_path) {
-                let _ = writeln!(warnings, "Warning: failed to remove vault backup file: {e}");
-            }
-        }
-        Err(_) => {
-            // Preserve the backup for manual recovery, even if restoration fails.
-            if let Err(e) = std::fs::copy(bak_path, vault_path) {
-                let _ = writeln!(
-                    warnings,
-                    "Warning: failed to restore vault from backup: {e}"
-                );
-            }
-        }
-    }
-    result
 }
 
 // =============================================================================
@@ -681,40 +656,6 @@ mod tests {
     use tempfile::tempdir;
 
     const TEST_MAC_KEY: [u8; 32] = [0x42; 32];
-
-    #[test]
-    fn failed_backup_warnings_preserve_primary_result_and_recovery_data() {
-        let dir = tempdir().unwrap();
-        let vault = dir.path().join("vault.pqd");
-        let backup = dir.path().join("vault.pqd.bak");
-        std::fs::write(&vault, b"current vault").unwrap();
-        // A directory makes both remove_file and copy fail without OS privileges.
-        std::fs::create_dir(&backup).unwrap();
-        std::fs::write(backup.join("keep"), b"recovery data").unwrap();
-        let mut warnings = &mut [][..];
-        let success = MergeResult {
-            added: 1,
-            updated: 0,
-            deleted: 0,
-            conflicts: vec![],
-        };
-        assert_eq!(
-            finish_pull(Ok(success), &backup, &vault, &mut warnings)
-                .unwrap()
-                .added,
-            1
-        );
-        let failure = Err(DiaryError::Git("original merge failure".into()));
-        assert!(matches!(
-            finish_pull(failure, &backup, &vault, &mut warnings),
-            Err(DiaryError::Git(message)) if message == "original merge failure"
-        ));
-        assert_eq!(std::fs::read(&vault).unwrap(), b"current vault");
-        assert_eq!(
-            std::fs::read(backup.join("keep")).unwrap(),
-            b"recovery data"
-        );
-    }
 
     #[test]
     fn timestamp_fuzz_rejects_unrepresentable_inputs() {

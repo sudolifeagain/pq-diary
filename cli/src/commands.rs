@@ -1542,137 +1542,54 @@ fn vault_dir_from_path(vault_path: &std::path::Path) -> anyhow::Result<PathBuf> 
     }
 }
 
-/// Collect choices and apply them only to the authenticated current snapshot.
-/// Returns whether remote choices were written; local-only choices are a no-op.
-fn apply_conflict_choices(
-    conflicts: &[pq_diary_core::git::MergeConflict],
-    vault_path: &std::path::Path,
-    mac_key: &[u8; 32],
+/// Ask before any merge write. Absence is an explicit choice, never a fallback.
+fn choose_git_conflict(
+    conflict: &pq_diary_core::git::MergeConflict,
     reader: &mut impl std::io::BufRead,
-) -> anyhow::Result<bool> {
-    use pq_diary_core::vault::{
-        reader::read_vault_with_attachments_authenticated,
-        writer::write_vault_with_attachments_authenticated,
-    };
-    use std::io::Write as _;
-
-    let mut remote_uuids: Vec<[u8; 16]> = Vec::new();
-
-    println!("Merge conflicts detected:");
-    for conflict in conflicts {
-        let uuid_hex: String = conflict.uuid.iter().map(|b| format!("{b:02x}")).collect();
-        println!("  UUID: {}", &uuid_hex[..8]);
-        println!("  Local  updated_at: {}", conflict.local.updated_at);
-        println!("  Remote updated_at: {}", conflict.remote.updated_at);
-        eprint!("  Keep [l]ocal or [r]emote? ");
-        std::io::stderr()
-            .flush()
-            .map_err(|e| anyhow::anyhow!("Failed to flush stderr: {e}"))?;
-
-        let mut input = String::new();
-        reader
-            .read_line(&mut input)
-            .map_err(|e| anyhow::anyhow!("Failed to read conflict choice: {e}"))?;
-        let choice = input.trim().to_lowercase();
-        if choice == "r" || choice == "remote" {
-            remote_uuids.push(conflict.uuid);
+    writer: &mut impl std::io::Write,
+) -> Result<Option<pq_diary_core::git::ConflictResolution>, pq_diary_core::DiaryError> {
+    use pq_diary_core::{git::ConflictResolution, DiaryError};
+    let id = uuid::Uuid::from_bytes(conflict.uuid);
+    writeln!(writer, "Merge conflict UUID: {id}")?;
+    for (label, entry) in [("Local", &conflict.local), ("Remote", &conflict.remote)] {
+        match entry {
+            Some(entry) => writeln!(writer, "  {label} updated_at: {}", entry.updated_at)?,
+            None => writeln!(writer, "  {label}: deleted")?,
         }
     }
-
-    if remote_uuids.is_empty() {
-        return Ok(false);
+    write!(writer, "  Keep [l]ocal or [r]emote (including deletion)? ")?;
+    writer.flush()?;
+    let mut input = String::new();
+    if reader.read_line(&mut input)? == 0 {
+        return Err(DiaryError::Git(
+            "conflict choice cancelled at end of input; no merge was applied".into(),
+        ));
     }
-
-    // Authenticate and parse one post-prompt snapshot, including attachments.
-    // This preserves unrelated edits made while the user was choosing. It is
-    // not a cross-process lock: another writer can still race after this read.
-    let (header, mut entries, attachments) =
-        read_vault_with_attachments_authenticated(vault_path, mac_key)?;
-    for uuid in &remote_uuids {
-        if let Some(conflict) = conflicts.iter().find(|c| &c.uuid == uuid) {
-            let pos = entries
-                .iter()
-                .position(|e| e.uuid == *uuid)
-                .ok_or_else(|| {
-                    anyhow::anyhow!("Conflict entry disappeared while prompting; retry the merge")
-                })?;
-            if entries[pos] != conflict.local {
-                anyhow::bail!("Conflict entry changed while prompting; retry the merge");
-            }
-            entries[pos] = conflict.remote.clone();
-        }
+    match input.trim().to_ascii_lowercase().as_str() {
+        "l" | "local" => Ok(Some(ConflictResolution::KeepLocal)),
+        "r" | "remote" => Ok(Some(ConflictResolution::KeepRemote)),
+        _ => Err(DiaryError::Git(
+            "explicit local or remote choice required; no merge was applied".into(),
+        )),
     }
-    // No write occurs unless every selected local version still matches.
-    write_vault_with_attachments_authenticated(
-        vault_path,
-        header,
-        &entries,
-        &attachments,
-        mac_key,
-    )?;
-    Ok(true)
 }
 
-/// Apply conflict resolutions chosen interactively by the user.
-///
-/// For each conflict where the user chooses `r` (remote), overwrites the
-/// local provisional entry in the vault with the remote version and commits
-/// the change using the vault's privacy pipeline.
-///
-/// `reader` is injected so that tests can supply pre-programmed responses
-/// instead of reading from the real stdin.
-fn resolve_conflicts_interactive(
-    conflicts: &[pq_diary_core::git::MergeConflict],
-    vault_dir: &std::path::Path,
+fn pull_with_choices(
+    dir: &std::path::Path,
     config: &pq_diary_core::vault::config::VaultConfig,
-    vault_path: &std::path::Path,
-    mac_key: &[u8; 32],
+    path: &std::path::Path,
+    key: &[u8; 32],
+    claude: bool,
     reader: &mut impl std::io::BufRead,
-) -> anyhow::Result<()> {
-    use pq_diary_core::git::{fuzz_timestamp, get_last_commit_timestamp};
-
-    // Validate timestamp arithmetic before prompting or writing conflict choices.
-    let prev_ts = get_last_commit_timestamp(vault_dir);
-    let fuzz_hours = config.git.privacy.timestamp_fuzz_hours;
-    let fuzzed_ts = fuzz_timestamp(prev_ts, fuzz_hours)?;
-    let ts_str = fuzzed_ts.to_rfc3339();
-
-    if !apply_conflict_choices(conflicts, vault_path, mac_key, reader)? {
-        return Ok(());
+) -> Result<pq_diary_core::git::MergeResult, pq_diary_core::DiaryError> {
+    use pq_diary_core::git;
+    if claude {
+        git::git_pull_merge(dir, config, path, key, true)
+    } else {
+        git::git_pull_merge_with_resolver(dir, config, path, key, &mut |conflict| {
+            choose_git_conflict(conflict, reader, &mut std::io::stderr().lock())
+        })
     }
-
-    // Commit the updated vault using the privacy pipeline.
-
-    // Commit only the resolved vault; preserve unrelated staging on success
-    // and leave the original index intact if a commit hook rejects it.
-    let commit_out = std::process::Command::new("git")
-        .current_dir(vault_dir)
-        .arg("-c")
-        .arg(format!("user.name={}", config.git.author_name))
-        .arg("-c")
-        .arg(format!("user.email={}", config.git.author_email))
-        .args([
-            "commit",
-            "--only",
-            "--date",
-            &ts_str,
-            "-m",
-            &config.git.commit_message,
-            "--",
-            "vault.pqd",
-        ])
-        .env("GIT_AUTHOR_DATE", &ts_str)
-        .env("GIT_COMMITTER_DATE", &ts_str)
-        .output()
-        .map_err(|e| anyhow::anyhow!("git commit failed: {e}"))?;
-    if !commit_out.status.success() {
-        let stderr = String::from_utf8_lossy(&commit_out.stderr);
-        if !stderr.contains("nothing to commit") {
-            return Err(anyhow::anyhow!("git commit failed: {}", stderr));
-        }
-    }
-
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1813,19 +1730,14 @@ fn cmd_git_pull_impl(cli: &Cli, reader: &mut impl std::io::BufRead) -> anyhow::R
     let mac_key = core.vault_mac_key().map_err(|e| anyhow::anyhow!("{e}"))?;
     let _guard = VaultGuard::new(&mut core);
 
-    let result = git::git_pull_merge(&vault_dir, &config, &vault_path, &mac_key, cli.claude)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    if !result.conflicts.is_empty() && !cli.claude {
-        resolve_conflicts_interactive(
-            &result.conflicts,
-            &vault_dir,
-            &config,
-            &vault_path,
-            &mac_key,
-            reader,
-        )?;
-    }
+    let result = pull_with_choices(
+        &vault_dir,
+        &config,
+        &vault_path,
+        &mac_key,
+        cli.claude,
+        reader,
+    )?;
 
     println!(
         "Pull complete: {} added, {} updated, {} deleted, {} conflict(s)",
@@ -1885,19 +1797,14 @@ fn cmd_git_sync_impl(cli: &Cli, reader: &mut impl std::io::BufRead) -> anyhow::R
     let _guard = VaultGuard::new(&mut core);
 
     // Phase 1: Pull + merge.
-    let pull_result = git::git_pull_merge(&vault_dir, &config, &vault_path, &mac_key, cli.claude)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    if !pull_result.conflicts.is_empty() && !cli.claude {
-        resolve_conflicts_interactive(
-            &pull_result.conflicts,
-            &vault_dir,
-            &config,
-            &vault_path,
-            &mac_key,
-            reader,
-        )?;
-    }
+    let pull_result = pull_with_choices(
+        &vault_dir,
+        &config,
+        &vault_path,
+        &mac_key,
+        cli.claude,
+        reader,
+    )?;
 
     // Phase 2: Push.
     git::git_push(&vault_dir, &config, &vault_path, &mac_key)
@@ -7497,6 +7404,24 @@ parallelism = 1
             .to_file(&toml_path)
             .expect("write updated vault.toml");
 
+        // Establish the policy in the authenticated common history before cloning.
+        for args in [
+            vec!["add", "vault.toml"],
+            vec!["commit", "-m", "shared full policy"],
+            vec!["push"],
+        ] {
+            let output = std::process::Command::new("git")
+                .current_dir(&vault_dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
         // Simulate remote change (empty vault) so pull has something to fetch.
         let bare_dir = tmp.path().join("bare.git");
         let contributor_dir = tmp.path().join("contributor");
@@ -9323,365 +9248,6 @@ parallelism = 1
 }
 
 #[cfg(test)]
-mod conflict_snapshot_tests {
-    use super::{apply_conflict_choices, resolve_conflicts_interactive};
-    use pq_diary_core::{
-        git::MergeConflict,
-        vault::{
-            format::{
-                AttachmentRecord, EntryRecord, VaultHeader, RECORD_TYPE_ATTACHMENT,
-                RECORD_TYPE_ENTRY,
-            },
-            reader::read_vault_with_attachments_authenticated,
-            writer::{write_header, write_vault_with_attachments_authenticated},
-        },
-    };
-    use std::io::{self, BufRead, Read};
-
-    const KEY: [u8; 32] = [42; 32];
-
-    #[test]
-    fn invalid_fuzz_config_preserves_conflicts_without_prompting() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("vault.pqd");
-        let conflicts = [conflict(11)];
-        save(&path, &[conflicts[0].local.clone()], &[]);
-        let before = std::fs::read(&path).unwrap();
-        let mut config = pq_diary_core::vault::config::VaultConfig::default();
-        config.git.privacy.timestamp_fuzz_hours = u64::MAX;
-        let mut input = io::Cursor::new("r\n");
-        let error =
-            resolve_conflicts_interactive(&conflicts, dir.path(), &config, &path, &KEY, &mut input)
-                .unwrap_err();
-        assert!(matches!(
-            error.downcast_ref::<pq_diary_core::error::DiaryError>(),
-            Some(pq_diary_core::error::DiaryError::Config(_))
-        ));
-        assert_eq!(input.position(), 0);
-        assert_eq!(std::fs::read(&path).unwrap(), before);
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
-    }
-
-    // Simulate another writer during the prompt without timing or real Git.
-    struct Prompt<F> {
-        input: io::Cursor<&'static str>,
-        during_prompt: Option<F>,
-    }
-    impl<F: FnOnce()> Read for Prompt<F> {
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            self.input.read(buf)
-        }
-    }
-    impl<F: FnOnce()> BufRead for Prompt<F> {
-        fn fill_buf(&mut self) -> io::Result<&[u8]> {
-            self.input.fill_buf()
-        }
-        fn consume(&mut self, amount: usize) {
-            self.input.consume(amount);
-        }
-        fn read_line(&mut self, line: &mut String) -> io::Result<usize> {
-            if let Some(callback) = self.during_prompt.take() {
-                callback();
-            }
-            self.input.read_line(line)
-        }
-    }
-
-    fn entry(id: u8) -> EntryRecord {
-        EntryRecord {
-            record_type: RECORD_TYPE_ENTRY,
-            uuid: [id; 16],
-            created_at: 10,
-            updated_at: 20,
-            iv: [1; 12],
-            ciphertext: vec![2; 32],
-            signature: vec![3; 32],
-            content_hmac: [4; 32],
-            legacy_flag: 0,
-            legacy_key_block: vec![],
-            attachment_count: 0,
-            attachment_offset: 0,
-            padding: vec![5],
-        }
-    }
-
-    fn conflict(id: u8) -> MergeConflict {
-        let local = entry(id);
-        let mut remote = local.clone();
-        remote.content_hmac = [6; 32];
-        remote.ciphertext = vec![7; 32];
-        MergeConflict {
-            uuid: local.uuid,
-            local,
-            remote,
-        }
-    }
-
-    fn save(path: &std::path::Path, entries: &[EntryRecord], attachments: &[AttachmentRecord]) {
-        write_vault_with_attachments_authenticated(
-            path,
-            VaultHeader::new(),
-            entries,
-            attachments,
-            &KEY,
-        )
-        .unwrap();
-    }
-
-    fn checked_git(dir: &std::path::Path, args: &[&str]) -> Vec<u8> {
-        let output = std::process::Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        output.stdout
-    }
-
-    fn resolution_fixture() -> (
-        tempfile::TempDir,
-        pq_diary_core::vault::config::VaultConfig,
-        MergeConflict,
-    ) {
-        let dir = tempfile::tempdir().unwrap();
-        checked_git(dir.path(), &["init"]);
-        checked_git(dir.path(), &["config", "user.name", "fixture"]);
-        checked_git(dir.path(), &["config", "user.email", "fixture@localhost"]);
-        checked_git(dir.path(), &["config", "commit.gpgsign", "false"]);
-        let conflict = conflict(11);
-        save(
-            &dir.path().join("vault.pqd"),
-            std::slice::from_ref(&conflict.local),
-            &[],
-        );
-        checked_git(dir.path(), &["add", "vault.pqd"]);
-        checked_git(dir.path(), &["commit", "-m", "initial"]);
-        std::fs::write(dir.path().join("sentinel.txt"), b"unrelated staged data").unwrap();
-        checked_git(dir.path(), &["add", "sentinel.txt"]);
-        let mut config = pq_diary_core::vault::config::VaultConfig::default();
-        config.git.author_name = "pq-diary".into();
-        config.git.author_email = "resolution@localhost".into();
-        config.git.commit_message = "Update vault".into();
-        config.git.privacy.timestamp_fuzz_hours = 0;
-        (dir, config, conflict)
-    }
-
-    #[test]
-    fn conflict_resolution_commits_only_vault_and_preserves_staged_sentinel() {
-        let (dir, config, conflict) = resolution_fixture();
-        let path = dir.path().join("vault.pqd");
-        super::resolve_conflicts_interactive(
-            std::slice::from_ref(&conflict),
-            dir.path(),
-            &config,
-            &path,
-            &KEY,
-            &mut io::Cursor::new("r\n"),
-        )
-        .unwrap();
-
-        assert_eq!(
-            checked_git(dir.path(), &["diff", "--cached", "--name-only"]),
-            b"sentinel.txt\n"
-        );
-        assert_eq!(
-            checked_git(dir.path(), &["ls-tree", "--name-only", "HEAD"]),
-            b"vault.pqd\n"
-        );
-        assert_eq!(
-            checked_git(dir.path(), &["show", ":sentinel.txt"]),
-            b"unrelated staged data"
-        );
-        assert_eq!(
-            checked_git(dir.path(), &["log", "-1", "--format=%an <%ae>%n%s"]),
-            b"pq-diary <resolution@localhost>\nUpdate vault\n"
-        );
-        let (_, records, _) = read_vault_with_attachments_authenticated(&path, &KEY).unwrap();
-        assert_eq!(records, vec![conflict.remote]);
-        assert_eq!(
-            checked_git(dir.path(), &["show", "HEAD:vault.pqd"]),
-            std::fs::read(&path).unwrap()
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn conflict_resolution_rejected_commit_preserves_head_and_index() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let (dir, config, conflict) = resolution_fixture();
-        let path = dir.path().join("vault.pqd");
-        let hook = dir.path().join(".git/hooks/pre-commit");
-        std::fs::write(&hook, b"#!/bin/sh\nexit 1\n").unwrap();
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let head = checked_git(dir.path(), &["rev-parse", "HEAD"]);
-        let index = std::fs::read(dir.path().join(".git/index")).unwrap();
-
-        assert!(super::resolve_conflicts_interactive(
-            std::slice::from_ref(&conflict),
-            dir.path(),
-            &config,
-            &path,
-            &KEY,
-            &mut io::Cursor::new("r\n"),
-        )
-        .is_err());
-        assert_eq!(checked_git(dir.path(), &["rev-parse", "HEAD"]), head);
-        assert_eq!(std::fs::read(dir.path().join(".git/index")).unwrap(), index);
-        assert_eq!(
-            checked_git(dir.path(), &["diff", "--cached", "--name-only"]),
-            b"sentinel.txt\n"
-        );
-        // The existing resolver writes the chosen vault before committing.
-        // A rejected commit leaves that authenticated choice available to retry.
-        let (_, records, _) = read_vault_with_attachments_authenticated(&path, &KEY).unwrap();
-        assert_eq!(records, vec![conflict.remote]);
-    }
-    #[test]
-    fn conflict_snapshot_rejects_changed_or_missing_selected_entry_without_writes() {
-        // Changes with unchanged content HMAC and timestamp must also be caught.
-        for mutation in 0..5 {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("vault.pqd");
-            let conflicts = [conflict(11), conflict(12)];
-            let original = vec![conflicts[0].local.clone(), conflicts[1].local.clone()];
-            save(&path, &original, &[]);
-            let mut current = original.clone();
-            match mutation {
-                0 => current[1].updated_at += 1,
-                1 => current[1].ciphertext[0] ^= 1,
-                2 => current[1].legacy_flag = 1,
-                3 => current[1].signature[0] ^= 1,
-                _ => {
-                    current.remove(1);
-                }
-            }
-            let mut after_prompt = Vec::new();
-            let mut prompt = Prompt {
-                input: io::Cursor::new("r\nremote\n"),
-                during_prompt: Some(|| {
-                    save(&path, &current, &[]);
-                    after_prompt = std::fs::read(&path).unwrap();
-                }),
-            };
-            let error = apply_conflict_choices(&conflicts, &path, &KEY, &mut prompt).unwrap_err();
-            assert!(
-                error.to_string().contains(if mutation == 4 {
-                    "disappeared"
-                } else {
-                    "changed"
-                }),
-                "{error}"
-            );
-            assert_eq!(std::fs::read(&path).unwrap(), after_prompt);
-            let (_, records, _) = read_vault_with_attachments_authenticated(&path, &KEY).unwrap();
-            assert_eq!(records, current);
-        }
-    }
-
-    #[test]
-    fn conflict_snapshot_rejects_corrupt_metadata_without_writes() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("vault.pqd");
-        let conflicts = [conflict(11)];
-        save(&path, &[conflicts[0].local.clone()], &[]);
-        let (header, _, _) = read_vault_with_attachments_authenticated(&path, &KEY).unwrap();
-        let mut encoded_header = Vec::new();
-        write_header(&mut encoded_header, &header).unwrap();
-        let mut corrupted = std::fs::read(&path).unwrap();
-        // Length prefix + record type + UUID + creation timestamp.
-        corrupted[encoded_header.len() + 4 + 1 + 16 + 8] ^= 1;
-        let mut prompt = Prompt {
-            input: io::Cursor::new("r\n"),
-            during_prompt: Some(|| std::fs::write(&path, &corrupted).unwrap()),
-        };
-        let error = apply_conflict_choices(&conflicts, &path, &KEY, &mut prompt).unwrap_err();
-        assert!(
-            error.to_string().contains("integrity verification failed"),
-            "{error}"
-        );
-        assert_eq!(std::fs::read(&path).unwrap(), corrupted);
-    }
-
-    #[test]
-    fn conflict_snapshot_preserves_post_prompt_unrelated_records_and_attachments() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("vault.pqd");
-        let conflicts = [conflict(11), conflict(12)];
-        save(
-            &path,
-            &[conflicts[0].local.clone(), conflicts[1].local.clone()],
-            &[],
-        );
-        let attachment = AttachmentRecord {
-            record_type: RECORD_TYPE_ATTACHMENT,
-            uuid: [13; 16],
-            iv: [14; 12],
-            ciphertext: vec![15; 32],
-            signature: vec![16; 32],
-            content_hmac: [17; 32],
-            legacy_flag: 0,
-            legacy_key_block: vec![],
-            padding: vec![18],
-        };
-        let mut unrelated = conflicts[1].local.clone();
-        unrelated.updated_at += 1;
-        let new_entry = entry(19);
-        let mut expected_attachments = Vec::new();
-        pq_diary_core::vault::writer::write_attachments(
-            &mut expected_attachments,
-            std::slice::from_ref(&attachment),
-        )
-        .unwrap();
-        let mut prompt = Prompt {
-            input: io::Cursor::new(" REMOTE \nl\n"),
-            during_prompt: Some(|| {
-                save(
-                    &path,
-                    &[
-                        conflicts[0].local.clone(),
-                        unrelated.clone(),
-                        new_entry.clone(),
-                    ],
-                    &[attachment],
-                )
-            }),
-        };
-        assert!(apply_conflict_choices(&conflicts, &path, &KEY, &mut prompt).unwrap());
-        let (_, entries, attachments) =
-            read_vault_with_attachments_authenticated(&path, &KEY).unwrap();
-        assert_eq!(
-            entries,
-            vec![conflicts[0].remote.clone(), unrelated, new_entry]
-        );
-        let mut actual_attachments = Vec::new();
-        pq_diary_core::vault::writer::write_attachments(&mut actual_attachments, &attachments)
-            .unwrap();
-        assert_eq!(actual_attachments, expected_attachments);
-    }
-
-    #[test]
-    fn conflict_snapshot_local_unknown_and_eof_choices_are_noops() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("vault.pqd");
-        let conflicts = [conflict(11)];
-        save(&path, &[conflicts[0].local.clone()], &[]);
-        let before = std::fs::read(&path).unwrap();
-        for input in ["l\n", "local\n", "unknown\n", ""] {
-            assert!(
-                !apply_conflict_choices(&conflicts, &path, &KEY, &mut io::Cursor::new(input))
-                    .unwrap()
-            );
-            assert_eq!(std::fs::read(&path).unwrap(), before);
-        }
-    }
-}
-
-#[cfg(test)]
 mod heatmap_window_tests {
     use super::render_heatmap_at;
     use chrono::{Datelike as _, Duration, NaiveDate};
@@ -9996,6 +9562,79 @@ mod confirmation_output_tests {
             core.unlock(secrecy::SecretString::new("password".into()))
                 .unwrap();
             assert_eq!(core.get_entry(&id).unwrap().1.body, "preserved body");
+        }
+    }
+}
+
+#[cfg(test)]
+mod git_choice_tests {
+    use super::choose_git_conflict;
+    use pq_diary_core::git::{ConflictResolution, MergeConflict};
+    use std::io::{self, BufRead, Read, Write};
+    fn deletion() -> MergeConflict {
+        MergeConflict {
+            uuid: [1; 16],
+            base: None,
+            local: None,
+            remote: None,
+        }
+    }
+    #[test]
+    fn explicit_choices_and_absent_side_display() {
+        for (input, expected) in [
+            ("local\n", ConflictResolution::KeepLocal),
+            ("r\n", ConflictResolution::KeepRemote),
+        ] {
+            let mut output = Vec::new();
+            let choice =
+                choose_git_conflict(&deletion(), &mut io::Cursor::new(input), &mut output).unwrap();
+            assert_eq!(choice, Some(expected));
+            let text = String::from_utf8(output).unwrap();
+            assert!(text.contains("Local: deleted"));
+            assert!(text.contains("Remote: deleted"));
+        }
+        for input in ["", "\n", "unknown\n"] {
+            assert!(
+                choose_git_conflict(&deletion(), &mut io::Cursor::new(input), &mut Vec::new())
+                    .is_err()
+            );
+        }
+    }
+    struct NeverRead;
+    impl Read for NeverRead {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            panic!("must not read")
+        }
+    }
+    impl BufRead for NeverRead {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            panic!("must not read")
+        }
+        fn consume(&mut self, _: usize) {
+            panic!("must not read")
+        }
+    }
+    struct Broken {
+        flush: bool,
+    }
+    impl Write for Broken {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.flush {
+                Ok(bytes.len())
+            } else {
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+    }
+    #[test]
+    fn prompt_write_and_flush_fail_before_input() {
+        for flush in [false, true] {
+            assert!(
+                choose_git_conflict(&deletion(), &mut NeverRead, &mut Broken { flush }).is_err()
+            );
         }
     }
 }

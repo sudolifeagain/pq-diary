@@ -231,10 +231,13 @@ pub(super) fn apply(
     let mut merge_files: Vec<OwnedPath> = Vec::new();
     let prepared = (|| {
         write()?;
+        // Pull already validated this path against the repository's vault.pqd.
+        // Use its relative name: canonicalize produces a verbatim Windows path
+        // (\\?\...) which Git for Windows cannot open here.
         let blob = value(output(
             command(c.dir, None)
                 .args(["hash-object", "-w", "--no-filters"])
-                .arg(std::fs::canonicalize(c.path)?),
+                .arg("vault.pqd"),
         )?)?;
         for target in [&private_index, &preserved_index] {
             output(command(c.dir, Some(target)).args([

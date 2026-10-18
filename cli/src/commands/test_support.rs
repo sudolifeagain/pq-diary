@@ -1,5 +1,6 @@
 //! Shared synthetic vault fixtures for command and session unit tests only.
 
+use clap::Parser;
 use pq_diary_core::DiaryCore;
 use std::path::PathBuf;
 
@@ -95,4 +96,40 @@ pub(super) fn read_vault_entries(vault_dir: &std::path::Path) -> Vec<pq_diary_co
     let entries = core.list_entries(None).expect("list_entries");
     core.lock();
     entries
+}
+
+/// Open the test vault and return the plaintext of the first entry.
+pub(super) fn read_first_entry_plaintext(
+    vault_dir: &std::path::Path,
+) -> pq_diary_core::EntryPlaintext {
+    let vault_pqd = vault_dir.join("vault.pqd");
+    let vault_str = vault_pqd.to_str().expect("utf8");
+    let mut core = DiaryCore::new(vault_str).expect("DiaryCore::new");
+    let pw: secrecy::SecretString = secrecy::SecretBox::new(Box::from("password"));
+    core.unlock(pw).expect("unlock");
+    let entries = core.list_entries(None).expect("list_entries");
+    assert!(!entries.is_empty(), "vault must not be empty");
+    let prefix = &entries[0].uuid_hex[..4];
+    let (_, plaintext) = core.get_entry(prefix).expect("get_entry");
+    core.lock();
+    plaintext
+}
+
+pub(super) fn make_cli_plain(args: &[&str]) -> crate::Cli {
+    let mut full: Vec<&str> = vec!["pq-diary"];
+    full.extend_from_slice(args);
+    crate::Cli::try_parse_from(&full).expect("parse cli")
+}
+
+pub(super) fn setup_s10_vault(
+    dir: &tempfile::TempDir,
+    name: &str,
+    password: &[u8],
+) -> std::path::PathBuf {
+    use pq_diary_core::vault::init::VaultManager;
+    let mgr = VaultManager::new(dir.path().to_path_buf())
+        .expect("VaultManager::new")
+        .with_kdf_params(fast_params());
+    mgr.init_vault(name, password).expect("init_vault");
+    dir.path().join(name)
 }

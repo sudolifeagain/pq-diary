@@ -44,6 +44,9 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         shell: bash
         run: bash ./ci/smoke-test.sh ./target/debug/pq-diary
+      - name: Isolated Cargo install/uninstall and setup confirmation
+        if: matrix.os == 'ubuntu-latest'
+        run: python3 ci/install-smoke.py
 
   audit:
     name: audit

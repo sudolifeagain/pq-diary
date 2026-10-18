@@ -19,7 +19,7 @@ use session::VaultGuard;
 pub use templates::{cmd_template_add, cmd_template_delete, cmd_template_list, cmd_template_show};
 
 use crate::editor::{self, EditorConfig};
-use crate::password::{get_password, PasswordSource};
+use crate::password::{confirm_new_password, get_password, PasswordSource};
 use crate::Cli;
 use chrono::{DateTime, Local, Utc};
 use pq_diary_core::{DiaryCore, EntryMeta, EntryPlaintext, Tag};
@@ -1314,6 +1314,9 @@ fn cmd_vault_create_impl(
         return Ok(());
     }
 
+    // Keep policy/weak-password confirmation before this additional secret read.
+    confirm_new_password(&password_source)?;
+
     // Step 4: Create vault.
     let base_dir = resolve_vaults_base_dir(cli)?;
     let mgr = mgr_factory(base_dir.clone())?;
@@ -1893,6 +1896,9 @@ pub fn cmd_init(cli: &Cli) -> anyhow::Result<()> {
         let mut reader = std::io::Cursor::new(Vec::<u8>::new());
         review_password_choice(password_source.secret().expose_secret(), false, &mut reader)?;
     }
+
+    // Confirm before creating config, directories, or cryptographic material.
+    confirm_new_password(&password_source)?;
 
     std::fs::create_dir_all(&parent_dir).map_err(|e| {
         let message = format!("Cannot create config directory: {e}");

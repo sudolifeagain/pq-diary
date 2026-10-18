@@ -4,12 +4,16 @@
 //! `main.rs`.  Handlers in this module may return `anyhow::Result` so that
 //! arbitrary error sources can be propagated through the main entry-point.
 
+#[cfg(test)]
+mod config_context_tests;
+mod export;
 mod import;
 mod session;
 mod templates;
 #[cfg(test)]
 mod test_support;
 
+pub use export::cmd_export;
 pub use import::cmd_import;
 use session::VaultGuard;
 pub use templates::{cmd_template_add, cmd_template_delete, cmd_template_list, cmd_template_show};
@@ -19,7 +23,7 @@ use crate::password::{confirm_new_password, get_password, PasswordSource};
 use crate::Cli;
 use chrono::{DateTime, Local, Utc};
 use pq_diary_core::{DiaryCore, EntryMeta, EntryPlaintext, Tag};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 // ---------------------------------------------------------------------------
 // Private helpers
@@ -75,7 +79,7 @@ fn filter_and_sort(
 ) -> anyhow::Result<Vec<EntryMeta>> {
     // Tag filter (prefix match for nested tags)
     if let Some(tag_str) = tag {
-        let filter_tag = Tag::new(tag_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let filter_tag = Tag::new(tag_str)?;
         entries.retain(|e| {
             e.tags.iter().any(|t| {
                 Tag::new(t)
@@ -129,9 +133,9 @@ fn check_claude_policy(
         .parent()
         .ok_or_else(|| anyhow::anyhow!("vault path has no parent directory"))?
         .join("vault.toml");
-    let config = VaultConfig::from_file(&toml_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let config = VaultConfig::from_file(&toml_path)?;
     let decision = policy::check_access(true, config.access.policy, operation, &config.vault.name);
-    decision.into_result().map_err(|e| anyhow::anyhow!("{}", e))
+    decision.into_result().map_err(anyhow::Error::new)
 }
 
 // ---------------------------------------------------------------------------
@@ -216,15 +220,14 @@ fn cmd_new_with_attach_to(
 
     // Step 1: Obtain password and unlock the vault.
     // Keep the source for the separate attachment session below.
-    let password_source =
-        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let password_source = get_password(cli.password.as_ref())?;
 
     let vault_path = resolve_vault_path(cli)?;
     let vault_str = vault_path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("Vault path contains non-UTF-8 characters"))?;
 
-    let mut core = DiaryCore::new(vault_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut core = DiaryCore::new(vault_str)?;
 
     let secret_password: secrecy::SecretString =
         SecretBox::new(Box::from(password_source.secret().expose_secret()));
@@ -291,7 +294,7 @@ fn cmd_new_with_attach_to(
         (content, title, tags)
     } else {
         // $EDITOR: write header-comment temp file, launch editor, read back.
-        let mut config = EditorConfig::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut config = EditorConfig::from_env()?;
 
         let initial = EntryPlaintext {
             title: title.clone().unwrap_or_else(|| "Untitled".to_string()),
@@ -402,8 +405,7 @@ fn cmd_list_to(
     // Policy check before any password prompt or vault decryption.
     check_claude_policy(cli, OperationType::Read)?;
 
-    let password_source =
-        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let password_source = get_password(cli.password.as_ref())?;
 
     let mut core = session::locked_core(cli)?;
     let guard = session::unlock(&mut core, password_source.into_secret())?;
@@ -464,15 +466,14 @@ fn cmd_show_impl(cli: &Cli, id: String, out: &mut dyn std::io::Write) -> anyhow:
     check_claude_policy(cli, OperationType::Read)?;
 
     // Keep the source for the separate attachment-listing session below.
-    let password_source =
-        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let password_source = get_password(cli.password.as_ref())?;
 
     let vault_path = resolve_vault_path(cli)?;
     let vault_str = vault_path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("Vault path contains non-UTF-8 characters"))?;
 
-    let mut core = DiaryCore::new(vault_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut core = DiaryCore::new(vault_str)?;
 
     let secret_password: secrecy::SecretString =
         SecretBox::new(Box::from(password_source.secret().expose_secret()));
@@ -480,7 +481,7 @@ fn cmd_show_impl(cli: &Cli, id: String, out: &mut dyn std::io::Write) -> anyhow:
         .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
     let guard = VaultGuard::new(&mut core);
 
-    let (record, plaintext) = guard.get_entry(&id).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (record, plaintext) = guard.get_entry(&id)?;
 
     let created = format_timestamp(record.created_at);
     let updated = format_timestamp(record.updated_at);
@@ -503,9 +504,7 @@ fn cmd_show_impl(cli: &Cli, id: String, out: &mut dyn std::io::Write) -> anyhow:
     write!(out, "{}", plaintext.body).context("Failed to write entry output")?;
 
     // Resolve [[link]] references in the body.
-    let resolved = guard
-        .resolve_links(&plaintext.body)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let resolved = guard.resolve_links(&plaintext.body)?;
 
     if !resolved.is_empty() {
         writeln!(out).context("Failed to write entry output")?;
@@ -561,9 +560,7 @@ fn cmd_show_impl(cli: &Cli, id: String, out: &mut dyn std::io::Write) -> anyhow:
     }
 
     // Display backlinks (newest first).
-    let mut backlinks = guard
-        .backlinks_for(&plaintext.title)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut backlinks = guard.backlinks_for(&plaintext.title)?;
 
     if !backlinks.is_empty() {
         backlinks.sort_by_key(|b| std::cmp::Reverse(b.created_at));
@@ -643,13 +640,12 @@ where
     // Policy check before any password prompt or vault decryption.
     check_claude_policy(cli, OperationType::Write)?;
 
-    let password_source =
-        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let password_source = get_password(cli.password.as_ref())?;
 
     let mut core = session::locked_core(cli)?;
     let guard = session::unlock(&mut core, password_source.into_secret())?;
 
-    let (_record, original) = guard.get_entry(&id).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (_record, original) = guard.get_entry(&id)?;
 
     let flag_mode = title.is_some() || !add_tags.is_empty() || !remove_tags.is_empty();
 
@@ -682,7 +678,7 @@ where
         println!("Updated: {prefix}");
     } else {
         // Editor mode: write header-comment temp file, launch editor, parse result.
-        let mut config = EditorConfig::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut config = EditorConfig::from_env()?;
 
         let mut session = editor::EditorSession::header(&config.secure_tmpdir, &original)
             .map_err(|e| anyhow::anyhow!("Failed to write temp file: {e}"))?;
@@ -782,13 +778,12 @@ fn cmd_delete_impl(
     // Policy check before any password prompt or vault decryption.
     check_claude_policy(cli, OperationType::Write)?;
 
-    let password_source =
-        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let password_source = get_password(cli.password.as_ref())?;
 
     let mut core = session::locked_core(cli)?;
     let guard = session::unlock(&mut core, password_source.into_secret())?;
 
-    let (record, plaintext) = guard.get_entry(&id).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (record, plaintext) = guard.get_entry(&id)?;
 
     let title = plaintext.title.clone();
     let date = format_timestamp(record.created_at);
@@ -853,8 +848,7 @@ where
     // Policy check before any password prompt or vault decryption.
     check_claude_policy(cli, OperationType::Write)?;
 
-    let password_source =
-        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let password_source = get_password(cli.password.as_ref())?;
 
     let mut core = session::locked_core(cli)?;
     let guard = session::unlock(&mut core, password_source.into_secret())?;
@@ -892,11 +886,9 @@ where
 
     // Open the entry in the editor (edit flow).
     let id_prefix = entry_id[..entry_id.len().min(8)].to_string();
-    let (_record, original) = guard
-        .get_entry(&id_prefix)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (_record, original) = guard.get_entry(&id_prefix)?;
 
-    let mut config = EditorConfig::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut config = EditorConfig::from_env()?;
 
     let mut session = editor::EditorSession::header(&config.secure_tmpdir, &original)
         .map_err(|e| anyhow::anyhow!("Failed to write temp file: {e}"))?;
@@ -966,8 +958,7 @@ pub(crate) fn cmd_search_to(
     // Policy check before any password prompt or vault decryption.
     check_claude_policy(cli, OperationType::Read)?;
 
-    let password_source =
-        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let password_source = get_password(cli.password.as_ref())?;
 
     let mut core = session::locked_core(cli)?;
     let guard = session::unlock(&mut core, password_source.into_secret())?;
@@ -979,7 +970,7 @@ pub(crate) fn cmd_search_to(
         count_only: args.count,
     };
 
-    let results = guard.search(&query).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let results = guard.search(&query)?;
 
     if args.count {
         writeln!(out, "{} entries matched", results.matched_entry_count)?;
@@ -1062,13 +1053,12 @@ pub(crate) fn cmd_stats_to(
     // Policy check before any password prompt or vault decryption.
     check_claude_policy(cli, OperationType::Read)?;
 
-    let password_source =
-        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let password_source = get_password(cli.password.as_ref())?;
 
     let mut core = session::locked_core(cli)?;
     let guard = session::unlock(&mut core, password_source.into_secret())?;
 
-    let stats = guard.stats().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let stats = guard.stats()?;
 
     if args.json {
         let json = serde_json::to_string_pretty(&stats)
@@ -1218,8 +1208,10 @@ fn render_heatmap_at(
 fn resolve_vaults_base_dir(cli: &Cli) -> anyhow::Result<PathBuf> {
     match &cli.vault {
         Some(v) => Ok(PathBuf::from(v)),
-        None => std::env::current_dir()
-            .map_err(|e| anyhow::anyhow!("Cannot determine current directory: {e}")),
+        None => std::env::current_dir().map_err(|e| {
+            let message = format!("Cannot determine current directory: {e}");
+            anyhow::Error::new(e).context(message)
+        }),
     }
 }
 
@@ -1232,13 +1224,15 @@ fn confirm_full_policy(reader: &mut impl std::io::BufRead) -> anyhow::Result<boo
     eprintln!("警告: \"full\"を設定すると日記内容がAnthropicのAPIサーバーを通過します。");
     eprintln!("      間接プロンプトインジェクション等のリスクがあります。");
     eprint!("      本当に許可しますか？ [y/N]: ");
-    std::io::stderr()
-        .flush()
-        .map_err(|e| anyhow::anyhow!("Failed to flush stderr: {e}"))?;
+    std::io::stderr().flush().map_err(|e| {
+        let message = format!("Failed to flush stderr: {e}");
+        anyhow::Error::new(e).context(message)
+    })?;
     let mut input = String::new();
-    reader
-        .read_line(&mut input)
-        .map_err(|e| anyhow::anyhow!("Failed to read input: {e}"))?;
+    reader.read_line(&mut input).map_err(|e| {
+        let message = format!("Failed to read input: {e}");
+        anyhow::Error::new(e).context(message)
+    })?;
     let trimmed = input.trim();
     Ok(trimmed == "y" || trimmed == "Y")
 }
@@ -1249,13 +1243,15 @@ fn confirm_full_policy(reader: &mut impl std::io::BufRead) -> anyhow::Result<boo
 fn confirm_vault_delete(name: &str, reader: &mut impl std::io::BufRead) -> anyhow::Result<bool> {
     use std::io::Write as _;
     eprint!("Delete vault '{name}'? [y/N]: ");
-    std::io::stderr()
-        .flush()
-        .map_err(|e| anyhow::anyhow!("Failed to flush stderr: {e}"))?;
+    std::io::stderr().flush().map_err(|e| {
+        let message = format!("Failed to flush stderr: {e}");
+        anyhow::Error::new(e).context(message)
+    })?;
     let mut input = String::new();
-    reader
-        .read_line(&mut input)
-        .map_err(|e| anyhow::anyhow!("Failed to read input: {e}"))?;
+    reader.read_line(&mut input).map_err(|e| {
+        let message = format!("Failed to read input: {e}");
+        anyhow::Error::new(e).context(message)
+    })?;
     let trimmed = input.trim();
     Ok(trimmed == "y" || trimmed == "Y")
 }
@@ -1278,7 +1274,7 @@ pub fn cmd_vault_create(cli: &Cli, name: &str, policy_str: Option<&str>) -> anyh
         name,
         policy_str,
         &mut std::io::BufReader::new(std::io::stdin()),
-        |base_dir| VaultManager::new(base_dir).map_err(|e| anyhow::anyhow!("{e}")),
+        |base_dir| VaultManager::new(base_dir).map_err(anyhow::Error::new),
     )
 }
 
@@ -1308,8 +1304,7 @@ fn cmd_vault_create_impl(
     }
 
     // Step 3: Get password.
-    let password_source =
-        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let password_source = get_password(cli.password.as_ref())?;
     if !review_password_choice(
         password_source.secret().expose_secret(),
         matches!(password_source, PasswordSource::Tty(_)),
@@ -1326,8 +1321,7 @@ fn cmd_vault_create_impl(
     let base_dir = resolve_vaults_base_dir(cli)?;
     let mgr = mgr_factory(base_dir.clone())?;
     let pw_bytes = password_source.secret().expose_secret().as_bytes();
-    mgr.create_vault(name, pw_bytes, policy)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    mgr.create_vault(name, pw_bytes, policy)?;
 
     // Step 5: Success message.
     let vault_dir = base_dir.join(name);
@@ -1359,13 +1353,15 @@ fn review_password_choice(
         eprintln!("Warning: weak passwords are not recommended for pq-diary vaults.");
         if confirm_weak {
             eprint!("Use this weak password anyway? [y/N]: ");
-            std::io::stderr()
-                .flush()
-                .map_err(|e| anyhow::anyhow!("Failed to flush stderr: {e}"))?;
+            std::io::stderr().flush().map_err(|e| {
+                let message = format!("Failed to flush stderr: {e}");
+                anyhow::Error::new(e).context(message)
+            })?;
             let mut input = String::new();
-            reader
-                .read_line(&mut input)
-                .map_err(|e| anyhow::anyhow!("Failed to read input: {e}"))?;
+            reader.read_line(&mut input).map_err(|e| {
+                let message = format!("Failed to read input: {e}");
+                anyhow::Error::new(e).context(message)
+            })?;
             let trimmed = input.trim();
             return Ok(trimmed == "y" || trimmed == "Y");
         }
@@ -1390,10 +1386,8 @@ fn cmd_vault_list_to(cli: &Cli, out: &mut dyn std::io::Write) -> anyhow::Result<
     use pq_diary_core::vault::init::VaultManager;
 
     let base_dir = resolve_vaults_base_dir(cli)?;
-    let mgr = VaultManager::new(base_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let vaults = mgr
-        .list_vaults_with_policy()
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mgr = VaultManager::new(base_dir)?;
+    let vaults = mgr.list_vaults_with_policy()?;
 
     writeln!(out, "{:<20} POLICY", "NAME")?;
     writeln!(out, "{}", "-".repeat(31))?;
@@ -1446,9 +1440,8 @@ fn cmd_vault_policy_impl(
 
     // Step 3: Set policy.
     let base_dir = resolve_vaults_base_dir(cli)?;
-    let mgr = VaultManager::new(base_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
-    mgr.set_policy(name, policy)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mgr = VaultManager::new(base_dir)?;
+    mgr.set_policy(name, policy)?;
 
     // Step 4: Success message.
     println!("Policy updated: {name} → {policy}");
@@ -1484,7 +1477,7 @@ fn cmd_vault_delete_impl(
     use pq_diary_core::vault::init::VaultManager;
 
     let base_dir = resolve_vaults_base_dir(cli)?;
-    let mgr = VaultManager::new(base_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mgr = VaultManager::new(base_dir)?;
 
     // Step 1: Check if vault exists.
     let vault_path = mgr.vault_path(name);
@@ -1509,8 +1502,7 @@ fn cmd_vault_delete_impl(
 
     if do_delete {
         // Step 4: Delete vault.
-        mgr.delete_vault(name, zeroize)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        mgr.delete_vault(name, zeroize)?;
         println!("Deleted vault '{name}'");
     } else {
         println!("キャンセルしました");
@@ -1536,144 +1528,63 @@ fn vault_dir_from_path(vault_path: &std::path::Path) -> anyhow::Result<PathBuf> 
         .parent()
         .ok_or_else(|| anyhow::anyhow!("vault path has no parent directory"))?;
     if parent.as_os_str().is_empty() {
-        std::env::current_dir()
-            .map_err(|e| anyhow::anyhow!("Cannot determine current directory: {e}"))
+        std::env::current_dir().map_err(|e| {
+            let message = format!("Cannot determine current directory: {e}");
+            anyhow::Error::new(e).context(message)
+        })
     } else {
         Ok(parent.to_path_buf())
     }
 }
 
-/// Collect choices and apply them only to the authenticated current snapshot.
-/// Returns whether remote choices were written; local-only choices are a no-op.
-fn apply_conflict_choices(
-    conflicts: &[pq_diary_core::git::MergeConflict],
-    vault_path: &std::path::Path,
-    mac_key: &[u8; 32],
+/// Ask before any merge write. Absence is an explicit choice, never a fallback.
+fn choose_git_conflict(
+    conflict: &pq_diary_core::git::MergeConflict,
     reader: &mut impl std::io::BufRead,
-) -> anyhow::Result<bool> {
-    use pq_diary_core::vault::{
-        reader::read_vault_with_attachments_authenticated,
-        writer::write_vault_with_attachments_authenticated,
-    };
-    use std::io::Write as _;
-
-    let mut remote_uuids: Vec<[u8; 16]> = Vec::new();
-
-    println!("Merge conflicts detected:");
-    for conflict in conflicts {
-        let uuid_hex: String = conflict.uuid.iter().map(|b| format!("{b:02x}")).collect();
-        println!("  UUID: {}", &uuid_hex[..8]);
-        println!("  Local  updated_at: {}", conflict.local.updated_at);
-        println!("  Remote updated_at: {}", conflict.remote.updated_at);
-        eprint!("  Keep [l]ocal or [r]emote? ");
-        std::io::stderr()
-            .flush()
-            .map_err(|e| anyhow::anyhow!("Failed to flush stderr: {e}"))?;
-
-        let mut input = String::new();
-        reader
-            .read_line(&mut input)
-            .map_err(|e| anyhow::anyhow!("Failed to read conflict choice: {e}"))?;
-        let choice = input.trim().to_lowercase();
-        if choice == "r" || choice == "remote" {
-            remote_uuids.push(conflict.uuid);
+    writer: &mut impl std::io::Write,
+) -> Result<Option<pq_diary_core::git::ConflictResolution>, pq_diary_core::DiaryError> {
+    use pq_diary_core::{git::ConflictResolution, DiaryError};
+    let id = uuid::Uuid::from_bytes(conflict.uuid);
+    writeln!(writer, "Merge conflict UUID: {id}")?;
+    for (label, entry) in [("Local", &conflict.local), ("Remote", &conflict.remote)] {
+        match entry {
+            Some(entry) => writeln!(writer, "  {label} updated_at: {}", entry.updated_at)?,
+            None => writeln!(writer, "  {label}: deleted")?,
         }
     }
-
-    if remote_uuids.is_empty() {
-        return Ok(false);
+    write!(writer, "  Keep [l]ocal or [r]emote (including deletion)? ")?;
+    writer.flush()?;
+    let mut input = String::new();
+    if reader.read_line(&mut input)? == 0 {
+        return Err(DiaryError::Git(
+            "conflict choice cancelled at end of input; no merge was applied".into(),
+        ));
     }
-
-    // Authenticate and parse one post-prompt snapshot, including attachments.
-    // This preserves unrelated edits made while the user was choosing. It is
-    // not a cross-process lock: another writer can still race after this read.
-    let (header, mut entries, attachments) =
-        read_vault_with_attachments_authenticated(vault_path, mac_key)?;
-    for uuid in &remote_uuids {
-        if let Some(conflict) = conflicts.iter().find(|c| &c.uuid == uuid) {
-            let pos = entries
-                .iter()
-                .position(|e| e.uuid == *uuid)
-                .ok_or_else(|| {
-                    anyhow::anyhow!("Conflict entry disappeared while prompting; retry the merge")
-                })?;
-            if entries[pos] != conflict.local {
-                anyhow::bail!("Conflict entry changed while prompting; retry the merge");
-            }
-            entries[pos] = conflict.remote.clone();
-        }
+    match input.trim().to_ascii_lowercase().as_str() {
+        "l" | "local" => Ok(Some(ConflictResolution::KeepLocal)),
+        "r" | "remote" => Ok(Some(ConflictResolution::KeepRemote)),
+        _ => Err(DiaryError::Git(
+            "explicit local or remote choice required; no merge was applied".into(),
+        )),
     }
-    // No write occurs unless every selected local version still matches.
-    write_vault_with_attachments_authenticated(
-        vault_path,
-        header,
-        &entries,
-        &attachments,
-        mac_key,
-    )?;
-    Ok(true)
 }
 
-/// Apply conflict resolutions chosen interactively by the user.
-///
-/// For each conflict where the user chooses `r` (remote), overwrites the
-/// local provisional entry in the vault with the remote version and commits
-/// the change using the vault's privacy pipeline.
-///
-/// `reader` is injected so that tests can supply pre-programmed responses
-/// instead of reading from the real stdin.
-fn resolve_conflicts_interactive(
-    conflicts: &[pq_diary_core::git::MergeConflict],
-    vault_dir: &std::path::Path,
+fn pull_with_choices(
+    dir: &std::path::Path,
     config: &pq_diary_core::vault::config::VaultConfig,
-    vault_path: &std::path::Path,
-    mac_key: &[u8; 32],
+    path: &std::path::Path,
+    key: &[u8; 32],
+    claude: bool,
     reader: &mut impl std::io::BufRead,
-) -> anyhow::Result<()> {
-    use pq_diary_core::git::{fuzz_timestamp, get_last_commit_timestamp};
-
-    // Validate timestamp arithmetic before prompting or writing conflict choices.
-    let prev_ts = get_last_commit_timestamp(vault_dir);
-    let fuzz_hours = config.git.privacy.timestamp_fuzz_hours;
-    let fuzzed_ts = fuzz_timestamp(prev_ts, fuzz_hours)?;
-    let ts_str = fuzzed_ts.to_rfc3339();
-
-    if !apply_conflict_choices(conflicts, vault_path, mac_key, reader)? {
-        return Ok(());
+) -> Result<pq_diary_core::git::MergeResult, pq_diary_core::DiaryError> {
+    use pq_diary_core::git;
+    if claude {
+        git::git_pull_merge(dir, config, path, key, true)
+    } else {
+        git::git_pull_merge_with_resolver(dir, config, path, key, &mut |conflict| {
+            choose_git_conflict(conflict, reader, &mut std::io::stderr().lock())
+        })
     }
-
-    // Commit the updated vault using the privacy pipeline.
-
-    // Commit only the resolved vault; preserve unrelated staging on success
-    // and leave the original index intact if a commit hook rejects it.
-    let commit_out = std::process::Command::new("git")
-        .current_dir(vault_dir)
-        .arg("-c")
-        .arg(format!("user.name={}", config.git.author_name))
-        .arg("-c")
-        .arg(format!("user.email={}", config.git.author_email))
-        .args([
-            "commit",
-            "--only",
-            "--date",
-            &ts_str,
-            "-m",
-            &config.git.commit_message,
-            "--",
-            "vault.pqd",
-        ])
-        .env("GIT_AUTHOR_DATE", &ts_str)
-        .env("GIT_COMMITTER_DATE", &ts_str)
-        .output()
-        .map_err(|e| anyhow::anyhow!("git commit failed: {e}"))?;
-    if !commit_out.status.success() {
-        let stderr = String::from_utf8_lossy(&commit_out.stderr);
-        if !stderr.contains("nothing to commit") {
-            return Err(anyhow::anyhow!("git commit failed: {}", stderr));
-        }
-    }
-
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1697,9 +1608,9 @@ pub fn cmd_git_init(cli: &Cli, remote: Option<&str>) -> anyhow::Result<()> {
     let vault_path = resolve_vault_path(cli)?;
     let vault_dir = vault_dir_from_path(&vault_path)?;
 
-    git::check_git_available().map_err(|e| anyhow::anyhow!("{e}"))?;
+    git::check_git_available()?;
 
-    git::git_init(&vault_dir, remote).map_err(|e| anyhow::anyhow!("{e}"))?;
+    git::git_init(&vault_dir, remote)?;
 
     println!("Initialized git repository in {}", vault_dir.display());
     // Try to show the generated author email from vault.toml if it exists.
@@ -1738,28 +1649,28 @@ pub fn cmd_git_push(cli: &Cli) -> anyhow::Result<()> {
     let vault_dir = vault_dir_from_path(&vault_path)?;
     let toml_path = vault_dir.join("vault.toml");
 
-    git::check_git_available().map_err(|e| anyhow::anyhow!("{e}"))?;
+    git::check_git_available()?;
 
-    let config = VaultConfig::from_file(&toml_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let config = VaultConfig::from_file(&toml_path)?;
 
-    let password_source =
-        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let password_source = get_password(cli.password.as_ref())?;
 
     let vault_str = vault_path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("vault path contains non-UTF-8 characters"))?;
 
-    let mut core = pq_diary_core::DiaryCore::new(vault_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut core = pq_diary_core::DiaryCore::new(vault_str)?;
 
     let secret_password: secrecy::SecretString =
         SecretBox::new(Box::from(password_source.secret().expose_secret()));
-    core.unlock(secret_password)
-        .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
-    let mac_key = core.vault_mac_key().map_err(|e| anyhow::anyhow!("{e}"))?;
+    core.unlock(secret_password).map_err(|e| {
+        let message = format!("Vault unlock failed: {e}");
+        anyhow::Error::new(e).context(message)
+    })?;
+    let mac_key = core.vault_mac_key()?;
     let _guard = VaultGuard::new(&mut core);
 
-    git::git_push(&vault_dir, &config, &vault_path, &mac_key)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    git::git_push(&vault_dir, &config, &vault_path, &mac_key)?;
 
     println!("Pushed vault to remote.");
     // _guard drops here → lock() called
@@ -1794,39 +1705,35 @@ fn cmd_git_pull_impl(cli: &Cli, reader: &mut impl std::io::BufRead) -> anyhow::R
     let vault_dir = vault_dir_from_path(&vault_path)?;
     let toml_path = vault_dir.join("vault.toml");
 
-    git::check_git_available().map_err(|e| anyhow::anyhow!("{e}"))?;
+    git::check_git_available()?;
 
-    let config = VaultConfig::from_file(&toml_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let config = VaultConfig::from_file(&toml_path)?;
 
-    let password_source =
-        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let password_source = get_password(cli.password.as_ref())?;
 
     let vault_str = vault_path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("vault path contains non-UTF-8 characters"))?;
 
-    let mut core = pq_diary_core::DiaryCore::new(vault_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut core = pq_diary_core::DiaryCore::new(vault_str)?;
 
     let secret_password: secrecy::SecretString =
         SecretBox::new(Box::from(password_source.secret().expose_secret()));
-    core.unlock(secret_password)
-        .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
-    let mac_key = core.vault_mac_key().map_err(|e| anyhow::anyhow!("{e}"))?;
+    core.unlock(secret_password).map_err(|e| {
+        let message = format!("Vault unlock failed: {e}");
+        anyhow::Error::new(e).context(message)
+    })?;
+    let mac_key = core.vault_mac_key()?;
     let _guard = VaultGuard::new(&mut core);
 
-    let result = git::git_pull_merge(&vault_dir, &config, &vault_path, &mac_key, cli.claude)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    if !result.conflicts.is_empty() && !cli.claude {
-        resolve_conflicts_interactive(
-            &result.conflicts,
-            &vault_dir,
-            &config,
-            &vault_path,
-            &mac_key,
-            reader,
-        )?;
-    }
+    let result = pull_with_choices(
+        &vault_dir,
+        &config,
+        &vault_path,
+        &mac_key,
+        cli.claude,
+        reader,
+    )?;
 
     println!(
         "Pull complete: {} added, {} updated, {} deleted, {} conflict(s)",
@@ -1864,45 +1771,40 @@ fn cmd_git_sync_impl(cli: &Cli, reader: &mut impl std::io::BufRead) -> anyhow::R
     let vault_dir = vault_dir_from_path(&vault_path)?;
     let toml_path = vault_dir.join("vault.toml");
 
-    git::check_git_available().map_err(|e| anyhow::anyhow!("{e}"))?;
+    git::check_git_available()?;
 
-    let config = VaultConfig::from_file(&toml_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let config = VaultConfig::from_file(&toml_path)?;
 
     // Single password prompt for both pull and push.
-    let password_source =
-        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let password_source = get_password(cli.password.as_ref())?;
 
     let vault_str = vault_path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("vault path contains non-UTF-8 characters"))?;
 
-    let mut core = pq_diary_core::DiaryCore::new(vault_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut core = pq_diary_core::DiaryCore::new(vault_str)?;
 
     let secret_password: secrecy::SecretString =
         SecretBox::new(Box::from(password_source.secret().expose_secret()));
-    core.unlock(secret_password)
-        .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
-    let mac_key = core.vault_mac_key().map_err(|e| anyhow::anyhow!("{e}"))?;
+    core.unlock(secret_password).map_err(|e| {
+        let message = format!("Vault unlock failed: {e}");
+        anyhow::Error::new(e).context(message)
+    })?;
+    let mac_key = core.vault_mac_key()?;
     let _guard = VaultGuard::new(&mut core);
 
     // Phase 1: Pull + merge.
-    let pull_result = git::git_pull_merge(&vault_dir, &config, &vault_path, &mac_key, cli.claude)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    if !pull_result.conflicts.is_empty() && !cli.claude {
-        resolve_conflicts_interactive(
-            &pull_result.conflicts,
-            &vault_dir,
-            &config,
-            &vault_path,
-            &mac_key,
-            reader,
-        )?;
-    }
+    let pull_result = pull_with_choices(
+        &vault_dir,
+        &config,
+        &vault_path,
+        &mac_key,
+        cli.claude,
+        reader,
+    )?;
 
     // Phase 2: Push.
-    git::git_push(&vault_dir, &config, &vault_path, &mac_key)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    git::git_push(&vault_dir, &config, &vault_path, &mac_key)?;
 
     println!("Sync complete.");
     println!(
@@ -1936,9 +1838,9 @@ fn cmd_git_status_to(cli: &Cli, out: &mut dyn std::io::Write) -> anyhow::Result<
     let vault_path = resolve_vault_path(cli)?;
     let vault_dir = vault_dir_from_path(&vault_path)?;
 
-    git::check_git_available().map_err(|e| anyhow::anyhow!("{e}"))?;
+    git::check_git_available()?;
 
-    let status = git::git_status(&vault_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let status = git::git_status(&vault_dir)?;
     write!(out, "{status}")?;
 
     out.flush()?;
@@ -1948,6 +1850,9 @@ fn cmd_git_status_to(cli: &Cli, out: &mut dyn std::io::Write) -> anyhow::Result<
 // ---------------------------------------------------------------------------
 // S10 Phase 2: init / sync / info / change-password / export
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod config_auth_sources_tests;
 
 /// Execute the `pq-diary init` command.
 ///
@@ -1967,7 +1872,7 @@ pub fn cmd_init(cli: &Cli) -> anyhow::Result<()> {
     use pq_diary_core::vault::init::VaultManager;
     use secrecy::ExposeSecret as _;
 
-    let config_path = AppConfig::default_path().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let config_path = AppConfig::default_path()?;
     let parent_dir = config_path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("config path has no parent directory"))?
@@ -1977,8 +1882,7 @@ pub fn cmd_init(cli: &Cli) -> anyhow::Result<()> {
         anyhow::bail!("Already initialized at {}", parent_dir.display());
     }
 
-    let password_source =
-        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let password_source = get_password(cli.password.as_ref())?;
     if password_source.secret().expose_secret().is_empty() {
         anyhow::bail!("New password must not be empty");
     }
@@ -1996,8 +1900,10 @@ pub fn cmd_init(cli: &Cli) -> anyhow::Result<()> {
     // Confirm before creating config, directories, or cryptographic material.
     confirm_new_password(&password_source)?;
 
-    std::fs::create_dir_all(&parent_dir)
-        .map_err(|e| anyhow::anyhow!("Cannot create config directory: {e}"))?;
+    std::fs::create_dir_all(&parent_dir).map_err(|e| {
+        let message = format!("Cannot create config directory: {e}");
+        anyhow::Error::new(e).context(message)
+    })?;
 
     // Reserve the config exclusively. The early existence check above is only
     // a convenience; create_new also rejects dangling symlinks and a config
@@ -2009,16 +1915,17 @@ pub fn cmd_init(cli: &Cli) -> anyhow::Result<()> {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
     }
-    let mut config_file = options
-        .open(&config_path)
-        .map_err(|e| anyhow::anyhow!("Cannot create config file: {e}"))?;
+    let mut config_file = options.open(&config_path).map_err(|e| {
+        let message = format!("Cannot create config file: {e}");
+        anyhow::Error::new(e).context(message)
+    })?;
     // Write through the reserved handle; reopening the pathname would lose
     // the exclusive-create guarantee if the path were replaced.
     let config_result = AppConfig::default().write_to(&mut config_file);
     drop(config_file);
     if let Err(e) = config_result {
         let _ = std::fs::remove_file(&config_path);
-        return Err(anyhow::anyhow!("{e}"));
+        return Err(e.into());
     }
 
     let vaults_dir = parent_dir.join("vaults");
@@ -2028,7 +1935,8 @@ pub fn cmd_init(cli: &Cli) -> anyhow::Result<()> {
         Ok(m) => m,
         Err(e) => {
             let _ = std::fs::remove_file(&config_path);
-            return Err(anyhow::anyhow!("Vault creation failed: {e}"));
+            let message = format!("Vault creation failed: {e}");
+            return Err(anyhow::Error::new(e).context(message));
         }
     };
 
@@ -2040,7 +1948,8 @@ pub fn cmd_init(cli: &Cli) -> anyhow::Result<()> {
 
     if let Err(e) = create_result {
         let _ = std::fs::remove_file(&config_path);
-        return Err(anyhow::anyhow!("Vault creation failed: {e}"));
+        let message = format!("Vault creation failed: {e}");
+        return Err(anyhow::Error::new(e).context(message));
     }
 
     println!("Initialized pq-diary at {}", parent_dir.display());
@@ -2051,15 +1960,17 @@ pub fn cmd_init(cli: &Cli) -> anyhow::Result<()> {
 pub fn cmd_sync(cli: &Cli) -> anyhow::Result<()> {
     use pq_diary_core::vault::config::AppConfig;
 
-    let config_path = AppConfig::default_path().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let config_path = AppConfig::default_path()?;
     if !config_path.exists() {
         anyhow::bail!(
             "pq-diary init を先に実行してください (~/.pq-diary/config.toml が見つかりません)"
         );
     }
 
-    let config = AppConfig::from_file(&config_path)
-        .map_err(|e| anyhow::anyhow!("Invalid config.toml: {e}"))?;
+    let config = AppConfig::from_file(&config_path).map_err(|e| {
+        let message = format!("Invalid config.toml: {e}");
+        anyhow::Error::new(e).context(message)
+    })?;
 
     match config.app.sync_backend.as_str() {
         "git" => cmd_git_sync(cli),
@@ -2077,14 +1988,12 @@ pub fn cmd_change_password(cli: &Cli) -> anyhow::Result<()> {
 
     resolve_change_password_vault_dir(cli)?;
 
-    let old_source = get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let old_source = get_password(cli.password.as_ref())?;
     let old_pwd: SecretString = SecretBox::new(Box::from(old_source.secret().expose_secret()));
     drop(old_source);
 
-    let new_pwd1 =
-        crate::password::prompt_password("New password: ").map_err(|e| anyhow::anyhow!("{e}"))?;
-    let new_pwd2 = crate::password::prompt_password("Confirm new password: ")
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let new_pwd1 = crate::password::prompt_password("New password: ")?;
+    let new_pwd2 = crate::password::prompt_password("Confirm new password: ")?;
 
     cmd_change_password_impl(
         cli,
@@ -2130,14 +2039,14 @@ fn cmd_change_password_impl(
         let vault_pqd_str = vault_pqd
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("vault path contains non-UTF-8 characters"))?;
-        let mut core = DiaryCore::new(vault_pqd_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut core = DiaryCore::new(vault_pqd_str)?;
         let attempt: secrecy::SecretString =
             secrecy::SecretBox::new(Box::from(old_pwd.expose_secret()));
         core.unlock(attempt)
             .map_err(|_| anyhow::anyhow!("Old password is incorrect"))?;
     }
 
-    re_encrypt_vault(&vault_dir, &old_pwd, &new_pwd1).map_err(|e| anyhow::anyhow!("{e}"))?;
+    re_encrypt_vault(&vault_dir, &old_pwd, &new_pwd1)?;
 
     println!("Password changed successfully");
     Ok(())
@@ -2150,17 +2059,22 @@ fn resolve_change_password_vault_dir(cli: &Cli) -> anyhow::Result<PathBuf> {
 
 fn resolve_default_vault_dir() -> anyhow::Result<PathBuf> {
     use pq_diary_core::vault::config::AppConfig;
-    let config_path = AppConfig::default_path().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let config_path = AppConfig::default_path()?;
     if !config_path.exists() {
         anyhow::bail!(
             "pq-diary init を先に実行してください (~/.pq-diary/config.toml が見つかりません)"
         );
     }
-    let config = AppConfig::from_file(&config_path)
-        .map_err(|e| anyhow::anyhow!("Invalid config.toml: {e}"))?;
+    let config = AppConfig::from_file(&config_path).map_err(|e| {
+        let message = format!("Invalid config.toml: {e}");
+        anyhow::Error::new(e).context(message)
+    })?;
     pq_diary_core::vault::init::VaultManager::validate_vault_name(&config.app.default_vault)
-        .map_err(|e| anyhow::anyhow!("Invalid config.toml default_vault: {e}"))?;
-    let vaults_dir = AppConfig::default_vaults_dir().map_err(|e| anyhow::anyhow!("{e}"))?;
+        .map_err(|e| {
+            let message = format!("Invalid config.toml default_vault: {e}");
+            anyhow::Error::new(e).context(message)
+        })?;
+    let vaults_dir = AppConfig::default_vaults_dir()?;
     Ok(vaults_dir.join(&config.app.default_vault))
 }
 
@@ -2182,26 +2096,27 @@ fn cmd_info_to(cli: &Cli, security: bool, out: &mut dyn std::io::Write) -> anyho
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("vault path contains non-UTF-8 characters"))?;
 
-    let vault_config = VaultConfig::from_file(&vault_toml)
-        .map_err(|e| anyhow::anyhow!("Invalid vault.toml: {e}"))?;
+    let vault_config = VaultConfig::from_file(&vault_toml).map_err(|e| {
+        let message = format!("Invalid vault.toml: {e}");
+        anyhow::Error::new(e).context(message)
+    })?;
 
-    let password_source =
-        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut core = DiaryCore::new(vault_pqd_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let password_source = get_password(cli.password.as_ref())?;
+    let mut core = DiaryCore::new(vault_pqd_str)?;
     let secret_password: secrecy::SecretString =
         SecretBox::new(Box::from(password_source.secret().expose_secret()));
     core.unlock(secret_password)
         .map_err(|_| anyhow::anyhow!("Vault unlock failed"))?;
     let guard = VaultGuard::new(&mut core);
 
-    let entries = guard
-        .list_entries(None)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let entries = guard.list_entries(None)?;
     let entry_count = entries.len();
     drop(entries);
 
-    let meta =
-        std::fs::metadata(&vault_pqd).map_err(|e| anyhow::anyhow!("Cannot stat vault.pqd: {e}"))?;
+    let meta = std::fs::metadata(&vault_pqd).map_err(|e| {
+        let message = format!("Cannot stat vault.pqd: {e}");
+        anyhow::Error::new(e).context(message)
+    })?;
     let created_str = match meta.created() {
         Ok(t) => format_system_time(t),
         Err(_) => "unknown".to_string(),
@@ -2282,322 +2197,6 @@ fn yes_no(b: bool) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
-// export command
-// ---------------------------------------------------------------------------
-
-/// Execute the `pq-diary export <DIR>` command.
-pub fn cmd_export(cli: &Cli, dir: PathBuf) -> anyhow::Result<()> {
-    cmd_export_impl(cli, dir, &mut std::io::BufReader::new(std::io::stdin()))
-}
-
-fn cmd_export_impl(
-    cli: &Cli,
-    dir: PathBuf,
-    reader: &mut impl std::io::BufRead,
-) -> anyhow::Result<()> {
-    use secrecy::{ExposeSecret as _, SecretBox};
-    use std::io::Write as _;
-
-    if cli.claude {
-        anyhow::bail!("export is not permitted with --claude");
-    }
-
-    if !dir.exists() {
-        anyhow::bail!("Directory does not exist: {}", dir.display());
-    }
-
-    // Preserve policy/output preflight errors before loading configuration,
-    // while rejecting unsupported vault targets before any plaintext writes.
-    let vault_dir = resolve_legacy_vault_dir(cli)?;
-
-    eprint!(
-        "平文を {} に書き出します。続行しますか? [y/N]: ",
-        dir.display()
-    );
-    std::io::stderr()
-        .flush()
-        .map_err(|e| anyhow::anyhow!("Failed to flush stderr: {e}"))?;
-    let mut answer = String::new();
-    reader
-        .read_line(&mut answer)
-        .map_err(|e| anyhow::anyhow!("Failed to read confirmation: {e}"))?;
-    let trimmed = answer.trim();
-    if !trimmed.eq_ignore_ascii_case("y") {
-        println!("キャンセルしました");
-        return Ok(());
-    }
-
-    let password_source =
-        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let vault_pqd = resolve_vault_path(cli)?;
-    let vault_pqd_str = vault_pqd
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("vault path contains non-UTF-8 characters"))?;
-
-    let mut core = DiaryCore::new(vault_pqd_str).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let secret_password: secrecy::SecretString =
-        SecretBox::new(Box::from(password_source.secret().expose_secret()));
-    core.unlock(secret_password)
-        .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
-    let guard = VaultGuard::new(&mut core);
-
-    let metas = guard
-        .list_entries(None)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    if metas.is_empty() {
-        println!("No entries to export");
-        return Ok(());
-    }
-
-    // Validate every attachment listing before publishing any plaintext output.
-    let listing_pwd: secrecy::SecretString =
-        secrecy::SecretBox::new(Box::from(password_source.secret().expose_secret()));
-    let mut targets = Vec::with_capacity(metas.len());
-    for meta in metas {
-        let filename = build_export_filename(&meta);
-        let path = dir.join(&filename);
-        if path.exists() {
-            anyhow::bail!("File exists: {}", path.display());
-        }
-        let attachments = pq_diary_core::attachment::list_attachments(
-            &vault_dir,
-            &listing_pwd,
-            Some(&meta.uuid_hex),
-        )
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to list attachments for entry {}: {e}",
-                meta.uuid_hex
-            )
-        })?;
-        targets.push((meta, path, attachments));
-    }
-
-    let count = targets.len();
-    // S13: attachment dir (created lazily — only if any entry has attachments).
-    let attachments_dir = dir.join("attachments");
-    let mut attachment_count = 0_usize;
-    let mut exported_attachment_files: std::collections::HashMap<String, [u8; 32]> =
-        std::collections::HashMap::new();
-    for (meta, path, attachments) in &targets {
-        let id_hex = meta.uuid_hex.clone();
-        let (_, plaintext) = guard
-            .get_entry(&id_hex)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        // Build base MD body.
-        let mut body = plaintext.body.clone();
-
-        // S13: append `![[filename]]` for each attachment, and extract the
-        // decrypted file into `<dir>/attachments/`.
-        if !attachments.is_empty() {
-            std::fs::create_dir_all(&attachments_dir).map_err(|e| {
-                anyhow::anyhow!("Failed to create {}: {e}", attachments_dir.display())
-            })?;
-            if !body.is_empty() && !body.ends_with('\n') {
-                body.push('\n');
-            }
-            for m in attachments {
-                let mut export_filename = m.filename.clone();
-                let mut out_path = attachments_dir.join(&export_filename);
-                let mut already_exported = false;
-
-                if let Some(existing_sha) = exported_attachment_files.get(&export_filename) {
-                    if existing_sha == &m.sha256 {
-                        already_exported = true;
-                    } else {
-                        export_filename = disambiguate_attachment_export_filename(
-                            &m.filename,
-                            &m.sha256,
-                            &attachments_dir,
-                            &exported_attachment_files,
-                        );
-                        out_path = attachments_dir.join(&export_filename);
-                    }
-                } else if out_path.exists() {
-                    export_filename = disambiguate_attachment_export_filename(
-                        &m.filename,
-                        &m.sha256,
-                        &attachments_dir,
-                        &exported_attachment_files,
-                    );
-                    out_path = attachments_dir.join(&export_filename);
-                }
-                if exported_attachment_files
-                    .get(&export_filename)
-                    .is_some_and(|existing_sha| existing_sha == &m.sha256)
-                {
-                    already_exported = true;
-                }
-
-                if !already_exported {
-                    pq_diary_core::attachment::extract_attachment(
-                        &vault_dir,
-                        &listing_pwd,
-                        &id_hex,
-                        &m.filename,
-                        &out_path,
-                    )
-                    .map_err(|e| anyhow::anyhow!("attachment extract: {e}"))?;
-                    exported_attachment_files.insert(export_filename.clone(), m.sha256);
-                }
-                body.push_str(&format!("\n![[{}]]", export_filename));
-                attachment_count += 1;
-            }
-        }
-
-        let content = build_export_content(meta, &body);
-        write_export_markdown(path, &content)?;
-    }
-
-    if attachment_count > 0 {
-        println!(
-            "Exported {} entries with {} attachments to {}",
-            count,
-            attachment_count,
-            dir.display()
-        );
-    } else {
-        println!("Exported {} entries to {}", count, dir.display());
-    }
-    Ok(())
-}
-
-/// Claim only a new export destination and write through that same handle.
-/// The earlier existence check is advisory: another writer or a dangling
-/// symlink may occupy the path by the time plaintext is ready to publish.
-fn write_export_markdown(path: &Path, content: &str) -> anyhow::Result<()> {
-    use anyhow::Context as _;
-    use std::io::Write as _;
-
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .with_context(|| format!("Failed to create export file {}", path.display()))?;
-    file.write_all(content.as_bytes())
-        .with_context(|| format!("Failed to write {}", path.display()))
-}
-
-fn build_export_filename(meta: &pq_diary_core::EntryMeta) -> String {
-    let date = chrono::DateTime::<chrono::Utc>::from_timestamp(meta.created_at as i64, 0)
-        .map(|dt| dt.format("%Y-%m-%d").to_string())
-        .unwrap_or_else(|| "0000-00-00".to_string());
-    let slug = slugify(&meta.title);
-    let id8 = &meta.uuid_hex[..meta.uuid_hex.len().min(8)];
-    format!("{date}-{slug}-{id8}.md")
-}
-
-fn build_export_content(meta: &pq_diary_core::EntryMeta, body: &str) -> String {
-    let mut out = String::new();
-    out.push_str("---\n");
-    out.push_str(&format!("id: {}\n", meta.uuid_hex));
-    out.push_str(&format!("title: \"{}\"\n", yaml_escape(&meta.title)));
-    if meta.tags.is_empty() {
-        out.push_str("tags: []\n");
-    } else {
-        out.push_str("tags:\n");
-        for tag in &meta.tags {
-            out.push_str(&format!("  - \"{}\"\n", yaml_escape(tag)));
-        }
-    }
-    let created = chrono::DateTime::<chrono::Utc>::from_timestamp(meta.created_at as i64, 0)
-        .map(|dt| dt.to_rfc3339())
-        .unwrap_or_else(|| "1970-01-01T00:00:00+00:00".to_string());
-    let updated = chrono::DateTime::<chrono::Utc>::from_timestamp(meta.updated_at as i64, 0)
-        .map(|dt| dt.to_rfc3339())
-        .unwrap_or_else(|| "1970-01-01T00:00:00+00:00".to_string());
-    out.push_str(&format!("created: {created}\n"));
-    out.push_str(&format!("updated: {updated}\n"));
-    out.push_str("---\n\n");
-    out.push_str(body);
-    out
-}
-
-fn disambiguate_attachment_export_filename(
-    filename: &str,
-    sha256: &[u8; 32],
-    attachments_dir: &std::path::Path,
-    exported: &std::collections::HashMap<String, [u8; 32]>,
-) -> String {
-    let suffix = short_sha_hex(sha256);
-    let path = std::path::Path::new(filename);
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("attachment");
-    let ext = path.extension().and_then(|s| s.to_str());
-
-    for attempt in 0..1000 {
-        let candidate = match (ext, attempt) {
-            (Some(ext), 0) => format!("{stem}-{suffix}.{ext}"),
-            (None, 0) => format!("{stem}-{suffix}"),
-            (Some(ext), n) => format!("{stem}-{suffix}-{n}.{ext}"),
-            (None, n) => format!("{stem}-{suffix}-{n}"),
-        };
-        if let Some(existing_sha) = exported.get(&candidate) {
-            if existing_sha == sha256 {
-                return candidate;
-            }
-            continue;
-        }
-        if !attachments_dir.join(&candidate).exists() {
-            return candidate;
-        }
-    }
-
-    format!("{stem}-{suffix}-overflow")
-}
-
-fn short_sha_hex(sha256: &[u8; 32]) -> String {
-    sha256.iter().take(4).map(|b| format!("{b:02x}")).collect()
-}
-
-fn slugify(title: &str) -> String {
-    let mut s = String::with_capacity(title.len());
-    let mut prev_dash = false;
-    for c in title.chars() {
-        if c.is_control() {
-            continue;
-        }
-        let mapped = match c {
-            ' ' | '\t' => '-',
-            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-            other => other,
-        };
-        if mapped == '-' {
-            if prev_dash {
-                continue;
-            }
-            prev_dash = true;
-        } else {
-            prev_dash = false;
-        }
-        s.push(mapped);
-    }
-    let trimmed = s.trim_matches('-').to_string();
-    if trimmed.is_empty() {
-        "untitled".to_string()
-    } else {
-        trimmed
-    }
-}
-
-fn yaml_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            c if c.is_control() => continue,
-            other => out.push(other),
-        }
-    }
-    out
-}
-
-// ---------------------------------------------------------------------------
 // Digital-legacy commands (S12)
 // ---------------------------------------------------------------------------
 
@@ -2608,12 +2207,14 @@ fn resolve_legacy_vault_dir(cli: &Cli) -> anyhow::Result<PathBuf> {
     resolve_change_password_vault_dir(cli)
 }
 
+#[cfg(test)]
+mod legacy_attachment_sources_tests;
+
 fn argon2_params_from_vault(
     vault_dir: &std::path::Path,
 ) -> anyhow::Result<pq_diary_core::crypto::kdf::Argon2Params> {
     use pq_diary_core::vault::config::VaultConfig;
-    let config = VaultConfig::from_file(&vault_dir.join("vault.toml"))
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let config = VaultConfig::from_file(&vault_dir.join("vault.toml"))?;
     Ok(pq_diary_core::crypto::kdf::Argon2Params {
         memory_cost_kb: config.argon2.memory_cost_kb,
         time_cost: config.argon2.time_cost,
@@ -2668,15 +2269,13 @@ fn cmd_legacy_init_impl<R: std::io::BufRead>(cli: &Cli, reader: &mut R) -> anyho
     use secrecy::{ExposeSecret as _, SecretBox, SecretString};
 
     let vault_dir = resolve_legacy_vault_dir(cli)?;
-    let master_source = get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let master_source = get_password(cli.password.as_ref())?;
     let master_pwd: SecretString =
         SecretBox::new(Box::from(master_source.secret().expose_secret()));
     drop(master_source);
 
-    let legacy_code1 =
-        crate::password::prompt_password("Legacy code: ").map_err(|e| anyhow::anyhow!("{e}"))?;
-    let legacy_code2 = crate::password::prompt_password("Confirm legacy code: ")
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let legacy_code1 = crate::password::prompt_password("Legacy code: ")?;
+    let legacy_code2 = crate::password::prompt_password("Confirm legacy code: ")?;
     if legacy_code1.expose_secret() != legacy_code2.expose_secret() {
         anyhow::bail!("Legacy codes do not match");
     }
@@ -2691,8 +2290,7 @@ fn cmd_legacy_init_impl<R: std::io::BufRead>(cli: &Cli, reader: &mut R) -> anyho
     let params = argon2_params_from_vault(&vault_dir)?;
     let deriver = Argon2LegacyDeriver::new(params);
 
-    initialize_legacy(&vault_dir, &master_pwd, &legacy_code1, mode, &deriver)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    initialize_legacy(&vault_dir, &master_pwd, &legacy_code1, mode, &deriver)?;
     println!(
         "Legacy code initialized. Confirmation mode: {}",
         mode_label(mode)
@@ -2730,14 +2328,13 @@ pub fn cmd_legacy_set(
     };
 
     let vault_dir = resolve_legacy_vault_dir(cli)?;
-    let master_source = get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let master_source = get_password(cli.password.as_ref())?;
     let master_pwd: SecretString =
         SecretBox::new(Box::from(master_source.secret().expose_secret()));
     drop(master_source);
 
     let legacy_code_opt = if flag == LegacyFlag::Inherit {
-        let code = crate::password::prompt_password("Legacy code: ")
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let code = crate::password::prompt_password("Legacy code: ")?;
         Some(code)
     } else {
         None
@@ -2752,8 +2349,7 @@ pub fn cmd_legacy_set(
         &id_prefix,
         flag,
         &deriver,
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    )?;
 
     match flag {
         LegacyFlag::Inherit => println!("Entry {id_prefix} set to INHERIT"),
@@ -2776,13 +2372,12 @@ fn cmd_legacy_list_to(cli: &Cli, out: &mut dyn std::io::Write) -> anyhow::Result
     }
 
     let vault_dir = resolve_legacy_vault_dir(cli)?;
-    let master_source = get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let master_source = get_password(cli.password.as_ref())?;
     let master_pwd: SecretString =
         SecretBox::new(Box::from(master_source.secret().expose_secret()));
     drop(master_source);
 
-    let statuses =
-        list_legacy_status(&vault_dir, &master_pwd).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let statuses = list_legacy_status(&vault_dir, &master_pwd)?;
 
     let mut inherits: Vec<_> = statuses
         .iter()
@@ -2838,17 +2433,14 @@ pub fn cmd_legacy_rotate(cli: &Cli) -> anyhow::Result<()> {
     }
 
     let vault_dir = resolve_legacy_vault_dir(cli)?;
-    let master_source = get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let master_source = get_password(cli.password.as_ref())?;
     let master_pwd: SecretString =
         SecretBox::new(Box::from(master_source.secret().expose_secret()));
     drop(master_source);
 
-    let old_code = crate::password::prompt_password("Old legacy code: ")
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let new_code1 = crate::password::prompt_password("New legacy code: ")
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let new_code2 = crate::password::prompt_password("Confirm new legacy code: ")
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let old_code = crate::password::prompt_password("Old legacy code: ")?;
+    let new_code1 = crate::password::prompt_password("New legacy code: ")?;
+    let new_code2 = crate::password::prompt_password("Confirm new legacy code: ")?;
     if new_code1.expose_secret() != new_code2.expose_secret() {
         anyhow::bail!("New legacy codes do not match");
     }
@@ -2861,8 +2453,7 @@ pub fn cmd_legacy_rotate(cli: &Cli) -> anyhow::Result<()> {
 
     let params = argon2_params_from_vault(&vault_dir)?;
     let deriver = Argon2LegacyDeriver::new(params);
-    let rotated = rotate_legacy_code(&vault_dir, &master_pwd, &old_code, &new_code1, &deriver)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let rotated = rotate_legacy_code(&vault_dir, &master_pwd, &old_code, &new_code1, &deriver)?;
     println!("Legacy code rotated successfully ({rotated} INHERIT entries re-encrypted)");
     Ok(())
 }
@@ -2878,8 +2469,7 @@ pub fn cmd_legacy_access(cli: &Cli) -> anyhow::Result<()> {
 
     let vault_dir = resolve_legacy_vault_dir(cli)?;
 
-    let legacy_code =
-        crate::password::prompt_password("Legacy code: ").map_err(|e| anyhow::anyhow!("{e}"))?;
+    let legacy_code = crate::password::prompt_password("Legacy code: ")?;
 
     let params = argon2_params_from_vault(&vault_dir)?;
     let deriver = Argon2LegacyDeriver::new(params);
@@ -3018,13 +2608,12 @@ pub fn cmd_attachment_add(cli: &Cli, entry: String, path: PathBuf) -> anyhow::Re
         anyhow::bail!("attachment add is not permitted with --claude");
     }
     let vault_dir = resolve_legacy_vault_dir(cli)?;
-    let master_source = get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let master_source = get_password(cli.password.as_ref())?;
     let master_pwd: SecretString =
         SecretBox::new(Box::from(master_source.secret().expose_secret()));
     drop(master_source);
 
-    let uuid = add_attachment(&vault_dir, &master_pwd, &entry, &path)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let uuid = add_attachment(&vault_dir, &master_pwd, &entry, &path)?;
     let filename = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -3059,13 +2648,12 @@ fn cmd_attachment_list_to(
         check_claude_policy(cli, OperationType::Read)?;
     }
     let vault_dir = resolve_legacy_vault_dir(cli)?;
-    let master_source = get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let master_source = get_password(cli.password.as_ref())?;
     let master_pwd: SecretString =
         SecretBox::new(Box::from(master_source.secret().expose_secret()));
     drop(master_source);
 
-    let metas = list_attachments(&vault_dir, &master_pwd, entry.as_deref())
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let metas = list_attachments(&vault_dir, &master_pwd, entry.as_deref())?;
     if metas.is_empty() {
         writeln!(out, "No attachments.")?;
         out.flush()?;
@@ -3117,13 +2705,12 @@ pub fn cmd_attachment_extract(
         anyhow::bail!("attachment extract is not permitted with --claude");
     }
     let vault_dir = resolve_legacy_vault_dir(cli)?;
-    let master_source = get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let master_source = get_password(cli.password.as_ref())?;
     let master_pwd: SecretString =
         SecretBox::new(Box::from(master_source.secret().expose_secret()));
     drop(master_source);
 
-    extract_attachment(&vault_dir, &master_pwd, &entry, &filename, &out)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    extract_attachment(&vault_dir, &master_pwd, &entry, &filename, &out)?;
     println!(
         "Extracted: {filename} → {} (SHA-256 verified)",
         out.display()
@@ -3172,13 +2759,12 @@ fn cmd_attachment_delete_with_io(
         anyhow::bail!("cancelled");
     }
     let vault_dir = resolve_legacy_vault_dir(cli)?;
-    let master_source = get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let master_source = get_password(cli.password.as_ref())?;
     let master_pwd: SecretString =
         SecretBox::new(Box::from(master_source.secret().expose_secret()));
     drop(master_source);
 
-    delete_attachment(&vault_dir, &master_pwd, &entry, &filename)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    delete_attachment(&vault_dir, &master_pwd, &entry, &filename)?;
     println!("Deleted: {filename}");
     Ok(())
 }
@@ -3206,16 +2792,13 @@ pub fn cmd_attachment_set(
     };
 
     let vault_dir = resolve_legacy_vault_dir(cli)?;
-    let master_source = get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let master_source = get_password(cli.password.as_ref())?;
     let master_pwd: SecretString =
         SecretBox::new(Box::from(master_source.secret().expose_secret()));
     drop(master_source);
 
     let legacy_code_opt = if flag == LegacyFlag::Inherit {
-        Some(
-            crate::password::prompt_password("Legacy code: ")
-                .map_err(|e| anyhow::anyhow!("{e}"))?,
-        )
+        Some(crate::password::prompt_password("Legacy code: ")?)
     } else {
         None
     };
@@ -3229,8 +2812,7 @@ pub fn cmd_attachment_set(
         &filename,
         flag,
         &deriver,
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    )?;
     match flag {
         LegacyFlag::Inherit => println!("Attachment '{filename}' set to INHERIT"),
         LegacyFlag::Destroy => println!("Attachment '{filename}' set to DESTROY"),
@@ -3248,9 +2830,92 @@ mod tests {
         fast_params, read_vault_entries, seed_malformed_template, seed_templates, setup_vault,
         setup_vault_with_policy, FailingMutationWriter,
     };
+    use super::test_support::{make_cli_plain, read_first_entry_plaintext, setup_s10_vault};
     use super::*;
     use clap::Parser as _;
     use std::path::Path;
+
+    #[test]
+    fn command_sources_entry_lookup_keeps_typed_error_and_display() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = setup_vault(&dir);
+        let cli = make_show_cli(vault.to_str().unwrap(), Some("password"), "deadbeef");
+        let mut core = session::locked_core(&cli).unwrap();
+        let guard =
+            session::unlock(&mut core, secrecy::SecretString::new("password".into())).unwrap();
+        guard
+            .new_entry("SOURCE_PRIVATE_TITLE", "SOURCE_PRIVATE_BODY", vec![])
+            .unwrap();
+        let expected = guard.get_entry("deadbeef").unwrap_err().to_string();
+        drop(guard);
+        let before = std::fs::read(vault.join("vault.pqd")).unwrap();
+        let mut output = Vec::new();
+        let error = cmd_show_impl(&cli, "deadbeef".into(), &mut output).unwrap_err();
+        assert_eq!(error.to_string(), expected);
+        assert!(matches!(
+            error.downcast_ref::<pq_diary_core::DiaryError>(),
+            Some(pq_diary_core::DiaryError::Entry(_))
+        ));
+        for secret in ["password", "SOURCE_PRIVATE_TITLE", "SOURCE_PRIVATE_BODY"] {
+            assert!(!format!("{error:?}").contains(secret));
+        }
+        assert!(output.is_empty());
+        assert_eq!(std::fs::read(vault.join("vault.pqd")).unwrap(), before);
+    }
+
+    #[test]
+    fn command_sources_policy_io_precedes_password_and_keeps_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = crate::Cli::try_parse_from([
+            "pq-diary",
+            "--claude",
+            "-v",
+            dir.path().to_str().unwrap(),
+            "show",
+            "missing",
+        ])
+        .unwrap();
+        let expected =
+            pq_diary_core::vault::config::VaultConfig::from_file(&dir.path().join("vault.toml"))
+                .unwrap_err()
+                .to_string();
+        let error = cmd_show_impl(&cli, "missing".into(), &mut Vec::new()).unwrap_err();
+        assert_eq!(error.to_string(), expected);
+        assert!(matches!(
+            error.downcast_ref::<pq_diary_core::DiaryError>(),
+            Some(pq_diary_core::DiaryError::Io(_))
+        ));
+        assert_eq!(
+            error
+                .chain()
+                .find_map(|e| e.downcast_ref::<std::io::Error>())
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn command_sources_vault_manager_io_keeps_source_and_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, "sentinel").unwrap();
+        let cli = make_vault_mgmt_cli(blocked.to_str().unwrap(), None, &["list"]);
+        let expected = pq_diary_core::vault::init::VaultManager::new(blocked.clone())
+            .err()
+            .unwrap()
+            .to_string();
+        let error = cmd_vault_list_to(&cli, &mut Vec::new()).unwrap_err();
+        assert_eq!(error.to_string(), expected);
+        assert!(matches!(
+            error.downcast_ref::<pq_diary_core::DiaryError>(),
+            Some(pq_diary_core::DiaryError::Io(_))
+        ));
+        assert!(error
+            .chain()
+            .any(|e| e.downcast_ref::<std::io::Error>().is_some()));
+        assert_eq!(std::fs::read(&blocked).unwrap(), b"sentinel");
+    }
 
     #[test]
     fn new_output_failure_keeps_requested_attachments() {
@@ -3450,21 +3115,6 @@ mod tests {
         }
         args.push("new");
         crate::Cli::try_parse_from(&args).expect("parse test CLI")
-    }
-
-    /// Open the test vault and return the plaintext of the first entry.
-    fn read_first_entry_plaintext(vault_dir: &std::path::Path) -> pq_diary_core::EntryPlaintext {
-        let vault_pqd = vault_dir.join("vault.pqd");
-        let vault_str = vault_pqd.to_str().expect("utf8");
-        let mut core = DiaryCore::new(vault_str).expect("DiaryCore::new");
-        let pw: secrecy::SecretString = secrecy::SecretBox::new(Box::from("password"));
-        core.unlock(pw).expect("unlock");
-        let entries = core.list_entries(None).expect("list_entries");
-        assert!(!entries.is_empty(), "vault must not be empty");
-        let prefix = &entries[0].uuid_hex[..4];
-        let (_, plaintext) = core.get_entry(prefix).expect("get_entry");
-        core.lock();
-        plaintext
     }
 
     // -------------------------------------------------------------------------
@@ -7831,6 +7481,24 @@ parallelism = 1
             .to_file(&toml_path)
             .expect("write updated vault.toml");
 
+        // Establish the policy in the authenticated common history before cloning.
+        for args in [
+            vec!["add", "vault.toml"],
+            vec!["commit", "-m", "shared full policy"],
+            vec!["push"],
+        ] {
+            let output = std::process::Command::new("git")
+                .current_dir(&vault_dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
         // Simulate remote change (empty vault) so pull has something to fetch.
         let bare_dir = tmp.path().join("bare.git");
         let contributor_dir = tmp.path().join("contributor");
@@ -9071,21 +8739,6 @@ parallelism = 1
         );
     }
 
-    fn make_cli_plain(args: &[&str]) -> crate::Cli {
-        let mut full: Vec<&str> = vec!["pq-diary"];
-        full.extend_from_slice(args);
-        crate::Cli::try_parse_from(&full).expect("parse cli")
-    }
-
-    fn setup_s10_vault(dir: &tempfile::TempDir, name: &str, password: &[u8]) -> std::path::PathBuf {
-        use pq_diary_core::vault::init::VaultManager;
-        let mgr = VaultManager::new(dir.path().to_path_buf())
-            .expect("VaultManager::new")
-            .with_kdf_params(fast_params());
-        mgr.init_vault(name, password).expect("init_vault");
-        dir.path().join(name)
-    }
-
     // -------------------------------------------------------------------------
     // TASK-0089: init tests
     // -------------------------------------------------------------------------
@@ -9669,845 +9322,6 @@ parallelism = 1
         ]);
         cmd_info(&cli, true).expect("cmd_info --security must succeed");
     }
-
-    // -------------------------------------------------------------------------
-    // TASK-0094: export tests (helpers + impl)
-    // -------------------------------------------------------------------------
-
-    /// TC-501-Slug: slugify handles common cases.
-    #[test]
-    fn tc_501_slug_handles_common_cases() {
-        assert_eq!(slugify("hello"), "hello");
-        assert_eq!(slugify(""), "untitled");
-        assert_eq!(slugify("   "), "untitled");
-        assert_eq!(slugify("foo bar"), "foo-bar");
-        assert_eq!(slugify("foo/bar"), "foo_bar");
-        assert_eq!(slugify("a\\b:c*d?e\"f<g>h|i"), "a_b_c_d_e_f_g_h_i");
-        assert_eq!(slugify("a  b"), "a-b");
-    }
-
-    /// TC-501-Yaml: yaml_escape handles quotes / backslashes / newlines.
-    #[test]
-    fn tc_501_yaml_escape() {
-        assert_eq!(yaml_escape("hello"), "hello");
-        assert_eq!(yaml_escape("a\"b"), "a\\\"b");
-        assert_eq!(yaml_escape("a\\b"), "a\\\\b");
-        assert_eq!(yaml_escape("a\nb"), "a\\nb");
-        assert_eq!(yaml_escape("a\x07b"), "ab");
-    }
-
-    #[test]
-    fn exported_frontmatter_roundtrips_without_literal_escapes() {
-        for title in [
-            "a\"b\\c\n日本語🦀",
-            "",
-            " leading and trailing ",
-            "'quoted'",
-        ] {
-            let meta = EntryMeta {
-                uuid_hex: "0123456789abcdef0123456789abcdef".into(),
-                title: title.into(),
-                tags: vec![
-                    "a,b".into(),
-                    "a\"b\\c\n日本語🦀".into(),
-                    "".into(),
-                    "'tag'".into(),
-                ],
-                created_at: 0,
-                updated_at: 0,
-            };
-            let exported = build_export_content(&meta, "body");
-            let (imported, _, _) =
-                pq_diary_core::importer::parse_markdown(&exported, "fallback.md").unwrap();
-            assert_eq!(imported.title, meta.title);
-            assert_eq!(imported.tags, meta.tags);
-        }
-    }
-
-    #[test]
-    fn exported_frontmatter_survives_import_and_reopen() {
-        let source = tempfile::tempdir().unwrap();
-        let source_vault = setup_vault(&source);
-        let title = "a\"b\\c\n日本語🦀";
-        let tags = vec!["comma,tag".to_string(), "'quote'".into(), "".into()];
-        let body = "literal #123 and `#code`";
-        {
-            let mut core =
-                DiaryCore::new(source_vault.join("vault.pqd").to_str().unwrap()).unwrap();
-            core.unlock(secrecy::SecretBox::new(Box::from("password")))
-                .unwrap();
-            core.new_entry(title, body, tags.clone()).unwrap();
-        }
-        let exported = tempfile::tempdir().unwrap();
-        let cli = make_cli_plain(&[
-            "-v",
-            source_vault.to_str().unwrap(),
-            "--password",
-            "password",
-            "export",
-            exported.path().to_str().unwrap(),
-        ]);
-        cmd_export_impl(
-            &cli,
-            exported.path().to_path_buf(),
-            &mut std::io::Cursor::new("y\n"),
-        )
-        .unwrap();
-        let destination = tempfile::tempdir().unwrap();
-        let destination_vault = setup_vault(&destination);
-        {
-            let mut core =
-                DiaryCore::new(destination_vault.join("vault.pqd").to_str().unwrap()).unwrap();
-            core.unlock(secrecy::SecretBox::new(Box::from("password")))
-                .unwrap();
-            assert_eq!(core.import(exported.path(), false).unwrap().imported, 1);
-        }
-        let imported = read_first_entry_plaintext(&destination_vault);
-        assert_eq!(imported.title, title);
-        assert_eq!(imported.tags, tags);
-        // Export deliberately separates frontmatter from the original body.
-        assert_eq!(imported.body, format!("\n{body}"));
-    }
-
-    /// TC-501-Fname: build_export_filename produces YYYY-MM-DD-slug-id8.md.
-    #[test]
-    fn tc_501_filename_format() {
-        let meta = EntryMeta {
-            uuid_hex: "3c6b775f4d8e4c2b9a1f8d5e1f0a2b3c".to_string(),
-            title: "Hello World".to_string(),
-            tags: vec![],
-            created_at: 1_747_440_000,
-            updated_at: 1_747_440_000,
-        };
-        let name = build_export_filename(&meta);
-        assert!(name.starts_with("2025-05-17-Hello-World-3c6b775f"));
-        assert!(name.ends_with(".md"));
-    }
-
-    /// TC-501-AttachmentName: same attachment filename with different content is disambiguated.
-    #[test]
-    fn tc_501_attachment_export_filename_disambiguates_collision() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut exported = std::collections::HashMap::new();
-        exported.insert("photo.png".to_string(), [0x11; 32]);
-
-        let name = disambiguate_attachment_export_filename(
-            "photo.png",
-            &[0x22; 32],
-            dir.path(),
-            &exported,
-        );
-
-        assert_eq!(name, "photo-22222222.png");
-    }
-
-    /// TC-503-01: build_export_content emits expected YAML keys.
-    #[test]
-    fn tc_503_01_content_has_yaml_keys() {
-        let meta = EntryMeta {
-            uuid_hex: "3c6b775f4d8e4c2b9a1f8d5e1f0a2b3c".to_string(),
-            title: "T".to_string(),
-            tags: vec!["x".to_string()],
-            created_at: 1_747_440_000,
-            updated_at: 1_747_440_000,
-        };
-        let body = "Hello!\n";
-        let content = build_export_content(&meta, body);
-        assert!(content.starts_with("---\n"));
-        assert!(content.contains("id: 3c6b775f4d8e4c2b9a1f8d5e1f0a2b3c"));
-        assert!(content.contains("title: \"T\""));
-        assert!(content.contains("tags:\n  - \"x\""));
-        assert!(content.contains("created: "));
-        assert!(content.contains("updated: "));
-        assert!(content.ends_with("Hello!\n"));
-    }
-
-    /// TC-511-01: --claude blocks export.
-    #[test]
-    fn tc_511_01_export_blocked_with_claude() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let out_dir = dir.path().join("out");
-        std::fs::create_dir_all(&out_dir).expect("mkdir out");
-
-        let cli = make_cli_plain(&["--claude", "export", out_dir.to_str().unwrap()]);
-        let mut stdin = std::io::Cursor::new(b"y\n".to_vec());
-        let err = cmd_export_impl(&cli, out_dir.clone(), &mut stdin).expect_err("must fail");
-        assert!(
-            format!("{err:#}").contains("not permitted with --claude"),
-            "got: {err:#}"
-        );
-
-        let count = std::fs::read_dir(&out_dir).unwrap().count();
-        assert_eq!(count, 0);
-    }
-
-    /// TC-512-01: nonexistent dir errors.
-    #[test]
-    fn tc_512_01_export_missing_dir_errors() {
-        let cli = make_cli_plain(&["export", "/no/such/dir"]);
-        let mut stdin = std::io::Cursor::new(b"y\n".to_vec());
-        let err = cmd_export_impl(&cli, PathBuf::from("/no/such/dir"), &mut stdin)
-            .expect_err("must fail");
-        assert!(
-            format!("{err:#}").contains("Directory does not exist"),
-            "got: {err:#}"
-        );
-    }
-
-    /// TC-513-01: empty input cancels.
-    #[test]
-    fn tc_513_01_export_cancel_on_empty_input() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let vault_dir = setup_s10_vault(&dir, "v", b"password");
-        let vault_dir_str = vault_dir.to_str().expect("utf8");
-        let out_dir = dir.path().join("out");
-        std::fs::create_dir_all(&out_dir).expect("mkdir out");
-
-        let cli = make_cli_plain(&[
-            "-v",
-            vault_dir_str,
-            "--password",
-            "password",
-            "export",
-            out_dir.to_str().unwrap(),
-        ]);
-        let mut stdin = std::io::Cursor::new(b"\n".to_vec());
-        cmd_export_impl(&cli, out_dir.clone(), &mut stdin).expect("cancel is Ok");
-        assert_eq!(std::fs::read_dir(&out_dir).unwrap().count(), 0);
-    }
-
-    /// TC-513-02: 'n' input cancels.
-    #[test]
-    fn tc_513_02_export_cancel_on_n() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let vault_dir = setup_s10_vault(&dir, "v", b"password");
-        let vault_dir_str = vault_dir.to_str().expect("utf8");
-        let out_dir = dir.path().join("out");
-        std::fs::create_dir_all(&out_dir).expect("mkdir out");
-
-        let cli = make_cli_plain(&[
-            "-v",
-            vault_dir_str,
-            "--password",
-            "password",
-            "export",
-            out_dir.to_str().unwrap(),
-        ]);
-        let mut stdin = std::io::Cursor::new(b"n\n".to_vec());
-        cmd_export_impl(&cli, out_dir.clone(), &mut stdin).expect("cancel is Ok");
-        assert_eq!(std::fs::read_dir(&out_dir).unwrap().count(), 0);
-    }
-
-    /// TC-501-B01: empty vault → "No entries to export".
-    #[test]
-    fn tc_501_b01_empty_vault() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let vault_dir = setup_s10_vault(&dir, "v", b"password");
-        let vault_dir_str = vault_dir.to_str().expect("utf8");
-        let out_dir = dir.path().join("out");
-        std::fs::create_dir_all(&out_dir).expect("mkdir out");
-
-        let cli = make_cli_plain(&[
-            "-v",
-            vault_dir_str,
-            "--password",
-            "password",
-            "export",
-            out_dir.to_str().unwrap(),
-        ]);
-        let mut stdin = std::io::Cursor::new(b"y\n".to_vec());
-        cmd_export_impl(&cli, out_dir.clone(), &mut stdin).expect("ok");
-        assert_eq!(std::fs::read_dir(&out_dir).unwrap().count(), 0);
-    }
-
-    /// Attachment metadata errors must fail export before publishing any files.
-    #[test]
-    fn export_rejects_corrupt_attachment_metadata() {
-        export_attachment_fixture(true);
-    }
-
-    #[test]
-    fn export_preserves_attachment_content_and_links() {
-        export_attachment_fixture(false);
-    }
-
-    fn export_attachment_fixture(corrupt: bool) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let vault_dir = setup_s10_vault(&dir, "v", b"password");
-        let pqd = vault_dir.join("vault.pqd");
-        let password = secrecy::SecretBox::new(Box::from("password"));
-        let id = {
-            let mut core = DiaryCore::new(pqd.to_str().unwrap()).expect("core");
-            core.unlock(secrecy::SecretBox::new(Box::from("password")))
-                .expect("unlock");
-            core.new_entry("without attachment", "first body", vec![])
-                .expect("first entry");
-            core.new_entry("with attachment", "second body", vec![])
-                .expect("second entry")
-        };
-        let source = dir.path().join("example.txt");
-        std::fs::write(&source, b"attachment contents").expect("source");
-        pq_diary_core::attachment::add_attachment(&vault_dir, &password, &id, &source)
-            .expect("add attachment");
-        if corrupt {
-            let (header, entries, mut attachments) =
-                pq_diary_core::vault::reader::read_vault_with_attachments(&pqd)
-                    .expect("read fixture");
-            attachments[0].content_hmac[0] ^= 1;
-            // The legacy/test writer omits the whole-vault MAC so unlock succeeds;
-            // attachment enumeration must still reject the invalid record HMAC.
-            pq_diary_core::vault::writer::write_vault_with_attachments(
-                &pqd,
-                header,
-                &entries,
-                &attachments,
-            )
-            .expect("write corrupt fixture");
-        }
-        let original = std::fs::read(&pqd).expect("vault bytes");
-        let original_config = std::fs::read(vault_dir.join("vault.toml")).expect("config bytes");
-        let out = dir.path().join("out");
-        std::fs::create_dir(&out).expect("output directory");
-        let cli = make_cli_plain(&[
-            "--vault",
-            vault_dir.to_str().unwrap(),
-            "--password",
-            "password",
-            "export",
-            out.to_str().unwrap(),
-        ]);
-        let result = cmd_export_impl(&cli, out.clone(), &mut std::io::Cursor::new(b"y\n"));
-        if corrupt {
-            let error = result
-                .expect_err("corrupt attachment must fail export")
-                .to_string();
-            assert!(
-                error.contains("Failed to list attachments for entry"),
-                "{error}"
-            );
-            assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0);
-        } else {
-            result.expect("export succeeds");
-            assert_eq!(
-                std::fs::read(out.join("attachments/example.txt")).unwrap(),
-                b"attachment contents"
-            );
-            let markdown: Vec<_> = std::fs::read_dir(&out)
-                .unwrap()
-                .map(|entry| entry.unwrap().path())
-                .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
-                .collect();
-            assert_eq!(markdown.len(), 2);
-            assert!(markdown.iter().any(|path| std::fs::read_to_string(path)
-                .unwrap()
-                .contains("second body\n\n![[example.txt]]")));
-        }
-        assert_eq!(std::fs::read(&pqd).unwrap(), original);
-        assert_eq!(
-            std::fs::read(vault_dir.join("vault.toml")).unwrap(),
-            original_config
-        );
-        let mut core = DiaryCore::new(pqd.to_str().unwrap()).expect("reopen");
-        core.unlock(password).expect("unlock after export");
-        assert_eq!(core.list_entries(None).unwrap().len(), 2);
-        assert_eq!(core.get_entry(&id).unwrap().1.body, "second body");
-    }
-
-    #[test]
-    fn export_preserves_destination_created_after_preflight() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("export.md");
-        assert!(!path.exists(), "export preflight sees an available path");
-        // A competing writer claims the destination after our preflight.
-        std::fs::write(&path, b"other writer's contents").expect("competing file");
-
-        let error = write_export_markdown(&path, "private export body")
-            .expect_err("exclusive creation must reject the competing file");
-        assert_eq!(
-            error
-                .downcast_ref::<std::io::Error>()
-                .expect("typed output error")
-                .kind(),
-            std::io::ErrorKind::AlreadyExists
-        );
-        assert_eq!(
-            std::fs::read(&path).expect("competing file"),
-            b"other writer's contents"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn export_rejects_dangling_symlink_without_publishing_plaintext() {
-        use std::os::unix::fs::symlink;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let vault_dir = setup_s10_vault(&dir, "v", b"password");
-        let pqd = vault_dir.join("vault.pqd");
-        let mut core = DiaryCore::new(pqd.to_str().expect("path")).expect("core");
-        core.unlock(secrecy::SecretBox::new(Box::from("password")))
-            .expect("unlock");
-        let id = core
-            .new_entry("export fixture", "private export body", vec![])
-            .expect("entry");
-        let meta = core.list_entries(None).expect("entries").remove(0);
-        core.lock();
-
-        let original = std::fs::read(&pqd).expect("vault snapshot");
-        let config_path = vault_dir.join("vault.toml");
-        let original_config = std::fs::read(&config_path).expect("config snapshot");
-        let out = dir.path().join("out");
-        std::fs::create_dir(&out).expect("output directory");
-        let destination = out.join(build_export_filename(&meta));
-        let outside = dir.path().join("must-not-create.md");
-        symlink(&outside, &destination).expect("dangling output symlink");
-        assert!(
-            !destination.exists(),
-            "preflight follows the missing target"
-        );
-
-        let cli = make_cli_plain(&[
-            "--vault",
-            vault_dir.to_str().expect("vault path"),
-            "--password",
-            "password",
-            "export",
-            out.to_str().expect("output path"),
-        ]);
-        let error = cmd_export_impl(&cli, out.clone(), &mut std::io::Cursor::new(b"y\n"))
-            .expect_err("export must not follow the output symlink");
-        assert_eq!(
-            error
-                .downcast_ref::<std::io::Error>()
-                .expect("typed output error")
-                .kind(),
-            std::io::ErrorKind::AlreadyExists
-        );
-        assert!(
-            !outside.exists(),
-            "plaintext must not escape the output directory"
-        );
-        assert_eq!(std::fs::read_link(&destination).expect("symlink"), outside);
-        assert_eq!(std::fs::read_dir(&out).expect("outputs").count(), 1);
-        assert_eq!(std::fs::read(&pqd).expect("vault"), original);
-        assert_eq!(
-            std::fs::read(&config_path).expect("config"),
-            original_config
-        );
-        core.unlock(secrecy::SecretBox::new(Box::from("password")))
-            .expect("reopen");
-        assert_eq!(
-            core.get_entry(&id).expect("entry").1.body,
-            "private export body"
-        );
-        core.lock();
-    }
-
-    /// TC-501-01: 3 entries export → 3 well-named files.
-    #[test]
-    fn tc_501_01_export_three_entries() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let vault_dir = setup_s10_vault(&dir, "v", b"password");
-        let vault_dir_str = vault_dir.to_str().expect("utf8");
-        let out_dir = dir.path().join("out");
-        std::fs::create_dir_all(&out_dir).expect("mkdir out");
-
-        let pqd = vault_dir.join("vault.pqd");
-        {
-            let mut core = DiaryCore::new(pqd.to_str().unwrap()).expect("DiaryCore::new");
-            core.unlock(secrecy::SecretBox::new(Box::from("password")))
-                .expect("unlock");
-            core.new_entry("first", "body1", vec!["t".into()])
-                .expect("e1");
-            core.new_entry("second", "body2", vec![]).expect("e2");
-            core.new_entry("third", "body3", vec![]).expect("e3");
-        }
-
-        let cli = make_cli_plain(&[
-            "-v",
-            vault_dir_str,
-            "--password",
-            "password",
-            "export",
-            out_dir.to_str().unwrap(),
-        ]);
-        let mut stdin = std::io::Cursor::new(b"y\n".to_vec());
-        cmd_export_impl(&cli, out_dir.clone(), &mut stdin).expect("export ok");
-
-        let files: Vec<_> = std::fs::read_dir(&out_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .collect();
-        assert_eq!(files.len(), 3, "must export 3 files");
-        for entry in files {
-            let name = entry.file_name();
-            let s = name.to_string_lossy();
-            assert!(s.ends_with(".md"), "extension .md: {s}");
-            assert!(
-                s.chars().nth(4) == Some('-') && s.chars().nth(7) == Some('-'),
-                "expected date prefix in {s}"
-            );
-        }
-    }
-}
-
-#[cfg(test)]
-mod conflict_snapshot_tests {
-    use super::{apply_conflict_choices, resolve_conflicts_interactive};
-    use pq_diary_core::{
-        git::MergeConflict,
-        vault::{
-            format::{
-                AttachmentRecord, EntryRecord, VaultHeader, RECORD_TYPE_ATTACHMENT,
-                RECORD_TYPE_ENTRY,
-            },
-            reader::read_vault_with_attachments_authenticated,
-            writer::{write_header, write_vault_with_attachments_authenticated},
-        },
-    };
-    use std::io::{self, BufRead, Read};
-
-    const KEY: [u8; 32] = [42; 32];
-
-    #[test]
-    fn invalid_fuzz_config_preserves_conflicts_without_prompting() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("vault.pqd");
-        let conflicts = [conflict(11)];
-        save(&path, &[conflicts[0].local.clone()], &[]);
-        let before = std::fs::read(&path).unwrap();
-        let mut config = pq_diary_core::vault::config::VaultConfig::default();
-        config.git.privacy.timestamp_fuzz_hours = u64::MAX;
-        let mut input = io::Cursor::new("r\n");
-        let error =
-            resolve_conflicts_interactive(&conflicts, dir.path(), &config, &path, &KEY, &mut input)
-                .unwrap_err();
-        assert!(matches!(
-            error.downcast_ref::<pq_diary_core::error::DiaryError>(),
-            Some(pq_diary_core::error::DiaryError::Config(_))
-        ));
-        assert_eq!(input.position(), 0);
-        assert_eq!(std::fs::read(&path).unwrap(), before);
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
-    }
-
-    // Simulate another writer during the prompt without timing or real Git.
-    struct Prompt<F> {
-        input: io::Cursor<&'static str>,
-        during_prompt: Option<F>,
-    }
-    impl<F: FnOnce()> Read for Prompt<F> {
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            self.input.read(buf)
-        }
-    }
-    impl<F: FnOnce()> BufRead for Prompt<F> {
-        fn fill_buf(&mut self) -> io::Result<&[u8]> {
-            self.input.fill_buf()
-        }
-        fn consume(&mut self, amount: usize) {
-            self.input.consume(amount);
-        }
-        fn read_line(&mut self, line: &mut String) -> io::Result<usize> {
-            if let Some(callback) = self.during_prompt.take() {
-                callback();
-            }
-            self.input.read_line(line)
-        }
-    }
-
-    fn entry(id: u8) -> EntryRecord {
-        EntryRecord {
-            record_type: RECORD_TYPE_ENTRY,
-            uuid: [id; 16],
-            created_at: 10,
-            updated_at: 20,
-            iv: [1; 12],
-            ciphertext: vec![2; 32],
-            signature: vec![3; 32],
-            content_hmac: [4; 32],
-            legacy_flag: 0,
-            legacy_key_block: vec![],
-            attachment_count: 0,
-            attachment_offset: 0,
-            padding: vec![5],
-        }
-    }
-
-    fn conflict(id: u8) -> MergeConflict {
-        let local = entry(id);
-        let mut remote = local.clone();
-        remote.content_hmac = [6; 32];
-        remote.ciphertext = vec![7; 32];
-        MergeConflict {
-            uuid: local.uuid,
-            local,
-            remote,
-        }
-    }
-
-    fn save(path: &std::path::Path, entries: &[EntryRecord], attachments: &[AttachmentRecord]) {
-        write_vault_with_attachments_authenticated(
-            path,
-            VaultHeader::new(),
-            entries,
-            attachments,
-            &KEY,
-        )
-        .unwrap();
-    }
-
-    fn checked_git(dir: &std::path::Path, args: &[&str]) -> Vec<u8> {
-        let output = std::process::Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        output.stdout
-    }
-
-    fn resolution_fixture() -> (
-        tempfile::TempDir,
-        pq_diary_core::vault::config::VaultConfig,
-        MergeConflict,
-    ) {
-        let dir = tempfile::tempdir().unwrap();
-        checked_git(dir.path(), &["init"]);
-        checked_git(dir.path(), &["config", "user.name", "fixture"]);
-        checked_git(dir.path(), &["config", "user.email", "fixture@localhost"]);
-        checked_git(dir.path(), &["config", "commit.gpgsign", "false"]);
-        let conflict = conflict(11);
-        save(
-            &dir.path().join("vault.pqd"),
-            std::slice::from_ref(&conflict.local),
-            &[],
-        );
-        checked_git(dir.path(), &["add", "vault.pqd"]);
-        checked_git(dir.path(), &["commit", "-m", "initial"]);
-        std::fs::write(dir.path().join("sentinel.txt"), b"unrelated staged data").unwrap();
-        checked_git(dir.path(), &["add", "sentinel.txt"]);
-        let mut config = pq_diary_core::vault::config::VaultConfig::default();
-        config.git.author_name = "pq-diary".into();
-        config.git.author_email = "resolution@localhost".into();
-        config.git.commit_message = "Update vault".into();
-        config.git.privacy.timestamp_fuzz_hours = 0;
-        (dir, config, conflict)
-    }
-
-    #[test]
-    fn conflict_resolution_commits_only_vault_and_preserves_staged_sentinel() {
-        let (dir, config, conflict) = resolution_fixture();
-        let path = dir.path().join("vault.pqd");
-        super::resolve_conflicts_interactive(
-            std::slice::from_ref(&conflict),
-            dir.path(),
-            &config,
-            &path,
-            &KEY,
-            &mut io::Cursor::new("r\n"),
-        )
-        .unwrap();
-
-        assert_eq!(
-            checked_git(dir.path(), &["diff", "--cached", "--name-only"]),
-            b"sentinel.txt\n"
-        );
-        assert_eq!(
-            checked_git(dir.path(), &["ls-tree", "--name-only", "HEAD"]),
-            b"vault.pqd\n"
-        );
-        assert_eq!(
-            checked_git(dir.path(), &["show", ":sentinel.txt"]),
-            b"unrelated staged data"
-        );
-        assert_eq!(
-            checked_git(dir.path(), &["log", "-1", "--format=%an <%ae>%n%s"]),
-            b"pq-diary <resolution@localhost>\nUpdate vault\n"
-        );
-        let (_, records, _) = read_vault_with_attachments_authenticated(&path, &KEY).unwrap();
-        assert_eq!(records, vec![conflict.remote]);
-        assert_eq!(
-            checked_git(dir.path(), &["show", "HEAD:vault.pqd"]),
-            std::fs::read(&path).unwrap()
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn conflict_resolution_rejected_commit_preserves_head_and_index() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let (dir, config, conflict) = resolution_fixture();
-        let path = dir.path().join("vault.pqd");
-        let hook = dir.path().join(".git/hooks/pre-commit");
-        std::fs::write(&hook, b"#!/bin/sh\nexit 1\n").unwrap();
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let head = checked_git(dir.path(), &["rev-parse", "HEAD"]);
-        let index = std::fs::read(dir.path().join(".git/index")).unwrap();
-
-        assert!(super::resolve_conflicts_interactive(
-            std::slice::from_ref(&conflict),
-            dir.path(),
-            &config,
-            &path,
-            &KEY,
-            &mut io::Cursor::new("r\n"),
-        )
-        .is_err());
-        assert_eq!(checked_git(dir.path(), &["rev-parse", "HEAD"]), head);
-        assert_eq!(std::fs::read(dir.path().join(".git/index")).unwrap(), index);
-        assert_eq!(
-            checked_git(dir.path(), &["diff", "--cached", "--name-only"]),
-            b"sentinel.txt\n"
-        );
-        // The existing resolver writes the chosen vault before committing.
-        // A rejected commit leaves that authenticated choice available to retry.
-        let (_, records, _) = read_vault_with_attachments_authenticated(&path, &KEY).unwrap();
-        assert_eq!(records, vec![conflict.remote]);
-    }
-    #[test]
-    fn conflict_snapshot_rejects_changed_or_missing_selected_entry_without_writes() {
-        // Changes with unchanged content HMAC and timestamp must also be caught.
-        for mutation in 0..5 {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("vault.pqd");
-            let conflicts = [conflict(11), conflict(12)];
-            let original = vec![conflicts[0].local.clone(), conflicts[1].local.clone()];
-            save(&path, &original, &[]);
-            let mut current = original.clone();
-            match mutation {
-                0 => current[1].updated_at += 1,
-                1 => current[1].ciphertext[0] ^= 1,
-                2 => current[1].legacy_flag = 1,
-                3 => current[1].signature[0] ^= 1,
-                _ => {
-                    current.remove(1);
-                }
-            }
-            let mut after_prompt = Vec::new();
-            let mut prompt = Prompt {
-                input: io::Cursor::new("r\nremote\n"),
-                during_prompt: Some(|| {
-                    save(&path, &current, &[]);
-                    after_prompt = std::fs::read(&path).unwrap();
-                }),
-            };
-            let error = apply_conflict_choices(&conflicts, &path, &KEY, &mut prompt).unwrap_err();
-            assert!(
-                error.to_string().contains(if mutation == 4 {
-                    "disappeared"
-                } else {
-                    "changed"
-                }),
-                "{error}"
-            );
-            assert_eq!(std::fs::read(&path).unwrap(), after_prompt);
-            let (_, records, _) = read_vault_with_attachments_authenticated(&path, &KEY).unwrap();
-            assert_eq!(records, current);
-        }
-    }
-
-    #[test]
-    fn conflict_snapshot_rejects_corrupt_metadata_without_writes() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("vault.pqd");
-        let conflicts = [conflict(11)];
-        save(&path, &[conflicts[0].local.clone()], &[]);
-        let (header, _, _) = read_vault_with_attachments_authenticated(&path, &KEY).unwrap();
-        let mut encoded_header = Vec::new();
-        write_header(&mut encoded_header, &header).unwrap();
-        let mut corrupted = std::fs::read(&path).unwrap();
-        // Length prefix + record type + UUID + creation timestamp.
-        corrupted[encoded_header.len() + 4 + 1 + 16 + 8] ^= 1;
-        let mut prompt = Prompt {
-            input: io::Cursor::new("r\n"),
-            during_prompt: Some(|| std::fs::write(&path, &corrupted).unwrap()),
-        };
-        let error = apply_conflict_choices(&conflicts, &path, &KEY, &mut prompt).unwrap_err();
-        assert!(
-            error.to_string().contains("integrity verification failed"),
-            "{error}"
-        );
-        assert_eq!(std::fs::read(&path).unwrap(), corrupted);
-    }
-
-    #[test]
-    fn conflict_snapshot_preserves_post_prompt_unrelated_records_and_attachments() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("vault.pqd");
-        let conflicts = [conflict(11), conflict(12)];
-        save(
-            &path,
-            &[conflicts[0].local.clone(), conflicts[1].local.clone()],
-            &[],
-        );
-        let attachment = AttachmentRecord {
-            record_type: RECORD_TYPE_ATTACHMENT,
-            uuid: [13; 16],
-            iv: [14; 12],
-            ciphertext: vec![15; 32],
-            signature: vec![16; 32],
-            content_hmac: [17; 32],
-            legacy_flag: 0,
-            legacy_key_block: vec![],
-            padding: vec![18],
-        };
-        let mut unrelated = conflicts[1].local.clone();
-        unrelated.updated_at += 1;
-        let new_entry = entry(19);
-        let mut expected_attachments = Vec::new();
-        pq_diary_core::vault::writer::write_attachments(
-            &mut expected_attachments,
-            std::slice::from_ref(&attachment),
-        )
-        .unwrap();
-        let mut prompt = Prompt {
-            input: io::Cursor::new(" REMOTE \nl\n"),
-            during_prompt: Some(|| {
-                save(
-                    &path,
-                    &[
-                        conflicts[0].local.clone(),
-                        unrelated.clone(),
-                        new_entry.clone(),
-                    ],
-                    &[attachment],
-                )
-            }),
-        };
-        assert!(apply_conflict_choices(&conflicts, &path, &KEY, &mut prompt).unwrap());
-        let (_, entries, attachments) =
-            read_vault_with_attachments_authenticated(&path, &KEY).unwrap();
-        assert_eq!(
-            entries,
-            vec![conflicts[0].remote.clone(), unrelated, new_entry]
-        );
-        let mut actual_attachments = Vec::new();
-        pq_diary_core::vault::writer::write_attachments(&mut actual_attachments, &attachments)
-            .unwrap();
-        assert_eq!(actual_attachments, expected_attachments);
-    }
-
-    #[test]
-    fn conflict_snapshot_local_unknown_and_eof_choices_are_noops() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("vault.pqd");
-        let conflicts = [conflict(11)];
-        save(&path, &[conflicts[0].local.clone()], &[]);
-        let before = std::fs::read(&path).unwrap();
-        for input in ["l\n", "local\n", "unknown\n", ""] {
-            assert!(
-                !apply_conflict_choices(&conflicts, &path, &KEY, &mut io::Cursor::new(input))
-                    .unwrap()
-            );
-            assert_eq!(std::fs::read(&path).unwrap(), before);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -10826,5 +9640,172 @@ mod confirmation_output_tests {
                 .unwrap();
             assert_eq!(core.get_entry(&id).unwrap().1.body, "preserved body");
         }
+    }
+}
+
+#[cfg(test)]
+mod git_choice_tests {
+    use super::choose_git_conflict;
+    use pq_diary_core::git::{ConflictResolution, MergeConflict};
+    use std::io::{self, BufRead, Read, Write};
+    fn deletion() -> MergeConflict {
+        MergeConflict {
+            uuid: [1; 16],
+            base: None,
+            local: None,
+            remote: None,
+        }
+    }
+    #[test]
+    fn explicit_choices_and_absent_side_display() {
+        for (input, expected) in [
+            ("local\n", ConflictResolution::KeepLocal),
+            ("r\n", ConflictResolution::KeepRemote),
+        ] {
+            let mut output = Vec::new();
+            let choice =
+                choose_git_conflict(&deletion(), &mut io::Cursor::new(input), &mut output).unwrap();
+            assert_eq!(choice, Some(expected));
+            let text = String::from_utf8(output).unwrap();
+            assert!(text.contains("Local: deleted"));
+            assert!(text.contains("Remote: deleted"));
+        }
+        for input in ["", "\n", "unknown\n"] {
+            assert!(
+                choose_git_conflict(&deletion(), &mut io::Cursor::new(input), &mut Vec::new())
+                    .is_err()
+            );
+        }
+    }
+    struct NeverRead;
+    impl Read for NeverRead {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            panic!("must not read")
+        }
+    }
+    impl BufRead for NeverRead {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            panic!("must not read")
+        }
+        fn consume(&mut self, _: usize) {
+            panic!("must not read")
+        }
+    }
+    struct Broken {
+        flush: bool,
+    }
+    impl Write for Broken {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.flush {
+                Ok(bytes.len())
+            } else {
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+    }
+    #[test]
+    fn prompt_write_and_flush_fail_before_input() {
+        for flush in [false, true] {
+            assert!(
+                choose_git_conflict(&deletion(), &mut NeverRead, &mut Broken { flush }).is_err()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod git_source_tests {
+    use super::*;
+    use clap::Parser as _;
+    use pq_diary_core::{git, vault::config::VaultConfig, DiaryError};
+
+    fn cli(dir: &std::path::Path, command: &str) -> Cli {
+        Cli::parse_from([
+            "pq-diary",
+            "--vault",
+            dir.to_str().unwrap(),
+            "--password",
+            "SOURCE_SECRET",
+            command,
+        ])
+    }
+
+    #[test]
+    fn git_commands_preserve_config_sources_before_password() {
+        let dir = tempfile::tempdir().unwrap();
+        for invalid in [false, true] {
+            if invalid {
+                std::fs::write(dir.path().join("vault.toml"), "[").unwrap();
+            }
+            let expected = VaultConfig::from_file(&dir.path().join("vault.toml")).unwrap_err();
+            for command in ["git-push", "git-pull", "git-sync"] {
+                let cli = cli(dir.path(), command);
+                let result = match command {
+                    "git-push" => cmd_git_push(&cli),
+                    "git-pull" => cmd_git_pull_impl(&cli, &mut std::io::Cursor::new("")),
+                    _ => cmd_git_sync_impl(&cli, &mut std::io::Cursor::new("")),
+                };
+                let error = result.unwrap_err();
+                assert_eq!(error.to_string(), expected.to_string());
+                assert!(error.downcast_ref::<DiaryError>().is_some());
+                if !invalid {
+                    assert!(error
+                        .chain()
+                        .any(|e| e.downcast_ref::<std::io::Error>().is_some()));
+                }
+                assert!(!format!("{error:?}").contains("SOURCE_SECRET"));
+            }
+        }
+    }
+
+    #[test]
+    fn git_commands_preserve_unlock_source_and_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = test_support::setup_vault(&dir);
+        let original = std::fs::read(vault.join("vault.pqd")).unwrap();
+        let mut core = DiaryCore::new(vault.join("vault.pqd").to_str().unwrap()).unwrap();
+        let expected = core
+            .unlock(secrecy::SecretString::new("SOURCE_SECRET".into()))
+            .unwrap_err();
+        for command in ["git-push", "git-pull", "git-sync"] {
+            let cli = cli(&vault, command);
+            let error = match command {
+                "git-push" => cmd_git_push(&cli),
+                "git-pull" => cmd_git_pull_impl(&cli, &mut std::io::Cursor::new("")),
+                _ => cmd_git_sync_impl(&cli, &mut std::io::Cursor::new("")),
+            }
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("Vault unlock failed: {expected}")
+            );
+            assert!(error.downcast_ref::<DiaryError>().is_some());
+            assert!(!format!("{error:?}").contains("SOURCE_SECRET"));
+        }
+        assert_eq!(std::fs::read(vault.join("vault.pqd")).unwrap(), original);
+    }
+
+    #[test]
+    fn git_init_and_status_preserve_git_variant() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = cmd_git_status_to(&cli(dir.path(), "git-status"), &mut Vec::new()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            git::git_status(dir.path()).unwrap_err().to_string()
+        );
+        assert!(matches!(
+            error.downcast_ref::<DiaryError>(),
+            Some(DiaryError::Git(_))
+        ));
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let error = cmd_git_init(&cli(dir.path(), "git-init"), None).unwrap_err();
+        assert_eq!(error.to_string(), "git error: already initialized");
+        assert!(matches!(
+            error.downcast_ref::<DiaryError>(),
+            Some(DiaryError::Git(_))
+        ));
     }
 }

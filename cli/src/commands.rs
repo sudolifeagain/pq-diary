@@ -1593,9 +1593,9 @@ pub fn cmd_git_init(cli: &Cli, remote: Option<&str>) -> anyhow::Result<()> {
     let vault_path = resolve_vault_path(cli)?;
     let vault_dir = vault_dir_from_path(&vault_path)?;
 
-    git::check_git_available().map_err(|e| anyhow::anyhow!("{e}"))?;
+    git::check_git_available()?;
 
-    git::git_init(&vault_dir, remote).map_err(|e| anyhow::anyhow!("{e}"))?;
+    git::git_init(&vault_dir, remote)?;
 
     println!("Initialized git repository in {}", vault_dir.display());
     // Try to show the generated author email from vault.toml if it exists.
@@ -1634,28 +1634,28 @@ pub fn cmd_git_push(cli: &Cli) -> anyhow::Result<()> {
     let vault_dir = vault_dir_from_path(&vault_path)?;
     let toml_path = vault_dir.join("vault.toml");
 
-    git::check_git_available().map_err(|e| anyhow::anyhow!("{e}"))?;
+    git::check_git_available()?;
 
-    let config = VaultConfig::from_file(&toml_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let config = VaultConfig::from_file(&toml_path)?;
 
-    let password_source =
-        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let password_source = get_password(cli.password.as_ref())?;
 
     let vault_str = vault_path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("vault path contains non-UTF-8 characters"))?;
 
-    let mut core = pq_diary_core::DiaryCore::new(vault_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut core = pq_diary_core::DiaryCore::new(vault_str)?;
 
     let secret_password: secrecy::SecretString =
         SecretBox::new(Box::from(password_source.secret().expose_secret()));
-    core.unlock(secret_password)
-        .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
-    let mac_key = core.vault_mac_key().map_err(|e| anyhow::anyhow!("{e}"))?;
+    core.unlock(secret_password).map_err(|e| {
+        let message = format!("Vault unlock failed: {e}");
+        anyhow::Error::new(e).context(message)
+    })?;
+    let mac_key = core.vault_mac_key()?;
     let _guard = VaultGuard::new(&mut core);
 
-    git::git_push(&vault_dir, &config, &vault_path, &mac_key)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    git::git_push(&vault_dir, &config, &vault_path, &mac_key)?;
 
     println!("Pushed vault to remote.");
     // _guard drops here → lock() called
@@ -1690,24 +1690,25 @@ fn cmd_git_pull_impl(cli: &Cli, reader: &mut impl std::io::BufRead) -> anyhow::R
     let vault_dir = vault_dir_from_path(&vault_path)?;
     let toml_path = vault_dir.join("vault.toml");
 
-    git::check_git_available().map_err(|e| anyhow::anyhow!("{e}"))?;
+    git::check_git_available()?;
 
-    let config = VaultConfig::from_file(&toml_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let config = VaultConfig::from_file(&toml_path)?;
 
-    let password_source =
-        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let password_source = get_password(cli.password.as_ref())?;
 
     let vault_str = vault_path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("vault path contains non-UTF-8 characters"))?;
 
-    let mut core = pq_diary_core::DiaryCore::new(vault_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut core = pq_diary_core::DiaryCore::new(vault_str)?;
 
     let secret_password: secrecy::SecretString =
         SecretBox::new(Box::from(password_source.secret().expose_secret()));
-    core.unlock(secret_password)
-        .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
-    let mac_key = core.vault_mac_key().map_err(|e| anyhow::anyhow!("{e}"))?;
+    core.unlock(secret_password).map_err(|e| {
+        let message = format!("Vault unlock failed: {e}");
+        anyhow::Error::new(e).context(message)
+    })?;
+    let mac_key = core.vault_mac_key()?;
     let _guard = VaultGuard::new(&mut core);
 
     let result = pull_with_choices(
@@ -1755,25 +1756,26 @@ fn cmd_git_sync_impl(cli: &Cli, reader: &mut impl std::io::BufRead) -> anyhow::R
     let vault_dir = vault_dir_from_path(&vault_path)?;
     let toml_path = vault_dir.join("vault.toml");
 
-    git::check_git_available().map_err(|e| anyhow::anyhow!("{e}"))?;
+    git::check_git_available()?;
 
-    let config = VaultConfig::from_file(&toml_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let config = VaultConfig::from_file(&toml_path)?;
 
     // Single password prompt for both pull and push.
-    let password_source =
-        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let password_source = get_password(cli.password.as_ref())?;
 
     let vault_str = vault_path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("vault path contains non-UTF-8 characters"))?;
 
-    let mut core = pq_diary_core::DiaryCore::new(vault_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut core = pq_diary_core::DiaryCore::new(vault_str)?;
 
     let secret_password: secrecy::SecretString =
         SecretBox::new(Box::from(password_source.secret().expose_secret()));
-    core.unlock(secret_password)
-        .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
-    let mac_key = core.vault_mac_key().map_err(|e| anyhow::anyhow!("{e}"))?;
+    core.unlock(secret_password).map_err(|e| {
+        let message = format!("Vault unlock failed: {e}");
+        anyhow::Error::new(e).context(message)
+    })?;
+    let mac_key = core.vault_mac_key()?;
     let _guard = VaultGuard::new(&mut core);
 
     // Phase 1: Pull + merge.
@@ -1787,8 +1789,7 @@ fn cmd_git_sync_impl(cli: &Cli, reader: &mut impl std::io::BufRead) -> anyhow::R
     )?;
 
     // Phase 2: Push.
-    git::git_push(&vault_dir, &config, &vault_path, &mac_key)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    git::git_push(&vault_dir, &config, &vault_path, &mac_key)?;
 
     println!("Sync complete.");
     println!(
@@ -1822,9 +1823,9 @@ fn cmd_git_status_to(cli: &Cli, out: &mut dyn std::io::Write) -> anyhow::Result<
     let vault_path = resolve_vault_path(cli)?;
     let vault_dir = vault_dir_from_path(&vault_path)?;
 
-    git::check_git_available().map_err(|e| anyhow::anyhow!("{e}"))?;
+    git::check_git_available()?;
 
-    let status = git::git_status(&vault_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let status = git::git_status(&vault_dir)?;
     write!(out, "{status}")?;
 
     out.flush()?;
@@ -9681,5 +9682,99 @@ mod git_choice_tests {
                 choose_git_conflict(&deletion(), &mut NeverRead, &mut Broken { flush }).is_err()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod git_source_tests {
+    use super::*;
+    use clap::Parser as _;
+    use pq_diary_core::{git, vault::config::VaultConfig, DiaryError};
+
+    fn cli(dir: &std::path::Path, command: &str) -> Cli {
+        Cli::parse_from([
+            "pq-diary",
+            "--vault",
+            dir.to_str().unwrap(),
+            "--password",
+            "SOURCE_SECRET",
+            command,
+        ])
+    }
+
+    #[test]
+    fn git_commands_preserve_config_sources_before_password() {
+        let dir = tempfile::tempdir().unwrap();
+        for invalid in [false, true] {
+            if invalid {
+                std::fs::write(dir.path().join("vault.toml"), "[").unwrap();
+            }
+            let expected = VaultConfig::from_file(&dir.path().join("vault.toml")).unwrap_err();
+            for command in ["git-push", "git-pull", "git-sync"] {
+                let cli = cli(dir.path(), command);
+                let result = match command {
+                    "git-push" => cmd_git_push(&cli),
+                    "git-pull" => cmd_git_pull_impl(&cli, &mut std::io::Cursor::new("")),
+                    _ => cmd_git_sync_impl(&cli, &mut std::io::Cursor::new("")),
+                };
+                let error = result.unwrap_err();
+                assert_eq!(error.to_string(), expected.to_string());
+                assert!(error.downcast_ref::<DiaryError>().is_some());
+                if !invalid {
+                    assert!(error
+                        .chain()
+                        .any(|e| e.downcast_ref::<std::io::Error>().is_some()));
+                }
+                assert!(!format!("{error:?}").contains("SOURCE_SECRET"));
+            }
+        }
+    }
+
+    #[test]
+    fn git_commands_preserve_unlock_source_and_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = test_support::setup_vault(&dir);
+        let original = std::fs::read(vault.join("vault.pqd")).unwrap();
+        let mut core = DiaryCore::new(vault.join("vault.pqd").to_str().unwrap()).unwrap();
+        let expected = core
+            .unlock(secrecy::SecretString::new("SOURCE_SECRET".into()))
+            .unwrap_err();
+        for command in ["git-push", "git-pull", "git-sync"] {
+            let cli = cli(&vault, command);
+            let error = match command {
+                "git-push" => cmd_git_push(&cli),
+                "git-pull" => cmd_git_pull_impl(&cli, &mut std::io::Cursor::new("")),
+                _ => cmd_git_sync_impl(&cli, &mut std::io::Cursor::new("")),
+            }
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("Vault unlock failed: {expected}")
+            );
+            assert!(error.downcast_ref::<DiaryError>().is_some());
+            assert!(!format!("{error:?}").contains("SOURCE_SECRET"));
+        }
+        assert_eq!(std::fs::read(vault.join("vault.pqd")).unwrap(), original);
+    }
+
+    #[test]
+    fn git_init_and_status_preserve_git_variant() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = cmd_git_status_to(&cli(dir.path(), "git-status"), &mut Vec::new()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            git::git_status(dir.path()).unwrap_err().to_string()
+        );
+        assert!(matches!(
+            error.downcast_ref::<DiaryError>(),
+            Some(DiaryError::Git(_))
+        ));
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let error = cmd_git_init(&cli(dir.path(), "git-init"), None).unwrap_err();
+        assert_eq!(error.to_string(), "git error: already initialized");
+        assert!(matches!(
+            error.downcast_ref::<DiaryError>(),
+            Some(DiaryError::Git(_))
+        ));
     }
 }

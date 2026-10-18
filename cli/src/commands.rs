@@ -77,7 +77,7 @@ fn filter_and_sort(
 ) -> anyhow::Result<Vec<EntryMeta>> {
     // Tag filter (prefix match for nested tags)
     if let Some(tag_str) = tag {
-        let filter_tag = Tag::new(tag_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let filter_tag = Tag::new(tag_str)?;
         entries.retain(|e| {
             e.tags.iter().any(|t| {
                 Tag::new(t)
@@ -131,9 +131,9 @@ fn check_claude_policy(
         .parent()
         .ok_or_else(|| anyhow::anyhow!("vault path has no parent directory"))?
         .join("vault.toml");
-    let config = VaultConfig::from_file(&toml_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let config = VaultConfig::from_file(&toml_path)?;
     let decision = policy::check_access(true, config.access.policy, operation, &config.vault.name);
-    decision.into_result().map_err(|e| anyhow::anyhow!("{}", e))
+    decision.into_result().map_err(anyhow::Error::new)
 }
 
 // ---------------------------------------------------------------------------
@@ -218,15 +218,14 @@ fn cmd_new_with_attach_to(
 
     // Step 1: Obtain password and unlock the vault.
     // Keep the source for the separate attachment session below.
-    let password_source =
-        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let password_source = get_password(cli.password.as_ref())?;
 
     let vault_path = resolve_vault_path(cli)?;
     let vault_str = vault_path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("Vault path contains non-UTF-8 characters"))?;
 
-    let mut core = DiaryCore::new(vault_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut core = DiaryCore::new(vault_str)?;
 
     let secret_password: secrecy::SecretString =
         SecretBox::new(Box::from(password_source.secret().expose_secret()));
@@ -293,7 +292,7 @@ fn cmd_new_with_attach_to(
         (content, title, tags)
     } else {
         // $EDITOR: write header-comment temp file, launch editor, read back.
-        let mut config = EditorConfig::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut config = EditorConfig::from_env()?;
 
         let initial = EntryPlaintext {
             title: title.clone().unwrap_or_else(|| "Untitled".to_string()),
@@ -404,8 +403,7 @@ fn cmd_list_to(
     // Policy check before any password prompt or vault decryption.
     check_claude_policy(cli, OperationType::Read)?;
 
-    let password_source =
-        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let password_source = get_password(cli.password.as_ref())?;
 
     let mut core = session::locked_core(cli)?;
     let guard = session::unlock(&mut core, password_source.into_secret())?;
@@ -466,15 +464,14 @@ fn cmd_show_impl(cli: &Cli, id: String, out: &mut dyn std::io::Write) -> anyhow:
     check_claude_policy(cli, OperationType::Read)?;
 
     // Keep the source for the separate attachment-listing session below.
-    let password_source =
-        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let password_source = get_password(cli.password.as_ref())?;
 
     let vault_path = resolve_vault_path(cli)?;
     let vault_str = vault_path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("Vault path contains non-UTF-8 characters"))?;
 
-    let mut core = DiaryCore::new(vault_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut core = DiaryCore::new(vault_str)?;
 
     let secret_password: secrecy::SecretString =
         SecretBox::new(Box::from(password_source.secret().expose_secret()));
@@ -482,7 +479,7 @@ fn cmd_show_impl(cli: &Cli, id: String, out: &mut dyn std::io::Write) -> anyhow:
         .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
     let guard = VaultGuard::new(&mut core);
 
-    let (record, plaintext) = guard.get_entry(&id).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (record, plaintext) = guard.get_entry(&id)?;
 
     let created = format_timestamp(record.created_at);
     let updated = format_timestamp(record.updated_at);
@@ -505,9 +502,7 @@ fn cmd_show_impl(cli: &Cli, id: String, out: &mut dyn std::io::Write) -> anyhow:
     write!(out, "{}", plaintext.body).context("Failed to write entry output")?;
 
     // Resolve [[link]] references in the body.
-    let resolved = guard
-        .resolve_links(&plaintext.body)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let resolved = guard.resolve_links(&plaintext.body)?;
 
     if !resolved.is_empty() {
         writeln!(out).context("Failed to write entry output")?;
@@ -563,9 +558,7 @@ fn cmd_show_impl(cli: &Cli, id: String, out: &mut dyn std::io::Write) -> anyhow:
     }
 
     // Display backlinks (newest first).
-    let mut backlinks = guard
-        .backlinks_for(&plaintext.title)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut backlinks = guard.backlinks_for(&plaintext.title)?;
 
     if !backlinks.is_empty() {
         backlinks.sort_by_key(|b| std::cmp::Reverse(b.created_at));
@@ -645,13 +638,12 @@ where
     // Policy check before any password prompt or vault decryption.
     check_claude_policy(cli, OperationType::Write)?;
 
-    let password_source =
-        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let password_source = get_password(cli.password.as_ref())?;
 
     let mut core = session::locked_core(cli)?;
     let guard = session::unlock(&mut core, password_source.into_secret())?;
 
-    let (_record, original) = guard.get_entry(&id).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (_record, original) = guard.get_entry(&id)?;
 
     let flag_mode = title.is_some() || !add_tags.is_empty() || !remove_tags.is_empty();
 
@@ -684,7 +676,7 @@ where
         println!("Updated: {prefix}");
     } else {
         // Editor mode: write header-comment temp file, launch editor, parse result.
-        let mut config = EditorConfig::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut config = EditorConfig::from_env()?;
 
         let mut session = editor::EditorSession::header(&config.secure_tmpdir, &original)
             .map_err(|e| anyhow::anyhow!("Failed to write temp file: {e}"))?;
@@ -784,13 +776,12 @@ fn cmd_delete_impl(
     // Policy check before any password prompt or vault decryption.
     check_claude_policy(cli, OperationType::Write)?;
 
-    let password_source =
-        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let password_source = get_password(cli.password.as_ref())?;
 
     let mut core = session::locked_core(cli)?;
     let guard = session::unlock(&mut core, password_source.into_secret())?;
 
-    let (record, plaintext) = guard.get_entry(&id).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (record, plaintext) = guard.get_entry(&id)?;
 
     let title = plaintext.title.clone();
     let date = format_timestamp(record.created_at);
@@ -855,8 +846,7 @@ where
     // Policy check before any password prompt or vault decryption.
     check_claude_policy(cli, OperationType::Write)?;
 
-    let password_source =
-        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let password_source = get_password(cli.password.as_ref())?;
 
     let mut core = session::locked_core(cli)?;
     let guard = session::unlock(&mut core, password_source.into_secret())?;
@@ -894,11 +884,9 @@ where
 
     // Open the entry in the editor (edit flow).
     let id_prefix = entry_id[..entry_id.len().min(8)].to_string();
-    let (_record, original) = guard
-        .get_entry(&id_prefix)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (_record, original) = guard.get_entry(&id_prefix)?;
 
-    let mut config = EditorConfig::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut config = EditorConfig::from_env()?;
 
     let mut session = editor::EditorSession::header(&config.secure_tmpdir, &original)
         .map_err(|e| anyhow::anyhow!("Failed to write temp file: {e}"))?;
@@ -968,8 +956,7 @@ pub(crate) fn cmd_search_to(
     // Policy check before any password prompt or vault decryption.
     check_claude_policy(cli, OperationType::Read)?;
 
-    let password_source =
-        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let password_source = get_password(cli.password.as_ref())?;
 
     let mut core = session::locked_core(cli)?;
     let guard = session::unlock(&mut core, password_source.into_secret())?;
@@ -981,7 +968,7 @@ pub(crate) fn cmd_search_to(
         count_only: args.count,
     };
 
-    let results = guard.search(&query).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let results = guard.search(&query)?;
 
     if args.count {
         writeln!(out, "{} entries matched", results.matched_entry_count)?;
@@ -1064,13 +1051,12 @@ pub(crate) fn cmd_stats_to(
     // Policy check before any password prompt or vault decryption.
     check_claude_policy(cli, OperationType::Read)?;
 
-    let password_source =
-        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let password_source = get_password(cli.password.as_ref())?;
 
     let mut core = session::locked_core(cli)?;
     let guard = session::unlock(&mut core, password_source.into_secret())?;
 
-    let stats = guard.stats().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let stats = guard.stats()?;
 
     if args.json {
         let json = serde_json::to_string_pretty(&stats)
@@ -1280,7 +1266,7 @@ pub fn cmd_vault_create(cli: &Cli, name: &str, policy_str: Option<&str>) -> anyh
         name,
         policy_str,
         &mut std::io::BufReader::new(std::io::stdin()),
-        |base_dir| VaultManager::new(base_dir).map_err(|e| anyhow::anyhow!("{e}")),
+        |base_dir| VaultManager::new(base_dir).map_err(anyhow::Error::new),
     )
 }
 
@@ -1310,8 +1296,7 @@ fn cmd_vault_create_impl(
     }
 
     // Step 3: Get password.
-    let password_source =
-        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let password_source = get_password(cli.password.as_ref())?;
     if !review_password_choice(
         password_source.secret().expose_secret(),
         matches!(password_source, PasswordSource::Tty(_)),
@@ -1325,8 +1310,7 @@ fn cmd_vault_create_impl(
     let base_dir = resolve_vaults_base_dir(cli)?;
     let mgr = mgr_factory(base_dir.clone())?;
     let pw_bytes = password_source.secret().expose_secret().as_bytes();
-    mgr.create_vault(name, pw_bytes, policy)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    mgr.create_vault(name, pw_bytes, policy)?;
 
     // Step 5: Success message.
     let vault_dir = base_dir.join(name);
@@ -1389,10 +1373,8 @@ fn cmd_vault_list_to(cli: &Cli, out: &mut dyn std::io::Write) -> anyhow::Result<
     use pq_diary_core::vault::init::VaultManager;
 
     let base_dir = resolve_vaults_base_dir(cli)?;
-    let mgr = VaultManager::new(base_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let vaults = mgr
-        .list_vaults_with_policy()
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mgr = VaultManager::new(base_dir)?;
+    let vaults = mgr.list_vaults_with_policy()?;
 
     writeln!(out, "{:<20} POLICY", "NAME")?;
     writeln!(out, "{}", "-".repeat(31))?;
@@ -1445,9 +1427,8 @@ fn cmd_vault_policy_impl(
 
     // Step 3: Set policy.
     let base_dir = resolve_vaults_base_dir(cli)?;
-    let mgr = VaultManager::new(base_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
-    mgr.set_policy(name, policy)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mgr = VaultManager::new(base_dir)?;
+    mgr.set_policy(name, policy)?;
 
     // Step 4: Success message.
     println!("Policy updated: {name} → {policy}");
@@ -1483,7 +1464,7 @@ fn cmd_vault_delete_impl(
     use pq_diary_core::vault::init::VaultManager;
 
     let base_dir = resolve_vaults_base_dir(cli)?;
-    let mgr = VaultManager::new(base_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mgr = VaultManager::new(base_dir)?;
 
     // Step 1: Check if vault exists.
     let vault_path = mgr.vault_path(name);
@@ -1508,8 +1489,7 @@ fn cmd_vault_delete_impl(
 
     if do_delete {
         // Step 4: Delete vault.
-        mgr.delete_vault(name, zeroize)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        mgr.delete_vault(name, zeroize)?;
         println!("Deleted vault '{name}'");
     } else {
         println!("キャンセルしました");
@@ -2839,6 +2819,88 @@ mod tests {
     use super::*;
     use clap::Parser as _;
     use std::path::Path;
+
+    #[test]
+    fn command_sources_entry_lookup_keeps_typed_error_and_display() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = setup_vault(&dir);
+        let cli = make_show_cli(vault.to_str().unwrap(), Some("password"), "deadbeef");
+        let mut core = session::locked_core(&cli).unwrap();
+        let guard =
+            session::unlock(&mut core, secrecy::SecretString::new("password".into())).unwrap();
+        guard
+            .new_entry("SOURCE_PRIVATE_TITLE", "SOURCE_PRIVATE_BODY", vec![])
+            .unwrap();
+        let expected = guard.get_entry("deadbeef").unwrap_err().to_string();
+        drop(guard);
+        let before = std::fs::read(vault.join("vault.pqd")).unwrap();
+        let mut output = Vec::new();
+        let error = cmd_show_impl(&cli, "deadbeef".into(), &mut output).unwrap_err();
+        assert_eq!(error.to_string(), expected);
+        assert!(matches!(
+            error.downcast_ref::<pq_diary_core::DiaryError>(),
+            Some(pq_diary_core::DiaryError::Entry(_))
+        ));
+        for secret in ["password", "SOURCE_PRIVATE_TITLE", "SOURCE_PRIVATE_BODY"] {
+            assert!(!format!("{error:?}").contains(secret));
+        }
+        assert!(output.is_empty());
+        assert_eq!(std::fs::read(vault.join("vault.pqd")).unwrap(), before);
+    }
+
+    #[test]
+    fn command_sources_policy_io_precedes_password_and_keeps_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = crate::Cli::try_parse_from([
+            "pq-diary",
+            "--claude",
+            "-v",
+            dir.path().to_str().unwrap(),
+            "show",
+            "missing",
+        ])
+        .unwrap();
+        let expected =
+            pq_diary_core::vault::config::VaultConfig::from_file(&dir.path().join("vault.toml"))
+                .unwrap_err()
+                .to_string();
+        let error = cmd_show_impl(&cli, "missing".into(), &mut Vec::new()).unwrap_err();
+        assert_eq!(error.to_string(), expected);
+        assert!(matches!(
+            error.downcast_ref::<pq_diary_core::DiaryError>(),
+            Some(pq_diary_core::DiaryError::Io(_))
+        ));
+        assert_eq!(
+            error
+                .chain()
+                .find_map(|e| e.downcast_ref::<std::io::Error>())
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn command_sources_vault_manager_io_keeps_source_and_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, "sentinel").unwrap();
+        let cli = make_vault_mgmt_cli(blocked.to_str().unwrap(), None, &["list"]);
+        let expected = pq_diary_core::vault::init::VaultManager::new(blocked.clone())
+            .err()
+            .unwrap()
+            .to_string();
+        let error = cmd_vault_list_to(&cli, &mut Vec::new()).unwrap_err();
+        assert_eq!(error.to_string(), expected);
+        assert!(matches!(
+            error.downcast_ref::<pq_diary_core::DiaryError>(),
+            Some(pq_diary_core::DiaryError::Io(_))
+        ));
+        assert!(error
+            .chain()
+            .any(|e| e.downcast_ref::<std::io::Error>().is_some()));
+        assert_eq!(std::fs::read(&blocked).unwrap(), b"sentinel");
+    }
 
     #[test]
     fn new_output_failure_keeps_requested_attachments() {

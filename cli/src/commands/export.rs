@@ -39,36 +39,37 @@ fn cmd_export_impl(
         "平文を {} に書き出します。続行しますか? [y/N]: ",
         dir.display()
     );
-    std::io::stderr()
-        .flush()
-        .map_err(|e| anyhow::anyhow!("Failed to flush stderr: {e}"))?;
+    std::io::stderr().flush().map_err(|e| {
+        let message = format!("Failed to flush stderr: {e}");
+        anyhow::Error::new(e).context(message)
+    })?;
     let mut answer = String::new();
-    reader
-        .read_line(&mut answer)
-        .map_err(|e| anyhow::anyhow!("Failed to read confirmation: {e}"))?;
+    reader.read_line(&mut answer).map_err(|e| {
+        let message = format!("Failed to read confirmation: {e}");
+        anyhow::Error::new(e).context(message)
+    })?;
     let trimmed = answer.trim();
     if !trimmed.eq_ignore_ascii_case("y") {
         println!("キャンセルしました");
         return Ok(());
     }
 
-    let password_source =
-        get_password(cli.password.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let password_source = get_password(cli.password.as_ref())?;
     let vault_pqd = resolve_vault_path(cli)?;
     let vault_pqd_str = vault_pqd
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("vault path contains non-UTF-8 characters"))?;
 
-    let mut core = DiaryCore::new(vault_pqd_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut core = DiaryCore::new(vault_pqd_str)?;
     let secret_password: secrecy::SecretString =
         SecretBox::new(Box::from(password_source.secret().expose_secret()));
-    core.unlock(secret_password)
-        .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+    core.unlock(secret_password).map_err(|e| {
+        let message = format!("Vault unlock failed: {e}");
+        anyhow::Error::new(e).context(message)
+    })?;
     let guard = VaultGuard::new(&mut core);
 
-    let metas = guard
-        .list_entries(None)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let metas = guard.list_entries(None)?;
 
     if metas.is_empty() {
         println!("No entries to export");
@@ -91,10 +92,11 @@ fn cmd_export_impl(
             Some(&meta.uuid_hex),
         )
         .map_err(|e| {
-            anyhow::anyhow!(
+            let message = format!(
                 "Failed to list attachments for entry {}: {e}",
                 meta.uuid_hex
-            )
+            );
+            anyhow::Error::new(e).context(message)
         })?;
         targets.push((meta, path, attachments));
     }
@@ -107,9 +109,7 @@ fn cmd_export_impl(
         std::collections::HashMap::new();
     for (meta, path, attachments) in &targets {
         let id_hex = meta.uuid_hex.clone();
-        let (_, plaintext) = guard
-            .get_entry(&id_hex)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let (_, plaintext) = guard.get_entry(&id_hex)?;
         // Build base MD body.
         let mut body = plaintext.body.clone();
 
@@ -117,7 +117,8 @@ fn cmd_export_impl(
         // decrypted file into `<dir>/attachments/`.
         if !attachments.is_empty() {
             std::fs::create_dir_all(&attachments_dir).map_err(|e| {
-                anyhow::anyhow!("Failed to create {}: {e}", attachments_dir.display())
+                let message = format!("Failed to create {}: {e}", attachments_dir.display());
+                anyhow::Error::new(e).context(message)
             })?;
             if !body.is_empty() && !body.ends_with('\n') {
                 body.push('\n');
@@ -163,7 +164,10 @@ fn cmd_export_impl(
                         &m.filename,
                         &out_path,
                     )
-                    .map_err(|e| anyhow::anyhow!("attachment extract: {e}"))?;
+                    .map_err(|e| {
+                        let message = format!("attachment extract: {e}");
+                        anyhow::Error::new(e).context(message)
+                    })?;
                     exported_attachment_files.insert(export_filename.clone(), m.sha256);
                 }
                 body.push_str(&format!("\n![[{}]]", export_filename));
@@ -329,6 +333,113 @@ mod tests {
     };
     use super::*;
     use pq_diary_core::EntryMeta;
+
+    #[test]
+    fn export_preserves_constructor_source_and_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let cli = make_cli_plain(&[
+            "--vault",
+            dir.path().to_str().unwrap(),
+            "--password",
+            "EXPORT_SECRET",
+            "export",
+            output.path().to_str().unwrap(),
+        ]);
+        for invalid in [false, true] {
+            if invalid {
+                std::fs::write(dir.path().join("vault.toml"), "[").unwrap();
+            }
+            let expected = DiaryCore::new(dir.path().join("vault.pqd").to_str().unwrap())
+                .err()
+                .unwrap();
+            let error = cmd_export_impl(
+                &cli,
+                output.path().to_path_buf(),
+                &mut std::io::Cursor::new("y\n"),
+            )
+            .unwrap_err();
+            assert_eq!(error.to_string(), expected.to_string());
+            assert!(error.downcast_ref::<pq_diary_core::DiaryError>().is_some());
+            if !invalid {
+                assert!(error
+                    .chain()
+                    .any(|e| e.downcast_ref::<std::io::Error>().is_some()));
+            }
+            assert!(!format!("{error:?}").contains("EXPORT_SECRET"));
+            assert_eq!(std::fs::read_dir(output.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn export_preserves_confirmation_io_source_before_unlock() {
+        struct BrokenReader;
+        impl std::io::Read for BrokenReader {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        impl std::io::BufRead for BrokenReader {
+            fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn consume(&mut self, _: usize) {}
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let cli = make_cli_plain(&[
+            "--vault",
+            dir.path().to_str().unwrap(),
+            "export",
+            output.path().to_str().unwrap(),
+        ]);
+        let error =
+            cmd_export_impl(&cli, output.path().to_path_buf(), &mut BrokenReader).unwrap_err();
+        let expected = std::io::Error::from(std::io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            error.to_string(),
+            format!("Failed to read confirmation: {expected}")
+        );
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(std::fs::read_dir(output.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn export_preserves_unlock_source_and_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = setup_vault(&dir);
+        let output = tempfile::tempdir().unwrap();
+        let original = std::fs::read(vault.join("vault.pqd")).unwrap();
+        let cli = make_cli_plain(&[
+            "--vault",
+            vault.to_str().unwrap(),
+            "--password",
+            "EXPORT_SECRET",
+            "export",
+            output.path().to_str().unwrap(),
+        ]);
+        let mut core = DiaryCore::new(vault.join("vault.pqd").to_str().unwrap()).unwrap();
+        let expected = core
+            .unlock(secrecy::SecretString::new("EXPORT_SECRET".into()))
+            .unwrap_err();
+        let error = cmd_export_impl(
+            &cli,
+            output.path().to_path_buf(),
+            &mut std::io::Cursor::new("y\n"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("Vault unlock failed: {expected}")
+        );
+        assert!(error.downcast_ref::<pq_diary_core::DiaryError>().is_some());
+        assert!(!format!("{error:?}").contains("EXPORT_SECRET"));
+        assert_eq!(std::fs::read_dir(output.path()).unwrap().count(), 0);
+        assert_eq!(std::fs::read(vault.join("vault.pqd")).unwrap(), original);
+    }
 
     // -------------------------------------------------------------------------
     // TASK-0094: export tests (helpers + impl)
@@ -638,9 +749,18 @@ mod tests {
         ]);
         let result = cmd_export_impl(&cli, out.clone(), &mut std::io::Cursor::new(b"y\n"));
         if corrupt {
-            let error = result
-                .expect_err("corrupt attachment must fail export")
-                .to_string();
+            let error = result.expect_err("corrupt attachment must fail export");
+            assert!(error.downcast_ref::<pq_diary_core::DiaryError>().is_some());
+            let diagnostic = format!("{error:?}");
+            for secret in [
+                "first body",
+                "second body",
+                "attachment contents",
+                "password",
+            ] {
+                assert!(!diagnostic.contains(secret));
+            }
+            let error = error.to_string();
             assert!(
                 error.contains("Failed to list attachments for entry"),
                 "{error}"

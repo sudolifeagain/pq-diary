@@ -6,6 +6,8 @@
 
 #[cfg(test)]
 mod config_context_tests;
+#[cfg(test)]
+mod entry_context_sources_tests;
 mod export;
 mod import;
 mod session;
@@ -231,8 +233,10 @@ fn cmd_new_with_attach_to(
 
     let secret_password: secrecy::SecretString =
         SecretBox::new(Box::from(password_source.secret().expose_secret()));
-    core.unlock(secret_password)
-        .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+    core.unlock(secret_password).map_err(|e| {
+        let message = format!("Vault unlock failed: {e}");
+        anyhow::Error::new(e).context(message)
+    })?;
     let guard = VaultGuard::new(&mut core);
 
     // Step 2: Determine body text and potentially update title/tags.
@@ -271,14 +275,15 @@ fn cmd_new_with_attach_to(
             {
                 use std::io::Write as _;
                 print!("{}: ", var_ref.name);
-                std::io::stdout()
-                    .flush()
-                    .map_err(|e| anyhow::anyhow!("Failed to flush stdout: {e}"))?;
+                std::io::stdout().flush().map_err(|e| {
+                    let message = format!("Failed to flush stdout: {e}");
+                    anyhow::Error::new(e).context(message)
+                })?;
                 let mut input = String::new();
-                std::io::stdin()
-                    .lock()
-                    .read_line(&mut input)
-                    .map_err(|e| anyhow::anyhow!("Failed to read variable input: {e}"))?;
+                std::io::stdin().lock().read_line(&mut input).map_err(|e| {
+                    let message = format!("Failed to read variable input: {e}");
+                    anyhow::Error::new(e).context(message)
+                })?;
                 vars.insert(var_ref.name.clone(), input.trim().to_string());
             }
         }
@@ -288,9 +293,10 @@ fn cmd_new_with_attach_to(
     } else if !std::io::stdin().is_terminal() {
         // Piped stdin: read all content.
         let mut content = String::new();
-        std::io::stdin()
-            .read_to_string(&mut content)
-            .map_err(|e| anyhow::anyhow!("Failed to read stdin: {e}"))?;
+        std::io::stdin().read_to_string(&mut content).map_err(|e| {
+            let message = format!("Failed to read stdin: {e}");
+            anyhow::Error::new(e).context(message)
+        })?;
         (content, title, tags)
     } else {
         // $EDITOR: write header-comment temp file, launch editor, read back.
@@ -302,8 +308,11 @@ fn cmd_new_with_attach_to(
             body: String::new(),
         };
 
-        let mut session = editor::EditorSession::header(&config.secure_tmpdir, &initial)
-            .map_err(|e| anyhow::anyhow!("Failed to write temp file: {e}"))?;
+        let mut session =
+            editor::EditorSession::header(&config.secure_tmpdir, &initial).map_err(|e| {
+                let message = format!("Failed to write temp file: {e}");
+                anyhow::Error::new(e).context(message)
+            })?;
 
         // Inject optional vim completion for [[title]] links.
         if !config.vim_options.is_empty() {
@@ -326,7 +335,10 @@ fn cmd_new_with_attach_to(
     // Step 4: Create the entry.
     let uuid_hex = guard
         .new_entry(&actual_title, &final_body, final_tags)
-        .map_err(|e| anyhow::anyhow!("Failed to create entry: {e}"))?;
+        .map_err(|e| {
+            let message = format!("Failed to create entry: {e}");
+            anyhow::Error::new(e).context(message)
+        })?;
 
     // Retain result details until attachment processing completes.
     let prefix = &uuid_hex[..8];
@@ -410,9 +422,10 @@ fn cmd_list_to(
     let mut core = session::locked_core(cli)?;
     let guard = session::unlock(&mut core, password_source.into_secret())?;
 
-    let entries = guard
-        .list_entries(None)
-        .map_err(|e| anyhow::anyhow!("Failed to list entries: {e}"))?;
+    let entries = guard.list_entries(None).map_err(|e| {
+        let message = format!("Failed to list entries: {e}");
+        anyhow::Error::new(e).context(message)
+    })?;
 
     let filtered = filter_and_sort(entries, tag.as_deref(), query.as_deref(), number)?;
 
@@ -477,8 +490,10 @@ fn cmd_show_impl(cli: &Cli, id: String, out: &mut dyn std::io::Write) -> anyhow:
 
     let secret_password: secrecy::SecretString =
         SecretBox::new(Box::from(password_source.secret().expose_secret()));
-    core.unlock(secret_password)
-        .map_err(|e| anyhow::anyhow!("Vault unlock failed: {e}"))?;
+    core.unlock(secret_password).map_err(|e| {
+        let message = format!("Vault unlock failed: {e}");
+        anyhow::Error::new(e).context(message)
+    })?;
     let guard = VaultGuard::new(&mut core);
 
     let (record, plaintext) = guard.get_entry(&id)?;
@@ -671,17 +686,21 @@ where
             new_plaintext.tags.retain(|t| t != tag);
         }
 
-        guard
-            .update_entry(&id, &new_plaintext)
-            .map_err(|e| anyhow::anyhow!("Failed to update entry: {e}"))?;
+        guard.update_entry(&id, &new_plaintext).map_err(|e| {
+            let message = format!("Failed to update entry: {e}");
+            anyhow::Error::new(e).context(message)
+        })?;
         let prefix = &id[..id.len().min(8)];
         println!("Updated: {prefix}");
     } else {
         // Editor mode: write header-comment temp file, launch editor, parse result.
         let mut config = EditorConfig::from_env()?;
 
-        let mut session = editor::EditorSession::header(&config.secure_tmpdir, &original)
-            .map_err(|e| anyhow::anyhow!("Failed to write temp file: {e}"))?;
+        let mut session =
+            editor::EditorSession::header(&config.secure_tmpdir, &original).map_err(|e| {
+                let message = format!("Failed to write temp file: {e}");
+                anyhow::Error::new(e).context(message)
+            })?;
 
         // Inject optional vim completion for [[title]] links.
         if !config.vim_options.is_empty() {
@@ -710,9 +729,10 @@ where
             body: new_body,
         };
 
-        guard
-            .update_entry(&id, &new_plaintext)
-            .map_err(|e| anyhow::anyhow!("Failed to update entry: {e}"))?;
+        guard.update_entry(&id, &new_plaintext).map_err(|e| {
+            let message = format!("Failed to update entry: {e}");
+            anyhow::Error::new(e).context(message)
+        })?;
         let prefix = &id[..id.len().min(8)];
         println!("Updated: {prefix}");
     }
@@ -732,13 +752,15 @@ fn confirm_delete(
 ) -> anyhow::Result<bool> {
     use std::io::Write as _;
     eprint!("Delete \"{title}\" ({date})? [y/N]: ");
-    std::io::stderr()
-        .flush()
-        .map_err(|e| anyhow::anyhow!("Failed to flush stderr: {e}"))?;
+    std::io::stderr().flush().map_err(|e| {
+        let message = format!("Failed to flush stderr: {e}");
+        anyhow::Error::new(e).context(message)
+    })?;
     let mut input = String::new();
-    reader
-        .read_line(&mut input)
-        .map_err(|e| anyhow::anyhow!("Failed to read input: {e}"))?;
+    reader.read_line(&mut input).map_err(|e| {
+        let message = format!("Failed to read input: {e}");
+        anyhow::Error::new(e).context(message)
+    })?;
     let trimmed = input.trim();
     Ok(trimmed == "y" || trimmed == "Y")
 }
@@ -798,9 +820,10 @@ fn cmd_delete_impl(
     };
 
     if do_delete {
-        guard
-            .delete_entry(&id)
-            .map_err(|e| anyhow::anyhow!("Failed to delete entry: {e}"))?;
+        guard.delete_entry(&id).map_err(|e| {
+            let message = format!("Failed to delete entry: {e}");
+            anyhow::Error::new(e).context(message)
+        })?;
         println!("Deleted: {prefix} \"{title}\"");
     } else {
         println!("キャンセルしました");
@@ -854,9 +877,10 @@ where
     let guard = session::unlock(&mut core, password_source.into_secret())?;
 
     // Search for today's entry by exact title match.
-    let entries = guard
-        .list_entries(None)
-        .map_err(|e| anyhow::anyhow!("Failed to list entries: {e}"))?;
+    let entries = guard.list_entries(None).map_err(|e| {
+        let message = format!("Failed to list entries: {e}");
+        anyhow::Error::new(e).context(message)
+    })?;
     let today_entry = entries.iter().find(|e| e.title == today);
 
     let entry_id = if let Some(meta) = today_entry {
@@ -879,9 +903,10 @@ where
         };
 
         // Create the entry.
-        guard
-            .new_entry(today, &initial_body, vec![])
-            .map_err(|e| anyhow::anyhow!("Failed to create entry: {e}"))?
+        guard.new_entry(today, &initial_body, vec![]).map_err(|e| {
+            let message = format!("Failed to create entry: {e}");
+            anyhow::Error::new(e).context(message)
+        })?
     };
 
     // Open the entry in the editor (edit flow).
@@ -890,8 +915,11 @@ where
 
     let mut config = EditorConfig::from_env()?;
 
-    let mut session = editor::EditorSession::header(&config.secure_tmpdir, &original)
-        .map_err(|e| anyhow::anyhow!("Failed to write temp file: {e}"))?;
+    let mut session =
+        editor::EditorSession::header(&config.secure_tmpdir, &original).map_err(|e| {
+            let message = format!("Failed to write temp file: {e}");
+            anyhow::Error::new(e).context(message)
+        })?;
 
     // Inject optional vim completion for [[title]] links.
     if !config.vim_options.is_empty() {
@@ -920,7 +948,10 @@ where
 
     guard
         .update_entry(&id_prefix, &new_plaintext)
-        .map_err(|e| anyhow::anyhow!("Failed to update entry: {e}"))?;
+        .map_err(|e| {
+            let message = format!("Failed to update entry: {e}");
+            anyhow::Error::new(e).context(message)
+        })?;
     println!("Updated: {id_prefix}");
 
     // guard drops here, automatically calling lock().
@@ -1061,8 +1092,10 @@ pub(crate) fn cmd_stats_to(
     let stats = guard.stats()?;
 
     if args.json {
-        let json = serde_json::to_string_pretty(&stats)
-            .map_err(|e| anyhow::anyhow!("JSON serialization failed: {e}"))?;
+        let json = serde_json::to_string_pretty(&stats).map_err(|e| {
+            let message = format!("JSON serialization failed: {e}");
+            anyhow::Error::new(e).context(message)
+        })?;
         writeln!(out, "{json}")?;
     } else if args.heatmap {
         let heatmap = render_heatmap(&stats.daily_activity);

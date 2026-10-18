@@ -16,13 +16,15 @@ use crate::Cli;
 fn confirm_template_delete(name: &str, reader: &mut impl std::io::BufRead) -> anyhow::Result<bool> {
     use std::io::Write as _;
     eprint!("Delete template \"{name}\"? [y/N]: ");
-    std::io::stderr()
-        .flush()
-        .map_err(|e| anyhow::anyhow!("Failed to flush stderr: {e}"))?;
+    std::io::stderr().flush().map_err(|e| {
+        let message = format!("Failed to flush stderr: {e}");
+        anyhow::Error::new(e).context(message)
+    })?;
     let mut input = String::new();
-    reader
-        .read_line(&mut input)
-        .map_err(|e| anyhow::anyhow!("Failed to read input: {e}"))?;
+    reader.read_line(&mut input).map_err(|e| {
+        let message = format!("Failed to read input: {e}");
+        anyhow::Error::new(e).context(message)
+    })?;
     let trimmed = input.trim();
     Ok(trimmed == "y" || trimmed == "Y")
 }
@@ -85,13 +87,15 @@ where
     if already_exists && !cli.claude {
         use std::io::Write as _;
         eprint!("Template \"{name}\" already exists. Overwrite? [y/N]: ");
-        std::io::stderr()
-            .flush()
-            .map_err(|e| anyhow::anyhow!("Failed to flush stderr: {e}"))?;
+        std::io::stderr().flush().map_err(|e| {
+            let message = format!("Failed to flush stderr: {e}");
+            anyhow::Error::new(e).context(message)
+        })?;
         let mut input = String::new();
-        reader
-            .read_line(&mut input)
-            .map_err(|e| anyhow::anyhow!("Failed to read input: {e}"))?;
+        reader.read_line(&mut input).map_err(|e| {
+            let message = format!("Failed to read input: {e}");
+            anyhow::Error::new(e).context(message)
+        })?;
         let trimmed = input.trim();
         if trimmed != "y" && trimmed != "Y" {
             println!("キャンセルしました");
@@ -104,8 +108,10 @@ where
     let config = editor::EditorConfig::from_env()?;
 
     // Write a blank temp file and launch editor.
-    let session = editor::EditorSession::template(&config.secure_tmpdir)
-        .map_err(|e| anyhow::anyhow!("Failed to write temp file: {e}"))?;
+    let session = editor::EditorSession::template(&config.secure_tmpdir).map_err(|e| {
+        let message = format!("Failed to write temp file: {e}");
+        anyhow::Error::new(e).context(message)
+    })?;
     let body = session.finish(&config, launch_fn, editor::read_template_file)?;
 
     // Commit an overwrite once, so a failed replacement retains the original.
@@ -877,5 +883,99 @@ mod tests {
         );
 
         core.lock();
+    }
+    #[test]
+    fn template_context_sources_editor_failures_retain_source_and_cleanup() {
+        for launch_fails in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let vault = setup_vault(&dir);
+            let before = std::fs::read(vault.join("vault.pqd")).unwrap();
+            let cli = make_template_list_cli(vault.to_str().unwrap(), Some("password"));
+            let path = std::cell::RefCell::new(None);
+            let error = cmd_template_add_impl(
+                &cli,
+                "daily".into(),
+                |temporary, _| {
+                    *path.borrow_mut() = Some(temporary.to_path_buf());
+                    if launch_fails {
+                        std::fs::write(temporary, "SOURCE_PRIVATE_BODY")?;
+                        Err(pq_diary_core::DiaryError::Editor(
+                            "synthetic editor failure".into(),
+                        ))
+                    } else {
+                        std::fs::write(temporary, [0xff])?;
+                        Ok(())
+                    }
+                },
+                &mut std::io::Cursor::new("n\n"),
+            )
+            .unwrap_err();
+            let source = error
+                .downcast_ref::<pq_diary_core::DiaryError>()
+                .expect("typed editor/read failure");
+            if launch_fails {
+                assert!(matches!(source, pq_diary_core::DiaryError::Editor(_)));
+                assert_eq!(
+                    error.to_string(),
+                    "Editor failed: editor error: synthetic editor failure"
+                );
+            } else {
+                assert!(matches!(source, pq_diary_core::DiaryError::Io(_)));
+                assert_eq!(
+                    error.to_string(),
+                    format!("Failed to read temp file: {source}")
+                );
+                assert_eq!(
+                    error
+                        .chain()
+                        .find_map(|e| e.downcast_ref::<std::io::Error>())
+                        .unwrap()
+                        .kind(),
+                    std::io::ErrorKind::InvalidData
+                );
+            }
+            for secret in ["password", "SOURCE_PRIVATE_BODY"] {
+                assert!(!format!("{error:?}").contains(secret));
+            }
+            assert!(!path.borrow().as_ref().unwrap().exists());
+            assert_eq!(std::fs::read(vault.join("vault.pqd")).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn template_context_sources_confirmation_failure_keeps_io_and_template() {
+        struct FailedRead;
+        impl std::io::Read for FailedRead {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "confirmation unavailable",
+                ))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let vault = setup_vault(&dir);
+        seed_templates(&vault, &[("daily", "SOURCE_PRIVATE_BODY")]);
+        let before = std::fs::read(vault.join("vault.pqd")).unwrap();
+        let cli = make_template_list_cli(vault.to_str().unwrap(), Some("password"));
+        let error = cmd_template_delete_impl(
+            &cli,
+            "daily".into(),
+            false,
+            &mut std::io::BufReader::new(FailedRead),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Failed to read input: confirmation unavailable"
+        );
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        for secret in ["password", "SOURCE_PRIVATE_BODY"] {
+            assert!(!format!("{error:?}").contains(secret));
+        }
+        assert_eq!(std::fs::read(vault.join("vault.pqd")).unwrap(), before);
     }
 }
